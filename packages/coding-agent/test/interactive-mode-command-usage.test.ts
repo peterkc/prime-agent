@@ -10,6 +10,7 @@ type SubmitContext = {
 
 type Prototype = {
 	setupEditorSubmitHandler(this: SubmitContext): void;
+	handleNameCommand(this: SubmitContext, text: string): Promise<void>;
 };
 
 const prototype = InteractiveMode.prototype as unknown as Prototype;
@@ -98,5 +99,14 @@ describe("InteractiveMode no-argument command usage errors", () => {
 		await context.defaultEditor.onSubmit?.("/speed banana");
 		expect(context.showError).toHaveBeenCalledWith("Usage: /speed [on|off]");
 		expect((context.agentConnection as { prompt: ReturnType<typeof vi.fn> }).prompt).not.toHaveBeenCalled();
+	});
+
+	it("shows a rejected /name as an error instead of crashing the client", async () => {
+		const context = makeSubmitContext();
+		const setSessionName = async () => Promise.reject(new Error("taken"));
+		Object.assign(context, { agentConnection: { setSessionName }, handleNameCommand: prototype.handleNameCommand });
+		prototype.setupEditorSubmitHandler.call(context);
+		await context.defaultEditor.onSubmit?.("/name taken");
+		expect(context.showError).toHaveBeenCalledWith("taken");
 	});
 });

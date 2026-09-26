@@ -1,0 +1,1 @@
+- Fixed `/name` crashing the interactive client when the name is already used by another session; the error is now shown in the chat.
