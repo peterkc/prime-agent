@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
@@ -61,6 +62,7 @@ class FakeDaemonClient {
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
+	createError: string | undefined;
 	hello: DaemonHello | undefined = {
 		type: "daemon_hello",
 		socketPath: "/tmp/fake.sock",
@@ -537,6 +539,30 @@ class FakeDaemonClient {
 					errorInfo: {
 						code: "session_import_file_not_found",
 						filePath: "/tmp/not-found.jsonl",
+					},
+				};
+			case "create":
+				if (this.createError) {
+					return { type: "response", command: command.type, success: false, error: this.createError };
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						id: "reopened",
+						activeSessionId: "reopened",
+						sessionId: "session-current",
+						sessionFile: command.sessionPath,
+						cwd: command.config?.cwd ?? "/daemon-default",
+						lifecycle: "live",
+						activity: "idle",
+						isSessionActive: false,
+						isStreaming: false,
+						isCompacting: false,
+						attachedClients: 0,
+						messageCount: 0,
+						sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 					},
 				};
 			default:
@@ -1680,6 +1706,96 @@ describe("DaemonAgentConnection", () => {
 			expect(closedEvents).toHaveLength(1);
 			const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;
 			expect(closedError).toContain("The Prime Agent daemon shut down while this window was attached.");
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("reopens the saved session in its own folder when the restarted daemon does not list it", async () => {
+		vi.useFakeTimers();
+		try {
+			const savedCwd = tmpdir();
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.attachResultFactory = (command) => {
+				const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+				result.snapshot.summary.cwd = savedCwd;
+				return result;
+			};
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+				restartReopenConfig: { cwd: "/client/launch/folder", model: "launch-model" },
+			});
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => void events.push(event));
+			await connection.attach();
+
+			// A plain shutdown stopped every worker: the restarted daemon lists nothing.
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(500);
+
+			const creates = fakeClient.requests.filter((request) => request.type === "create");
+			expect(creates).toEqual([
+				{
+					type: "create",
+					sessionPath: "/tmp/session-current.jsonl",
+					config: { cwd: savedCwd, model: "launch-model" },
+				},
+			]);
+			expect(
+				fakeClient.requests.some((request) => request.type === "attach" && request.activeSessionId === "reopened"),
+			).toBe(true);
+			expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(1);
+			expect(events.filter((event) => event.type === "closed")).toEqual([]);
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("drops a missing saved folder and stops reopening after repeated failures", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.createError = "Session file not found";
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+				reconnectTimeoutMs: 5000,
+				restartReopenConfig: { cwd: "/client/launch/folder" },
+			});
+			const closedEvents: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				if (event.type === "closed") closedEvents.push(event);
+			});
+			await connection.attach();
+
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(5100);
+
+			const creates = fakeClient.requests.filter((request) => request.type === "create");
+			expect(creates).toHaveLength(3);
+			// The attach summary's folder (/tmp/project) does not exist: the daemon picks its default.
+			expect(creates[0]).toMatchObject({ config: {} });
+			expect(creates[0]?.type === "create" ? creates[0].config?.cwd : "unset").toBeUndefined();
+			expect(closedEvents).toHaveLength(1);
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not reopen a client-owned session after a shutdown", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+				reconnectTimeoutMs: 1000,
+				ownedSession: true,
+			});
+			await connection.attach();
+
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(1100);
+
+			expect(fakeClient.requests.some((request) => request.type === "create")).toBe(false);
 			await connection.dispose();
 		} finally {
 			vi.useRealTimers();

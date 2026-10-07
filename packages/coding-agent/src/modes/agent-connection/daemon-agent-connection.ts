@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
@@ -42,6 +42,7 @@ import {
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
 	isDaemonDialogExtensionUiRequest,
+	isSessionSummary,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
 import {
@@ -157,6 +158,11 @@ class SnapshotTransferAbandonedError extends Error {}
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const DAEMON_RECONNECT_TIMEOUT_MS = 60_000;
+// Local patch: a plain shutdown is often followed by a manual restart from a fresh
+// shell (to reload the environment), so the window waits longer than a hiccup.
+export const DAEMON_SHUTDOWN_RECONNECT_TIMEOUT_MS = 10 * 60_000;
+// Local patch: stop re-sending a failing reopen; the loop keeps polling the list.
+const MAX_SHUTDOWN_REOPEN_FAILURES = 3;
 export const DAEMON_SNAPSHOT_TIMEOUT_MS = 30_000;
 const MAX_IGNORED_SNAPSHOT_IDS = 128;
 // Overflow replaces the initial render with a fresh attach snapshot.
@@ -244,6 +250,8 @@ export interface DaemonAgentConnectionOptions {
 	ownedSession?: boolean;
 	/** Fresh runtime context used only if the owned worker must be relaunched. */
 	ownedSessionRecoveryConfig?: AgentSessionRuntimeConfig;
+	/** Local patch: runtime context for reopening the saved session after a plain daemon shutdown. */
+	restartReopenConfig?: AgentSessionRuntimeConfig;
 	/** Require the target worker to have been created with telemetry disabled. */
 	telemetryDisabled?: true;
 }
@@ -309,6 +317,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private sessionRevision = 0;
 	private attachedSessionId: string | undefined;
 	private attachedSessionFile: string | undefined;
+	private attachedCwd: string | undefined;
+	private attachedRlmDepth: number | undefined;
 	private daemonLogPath: string | undefined;
 	private updateRestartPending = false;
 	private updateReconnectFailed = false;
@@ -566,6 +576,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.attachedSessionId = summary.sessionId;
 		this.attachedSessionFile =
 			summary.sessionFile ?? ("snapshot" in result ? result.snapshot.state.sessionFile : undefined);
+		this.attachedCwd = summary.cwd;
+		this.attachedRlmDepth = summary.rlmDepth;
 		this.captureDaemonLogPath();
 		this.updateReconnectFailed = false;
 		this.shutdownReconnectFailed = false;
@@ -2346,7 +2358,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			})
 			.then(() =>
 				this.restoreConnectionAfterDaemonRestart({
-					timeoutMs: this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS,
+					timeoutMs: this.options.reconnectTimeoutMs ?? DAEMON_SHUTDOWN_RECONNECT_TIMEOUT_MS,
 					retryMs: SHUTDOWN_RECONNECT_RETRY_MS,
 				}),
 			)
@@ -2378,6 +2390,31 @@ export class DaemonAgentConnection implements AgentConnection {
 		return reconnectPromise;
 	}
 
+	/**
+	 * Local patch: reopen the saved session on the restarted daemon, in the folder
+	 * recorded at attach (the daemon's default folder would otherwise replace it).
+	 */
+	private async reopenSessionAfterShutdown(sessionFile: string, deadline: number): Promise<SessionSummary> {
+		const config: AgentSessionRuntimeConfig = { ...this.options.restartReopenConfig };
+		if (this.attachedCwd && existsSync(this.attachedCwd)) {
+			config.cwd = this.attachedCwd;
+		} else {
+			delete config.cwd;
+		}
+		const response = await this.client.request(
+			{ type: "create", sessionPath: sessionFile, config },
+			Math.max(1, Math.min(30_000, deadline - Date.now())),
+			{ recoverable: false },
+		);
+		if (!response.success) {
+			throw deserializeDaemonError(response);
+		}
+		if (!isSessionSummary(response.data) || response.data.activeSessionId === undefined) {
+			throw new Error("Daemon returned an invalid create response");
+		}
+		return response.data;
+	}
+
 	private async restoreConnectionAfterUpdate(): Promise<boolean> {
 		return this.restoreConnectionAfterDaemonRestart({
 			timeoutMs: UPDATE_RECONNECT_TIMEOUT_MS,
@@ -2401,6 +2438,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		let ownRevisionBumps = 0;
 		const deadline = Date.now() + options.timeoutMs;
 		let lastError: unknown;
+		let reopenFailures = 0;
 		while (!this.disposed && !this.terminalCloseEmitted && Date.now() < deadline) {
 			// An update-restart recovery outranks a plain-shutdown recovery still polling:
 			// while it runs (its flag) and once it restored (its revision bump).
@@ -2430,12 +2468,32 @@ export class DaemonAgentConnection implements AgentConnection {
 					throw deserializeDaemonError(response);
 				}
 				const sessions = readSessionSummaries(response.data);
-				const restored = sessions.find(
+				let restored = sessions.find(
 					(summary) =>
 						summary.activeSessionId !== undefined &&
 						((sessionFile !== undefined && summary.sessionFile === sessionFile) ||
 							(sessionId !== undefined && summary.sessionId === sessionId)),
 				);
+				// Local patch: a plain shutdown archive-stops every worker, so the restarted
+				// daemon never lists this session again. Reopen it from its saved file.
+				if (
+					!restored &&
+					sessionFile !== undefined &&
+					!options.updateRestart &&
+					!this.options.ownedSession &&
+					(this.attachedRlmDepth ?? 0) === 0 &&
+					reopenFailures < MAX_SHUTDOWN_REOPEN_FAILURES
+				) {
+					try {
+						restored = await this.reopenSessionAfterShutdown(sessionFile, deadline);
+					} catch (error) {
+						reopenFailures++;
+						throw error;
+					}
+					if (this.disposed || this.terminalCloseEmitted) {
+						return false;
+					}
+				}
 				if (restored?.activeSessionId) {
 					if (this.disposed || this.terminalCloseEmitted) {
 						return false;
