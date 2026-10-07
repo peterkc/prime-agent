@@ -35,7 +35,10 @@ execFileSync("node", ["scripts/catalog-assets.mjs", "copy-source", "--out", "dis
 	stdio: "inherit",
 });
 
-const buildId = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+const buildId = execFileSync("git", ["describe", "--tags", "--long", "--always", "--dirty"], {
+	cwd: root,
+	encoding: "utf8",
+}).trim();
 const outputRoot = join(packageDir, "binaries");
 mkdirSync(outputRoot, { recursive: true });
 for (const target of platform === "all" ? platforms : [platform]) {
