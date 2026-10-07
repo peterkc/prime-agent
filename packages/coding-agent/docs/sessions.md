@@ -8,9 +8,9 @@ Sessions auto-save to `~/.prime/agent/sessions/`. Each session is a JSONL file w
 
 ```bash
 prime-agent --continue          # Continue the most recent session
-prime-agent --resume [path|id]  # Browse past sessions or resume one directly
+prime-agent --resume [path|id|name] # Browse past sessions or resume one directly
 prime-agent --no-session        # Ephemeral mode; do not save
-prime-agent --fork <path|id>    # Fork a session file or partial session ID into a new session
+prime-agent --fork <path|id|name>   # Fork a session file, partial session ID or name into a new session
 ```
 
 Use `/session` in interactive mode to see the current session file, session ID, and message count. Use `/usage` for token, cost, and context usage.
@@ -35,7 +35,7 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 
 ## Resuming and Deleting Sessions
 
-`/resume` opens an interactive session picker for the current project. `prime-agent --resume` opens the same picker at startup, and `prime-agent --resume <path|id>` resumes a specific session.
+`/resume` opens an interactive session picker for the current project. `prime-agent --resume` opens the same picker at startup, and `prime-agent --resume <path|id|name>` resumes a specific session.
 
 An invalid ID exits with the closest unambiguous session ID when one is available. To open the picker and send an initial prompt after selecting a session, separate the prompt with `--`: `prime-agent --resume -- "continue this work"`.
 
@@ -58,7 +58,7 @@ Use `/name <name>` to set a human-readable session name:
 /name Refactor auth module
 ```
 
-Named sessions are easier to find in `/resume` and `prime-agent --resume`.
+Named sessions are easier to find in `/resume` and `prime-agent --resume`. You can also resume or fork a session by its exact name, for example `prime-agent --resume "Refactor auth module"`. If two saved sessions share a name, use the session ID instead.
 
 ## Branching with `/tree`
 

@@ -108,11 +108,12 @@ export function findClosestSessionId(
 	return closest && !tied && closest.distance <= maximumDistance ? closest.id : undefined;
 }
 
+/** Matches a whole session id, normalized, or a session name exactly as written. */
 function resolveExactMatch(selector: string, sessions: readonly SessionInfo[]): SessionInfo | undefined {
 	const normalizedSelector = normalizeSessionId(selector);
 	return resolveUniqueMatch(
 		selector,
-		sessions.filter((session) => normalizeSessionId(session.id) === normalizedSelector),
+		sessions.filter((session) => normalizeSessionId(session.id) === normalizedSelector || session.name === selector),
 	);
 }
 

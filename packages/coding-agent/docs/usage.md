@@ -91,9 +91,9 @@ Sessions are saved automatically as flat JSONL files under `~/.prime/agent/sessi
 
 ```bash
 prime-agent -c                  # Continue most recent session
-prime-agent -r [path|id]        # Browse sessions or resume one directly
+prime-agent -r [path|id|name]   # Browse sessions or resume one directly
 prime-agent --no-session        # Ephemeral mode; do not save
-prime-agent --fork <path|id>    # Fork a session into a new session file
+prime-agent --fork <path|id|name> # Fork a session into a new session file
 ```
 
 Useful session commands:
@@ -226,8 +226,8 @@ Use `prime-agent model list [search]` to list available models.
 | Option | Description |
 |--------|-------------|
 | `-c`, `--continue` | Continue the most recent session |
-| `-r`, `--resume [path\|id]` | Browse and select a session, or resume a specific session file or partial UUID |
-| `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
+| `-r`, `--resume [path\|id\|name]` | Browse and select a session, or resume a specific session file, partial UUID or session name |
+| `--fork <path\|id\|name>` | Fork a session file, partial UUID or session name into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode; do not save |
 

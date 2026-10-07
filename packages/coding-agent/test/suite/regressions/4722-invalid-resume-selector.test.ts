@@ -12,10 +12,12 @@ import { createHarness, type Harness } from "../harness.js";
 
 const SAVED_ID = "019e71ec-e08a-75a9-b573-aaaaaaaaaaaa";
 
-function createSavedSession(cwd: string, sessionDir: string, sessionId: string): void {
+function createSavedSession(cwd: string, sessionDir: string, idAndName: string): void {
+	const [sessionId, name] = idAndName.split("=");
 	const session = SessionManager.create(cwd, sessionDir);
 	session.newSession({ id: sessionId });
 	session.appendSessionState({ status: "archived" });
+	if (name) session.appendSessionInfo(name);
 }
 
 describe("ENG-4722 resume selector matching", () => {
@@ -39,6 +41,7 @@ describe("ENG-4722 resume selector matching", () => {
 			selector: "aaaaaaaaaaaa",
 			resolved: SAVED_ID,
 		},
+		{ name: "an exact name beats an id prefix", saved: ["abcd1", "efgh=abcd"], selector: "abcd", resolved: "efgh" },
 		{
 			name: "an ambiguous prefix is rejected",
 			saved: ["11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb"],

@@ -233,9 +233,9 @@ Sessions auto-save as flat JSONL files under `~/.prime/agent/sessions/`. Each se
 
 ```bash
 prime-agent -c                  # Continue most recent session
-prime-agent -r [path|id]        # Browse past sessions or resume one directly
+prime-agent -r [path|id|name]   # Browse past sessions or resume one directly
 prime-agent --no-session        # Ephemeral mode (don't save)
-prime-agent --fork <path|id>    # Fork specific session file or ID into a new session
+prime-agent --fork <path|id|name> # Fork specific session file, ID or name into a new session
 ```
 
 Use `/session` in interactive mode to see the current session ID before reusing it with `--resume <id>` or `--fork <id>`.
@@ -254,7 +254,7 @@ Use `/session` in interactive mode to see the current session ID before reusing 
 
 **`/clone`** - Duplicate the current active branch into a new session file at the current position. The new session keeps the full active-path history and opens with an empty editor.
 
-**`--fork <path|id>`** - Fork an existing session file or partial session UUID directly from the CLI. This copies the full source session into a new session file in the current project.
+**`--fork <path|id|name>`** - Fork an existing session file, partial session UUID or session name directly from the CLI. This copies the full source session into a new session file in the current project.
 
 ### Compaction
 
@@ -589,8 +589,8 @@ Use `prime-agent model list [search]` to list available models.
 | Option | Description |
 |--------|-------------|
 | `-c`, `--continue` | Continue most recent session |
-| `-r`, `--resume [path\|id]` | Open the searchable session view, or resume a specific session file or partial UUID |
-| `--fork <path\|id>` | Fork specific session file or partial UUID into a new session |
+| `-r`, `--resume [path\|id\|name]` | Open the searchable session view, or resume a specific session file, partial UUID or session name |
+| `--fork <path\|id\|name>` | Fork specific session file, partial UUID or session name into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode (don't save) |
 

@@ -139,7 +139,7 @@ Sessions are saved automatically under `~/.prime/agent/sessions/`:
 
 ```bash
 prime-agent -c                  # Continue the most recent session
-prime-agent -r [path|id]        # Browse sessions or open a specific session
+prime-agent -r [path|id|name]   # Browse sessions or open a specific session
 ```
 
 Inside Prime Agent, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions. Persistent sessions run in worker processes, so closing the TUI detaches from the agent rather than necessarily stopping it. Use `prime-agent agents` to inspect or reattach to active work.
