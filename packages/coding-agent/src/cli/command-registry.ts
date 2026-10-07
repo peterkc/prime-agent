@@ -106,6 +106,19 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		examples: ['incident --since "2026-09-16T20:02" --until "2026-09-16T20:21"', "incident --session 2339fb7da605"],
 	},
 	{
+		path: ["restart"],
+		usage: "restart [<daemon>...] [--force] [--json]",
+		summary: "Restart one, several or all reachable daemons",
+		description:
+			"Without names, restart all reachable daemons. Names accept a socket path, socket file name, or short name such as prime or default. Confirm once before restarting each daemon in order. Restarted daemons get the caller's environment. Run pa restart inside a repository to keep its environment.",
+		options: [
+			"--daemon-socket <path>  Restart only this daemon (cannot be combined with names)",
+			"--force  Skip confirmation",
+			"--json  Print results as JSON (requires --force)",
+		],
+		examples: ["restart default --force", "restart work personal", "restart --daemon-socket /tmp/work.sock --force"],
+	},
+	{
 		path: ["shutdown"],
 		usage: "shutdown [--force] [--json]",
 		summary: "Stop every agent and background service",

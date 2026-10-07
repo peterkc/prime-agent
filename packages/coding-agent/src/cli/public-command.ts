@@ -17,6 +17,7 @@ import {
 } from "./command-registry.js";
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
+import { runRestart } from "./daemon-restart.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
 import { extractHelpCommandPath, rotateGlobalFlagsBeforeCommand } from "./global-flags.js";
 import {
@@ -124,6 +125,9 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return runDoctor(args.slice(1));
 		case "incident":
 			return runIncidentCommand(args.slice(1));
+		case "restart":
+			await runRestart(args.slice(1));
+			return HANDLED;
 		case "shutdown":
 			return runShutdown(args.slice(1));
 		case "package":

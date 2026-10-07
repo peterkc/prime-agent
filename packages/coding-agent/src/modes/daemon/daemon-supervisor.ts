@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -587,6 +587,36 @@ function descriptorKey(socketPath: string): string {
 
 function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
+}
+
+export function readPersistedDaemonFolders(
+	agentDir: string,
+	socketPath: string,
+): { cwd?: string; sessionDir?: string } | undefined {
+	try {
+		const configPath = join(defaultWorkerDescriptorDir(agentDir, socketPath), SUPERVISOR_CONFIG_FILE_NAME);
+		const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Partial<PersistedSupervisorConfig>;
+		if (
+			parsed.version !== 1 ||
+			typeof parsed.socketPath !== "string" ||
+			normalizeSocketPath(parsed.socketPath) !== normalizeSocketPath(socketPath) ||
+			!parsed.defaultSessionConfig ||
+			typeof parsed.defaultSessionConfig !== "object" ||
+			typeof parsed.defaultSessionConfig.agentDir !== "string"
+		) {
+			return undefined;
+		}
+		const { cwd, sessionDir } = durableAgentSessionRuntimeConfig(parsed.defaultSessionConfig);
+		const folders = { sessionDir };
+		try {
+			if (cwd && statSync(cwd).isDirectory()) return { ...folders, cwd };
+		} catch {
+			// An unavailable default folder does not invalidate the saved session folder.
+		}
+		return folders;
+	} catch {
+		return undefined;
+	}
 }
 
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {

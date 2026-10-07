@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 	psCalls: [] as boolean[],
 	reapCalls: [] as Array<[boolean, boolean]>,
 	shutdownCalls: [] as Array<[boolean, boolean]>,
+	restartCalls: [] as string[][],
 	mcpCommands: [] as string[][],
 	incidentCalls: [] as Array<Record<string, string | undefined>>,
 	incidentWindows: [] as Array<{ sinceMs: number; untilMs: number } | undefined>,
@@ -60,6 +61,10 @@ vi.mock("../src/cli/daemon-ps.js", () => ({
 	},
 }));
 
+vi.mock("../src/cli/daemon-restart.js", () => ({
+	runRestart: async (args: string[]) => void mocks.restartCalls.push(args),
+}));
+
 import { INTERNAL_RUNTIME_COMMAND_MARKER } from "../src/cli/args.js";
 import { formatTopLevelHelp } from "../src/cli/command-registry.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "../src/cli/daemon-update-restart.js";
@@ -72,6 +77,7 @@ describe("public command routing", () => {
 		mocks.psCalls.length = 0;
 		mocks.reapCalls.length = 0;
 		mocks.shutdownCalls.length = 0;
+		mocks.restartCalls.length = 0;
 		mocks.mcpCommands.length = 0;
 		mocks.incidentCalls.length = 0;
 		mocks.incidentWindows.length = 0;
@@ -413,6 +419,24 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalled();
 		expect(mocks.packageCommands).toEqual([]);
 		expect(mocks.daemonCommands).toEqual([]);
+	});
+
+	it("routes restart arguments after global-flag rotation", async () => {
+		await handlePublicCommand(["restart", "--daemon-socket", "/tmp/a.sock", "--force", "--json"]);
+		expect(mocks.restartCalls).toEqual([["--daemon-socket", "/tmp/a.sock", "--force", "--json"]]);
+		await handlePublicCommand(["--daemon-socket", "/tmp/a.sock", "restart"]);
+		expect(mocks.restartCalls[1]).toEqual(["--daemon-socket", "/tmp/a.sock"]);
+	});
+	it.each([
+		["help", "restart"],
+		["restart", "--help"],
+	])("prints restart help %j", async (...argv) => {
+		await handlePublicCommand(argv);
+		expect(formatTopLevelHelp()).toContain("restart");
+		expect(console.log).toHaveBeenLastCalledWith(expect.stringContaining("restart [<daemon>...] [--force] [--json]"));
+		expect(mocks.restartCalls).toEqual([]);
+		const details = /socket path.*socket file name.*short name.*caller.s environment.*pa restart/;
+		expect(console.log).toHaveBeenLastCalledWith(expect.stringMatching(details));
 	});
 
 	it("uses force only when explicitly requested for full shutdown", async () => {
