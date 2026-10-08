@@ -27,6 +27,7 @@ import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { installOwnedSessionRecoveryTracking, isOwnedSessionWorkerProcess } from "./cli/owned-session-worker.js";
 import { handlePublicCommand } from "./cli/public-command.js";
+import { repositoryDaemon } from "./cli/repository-daemon.js";
 import {
 	looksLikeSessionPath,
 	resolveSessionPath,
@@ -1255,11 +1256,15 @@ export async function main(args: string[], options?: MainOptions) {
 	// settings, resources, provider registrations, and models must be resolved only after
 	// the target session cwd is known. The startup-cwd settings manager is used only for
 	// sessionDir lookup during session selection.
+	const repository =
+		useDaemonClient && !parsed.daemonSocket && !parsed.sessionDir && !parsed.noSession
+			? repositoryDaemon(cwd)
+			: undefined;
 	const sessionDir =
 		(parsed.sessionDir ? expandTildePath(parsed.sessionDir) : undefined) ??
 		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
-	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
+	const daemonSocketPath = parsed.daemonSocket ?? repository?.socketPath ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; attach only connects to an existing daemon.
 	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonClient, publicCommand.attachAgent)

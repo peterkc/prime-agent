@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ensureInteractiveDaemonRunning } from "../src/cli/daemon-launch.js";
 import type * as DaemonUpdateRestartModule from "../src/cli/daemon-update-restart.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
@@ -21,6 +22,7 @@ import {
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
+import * as supervisor from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	handlePackageCommand,
 	prepareDaemonUpdateRestart,
@@ -936,8 +938,12 @@ describe("self-update daemon restart", () => {
 		}
 	});
 
-	it("restarts the daemon only after the package update succeeds", async () => {
+	it("TM-20 restarts after update from the saved daemon folder", async () => {
 		useFixedOwnerHello();
+		const saved = vi
+			.spyOn(supervisor, "readPersistedDaemonFolders")
+			.mockImplementation(() => (mockState.calls.includes("shutdown-daemon") ? undefined : { cwd: tempDir }));
+		const sessionDir = process.env.PRIME_AGENT_SESSION_DIR;
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -964,8 +970,11 @@ describe("self-update daemon restart", () => {
 			expect(releaseAdmissionIndex).toBeGreaterThan(startupFenceIndex);
 			expect(ensureIndex).toBeGreaterThan(releaseAdmissionIndex);
 			expect(ensureIndex).toBeGreaterThan(shutdownIndex);
+			expect(ensureInteractiveDaemonRunning).toHaveBeenLastCalledWith(mockState.socketPath, tempDir);
+			expect(process.env.PRIME_AGENT_SESSION_DIR).toBe(sessionDir);
 			expect(statSync(join(agentDir, "update-restarts", "test-status.json")).mode & 0o777).toBe(0o600);
 		} finally {
+			saved.mockRestore();
 			errorSpy.mockRestore();
 			logSpy.mockRestore();
 		}

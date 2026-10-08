@@ -18,6 +18,7 @@ import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
+import { repositoryDaemon } from "./repository-daemon.js";
 import { formatSessionsTable } from "./sessions-table-format.js";
 
 interface ParsedDaemonClientCommand {
@@ -25,6 +26,7 @@ interface ParsedDaemonClientCommand {
 	socketPath: string;
 	json: boolean;
 	positionals: string[];
+	repositoryRouted: boolean;
 }
 
 const DAEMON_CLIENT_COMMANDS = new Set([
@@ -70,7 +72,7 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 }
 
 function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
-	let socketPath = defaultDaemonSocketPath();
+	let socketPath: string | undefined;
 	let json = false;
 	const positionals: string[] = [];
 	let passthrough = false;
@@ -129,7 +131,14 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 	}
 
 	command = command ?? "open";
-	return { command, socketPath, json, positionals };
+	const repository = socketPath === undefined ? repositoryDaemon(process.cwd()) : undefined;
+	return {
+		command,
+		socketPath: socketPath ?? repository?.socketPath ?? defaultDaemonSocketPath(),
+		json,
+		positionals,
+		repositoryRouted: repository !== undefined,
+	};
 }
 
 async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promise<void> {
@@ -148,6 +157,16 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 		return;
 	}
 
+	if (
+		parsed.repositoryRouted &&
+		(parsed.command === "list" || parsed.command === "sessions") &&
+		!(parsed.command === "list" ? parseListArgs : parseSessionsArgs)(parsed.positionals).all &&
+		!(await canConnectToDaemon(parsed.socketPath, 250))
+	) {
+		if (parsed.json) printJson({ sessions: [] });
+		else console.log("No active agents.");
+		return;
+	}
 	const client = new DaemonClient(parsed.socketPath);
 	await client.connect();
 

@@ -6,8 +6,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
+import { appendRotatingLog, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
@@ -30,6 +29,7 @@ import {
 	isCommandPositional,
 	PROMPT_RUN_FLAGS,
 } from "./global-flags.js";
+import { repositoryDaemon, repositoryDaemonRoot } from "./repository-daemon.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
@@ -404,7 +404,7 @@ Then retry the original command.`,
 		process.execPath,
 		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
 		{
-			cwd: spawnCwd ?? process.cwd(),
+			cwd: repositoryDaemonRoot(socketPath) ?? spawnCwd ?? process.cwd(),
 			detached: true,
 			env,
 			// A pipe would tie the daemon's stderr to this short-lived CLI
@@ -553,14 +553,11 @@ export function maybeStartDaemonEarly(args: readonly string[]): void {
 	if (!shouldStartDaemonEarly(args, startupBenchmark)) {
 		return;
 	}
+	if (args.some((arg) => ["--", "--cwd", "--session-dir", "--no-session"].includes(arg))) return;
 	const socketIndex = args.indexOf("--daemon-socket");
 	const rawSocketPath =
-		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : defaultDaemonSocketPath();
-	const cwdIndex = args.indexOf("--cwd");
-	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
-	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;
-	if (spawnCwd && !existsSync(spawnCwd)) {
-		return;
-	}
-	void ensureInteractiveDaemonRunning(normalizeSocketPath(rawSocketPath, spawnCwd), spawnCwd);
+		socketIndex !== -1
+			? args[socketIndex + 1] || defaultDaemonSocketPath()
+			: (repositoryDaemon(process.cwd())?.socketPath ?? defaultDaemonSocketPath());
+	void ensureInteractiveDaemonRunning(normalizeSocketPath(rawSocketPath));
 }

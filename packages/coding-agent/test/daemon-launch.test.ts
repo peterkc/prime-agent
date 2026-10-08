@@ -6,13 +6,17 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ensureInteractiveDaemonRunning,
+	maybeStartDaemonEarly,
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
 	shouldStartDaemonEarly,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
+import * as repository from "../src/cli/repository-daemon.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
+import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import * as childProcess from "../src/utils/child-process.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -212,6 +216,56 @@ describe("probeRunningDaemonSessions", () => {
 
 describe("shouldStartDaemonEarly", () => {
 	it.each([
+		["--cwd", "B"],
+		["--cwd", "A", "--cwd", "B"],
+		["--goal", "--cwd", "B"],
+		["--", "--cwd", "B"],
+		["--session-dir", "sessions"],
+		["--no-session"],
+		[],
+	])("TM-19 early start %j", async (...args) => {
+		const temp = mkdtempSync(join(tmpdir(), "pa-early-"));
+		const socketPath = join(temp, "d.sock");
+		const route = vi
+			.spyOn(repository, "repositoryDaemon")
+			.mockReturnValue({ root: temp, socketPath, sessionDir: temp });
+		vi.spyOn(process, "cwd").mockReturnValue(temp);
+		let finish = () => {};
+		const settled = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		const connects = vi.spyOn(DaemonClient.prototype, "connect").mockResolvedValue();
+		vi.spyOn(DaemonClient.prototype, "waitForHello").mockResolvedValue({
+			type: "daemon_hello",
+			socketPath,
+			clientId: "fake-client",
+			serverCapabilities: [],
+			protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
+			schemaId: DAEMON_SCHEMA_ID,
+			appVersion: VERSION,
+		});
+		vi.spyOn(DaemonClient.prototype, "close").mockImplementation(finish);
+		const spawn = vi
+			.spyOn(childProcess, "spawnHidden")
+			.mockReturnValue({} as ReturnType<typeof childProcess.spawnHidden>);
+		try {
+			maybeStartDaemonEarly(args);
+			if (args.length) {
+				expect(route).not.toHaveBeenCalled();
+				expect(spawn).not.toHaveBeenCalled();
+			} else {
+				expect(route).toHaveBeenCalledExactlyOnceWith(temp);
+				await settled;
+				expect(connects.mock.contexts[0]).toMatchObject({ socketPath });
+				expect(spawn).not.toHaveBeenCalled();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			rmSync(temp, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
 		["interactive", []],
 		["print", ["--print", "hello"]],
 		["json", ["--mode", "json", "hello"]],
@@ -399,7 +453,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		const startedAt = Date.now();
 
 		try {
-			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+			await expect(ensureInteractiveDaemonRunning(socketPath, dir)).rejects.toThrow(
 				/Prime Agent daemon exited during startup \(code 23\)\.[\s\S]*fatal startup failure/,
 			);
 			expect(Date.now() - startedAt).toBeLessThan(10_000);
@@ -422,7 +476,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		process.argv[1] = entrypoint;
 
 		try {
-			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+			await expect(ensureInteractiveDaemonRunning(socketPath, dir)).rejects.toThrow(
 				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
 			);
 		} finally {
@@ -473,7 +527,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		});
 
 		try {
-			const ensurePromise = ensureInteractiveDaemonRunning(socketPath);
+			const ensurePromise = ensureInteractiveDaemonRunning(socketPath, dir);
 			// Let the child exit first, then bring up the winning daemon inside
 			// the exit grace window.
 			await new Promise((resolve) => setTimeout(resolve, 300));
@@ -502,7 +556,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		process.argv[1] = entrypoint;
 
 		try {
-			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+			await expect(ensureInteractiveDaemonRunning(socketPath, dir)).rejects.toThrow(
 				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
 			);
 		} finally {

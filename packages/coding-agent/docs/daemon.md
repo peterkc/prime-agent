@@ -2,6 +2,27 @@
 
 Prime Agent isolates each active root session tree in its own process. The daemon is internal infrastructure: interactive, print, JSON, RPC, piped-stdin, and `--no-session` describe client behavior and retain their public I/O contracts.
 
+## Repository daemons
+
+Inside a Git repository, session commands use that repository's daemon by default.
+Subfolders and linked worktrees share the main checkout's daemon. Submodules use their own daemon.
+Outside a repository, the default remains the shared daemon.
+
+The repository socket is `<defaultDaemonSocketDir()>/<name>-<checksum>.sock`.
+The name comes from the repository folder. The checksum is POSIX `cksum` of its absolute path.
+Sessions are saved in `<root>/.prime/agent/sessions`, with artifacts in the sibling `session-artifacts` folder.
+For a root named `.prime`, these folders are `<root>/agent/sessions` and `<root>/agent/session-artifacts`.
+Existing saved sessions elsewhere are not moved.
+
+The CLI creates both folders and adds root-anchored entries to Git's local exclude file when needed.
+It warns and continues if a folder cannot be ignored. Ignore rules do not affect files already tracked by Git.
+
+`--daemon-socket <path>` selects another daemon and disables repository routing.
+`--session-dir <path>` also disables repository routing, keeping the shared daemon unless an explicit socket is given.
+`--no-session` keeps the existing non-daemon behavior.
+With no repository daemon listening, `list` and `sessions` report no active agents without starting a daemon.
+`list --all` still requires a running daemon.
+
 ## Process Topology
 
 ```mermaid

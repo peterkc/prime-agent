@@ -234,7 +234,7 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 			["--cwd <dir>", "Use a specific working directory"],
 			["--offline", "Disable startup network operations"],
 			["--verbose", "Force verbose startup"],
-			["--daemon-socket <path>", "Use a specific daemon socket"],
+			["--daemon-socket <path>", "Use a specific daemon socket (default inside a repository: its daemon)"],
 		],
 	},
 	{

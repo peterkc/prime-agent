@@ -65,6 +65,7 @@ import {
 	isUnknownDaemonCommandError,
 } from "./modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "./modes/daemon/daemon-socket.js";
+import { readPersistedDaemonFolders } from "./modes/daemon/daemon-supervisor.js";
 import {
 	acquireDaemonShutdownAdmission,
 	persistDaemonStartupFenceFromOwner,
@@ -1366,6 +1367,8 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		}
 		shutdownAdmission = await acquireDaemonShutdownAdmission();
 		const daemonProbe = await probeRunningDaemonSessions(options.socketPath);
+		// A clean shutdown deletes the saved supervisor config, so read the start folder first.
+		const savedCwd = readPersistedDaemonFolders(options.agentDir, options.socketPath)?.cwd;
 		const reportRestoreProgress = (progress: RestoreDaemonUpdateRestartResult) => {
 			const { failures, ...counts } = progress;
 			statusWriter.update({ counts, failures });
@@ -1441,7 +1444,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		await shutdownAdmission.assertOrRenew();
 		await shutdownAdmission.release();
 		shutdownAdmission = undefined;
-		await ensureInteractiveDaemonRunning(options.socketPath);
+		await ensureInteractiveDaemonRunning(options.socketPath, savedCwd);
 		const successorClient = new DaemonClient(options.socketPath);
 		let successor: DaemonUpdateRestartProcessIdentity;
 		try {

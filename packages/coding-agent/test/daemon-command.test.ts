@@ -1,4 +1,9 @@
+import * as cp from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { repositoryDaemon } from "../src/cli/repository-daemon.js";
 
 const daemonClientMock = vi.hoisted(() => {
 	type Listener = (message: { type: string; activeSessionId?: string; event?: { type: string } }) => void;
@@ -235,6 +240,40 @@ describe("daemon command", () => {
 	afterEach(() => {
 		process.exitCode = undefined;
 		vi.restoreAllMocks();
+	});
+
+	it.each([
+		["list", ["--json"], true],
+		["sessions", [], true],
+		["list", ["--all"], false],
+		["list", ["--daemon-socket", "explicit.sock", "--json"], false],
+		["list", ["--json"], false],
+	])("TM-10/TM-18 %s %j missing=%s", async (command, flags, missing) => {
+		const temp = mkdtempSync(join(tmpdir(), "pa-list-"));
+		const env = { ...process.env };
+		vi.spyOn(process, "cwd").mockReturnValue(temp);
+		try {
+			cp.execFileSync("git", ["init"], { cwd: temp });
+			const socket = flags.includes("--daemon-socket")
+				? join(temp, "explicit.sock")
+				: repositoryDaemon(temp)!.socketPath;
+			daemonClientMock.behavior.connectFails =
+				missing || flags.includes("--all") || flags.includes("--daemon-socket");
+			const git = vi.spyOn(cp, "spawnSync");
+			const spawns = spawnMock.calls.length;
+			await handleDaemonCommand(["daemon", command, ...flags]);
+			expect(spawnMock.calls).toHaveLength(spawns);
+			if (flags.includes("--daemon-socket")) expect(git).not.toHaveBeenCalled();
+			expect(daemonClientMock.instances[0]?.socketPath).toBe(socket);
+			expect(process.exitCode).toBe(!missing && daemonClientMock.behavior.connectFails ? 1 : undefined);
+			if (missing)
+				expect(console.log).toHaveBeenCalledWith(
+					flags.includes("--json") ? '{\n  "sessions": []\n}' : "No active agents.",
+				);
+		} finally {
+			process.env = env;
+			rmSync(temp, { recursive: true, force: true });
+		}
 	});
 
 	it("ignores stale agent_end events before a daemon prompt starts", async () => {
