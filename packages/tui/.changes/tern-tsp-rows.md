@@ -1,0 +1,2 @@
+- Added opt-in Tern native fullscreen transcript scrolling with a docked editor via `PI_TUI_NATIVE=1`.
+- Added `TUI.releaseNative()`, `FullscreenOptions.native` and `Terminal.native` for callers that hand the terminal to another program or opt in to native fullscreen.

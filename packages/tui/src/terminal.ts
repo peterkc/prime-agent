@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { setKittyProtocolActive } from "./keys.js";
+import { type NativeConnection, nativeConnection } from "./native/connection.js";
 import { StdinBuffer } from "./stdin-buffer.js";
 import {
 	parseOscColorResponse,
@@ -78,6 +79,8 @@ function cancelInputHandoff(token: symbol): void {
  * Minimal terminal interface for TUI
  */
 export interface Terminal {
+	readonly native?: NativeConnection;
+
 	// Start the terminal with input and resize handlers
 	start(onInput: (data: string) => void, onResize: () => void): void;
 
@@ -151,6 +154,7 @@ export class ProcessTerminal implements Terminal {
 	private _altScreenActive = consumeAltScreenHandoff();
 	private _mouseTrackingActive = false;
 	private stdinBuffer?: StdinBuffer;
+	private nativeConnection?: NativeConnection;
 	private stdinDataHandler?: (data: string) => void;
 	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
 	private progressInterval?: ReturnType<typeof setInterval>;
@@ -178,7 +182,12 @@ export class ProcessTerminal implements Terminal {
 		return this._kittyProtocolActive;
 	}
 
+	get native(): NativeConnection | undefined {
+		return this.nativeConnection;
+	}
+
 	start(onInput: (data: string) => void, onResize: () => void): void {
+		this.nativeConnection = process.env.PI_TUI_NATIVE === "1" ? nativeConnection : undefined;
 		this.started = true;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
@@ -213,6 +222,7 @@ export class ProcessTerminal implements Terminal {
 		// The query handler intercepts input temporarily, then installs the user's handler
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.queryAndEnableKittyProtocol();
+		this.nativeConnection?.start(this, (text) => this.stdinBuffer?.process(text));
 	}
 
 	/**
@@ -267,7 +277,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Handler that pipes stdin data through the buffer
 		this.stdinDataHandler = (data: string) => {
-			this.stdinBuffer!.process(data);
+			if (this.nativeConnection) this.nativeConnection.probe.feed(data);
+			else this.stdinBuffer!.process(data);
 		};
 	}
 
@@ -455,6 +466,8 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write("\x1b[>4;0m");
 			this._modifyOtherKeysActive = false;
 		}
+
+		this.nativeConnection?.probe.stop();
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {

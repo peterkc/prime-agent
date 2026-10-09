@@ -2,6 +2,29 @@
 
 Prime Agent uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
 
+## Tern native fullscreen (opt-in)
+
+Set `PI_TUI_NATIVE=1` before starting Prime Agent to use Tern's native transcript scrolling in the session's fullscreen view. Nothing changes without this opt-in. Other fullscreen screens, including the agents view, keep the ANSI renderer. If the terminal does not support TSP, Prime uses the ANSI renderer. If Tern reports a protocol error, Prime switches to the ANSI renderer for the rest of the session. To turn native mode off, unset `PI_TUI_NATIVE` or set it to `0`. When Prime quits to a shell prompt, Tern removes the transcript from the pane; it does not stay in the scrollback as it does with the ANSI renderer.
+
+To enable it only in Tern, add this to your shell configuration:
+
+```sh
+[[ $TERM_PROGRAM == tern ]] && export PI_TUI_NATIVE=1
+```
+
+Use Tern's **Reader** chat style. Spine and Console constrain the transcript width and are not supported by this layout. Rows show Tern's small fallback marker. No stylesheet hides it.
+
+The mouse wheel and `Shift+PgUp` scroll the transcript. Prime's viewport-top and follow bindings reveal the start and end. On a long transcript, one viewport-top press can stop short of the start, especially after you return from Ctrl+Z, the agents view or the external editor. Use the mouse wheel or `Shift+PgUp` to reach the start. Tern 0.6.3 binds `Ctrl+Shift+Down`, the default follow key, to Park pane, so that key may not reach Prime; bind `tui.viewport.follow` to another key in [`keybindings.json`](keybindings.md). Plain `PgUp` and `PgDn` reach the focused component instead of paging the transcript.
+
+Native mode does not support Prime's click actions:
+- Placing the editor cursor with a click.
+- Expanding or collapsing shell output, background shell completions, errors, branch and compaction summaries, custom messages, injected prompts, harness refinement outcomes, skill invocations, and event summaries.
+- Click actions supplied by extensions through `Clickable` or component click regions, including actions inside tool panels and side questions.
+
+The keyboard actions remain available. Tern owns text selection and scrolling; Prime does not map Tern pointer events to component click regions.
+
+Code that stops the TUI to hand the terminal to another program must first `await tui.releaseNative()`. It closes the native surface and consumes replies in flight for 50 ms before the next program reads stdin. With native mode off, it resolves at once and writes nothing.
+
 ## Kitty, iTerm2
 
 Work out of the box.
