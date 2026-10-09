@@ -222,6 +222,8 @@ export const HEARTBEATS_CHANGED_COALESCE_MS = 100;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
+// The worker stops waiting for session checkpoints this much earlier, so its answer names the blockers.
+const UPDATE_RESTART_WORKER_REPLY_MARGIN_MS = 5_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
 // caller's 120s prepare_update_restart request timeout, or roll back; otherwise
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
@@ -432,6 +434,22 @@ function rosterFamilyDescendsFrom(
 
 function isDaemonWorkerProbeTimeout(error: unknown): boolean {
 	return error instanceof DaemonWorkerProbeTimeoutError;
+}
+
+/** Leaves a worker time to report which sessions block it before the supervisor stops waiting. */
+export function workerCheckpointBudgetMs(requestTimeoutMs: number): number {
+	return requestTimeoutMs - Math.min(UPDATE_RESTART_WORKER_REPLY_MARGIN_MS, Math.floor(requestTimeoutMs / 2));
+}
+
+/**
+ * Names the worker in an update-prepare failure. A worker that answered names its own blocking
+ * sessions; for one that never answered, list the sessions the supervisor knows it hosts.
+ */
+function describeUpdatePrepareFailure(worker: ResidentWorker, reason: unknown): string {
+	const message = reason instanceof Error ? reason.message : String(reason);
+	if (!isDaemonWorkerProbeTimeout(reason)) return `worker ${worker.descriptor.workerId}: ${message}`;
+	const sessions = [...worker.summaries].map(([activeSessionId, summary]) => summary.sessionName ?? activeSessionId);
+	return `worker ${worker.descriptor.workerId} (sessions: ${sessions.join(", ") || "none known"}): ${message}`;
 }
 
 function isSupervisorShutdownAdmissionCancelled(error: unknown): boolean {
@@ -6626,9 +6644,13 @@ export class DaemonSupervisor {
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const client = worker.client;
+				const requestTimeoutMs = Math.max(
+					1,
+					Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now()),
+				);
 				const response = await client.requestWorker(
-					{ type: "worker_prepare_update" },
-					Math.max(1, Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now())),
+					{ type: "worker_prepare_update", checkpointTimeoutMs: workerCheckpointBudgetMs(requestTimeoutMs) },
+					requestTimeoutMs,
 				);
 				if (!response.success) throw new Error(response.error);
 				worker.updateRestartPrepareClient = client;
@@ -6675,12 +6697,12 @@ export class DaemonSupervisor {
 				}),
 			);
 		};
-		const preparationFailure = preparationResults.find(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
+		const failures = preparationResults.flatMap((result, index) =>
+			result.status === "rejected" ? [describeUpdatePrepareFailure(workers[index]!, result.reason)] : [],
 		);
-		if (preparationFailure) {
+		if (failures.length > 0) {
 			await cancelAcknowledged();
-			throw preparationFailure.reason;
+			throw new Error(failures.join("; "));
 		}
 		const prepared = preparationResults.flatMap((result) =>
 			result.status === "fulfilled" ? [result.value.worker] : [],

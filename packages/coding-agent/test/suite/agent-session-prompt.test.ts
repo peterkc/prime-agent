@@ -756,10 +756,12 @@ describe("AgentSession prompt characterization", () => {
 		});
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(checkpointReleased).toBe(false);
+		expect(harness.session.describeSessionInputCheckpointBlockers()).toEqual(["turn committing"]);
 
 		dispatchGate.resolve();
 		await customStarted.promise;
 		await checkpoint;
+		expect(harness.session.describeSessionInputCheckpointBlockers()).toEqual([]);
 		await send;
 		unsubscribe();
 	});

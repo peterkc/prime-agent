@@ -329,6 +329,55 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
+function positiveTimeoutMs(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** The parts of a resident session that an update-restart checkpoint wait uses. */
+interface CheckpointSession {
+	readonly activeSessionId: string;
+	readonly runtime: {
+		readonly session: {
+			readonly sessionName: string | undefined;
+			waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void>;
+			describeSessionInputCheckpointBlockers(): string[];
+		};
+	};
+}
+
+function describeCheckpointWait(state: CheckpointSession): string {
+	const { session } = state.runtime;
+	const label = session.sessionName ? `${session.sessionName} (${state.activeSessionId})` : state.activeSessionId;
+	const blockers = session.describeSessionInputCheckpointBlockers();
+	return `${label}: ${blockers.length > 0 ? blockers.join(", ") : "waiting for agent events or an action commit"}`;
+}
+
+/**
+ * Waits until every session reaches its input checkpoint. When timeoutMs runs out first, fails
+ * with an error that names each session still waiting and the actions that hold it.
+ */
+export async function waitForUpdateRestartCheckpoints(
+	states: readonly CheckpointSession[],
+	signal: AbortSignal,
+	timeoutMs: number | undefined,
+): Promise<void> {
+	const timeout = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
+	const waitSignal = timeout ? AbortSignal.any([signal, timeout]) : signal;
+	const waiting = new Set(states);
+	try {
+		await Promise.all(
+			states.map(async (state) => {
+				await state.runtime.session.waitForSessionInputCheckpoint(waitSignal);
+				waiting.delete(state);
+			}),
+		);
+	} catch (error) {
+		if (!timeout?.aborted) throw error;
+		const blocked = [...waiting].map(describeCheckpointWait).join("; ");
+		throw new Error(`Sessions did not reach a restart checkpoint within ${timeoutMs} ms: ${blocked}`);
+	}
+}
+
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
@@ -421,6 +470,8 @@ export class AgentDaemon {
 		owner?: DaemonSocketClient;
 		abort: AbortController;
 		deadline?: ReturnType<typeof setTimeout>;
+		/** Supervisor budget for session checkpoints; past it, preparation fails and names the blockers. */
+		checkpointTimeoutMs?: number;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
 		deferredClientEnv: Array<{
@@ -4041,7 +4092,10 @@ export class AgentDaemon {
 				}
 				case "worker_prepare_update": {
 					this.fencePeerTransports("update");
-					const transaction = this.beginUpdateRestartTransaction(client);
+					const transaction = this.beginUpdateRestartTransaction(
+						client,
+						positiveTimeoutMs(command.checkpointTimeoutMs),
+					);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
 					this.writeWorkerSuccess(client, command, manifest);
 					return;
@@ -6538,11 +6592,15 @@ export class AgentDaemon {
 		}
 	}
 
-	private beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemon["updateRestart"]> {
+	private beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		checkpointTimeoutMs?: number,
+	): NonNullable<AgentDaemon["updateRestart"]> {
 		if (this.updateRestart) throw new Error("Daemon is already preparing an update restart");
 		const transaction: NonNullable<AgentDaemon["updateRestart"]> = {
 			id: Symbol("update-restart"),
 			...(owner ? { owner } : {}),
+			...(checkpointTimeoutMs !== undefined ? { checkpointTimeoutMs } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
 			deferredClientEnv: [],
@@ -6587,7 +6645,7 @@ export class AgentDaemon {
 			for (const state of states) {
 				this.updateRestartQueuePauses.set(state.activeSessionId, state.runtime.session.acquireQueuedWorkPause());
 			}
-			await Promise.all(states.map((state) => state.runtime.session.waitForSessionInputCheckpoint(signal)));
+			await waitForUpdateRestartCheckpoints(states, signal, transaction.checkpointTimeoutMs);
 			this.assertUpdateRestartNotCancelled(transaction);
 			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
 			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));

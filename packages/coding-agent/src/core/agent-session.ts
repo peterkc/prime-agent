@@ -845,6 +845,18 @@ function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
 	return record;
 }
 
+/** True while an action can still change the input that an update-restart checkpoint captures. */
+function blocksSessionInputCheckpoint(action: QueuedSessionAction): boolean {
+	if (action.payload.kind === "session_command") {
+		return action.lifecycle.state === "selected" || action.lifecycle.state === "running";
+	}
+	return (
+		action.lifecycle.state === "selected" ||
+		action.lifecycle.state === "preparing" ||
+		(action.lifecycle.state === "committing" && !primaryDeliveryRecord(action).durable)
+	);
+}
+
 function normalizeMessageContent(content: string | (TextContent | ImageContent)[]): {
 	text: string;
 	images?: ImageContent[];
@@ -7928,18 +7940,16 @@ export class AgentSession {
 		};
 	}
 
+	/** Labels each action that keeps this session from an update-restart checkpoint as "<kind> <state>". */
+	describeSessionInputCheckpointBlockers(): string[] {
+		return this._actionStore
+			.activeActions()
+			.filter(blocksSessionInputCheckpoint)
+			.map((action) => `${action.payload.kind} ${action.lifecycle.state}`);
+	}
+
 	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
-		const blocksCheckpoint = () =>
-			this._actionStore.activeActions().some((action) => {
-				if (action.payload.kind === "session_command") {
-					return action.lifecycle.state === "selected" || action.lifecycle.state === "running";
-				}
-				return (
-					action.lifecycle.state === "selected" ||
-					action.lifecycle.state === "preparing" ||
-					(action.lifecycle.state === "committing" && !primaryDeliveryRecord(action).durable)
-				);
-			});
+		const blocksCheckpoint = () => this._actionStore.activeActions().some(blocksSessionInputCheckpoint);
 		while (true) {
 			while (blocksCheckpoint()) {
 				if (signal?.aborted) throw new Error("Update restart preparation cancelled");

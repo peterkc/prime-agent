@@ -44,6 +44,7 @@ import {
 	finishClientSnapshotStreaming,
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
+	waitForUpdateRestartCheckpoints,
 } from "../src/modes/daemon/daemon-mode.js";
 import {
 	DAEMON_PROTOCOL_INFO,
@@ -4240,5 +4241,65 @@ describe("session replacement binding", () => {
 		});
 		await expect(rebind()(session)).rejects.toThrow("cron store contention");
 		expect(broadcasts).toEqual(["session_replaced"]);
+	});
+});
+
+describe("update restart checkpoint wait", () => {
+	function checkpointSession(
+		activeSessionId: string,
+		options: { name?: string; blockers?: string[]; ready?: boolean } = {},
+	) {
+		return {
+			activeSessionId,
+			runtime: {
+				session: {
+					sessionName: options.name,
+					describeSessionInputCheckpointBlockers: () => options.blockers ?? [],
+					waitForSessionInputCheckpoint: (signal?: AbortSignal) =>
+						options.ready
+							? Promise.resolve()
+							: new Promise<void>((_resolve, reject) => {
+									signal?.addEventListener(
+										"abort",
+										() => reject(new Error("Update restart preparation cancelled")),
+										{ once: true },
+									);
+								}),
+				},
+			},
+		};
+	}
+
+	it("names each session still blocked when the checkpoint budget runs out", async () => {
+		const states = [
+			checkpointSession("ready-1", { name: "ready", ready: true }),
+			checkpointSession("stuck-1", { name: "pi-plan", blockers: ["turn preparing"] }),
+			checkpointSession("stuck-2"),
+		];
+		await expect(waitForUpdateRestartCheckpoints(states, new AbortController().signal, 20)).rejects.toThrow(
+			"Sessions did not reach a restart checkpoint within 20 ms: pi-plan (stuck-1): turn preparing; " +
+				"stuck-2: waiting for agent events or an action commit",
+		);
+	});
+
+	it("keeps the cancellation error when the update transaction aborts", async () => {
+		const abort = new AbortController();
+		const wait = waitForUpdateRestartCheckpoints(
+			[checkpointSession("stuck-1", { name: "pi-plan" })],
+			abort.signal,
+			60_000,
+		);
+		abort.abort();
+		await expect(wait).rejects.toThrow(/^Update restart preparation cancelled$/);
+	});
+
+	it("waits without a budget when the supervisor sends none", async () => {
+		await expect(
+			waitForUpdateRestartCheckpoints(
+				[checkpointSession("ready-1", { ready: true })],
+				new AbortController().signal,
+				undefined,
+			),
+		).resolves.toBeUndefined();
 	});
 });
