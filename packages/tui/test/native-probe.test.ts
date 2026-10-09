@@ -124,9 +124,10 @@ it("adopts the retained Surface, routes ack and gone, and never reopens after na
 	assert.equal(fresh.id, "prime-2");
 	assert.equal(fresh.seq, 0);
 	assert.equal(
-		writes.at(-1),
+		writes.at(-2),
 		'\x1b_tsp;o;{"id":"prime-2","mode":"inline","title":"Prime","role":"prime.session"}\x1b\\',
 	);
+	assert.match(writes.at(-1)!, /tsp;s;\{"sf":"prime-2","name":"prime","css":"\.sf-rows-mark \{ display: none; \}"\}/);
 	await fresh.close({ keep: true });
 	native.probe.feed('\x1b_tsp;e;{"ev":"gone","ids":["prime-2"]}\x1b\\');
 	assert.equal(native.open()?.id, "prime-3");
