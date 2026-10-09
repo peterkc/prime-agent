@@ -1,11 +1,14 @@
 import assert from "node:assert";
 import { describe, it, type TestContext } from "node:test";
 import { InputParser } from "@stencil-hq/tern";
+import pkg from "../package.json";
 import { nativeConnection } from "../src/native/connection.js";
 import { NativeProbe } from "../src/native/probe.js";
 import { StdinBuffer } from "../src/stdin-buffer.js";
 import { ProcessTerminal } from "../src/terminal.js";
 import { parseOscColorResponse } from "../src/terminal-colors.js";
+
+const helloQuery = `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\`;
 
 describe("ProcessTerminal dimensions", () => {
 	it("falls back to COLUMNS and LINES before default dimensions", () => {
@@ -331,12 +334,7 @@ describe("ProcessTerminal native probe gate", () => {
 		it(`probes only for exact gate ${JSON.stringify(gate)}, terminal ${term}, tmux ${tmux}`, (t) => {
 			const { terminal, writes } = nativeTerminal(t, gate, term, tmux);
 			const probeWrites = writes.filter((text) => text.includes("tsp;") || text === "\x1b[c");
-			assert.deepEqual(
-				probeWrites,
-				gate === "1"
-					? ['\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"0.9.8+fork.3"}\x1b\\', "\x1b[c"]
-					: [],
-			);
+			assert.deepEqual(probeWrites, gate === "1" ? [helloQuery, "\x1b[c"] : []);
 			terminal.stop();
 			writes.length = 0;
 			terminal.start(ignoreInput, ignoreInput);

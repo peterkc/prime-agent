@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { spawnSync } from "node:child_process";
 import { describe, it, type TestContext } from "node:test";
 import type { OutMessage } from "@stencil-hq/tern";
+import pkg from "../package.json";
 import { NativeConnection } from "../src/native/connection.js";
 import type { TerminalStopOptions } from "../src/terminal.js";
 import { type Component, CURSOR_MARKER, TUI } from "../src/tui.js";
@@ -497,7 +498,7 @@ for (const gate of [undefined, "1"]) {
 		assert.equal(result.error, undefined);
 		assert.equal(result.status, 0, result.stderr);
 		const probe =
-			gate === "1" ? '\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"0.9.8+fork.3"}\x1b\\\x1b[c' : "";
+			gate === "1" ? `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\\x1b[c` : "";
 		assert.equal(result.stdout, baseAnsiBytes.replace("\x1b[?u", `\x1b[?u${probe}`));
 	});
 }
