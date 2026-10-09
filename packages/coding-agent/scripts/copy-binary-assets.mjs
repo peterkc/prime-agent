@@ -102,6 +102,15 @@ export function validateBinaryAssets(directory) {
 	visit(directory);
 }
 
+/**
+ * Fork build version: the package version's release part plus the commit, for example
+ * `0.9.8+fork.683337fd4`. A build from uncommitted code ends in `.dirty`.
+ */
+export function forkBinaryVersion(packageVersion, commit, dirty) {
+	const release = packageVersion.split("+")[0];
+	return `${release}+fork.${commit}${dirty ? ".dirty" : ""}`;
+}
+
 export function setBinaryVersion(directory, version) {
 	const path = join(directory, "package.json");
 	const metadata = JSON.parse(readFileSync(path, "utf8"));
