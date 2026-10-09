@@ -12,7 +12,9 @@ import {
 	type AgentModelOverride,
 	type AgentState,
 	type AgentTool,
+	type AgentToolResult,
 	type GetContinuationMessagesContext,
+	runToolCall,
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -5238,6 +5240,33 @@ export class AgentSession {
 
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map((t) => t.name);
+	}
+
+	/** Run an active tool through the installed hooks without adding session messages or events. */
+	async runNestedToolCall(
+		callId: string,
+		name: string,
+		args: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<{ result: AgentToolResult<unknown>; isError: boolean }> {
+		const assistantMessage = this._findLastAssistantMessage();
+		if (!assistantMessage) {
+			return {
+				result: { content: [{ type: "text", text: "No assistant message for nested tool call" }], details: {} },
+				isError: true,
+			};
+		}
+		return runToolCall(
+			{ type: "toolCall", id: callId, name, arguments: args },
+			{
+				tools: this.agent.state.tools.filter((tool) => tool.name !== "codemode"),
+				context: this.agent.state,
+				assistantMessage,
+				beforeToolCall: this.agent.beforeToolCall,
+				afterToolCall: this.agent.afterToolCall,
+				signal,
+			},
+		);
 	}
 
 	getAllTools(): ToolInfo[] {
@@ -10824,6 +10853,19 @@ export class AgentSession {
 				},
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
+				codemode: {
+					callableTools: () => this.agent.state.tools,
+					runTool: (callId, name, args, signal) => this.runNestedToolCall(callId, name, args, signal),
+					storeEntries: () =>
+						this.sessionManager
+							.getBranch()
+							.flatMap((entry) =>
+								entry.type === "custom" && entry.customType === "codemode-store" ? [entry.data] : [],
+							),
+					appendStore: (delta) => {
+						this.sessionManager.appendCustomEntry("codemode-store", delta);
+					},
+				},
 				ipython: {
 					provisioner: this._ipythonKernelProvisioner,
 					commandPrefix: this.settingsManager.getShellCommandPrefix(),
@@ -10886,7 +10928,9 @@ export class AgentSession {
 		for (const tool of acpMcpTools) this._allowedToolNames?.add(tool.name);
 		this._acpMcpTools = acpMcpTools;
 
-		const defaultActiveToolNames = this._baseToolsOverride ? Object.keys(this._baseToolsOverride) : ["ipython"];
+		const defaultActiveToolNames = this._baseToolsOverride
+			? Object.keys(this._baseToolsOverride)
+			: ["ipython", ...(this.settingsManager.getCodemode() ? ["codemode"] : [])];
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
 		if (this._goalState.status === "active" && this._includeGoals) {
 			// An active goal needs ipython so the model can reach the goal skill.

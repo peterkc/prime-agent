@@ -1,0 +1,1 @@
+- Added the default `codemode` tool for sandboxed JavaScript tool calls, branch-local storage, and partial results on failure or cancellation.

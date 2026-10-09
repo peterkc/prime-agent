@@ -45,11 +45,16 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	}
 }
 
-function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal | undefined, onAbort?: () => void): Promise<T> {
+function raceWithAbort<T>(
+	operation: Promise<T>,
+	signal: AbortSignal | undefined,
+	onAbort?: () => void,
+	abortResult?: { graceMs: number; deadline?: number; expired?: boolean },
+): Promise<T> {
 	if (!signal) {
 		return operation;
 	}
-	if (signal.aborted) {
+	if (signal.aborted && !abortResult) {
 		onAbort?.();
 		void operation.catch(() => undefined);
 		return Promise.reject(createAbortError());
@@ -57,19 +62,41 @@ function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal | undefined
 
 	return new Promise<T>((resolve, reject) => {
 		let settled = false;
+		let abortTimer: ReturnType<typeof setTimeout> | undefined;
 		const cleanup = () => {
 			signal.removeEventListener("abort", abort);
+			clearTimeout(abortTimer);
 		};
-		const abort = () => {
+		const rejectAbort = () => {
 			if (settled) {
 				return;
 			}
 			settled = true;
+			if (abortResult) {
+				abortResult.expired = true;
+			}
 			cleanup();
-			onAbort?.();
 			reject(createAbortError());
 		};
-		signal.addEventListener("abort", abort, { once: true });
+		const abort = () => {
+			onAbort?.();
+			if (!abortResult) {
+				rejectAbort();
+				return;
+			}
+			abortResult.deadline ??= Date.now() + abortResult.graceMs;
+			const remaining = abortResult.deadline - Date.now();
+			if (remaining <= 0) {
+				rejectAbort();
+			} else {
+				abortTimer = setTimeout(rejectAbort, remaining);
+			}
+		};
+		if (signal.aborted) {
+			abort();
+		} else {
+			signal.addEventListener("abort", abort, { once: true });
+		}
 		operation.then(
 			(value) => {
 				if (settled) {
@@ -95,8 +122,9 @@ function maybePromiseWithAbort<T>(
 	operation: T | Promise<T>,
 	signal: AbortSignal | undefined,
 	onAbort?: () => void,
+	abortResult?: { graceMs: number; deadline?: number; expired?: boolean },
 ): Promise<T> {
-	return raceWithAbort(Promise.resolve(operation), signal, onAbort);
+	return raceWithAbort(Promise.resolve(operation), signal, onAbort, abortResult);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -741,6 +769,8 @@ type ImmediateToolCallOutcome = {
 type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
+	abortDeadline?: number;
+	abortFallback?: boolean;
 };
 
 type FinalizedToolCallOutcome = {
@@ -773,7 +803,7 @@ async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
 	toolCall: AgentToolCall,
-	config: AgentLoopConfig,
+	config: Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">,
 	signal: AbortSignal | undefined,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
@@ -824,6 +854,43 @@ async function prepareToolCall(
 	}
 }
 
+/** Options for one checked, event-free tool call. */
+export interface RunToolCallOptions extends Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall"> {
+	readonly tools: readonly AgentTool<any>[];
+	readonly context: AgentContext;
+	readonly assistantMessage: AssistantMessage;
+	readonly signal?: AbortSignal;
+	readonly onUpdate?: (partialResult: AgentToolResult<unknown>) => Promise<void> | void;
+}
+
+/** Run the shared checks and hooks without adding messages or emitting agent events. */
+export async function runToolCall(
+	toolCall: AgentToolCall,
+	options: RunToolCallOptions,
+): Promise<{ result: AgentToolResult<unknown>; isError: boolean }> {
+	// pi precedent: checked nested tool runner, commit 6fb2e781.
+	const context = { ...options.context, tools: [...options.tools] };
+	const { assistantMessage, signal } = options;
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal);
+	if (preparation.kind === "immediate") {
+		return { result: preparation.result, isError: preparation.isError };
+	}
+	const executed = await executePreparedToolCall(preparation, signal, (event) => {
+		if (event.type === "tool_execution_update") {
+			return options.onUpdate?.(event.partialResult);
+		}
+	});
+	const { result, isError } = await finalizeExecutedToolCall(
+		context,
+		assistantMessage,
+		preparation,
+		executed,
+		options,
+		signal,
+	);
+	return { result, isError };
+}
+
 async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,
@@ -831,6 +898,10 @@ async function executePreparedToolCall(
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
+	const abortResult =
+		prepared.tool.abortResultGraceMs === undefined
+			? undefined
+			: { graceMs: prepared.tool.abortResultGraceMs, deadline: undefined as number | undefined };
 
 	try {
 		throwIfAborted(signal);
@@ -852,6 +923,8 @@ async function executePreparedToolCall(
 				);
 			}),
 			signal,
+			undefined,
+			abortResult,
 		);
 		acceptingUpdates = false;
 		try {
@@ -864,7 +937,7 @@ async function executePreparedToolCall(
 				throw error;
 			}
 		}
-		return { result, isError: false };
+		return { result, isError: result.isError === true, abortDeadline: abortResult?.deadline };
 	} catch (error) {
 		acceptingUpdates = false;
 		await raceWithAbort(
@@ -876,6 +949,7 @@ async function executePreparedToolCall(
 				signal?.aborted ? "Tool execution aborted" : error instanceof Error ? error.message : String(error),
 			),
 			isError: true,
+			abortFallback: abortResult?.deadline !== undefined,
 		};
 	}
 }
@@ -885,13 +959,17 @@ async function finalizeExecutedToolCall(
 	assistantMessage: AssistantMessage,
 	prepared: PreparedToolCall,
 	executed: ExecutedToolCallOutcome,
-	config: AgentLoopConfig,
+	config: Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">,
 	signal: AbortSignal | undefined,
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
 
-	if (config.afterToolCall) {
+	if (config.afterToolCall && !executed.abortFallback) {
+		const abortResult =
+			prepared.tool.abortResultGraceMs === undefined
+				? undefined
+				: { graceMs: prepared.tool.abortResultGraceMs, deadline: executed.abortDeadline, expired: false };
 		try {
 			const afterResult = await maybePromiseWithAbort(
 				config.afterToolCall(
@@ -906,6 +984,8 @@ async function finalizeExecutedToolCall(
 					signal,
 				),
 				signal,
+				undefined,
+				abortResult,
 			);
 			if (afterResult) {
 				result = {
@@ -916,8 +996,21 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
-			isError = true;
+			if (abortResult?.expired && signal?.aborted && isAbortError(error)) {
+				result = {
+					...result,
+					content: [
+						...result.content,
+						{
+							type: "text",
+							text: "Note: a tool_result handler did not finish before the abort deadline; its changes were not applied.",
+						},
+					],
+				};
+			} else {
+				result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+				isError = true;
+			}
 		}
 	}
 

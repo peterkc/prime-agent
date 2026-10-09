@@ -105,4 +105,45 @@ describe("conversation event row hierarchy", () => {
 		expect(raw).toContain(theme.fg("toolTitle", "edit"));
 		expect(raw).toContain(theme.fg("dim", "src/foo.ts"));
 	});
+
+	it("TM-16 rebuilds the codemode renderer from daemon metadata and shows the script and nested calls", () => {
+		const row = new ToolExecutionComponent(
+			"codemode",
+			"script",
+			{ code: 'text("answer");' },
+			{},
+			{ name: "codemode", label: "codemode", description: "Run script", parameters: {} },
+			createTuiStub(),
+			"/tmp",
+		);
+		row.markExecutionStarted();
+		row.setArgsComplete();
+		row.setExpanded(true);
+		row.updateResult({
+			content: [
+				{ type: "text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+				{ type: "text", text: "answer" },
+			],
+			isError: false,
+			details: {
+				calls: [{ id: "script/1", name: "nested-echo", args: '{"value":42}', status: "ok", durationMs: 12 }],
+			},
+		});
+		const rendered = row.render(100).join("\n");
+		expect(rendered).toContain('text("answer");');
+		expect(rendered).toContain("nested-echo");
+		expect(rendered).toContain('{"value":42} ok 12ms');
+		expect(rendered).not.toContain("Script completed");
+		row.updateResult({
+			content: [
+				{ type: "text", text: "Script failed\nWall time 0.1 seconds\nOutput:\n" },
+				{ type: "text", text: "Tool execution aborted" },
+			],
+			isError: true,
+			details: {},
+		});
+		const failed = row.render(100).join("\n");
+		expect(failed).toContain("Tool execution aborted");
+		expect(failed).not.toContain("Script failed");
+	});
 });

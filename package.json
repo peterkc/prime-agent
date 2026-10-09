@@ -50,7 +50,7 @@
 		"typescript": "^7.0.2"
 	},
 	"engines": {
-		"node": ">=22.8.0"
+		"node": ">=22.19.0"
 	},
 	"version": "0.9.8+fork.3",
 	"dependencies": {

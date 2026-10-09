@@ -239,6 +239,7 @@ export interface Settings {
 	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
+	codemode?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
 	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
@@ -1142,6 +1143,10 @@ export class SettingsManager {
 		this.globalSettings.shellPath = path;
 		this.markModified("shellPath");
 		this.save();
+	}
+
+	getCodemode(): boolean {
+		return this.settings.codemode ?? true;
 	}
 
 	getQuietStartup(): boolean {

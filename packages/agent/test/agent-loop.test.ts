@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.js";
+import { agentLoop, agentLoopContinue, runAgentLoop, runToolCall } from "../src/agent-loop.js";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -1848,6 +1848,254 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(llmCalls).toBe(1);
 	});
+});
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+describe("runToolCall", () => {
+	const definition = {
+		name: "work",
+		label: "Work",
+		description: "Work",
+		parameters: Type.Object({ value: Type.String() }),
+	};
+	const toolCall = { type: "toolCall" as const, id: "parent/1", name: "work", arguments: { value: "ok" } };
+	it("runs checked hooks in order and waits for event-free updates", async () => {
+		vi.useFakeTimers();
+		try {
+			const controller = new AbortController();
+			const order: string[] = [];
+			const updatePending = deferred<void>();
+			const updateStarted = deferred<void>();
+			const tool: AgentTool = {
+				...definition,
+				prepareArguments: (args) => {
+					order.push("prepare");
+					return { value: String((args as { value: number }).value) };
+				},
+				async execute(id, args, signal, onUpdate) {
+					order.push("execute");
+					expect([id, args, signal]).toEqual(["parent/1", { value: "42" }, controller.signal]);
+					onUpdate?.({ content: [{ type: "text", text: "partial" }], details: {} });
+					return { content: [{ type: "text", text: "original" }], details: { original: true } };
+				},
+			};
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+			const assistantMessage = createAssistantMessage([]);
+			const pending = runToolCall(
+				{ type: "toolCall", id: "parent/1", name: "work", arguments: { value: 42 } },
+				{
+					tools: [tool],
+					context,
+					assistantMessage,
+					signal: controller.signal,
+					beforeToolCall: async (call, signal) => {
+						order.push("before");
+						expect(call.assistantMessage).toBe(assistantMessage);
+						expect(call.args).toEqual({ value: "42" });
+						expect(signal).toBe(controller.signal);
+						return undefined;
+					},
+					onUpdate: (partial) => {
+						order.push("update");
+						expect(partial.content).toEqual([{ type: "text", text: "partial" }]);
+						updateStarted.resolve();
+						return updatePending.promise.then(() => {
+							order.push("update-complete");
+						});
+					},
+					afterToolCall: async (call, signal) => {
+						order.push("after");
+						expect(order[order.length - 2]).toBe("update-complete");
+						expect(call.result.details).toEqual({ original: true });
+						expect(signal).toBe(controller.signal);
+						return { content: [{ type: "text", text: "changed" }], details: { changed: true }, isError: true };
+					},
+				},
+			);
+			await updateStarted.promise;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(order).toEqual(["prepare", "before", "execute", "update"]);
+			updatePending.resolve();
+			expect(await pending).toEqual({
+				result: { content: [{ type: "text", text: "changed" }], details: { changed: true }, terminate: undefined },
+				isError: true,
+			});
+			expect(order).toEqual(["prepare", "before", "execute", "update", "update-complete", "after"]);
+			expect(context).toEqual({ systemPrompt: "", messages: [], tools: [] });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.each([
+		["unknown", /not found/, 0],
+		["invalid", /value/, 0],
+		["throws", /execute failed/, 1],
+		["blocked", /permission denied/, 0],
+	] as const)("returns an error for %s calls", async (failure, reason, executions) => {
+		const execute = vi.fn(async () => {
+			throw new Error("execute failed");
+		});
+		const afterToolCall = vi.fn();
+		const outcome = await runToolCall(
+			{
+				...toolCall,
+				name: failure === "unknown" ? "missing" : "work",
+				arguments: failure === "invalid" ? {} : { value: "ok" },
+			},
+			{
+				tools: [{ ...definition, execute }],
+				context: { systemPrompt: "", messages: [] },
+				assistantMessage: createAssistantMessage([]),
+				afterToolCall,
+				beforeToolCall: async () =>
+					failure === "blocked" ? { block: true, reason: "permission denied" } : undefined,
+			},
+		);
+		expect(outcome.isError).toBe(true);
+		expect(execute).toHaveBeenCalledTimes(executions);
+		expect(outcome.result.content[0]).toMatchObject({ type: "text", text: expect.stringMatching(reason) });
+		expect(afterToolCall).toHaveBeenCalledTimes(executions);
+	});
+
+	it("records a returned error flag without losing partial output", async () => {
+		const outcome = await runToolCall(toolCall, {
+			tools: [
+				{
+					...definition,
+					execute: async () => ({
+						content: [{ type: "text", text: "partial output" }],
+						details: { calls: ["parent/1"] },
+						isError: true,
+					}),
+				},
+			],
+			context: { systemPrompt: "", messages: [] },
+			assistantMessage: createAssistantMessage([]),
+		});
+		expect(outcome.isError).toBe(true);
+		expect(outcome.result.content).toEqual([{ type: "text", text: "partial output" }]);
+		expect(outcome.result.details).toEqual({ calls: ["parent/1"] });
+	});
+});
+
+describe("agent-loop abort result grace", () => {
+	it.each(["returned result", "never returns", "stuck after-hook"])(
+		"bounds %s on one abort deadline",
+		async (scenario) => {
+			vi.useFakeTimers();
+			try {
+				const controller = new AbortController();
+				const ownResult = {
+					content: [{ type: "text" as const, text: "partial output" }],
+					details: { calls: ["parent/1"] },
+					isError: true,
+				};
+				const toolPending = deferred<typeof ownResult>();
+				const started = deferred<void>();
+				const hookStarted = deferred<void>();
+				const hookPending = deferred<{ content: { type: "text"; text: string }[] }>();
+				const tool: AgentTool = {
+					name: "work",
+					label: "Work",
+					description: "Work",
+					parameters: Type.Object({}),
+					abortResultGraceMs: 100,
+					execute: async (_id, _args, signal) => {
+						expect(signal).toBe(controller.signal);
+						started.resolve();
+						return toolPending.promise;
+					},
+				};
+				let settled = false;
+				const pending = runAgentLoop(
+					[createUserMessage("start")],
+					{ systemPrompt: "", messages: [], tools: [tool] },
+					{
+						model: createModel(),
+						convertToLlm: identityConverter,
+						afterToolCall: async (call, signal) => {
+							expect(signal).toBe(controller.signal);
+							expect(call.isError).toBe(true);
+							hookStarted.resolve();
+							return scenario === "stuck after-hook"
+								? hookPending.promise
+								: { content: [{ type: "text", text: "hook output" }] };
+						},
+					},
+					() => {},
+					controller.signal,
+					() => {
+						const stream = new MockAssistantStream();
+						queueMicrotask(() =>
+							stream.push({
+								type: "done",
+								reason: "toolUse",
+								message: createAssistantMessage(
+									[{ type: "toolCall", id: "parent/1", name: "work", arguments: {} }],
+									"toolUse",
+								),
+							}),
+						);
+						return stream;
+					},
+				).then((messages) => {
+					settled = true;
+					return messages;
+				});
+				await started.promise;
+				const abortDeadline = Date.now() + 100;
+				controller.abort();
+				await vi.advanceTimersByTimeAsync(60);
+				expect(settled).toBe(false);
+				if (scenario !== "never returns") {
+					toolPending.resolve(ownResult);
+					await hookStarted.promise;
+				}
+				if (scenario !== "returned result") {
+					await vi.advanceTimersByTimeAsync(39);
+					expect(settled).toBe(false);
+					if (scenario === "stuck after-hook") {
+						vi.setSystemTime(Date.now() - 1);
+					}
+					await vi.advanceTimersByTimeAsync(1);
+					expect(settled).toBe(true);
+					expect(Date.now()).toBe(abortDeadline - (scenario === "stuck after-hook" ? 1 : 0));
+				}
+				const messages = await pending;
+				const recorded = messages.find((message) => message.role === "toolResult");
+				const note = {
+					type: "text" as const,
+					text: "Note: a tool_result handler did not finish before the abort deadline; its changes were not applied.",
+				};
+				const text = scenario === "never returns" ? "Tool execution aborted" : "hook output";
+				const expectedContent =
+					scenario === "stuck after-hook" ? [...ownResult.content, note] : [{ type: "text", text }];
+				expect(recorded).toMatchObject({
+					role: "toolResult",
+					toolCallId: "parent/1",
+					isError: true,
+					content: expectedContent,
+					details: scenario === "never returns" ? {} : ownResult.details,
+				});
+				if (scenario === "stuck after-hook") {
+					hookPending.resolve({ content: [{ type: "text", text: "late changes" }] });
+					await vi.advanceTimersByTimeAsync(0);
+					expect(recorded?.role === "toolResult" && recorded.content).toEqual(expectedContent);
+				}
+				expect(vi.getTimerCount()).toBe(0);
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 });
 
 describe("agentLoopContinue with AgentMessage", () => {

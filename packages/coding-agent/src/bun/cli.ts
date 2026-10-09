@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-import { APP_NAME } from "../config.js";
+/// <reference path="./quickjs-wasm.d.ts" />
+import quickjsWasmPath from "quickjs-wasi/quickjs.wasm";
+import { APP_NAME, setCodemodeRuntimeAssets } from "../config.js";
+
+setCodemodeRuntimeAssets(quickjsWasmPath, "./src/bun/codemode-worker.ts");
 
 process.title = APP_NAME;
 process.emitWarning = (() => {}) as typeof process.emitWarning;

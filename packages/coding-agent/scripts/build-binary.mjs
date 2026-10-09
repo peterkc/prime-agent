@@ -62,6 +62,7 @@ for (const target of platform === "all" ? platforms : [platform]) {
 				`__PI_BUILD_ID__=${JSON.stringify(buildId)}`,
 				`--target=bun-${target}`,
 				"./dist/bun/cli.js",
+				"./src/bun/codemode-worker.ts",
 				"--outfile",
 				join(staging, "prime-agent"),
 			],

@@ -57,8 +57,8 @@ function createReplayBuiltInToolDefinition(
 	cwd: string,
 	toolDefinition: ToolExecutionDefinition | undefined,
 ): ToolDefinition<any, any> | undefined {
-	if (toolName === "ipython") {
-		return createAllToolDefinitions(cwd).ipython;
+	if (toolName === "ipython" || toolName === "codemode") {
+		return createAllToolDefinitions(cwd)[toolName];
 	}
 	switch (toolName) {
 		case "bash": {

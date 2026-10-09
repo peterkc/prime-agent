@@ -1,0 +1,24 @@
+{"id":"output-order","tm":"TM-06","code":"text(\"first\"); console.log(\"second\"); return \"third\";","replies":{},"expected":{"isError":false,"text":["first\nsecond\nthird"],"calls":[]}}
+{"id":"hook-ready-call","tm":"TM-04","code":"text(await tools.echo({value:\"hello\"}));","replies":{"echo":"reply"},"expected":{"isError":false,"text":["reply"],"calls":[{"name":"echo","status":"ok"}]}}
+{"id":"failed-call","tm":"TM-07","code":"text(\"kept\"); await tools.echo({value:\"bad\"});","replies":{"echo":{"error":"denied"}},"expected":{"isError":true,"text":["kept","denied","Calls already made (not undone):","echo (error)"],"calls":[{"name":"echo","status":"error"}]}}
+{"id":"zero-budget-failure","tm":"TM-06","code":"// @options: {\"max_output_tokens\":0}\ntext(\"hidden output\"); throw new Error(\"still visible\");","replies":{},"expected":{"isError":true,"text":["tokens truncated","still visible","Calls already made (not undone):"],"absent":["hidden output"],"fullText":"hidden output","calls":[]}}
+{"id":"head-tail","tm":"TM-06","code":"// @options: {\"max_output_tokens\":2}\ntext(\"abcdefghijklmnop\");","replies":{},"expected":{"isError":false,"text":["abcd…2 tokens truncated…mnop"],"fullText":"abcdefghijklmnop","calls":[]}}
+{"id":"image-exit","tm":"TM-14","code":"text(\"before\"); image(\"data:image/png;base64,iVBORw0KGgo=\"); exit(); text(\"after\");","replies":{},"expected":{"isError":false,"text":["before"],"absent":["after"],"images":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}],"calls":[]}}
+{"id":"image-forms","tm":"TM-14","code":"image({image_url:\"data:image/jpeg;base64,/9j/\"}); image({type:\"image\",data:\"R0lGODlh\",mimeType:\"image/gif\"}); image({type:\"image\",data:\"UklGRgAAAABXRUJQ\",mimeType:\"image/webp\"});","replies":{},"expected":{"isError":false,"images":[{"type":"image","data":"/9j/","mimeType":"image/jpeg"},{"type":"image","data":"R0lGODlh","mimeType":"image/gif"},{"type":"image","data":"UklGRgAAAABXRUJQ","mimeType":"image/webp"}],"calls":[]}}
+{"id":"remote-image","tm":"TM-05","code":"image(\"https://example.com/image.png\");","replies":{},"expected":{"isError":true,"text":["remote image URLs are not supported"],"calls":[]}}
+{"id":"discovery-alias","tm":"TM-14","code":"text(ALL_TOOLS[0]); text(await describeTool(\"my_tool\")); text(await tools.my_tool({value:\"a\"})); text(await tools[\"my-tool\"]({value:\"b\"}));","replies":{"my-tool":"alias reply"},"expected":{"isError":false,"text":["my_tool","Promise<string>","alias reply\nalias reply"],"calls":[{"name":"my-tool","status":"ok"},{"name":"my-tool","status":"ok"}]}}
+{"id":"missing-store","tm":"TM-08","code":"text(typeof load(\"missing\"));","replies":{},"expected":{"isError":false,"text":["undefined"],"calls":[]}}
+{"id":"cpu-timeout","tm":"TM-07","code":"// @options: {\"timeout_ms\":100}\nwhile (true) {}","replies":{},"expected":{"isError":true,"text":["Script timeout:"],"calls":[]}}
+{"id":"heap-limit","tm":"TM-14","code":"const buffer = new ArrayBuffer(257 * 1024 * 1024); text(buffer.byteLength);","replies":{},"expected":{"isError":true,"text":["out of memory"],"calls":[]}}
+{"id":"excluded-fetch","tm":"TM-05","code":"fetch();","replies":{},"expected":{"isError":true,"text":["ReferenceError","fetch"],"calls":[]}}
+{"id":"excluded-require","tm":"TM-05","code":"require();","replies":{},"expected":{"isError":true,"text":["ReferenceError","require"],"calls":[]}}
+{"id":"excluded-setTimeout","tm":"TM-05","code":"setTimeout();","replies":{},"expected":{"isError":true,"text":["ReferenceError","setTimeout"],"calls":[]}}
+{"id":"excluded-process","tm":"TM-05","code":"process();","replies":{},"expected":{"isError":true,"text":["ReferenceError","process"],"calls":[]}}
+{"id":"excluded-models","tm":"TM-05","code":"models();","replies":{},"expected":{"isError":true,"text":["ReferenceError","models"],"calls":[]}}
+{"id":"excluded-searchTools","tm":"TM-05","code":"searchTools();","replies":{},"expected":{"isError":true,"text":["ReferenceError","searchTools"],"calls":[]}}
+{"id":"empty","tm":"TM-05","code":"  ","replies":{},"expected":{"isError":true,"absent":["ran"],"calls":[]}}
+{"id":"invalid-json","tm":"TM-05","code":"// @options: {\ntext(\"ran\");","replies":{},"expected":{"isError":true,"absent":["ran"],"calls":[]}}
+{"id":"unknown-option","tm":"TM-05","code":"// @options: {\"only\":true}\ntext(\"ran\");","replies":{},"expected":{"isError":true,"absent":["ran"],"calls":[]}}
+{"id":"bad-budget","tm":"TM-05","code":"// @options: {\"max_output_tokens\":-1}\ntext(\"ran\");","replies":{},"expected":{"isError":true,"absent":["ran"],"calls":[]}}
+{"id":"bad-timeout","tm":"TM-05","code":"// @options: {\"timeout_ms\":0}\ntext(\"ran\");","replies":{},"expected":{"isError":true,"absent":["ran"],"calls":[]}}
+{"id":"missing-member-typeerror","tm":"TM-04","code":"try { tools.missing({}); } catch (e) { text(e.name); }","replies":{},"expected":{"isError":false,"text":["TypeError"],"calls":[]}}

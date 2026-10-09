@@ -449,6 +449,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 * If omitted, the default execution mode applies.
 	 */
 	executionMode?: ToolExecutionMode;
+	/** Time after abort to retain a tool's partial result; ordinary tools abort immediately. */
+	abortResultGraceMs?: number;
 
 	/** Execute the tool. */
 	execute(

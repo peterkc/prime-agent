@@ -334,6 +334,8 @@ export interface AgentToolResult<T> {
 	content: (TextContent | ImageContent)[];
 	/** Structured details for logs or UI rendering. */
 	details: T;
+	/** Marks a returned result as an error without discarding its content or details. */
+	isError?: boolean;
 	/**
 	 * Hint that the agent should stop after the current tool batch.
 	 * Early termination only happens when every finalized tool result in the batch sets this to true.
@@ -353,7 +355,7 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * Must return an object that matches `TParameters`.
 	 */
 	prepareArguments?: (args: unknown) => Static<TParameters>;
-	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */
+	/** Execute the tool call. Throw on failure or return a result with `isError: true`. */
 	execute: (
 		toolCallId: string,
 		params: Static<TParameters>,
@@ -368,6 +370,8 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * If omitted, the default execution mode applies.
 	 */
 	executionMode?: ToolExecutionMode;
+	/** Optional time after abort to return a result, shared with the after-tool hook. */
+	abortResultGraceMs?: number;
 }
 
 /** Context snapshot passed to the low-level agent loop and tool hooks. */

@@ -264,6 +264,16 @@ Extension state persistence. Does NOT participate in LLM context.
 
 Use `customType` to identify your extension's entries on reload.
 
+### Codemode Store
+
+Completed codemode scripts persist branch-local JSON values as custom entries. Failed scripts append no writes.
+
+```json
+{"type":"custom","customType":"codemode-store","data":{"set":{"k":1},"delete":["old"]},"id":"a1b2c3d4","parentId":"previous","timestamp":"2026-10-09T12:00:00.000Z"}
+```
+
+Fold these entries from root to leaf on the current branch. Older readers ignore them in model context. See [codemode.md](codemode.md) for the port protocol.
+
 ### ChildUsageAttributionEntry
 
 Records RLM child usage folded into a parent assistant message. This entry is daemon bookkeeping and does not enter model context.
