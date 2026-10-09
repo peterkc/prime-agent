@@ -21,7 +21,11 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSocketPathLease } from "../src/modes/daemon/daemon-socket.js";
-import { DaemonSupervisor, handshakeBudgetMs } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	DaemonSupervisor,
+	handshakeBudgetMs,
+	workerCheckpointBudgetMs,
+} from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
@@ -4586,6 +4590,92 @@ describe("daemon worker supervisor monitoring", () => {
 			/resident-1.*recovering.*disconnected.*blocked-root/,
 		);
 		expect(requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("reports every worker that fails update prepare, naming a silent worker's sessions", async () => {
+		const silent = {
+			descriptor: { workerId: "silent", lifecycle: "ready", rootActiveSessionId: "plan-root" },
+			client: {
+				requestWorker: vi.fn(async () => {
+					throw new DaemonWorkerProbeTimeoutError(
+						"Timed out waiting for daemon worker response to worker_prepare_update",
+					);
+				}),
+			},
+			summaries: new Map([
+				["plan-root", { sessionName: "pi-plan" }],
+				["unnamed-child", {}],
+			]),
+		};
+		const answered = {
+			descriptor: { workerId: "answered", lifecycle: "ready", rootActiveSessionId: "repo-root" },
+			client: {
+				requestWorker: vi.fn(async () => ({
+					success: false,
+					error: "Sessions did not reach a restart checkpoint within 85000 ms: pi-repo (repo-root): turn preparing",
+				})),
+			},
+			summaries: new Map(),
+		};
+		const preparedClient = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update"
+					? {
+							success: true,
+							data: {
+								formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+								createdAt: "now",
+								sessions: [],
+								discardedActiveSessionIds: ["ok-root"],
+							},
+						}
+					: { success: true },
+			),
+		};
+		const prepared = {
+			descriptor: { workerId: "prepared", lifecycle: "ready", rootActiveSessionId: "ok-root" },
+			client: preparedClient,
+			summaries: new Map(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map<string, unknown>([
+				["silent", silent],
+				["answered", answered],
+				["prepared", prepared],
+			]),
+		}) as { prepareUpdateRestartFenced(deadline: number): Promise<unknown> };
+
+		await expect(supervisor.prepareUpdateRestartFenced(Date.now() + 100_000)).rejects.toThrow(
+			"worker silent (sessions: pi-plan, unnamed-child): Timed out waiting for daemon worker response to worker_prepare_update; " +
+				"worker answered: Sessions did not reach a restart checkpoint within 85000 ms: pi-repo (repo-root): turn preparing",
+		);
+		expect(preparedClient.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
+	it("gives each worker a checkpoint budget that ends before the supervisor stops waiting", async () => {
+		const requestWorker = vi.fn(async () => {
+			throw new DaemonWorkerProbeTimeoutError(
+				"Timed out waiting for daemon worker response to worker_prepare_update",
+			);
+		});
+		const worker = {
+			descriptor: { workerId: "worker", lifecycle: "ready", rootActiveSessionId: "root" },
+			client: { requestWorker },
+			summaries: new Map(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+		}) as { prepareUpdateRestartFenced(deadline: number): Promise<unknown> };
+
+		await expect(supervisor.prepareUpdateRestartFenced(Date.now() + 100_000)).rejects.toThrow(
+			"worker worker (sessions: none known)",
+		);
+		expect(requestWorker).toHaveBeenCalledWith(
+			{ type: "worker_prepare_update", checkpointTimeoutMs: 85_000 },
+			90_000,
+		);
+		expect(workerCheckpointBudgetMs(4_000)).toBe(2_000);
+		expect(workerCheckpointBudgetMs(1)).toBe(1);
 	});
 
 	it("derives per-attempt handshake budgets from the remaining outer connect deadline", () => {

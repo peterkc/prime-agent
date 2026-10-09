@@ -132,7 +132,7 @@ export type DaemonWorkerCommand =
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
-	| { id?: string; type: "worker_prepare_update" }
+	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }
 	| { id?: string; type: "worker_cancel_update" };
 
