@@ -39,9 +39,12 @@ const buildId = execFileSync("git", ["describe", "--tags", "--long", "--always",
 	cwd: root,
 	encoding: "utf8",
 }).trim();
+// `git describe --dirty` ignores untracked files, but the build copies whole directories.
+const dirty =
+	execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: root, encoding: "utf8" }).trim() !== "";
 const commit = execFileSync("git", ["rev-parse", "--short=9", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 const packageVersion = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version;
-const binaryVersion = forkBinaryVersion(packageVersion, commit, buildId.endsWith("-dirty"));
+const binaryVersion = forkBinaryVersion(packageVersion, commit, dirty);
 const outputRoot = join(packageDir, "binaries");
 mkdirSync(outputRoot, { recursive: true });
 for (const target of platform === "all" ? platforms : [platform]) {
