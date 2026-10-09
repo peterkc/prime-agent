@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releasePlatforms } from "../../../scripts/release-platforms.mjs";
 import { writeClipboardBinaryBinding } from "./clipboard-binary-binding.mjs";
-import { copyBinaryAssets, validateBinaryAssets } from "./copy-binary-assets.mjs";
+import { copyBinaryAssets, forkBinaryVersion, setBinaryVersion, validateBinaryAssets } from "./copy-binary-assets.mjs";
 import { signMacosBinary } from "./macos-signature.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -39,6 +39,9 @@ const buildId = execFileSync("git", ["describe", "--tags", "--long", "--always",
 	cwd: root,
 	encoding: "utf8",
 }).trim();
+const commit = execFileSync("git", ["rev-parse", "--short=9", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+const packageVersion = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version;
+const binaryVersion = forkBinaryVersion(packageVersion, commit, buildId.endsWith("-dirty"));
 const outputRoot = join(packageDir, "binaries");
 mkdirSync(outputRoot, { recursive: true });
 for (const target of platform === "all" ? platforms : [platform]) {
@@ -70,11 +73,12 @@ for (const target of platform === "all" ? platforms : [platform]) {
 		);
 		signMacosBinary(join(staging, "prime-agent"), target);
 		copyBinaryAssets(staging);
+		setBinaryVersion(staging, binaryVersion);
 		validateBinaryAssets(staging);
 		const destination = join(outputRoot, target);
 		rmSync(destination, { recursive: true, force: true });
 		renameSync(staging, destination);
-		console.log(`Created ${destination}`);
+		console.log(`Created ${destination} (version ${binaryVersion})`);
 	} finally {
 		rmSync(staging, { recursive: true, force: true });
 	}
