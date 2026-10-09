@@ -1,0 +1,54 @@
+name: Fork upstream sync
+
+# Fast-forwards the `upstream` branch to PrimeIntellect-ai/prime-agent `main`.
+# The built-in GITHUB_TOKEN cannot push commits that change workflow files, and
+# upstream changes them often, so the push uses the UPSTREAM_SYNC_TOKEN secret:
+# a fine-grained token for this repository only, with Contents and Workflows
+# set to read and write.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Fast-forward upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fast-forward upstream
+        env:
+          TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TOKEN" ]; then
+            echo "::error::The UPSTREAM_SYNC_TOKEN secret is not set."
+            exit 1
+          fi
+          git init -q sync
+          cd sync
+          git remote add source https://github.com/PrimeIntellect-ai/prime-agent.git
+          git remote add fork "https://x-access-token:${TOKEN}@github.com/${REPOSITORY}.git"
+          git fetch -q --no-tags fork +refs/heads/upstream:refs/remotes/fork/upstream
+          git fetch -q --no-tags source +refs/heads/main:refs/remotes/source/main
+          current=$(git rev-parse refs/remotes/fork/upstream)
+          target=$(git rev-parse refs/remotes/source/main)
+          if [ "$current" = "$target" ]; then
+            echo "upstream is already at $target"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$current" "$target"; then
+            echo "::error::upstream ($current) is not an ancestor of PrimeIntellect-ai main ($target); not syncing."
+            exit 1
+          fi
+          git push -q fork "$target:refs/heads/upstream"
+          echo "upstream moved from $current to $target"
