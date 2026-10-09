@@ -361,6 +361,40 @@ describe("codemode", () => {
 		expect(session.getActiveToolNames()).toEqual(active);
 	});
 
+	it("leaves tools named in codemodeExcludeTools out of scripts", async () => {
+		const executed: string[] = [];
+		const { session } = await makeSession(
+			(pi) => {
+				for (const name of ["echo", "ask_user"])
+					pi.registerTool({
+						...stub(name, async (_id, args) => {
+							executed.push(name);
+							return reply(args.value);
+						}),
+					});
+			},
+			SettingsManager.inMemory({ codemodeExcludeTools: ["ask_user"] }),
+		);
+		session.setActiveToolsByName(["codemode", "echo", "ask_user"]);
+		const result = await sessionTool(session).execute("parent", {
+			code: `text(ALL_TOOLS.map((tool) => tool.name).join(",")); text(String(await describeTool("ask_user"))); text(await tools.echo({value: "ok"})); try { await tools.ask_user({value: "x"}); } catch (e) { text("blocked: " + e.message); }`,
+		});
+		expect(result.isError).toBe(false);
+		const lines = text(result).split("\n");
+		expect(lines).toEqual(expect.arrayContaining(["echo", "undefined", "ok"]));
+		expect(lines.filter((line) => line.includes("ask_user"))).toEqual([expect.stringMatching(/^blocked: /)]);
+		expect(executed).toEqual(["echo"]);
+	});
+
+	it("codemodeExcludeTools keeps only string names", () => {
+		expect(
+			SettingsManager.inMemory({
+				codemodeExcludeTools: ["a", 1, null] as unknown as string[],
+			}).getCodemodeExcludeTools(),
+		).toEqual(["a"]);
+		expect(SettingsManager.inMemory({}).getCodemodeExcludeTools()).toEqual([]);
+	});
+
 	it("TM-10 persists the boolean setting and lets project settings override global settings", async () => {
 		mkdirSync(join(dir, ".prime", "agent"), { recursive: true });
 		writeFileSync(join(dir, "settings.json"), '{"codemode":false}');
