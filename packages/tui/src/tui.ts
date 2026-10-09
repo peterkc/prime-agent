@@ -1748,8 +1748,8 @@ export class TUI extends Container {
 		if (this.stopped) return;
 		if (this.fullscreen?.entry === "pending") return;
 		if (this.fullscreen?.entry === "native") {
+			// No pinned header: Tern's tab already shows the chat name.
 			const dock: Component[] = [];
-			if (this.fullscreen.pin) dock.push(this.fullscreen.pin);
 			const overlays = this.overlayStack.filter((entry) => this.isOverlayVisible(entry));
 			overlays.sort((a, b) => a.focusOrder - b.focusOrder);
 			for (const entry of overlays) dock.push(entry.component);

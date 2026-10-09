@@ -12,7 +12,7 @@ To enable it only in Tern, add this to your shell configuration:
 [[ $TERM_PROGRAM == tern ]] && export PI_TUI_NATIVE=1
 ```
 
-Use Tern's **Reader** chat style. Spine and Console constrain the transcript width and are not supported by this layout. Rows show Tern's small fallback marker. No stylesheet hides it.
+Use Tern's **Reader** chat style. Spine and Console constrain the transcript width and are not supported by this layout. Prime hides the "fallback" label that Tern puts on each block of rows. It does this with a stylesheet on a Tern class that is not documented, so a Tern update can bring the label back. Native mode does not show the top bar with the chat name and cost; Tern's tab shows the name.
 
 The mouse wheel and `Shift+PgUp` scroll the transcript. Prime's viewport-top and follow bindings reveal the start and end. On a long transcript, one viewport-top press can stop short of the start, especially after you return from Ctrl+Z, the agents view or the external editor. Use the mouse wheel or `Shift+PgUp` to reach the start. Tern 0.6.3 binds `Ctrl+Shift+Down`, the default follow key, to Park pane, so that key may not reach Prime; bind `tui.viewport.follow` to another key in [`keybindings.json`](keybindings.md). Plain `PgUp` and `PgDn` reach the focused component instead of paging the transcript.
 

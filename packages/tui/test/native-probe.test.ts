@@ -125,7 +125,7 @@ it("adopts the retained Surface, routes ack and gone, and never reopens after na
 	assert.equal(fresh.seq, 0);
 	assert.equal(
 		writes.at(-1),
-		'\x1b_tsp;o;{"id":"prime-2","mode":"inline","title":"Prime","role":"prime.session"}\x1b\\',
+		'\x1b_tsp;s;{"sf":"prime-2","name":"prime","css":".sf-rows-mark { display: none; }"}\x1b\\',
 	);
 	await fresh.close({ keep: true });
 	native.probe.feed('\x1b_tsp;e;{"ev":"gone","ids":["prime-2"]}\x1b\\');

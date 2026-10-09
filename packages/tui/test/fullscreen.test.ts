@@ -361,7 +361,7 @@ function nativeSetup(t: TestContext) {
 	tui.addChild(chat);
 	tui.setFocus(chat);
 	t.after(() => tui.stop());
-	const layout = { scroll: [chat], dock: new TestComponent(), native: true };
+	const layout = { scroll: [chat], dock: new TestComponent(), pin: chat, native: true };
 	tui.start();
 	terminal.clearWrites();
 	tui.enterFullscreen(layout);
@@ -387,6 +387,7 @@ it("keeps pending entry and exit silent, opens inline without markers, and passe
 	await renderTui(h.tui);
 	assert.deepEqual(h.terminal.message("o"), { id: "prime", mode: "inline", title: "Prime", role: "prime.session" });
 	assert.equal(h.terminal.message("f").ops.length, 2);
+	assert.equal(JSON.stringify(h.terminal.message("f")).split("transcript").length, 2, "no pinned header");
 	assert.equal(h.terminal.getWrites().includes(JSON.stringify(CURSOR_MARKER).slice(1, -1)), false);
 	assert.ok(!h.terminal.altScreenActive && !h.terminal.mouseTrackingActive);
 	const before = h.tui.getScrollInfo();

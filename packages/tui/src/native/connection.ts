@@ -42,6 +42,9 @@ export class NativeConnection implements SurfaceLink {
 		} as const;
 		this.send({ verb: "o", body: { id, ...options } });
 		this.live = new Surface(this, id, options, previous);
+		// Hide Tern's "fallback" label on rows; an adopted surface keeps the sheet.
+		// The class is internal to Tern, so a Tern update can bring the label back.
+		if (!previous) this.live.stylesheet("prime", ".sf-rows-mark { display: none; }");
 		this.closed.delete(id);
 		this.kept.delete(id);
 		return this.live;

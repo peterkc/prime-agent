@@ -1,0 +1,1 @@
+- Hid Tern's "fallback" label on rows and the pinned header in Tern native fullscreen.
