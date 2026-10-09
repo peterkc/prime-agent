@@ -73,6 +73,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		const ui: FakeUi = {
 			releaseNative: vi.fn(async () => {
 				await Promise.resolve();
+				if (order === "SIGCONT first") sigcontHandler?.();
 				expect(ui.stop).not.toHaveBeenCalled();
 			}),
 			start: vi.fn(),
@@ -129,6 +130,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		expect(clearIntervalSpy).toHaveBeenCalledWith(keepAliveHandle);
 		expect(removeListenerSpy).toHaveBeenCalledWith("SIGINT", sigintHandler);
 		expect(ui.start).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(ui.start)).toHaveBeenCalledAfter(vi.mocked(ui.stop));
 		expect(ui.requestRender).toHaveBeenCalledExactlyOnceWith(true);
 		expect(context.applyFullscreen).toHaveBeenCalledExactlyOnceWith(true);
 	});

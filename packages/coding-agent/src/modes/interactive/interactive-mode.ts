@@ -7749,12 +7749,13 @@ export class InteractiveMode {
 			clearTimeout(suspendTimer);
 			resume();
 		};
-		process.once("SIGCONT", onSigcont);
 
 		try {
 			// Stop the TUI (restore terminal to normal mode)
 			await this.ui.releaseNative();
 			this.ui.stop();
+			// Listen only now: a SIGCONT that arrives earlier finds Prime still running
+			process.once("SIGCONT", onSigcont);
 
 			// Send SIGTSTP to process group (pid=0 means all processes in group)
 			process.kill(0, "SIGTSTP");
