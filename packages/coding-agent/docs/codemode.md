@@ -21,7 +21,7 @@ text(reply);
 store("lastAnswer", 42);
 ```
 
-The tool is active by default with `ipython`. Set `"codemode": false` in global or project settings to remove it from defaults.
+The tool is active by default with `ipython`. Set `"codemode": false` in global or project settings to remove it from defaults. Set `"codemodeExcludeTools": ["name", ...]` to keep named tools out of scripts: they are absent from `ALL_TOOLS` and `describeTool()`, and calling them fails as an unknown tool. Use it for tools that need their own turn or a guarded, visible action.
 An explicit CLI `--tools` or SDK tool list decides alone. For example, `--tools ipython` excludes it.
 Use `Promise.allSettled` for independent calls. Sequential tools, including `ipython`, share one queue per script.
 Python skills and MCP servers remain available through `ipython`, not as direct script tools.
@@ -51,7 +51,8 @@ Description (exact text):
 
 <!-- description:start -->
 Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, network, process, or timers.
-- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself. Use tools["my-tool"] or tools.my_tool for non-identifier names.
+- Use codemode only to call several typed tools that ipython cannot reach, such as beads, pr_inspect or ask_jev, in parallel or in a chain, when only a filtered result should reach the context. For one call, call the tool directly. For files, shell, Python skills, MCP servers or state that must last between calls, use ipython; do not wrap tools.ipython in codemode only to run Python.
+- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
 - Use Promise.allSettled for independent calls, chain calls, or filter large results. Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
 - text(value), console.log/info/warn/error/debug(...), and return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
 - store(key, value) and load(key) keep JSON values on the current session branch. store(key, undefined) deletes a key; missing keys load as undefined. Only completed scripts persist writes.

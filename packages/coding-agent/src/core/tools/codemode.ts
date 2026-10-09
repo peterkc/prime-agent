@@ -24,13 +24,20 @@ import { getTextOutput, replaceTabs, str } from "./render-utils.js";
 
 export const codemodeSchema = Type.Object({ code: Type.String({ description: "Raw JavaScript source." }) });
 export const CODEMODE_DESCRIPTION = `Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, network, process, or timers.
-- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself. Use tools["my-tool"] or tools.my_tool for non-identifier names.
+- Use codemode only to call several typed tools that ipython cannot reach, such as beads, pr_inspect or ask_jev, in parallel or in a chain, when only a filtered result should reach the context. For one call, call the tool directly. For files, shell, Python skills, MCP servers or state that must last between calls, use ipython; do not wrap tools.ipython in codemode only to run Python.
+- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
 - Use Promise.allSettled for independent calls, chain calls, or filter large results. Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
 - text(value), console.log/info/warn/error/debug(...), and return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
 - store(key, value) and load(key) keep JSON values on the current session branch. store(key, undefined) deletes a key; missing keys load as undefined. Only completed scripts persist writes.
 - ALL_TOOLS lists names and TypeScript declarations. await describeTool(name) returns a declaration. Python skills and MCP servers stay reachable through ipython, not as direct tools.
 - Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000}. max_output_tokens is a non-negative safe integer (default 10000, 4 characters per token); timeout_ms is an integer from 1 to 2147483647 (default none). Unknown fields are rejected.
 - The budget applies only to user text; over budget it keeps the head and tail and spills the full text to a temp file. Failure keeps partial output and a list of calls already made. Each run is fresh, with a 256 MiB guest heap, 16777216 output characters, 100000 output items, 262144 JSON characters per store value, and 1048576 total store characters (keys plus values). These do not bound host process memory or tool results.`;
+
+/** The tools a codemode script may call: the active tools minus the names the settings exclude. */
+export function codemodeCallableTools(tools: readonly AgentTool[], excluded: readonly string[]): readonly AgentTool[] {
+	const names = new Set(excluded);
+	return tools.filter((tool) => !names.has(tool.name));
+}
 
 export interface CodemodeHost {
 	callableTools(): readonly AgentTool[];

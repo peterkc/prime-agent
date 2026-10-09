@@ -354,6 +354,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import { codemodeCallableTools } from "./tools/codemode.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner, type UnavailablePythonSkills } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
@@ -10864,7 +10865,8 @@ export class AgentSession {
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				codemode: {
-					callableTools: () => this.agent.state.tools,
+					callableTools: () =>
+						codemodeCallableTools(this.agent.state.tools, this.settingsManager.getCodemodeExcludeTools()),
 					runTool: (callId, name, args, signal) => this.runNestedToolCall(callId, name, args, signal),
 					storeEntries: () =>
 						this.sessionManager
