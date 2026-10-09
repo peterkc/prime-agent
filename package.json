@@ -52,7 +52,7 @@
 	"engines": {
 		"node": ">=22.19.0"
 	},
-	"version": "0.9.8+fork.3",
+	"version": "0.9.8+fork.4",
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.9.8",
 		"get-east-asian-width": "^1.6.0"
