@@ -102,7 +102,7 @@ export interface FullscreenOptions {
 	native?: boolean;
 	scroll: Component[];
 	dock: Component;
-	/** Pinned above the scrolling transcript — stays on top while scrolling. */
+	/** Pinned above the scrolling transcript — stays on top while scrolling. Not shown in native mode. */
 	pin?: Component;
 	mouse?: boolean;
 	viewportControls?: boolean;
