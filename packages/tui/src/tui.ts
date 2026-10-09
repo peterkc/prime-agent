@@ -20,6 +20,7 @@ import {
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
+import { NativeBackend } from "./native/backend.js";
 import type { TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
@@ -98,6 +99,7 @@ export interface TuiStopOptions {
 }
 
 export interface FullscreenOptions {
+	native?: boolean;
 	scroll: Component[];
 	dock: Component;
 	/** Pinned above the scrolling transcript — stays on top while scrolling. */
@@ -358,6 +360,9 @@ export class TUI extends Container {
 	private fullRedrawCount = 0;
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
+	private nativeBackend: NativeBackend | undefined;
+	private unsubscribeNativeProbe: (() => void) | undefined;
+	private nativeRelease: Promise<void> | undefined;
 	private fullscreenLeftMouseDragged = false;
 	private fullscreenPressedHyperlink: string | null = null;
 	private fullscreenPressedClick: FrameClickTarget | null = null;
@@ -366,6 +371,7 @@ export class TUI extends Container {
 	// While set, doRender paints fixed frames via the viewport; the inline
 	// differ's bookkeeping stays frozen in `inlineState` until exit.
 	private fullscreen: {
+		entry: "pending" | "ansi" | "native";
 		viewport: FullscreenViewport;
 		scroll: Component[];
 		dock: Component;
@@ -571,7 +577,8 @@ export class TUI extends Container {
 	}
 
 	private shouldEnableFullscreenMouseTracking(): boolean {
-		if (!this.fullscreen?.mouse) return false;
+		if (this.fullscreen?.entry !== "ansi") return false;
+		if (!this.fullscreen.mouse) return false;
 		return !this.overlayStack.some(
 			(entry) => entry.options?.suspendFullscreenMouse === true && this.isOverlayVisible(entry),
 		);
@@ -582,6 +589,7 @@ export class TUI extends Container {
 	}
 
 	private syncFullscreenMouseTracking(): void {
+		if (this.fullscreen && this.fullscreen.entry !== "ansi") return;
 		const enabled = this.shouldEnableFullscreenMouseTracking();
 		if (!enabled) {
 			this.stopSelectionAutoScroll();
@@ -602,6 +610,7 @@ export class TUI extends Container {
 
 	start(): void {
 		this.stopped = false;
+		this.nativeRelease = undefined;
 		this.terminal.start(
 			(data) => this.handleInput(data),
 			() => this.requestRender(),
@@ -635,14 +644,19 @@ export class TUI extends Container {
 	stop(options: TuiStopOptions = {}): void {
 		const preserveAltScreen = options.preserveAltScreen === true && this.terminal.altScreenActive;
 		const flushFullscreen = options.flushFullscreen ?? !preserveAltScreen;
-		this.exitFullscreen({ flush: flushFullscreen, leaveAltScreen: !preserveAltScreen });
+		const native = this.fullscreen?.entry === "native";
+		if (native) {
+			void this.nativeBackend?.close(true);
+			this.terminal.native?.beginDrain();
+		}
+		this.exitFullscreen({ flush: native ? false : flushFullscreen, leaveAltScreen: !preserveAltScreen });
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
 		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
-		if (!preserveAltScreen && this.previousLines.length > 0) {
+		if (!native && !preserveAltScreen && this.previousLines.length > 0) {
 			const targetRow = this.previousLines.length; // Line after the last content
 			const lineDiff = targetRow - this.hardwareCursorRow;
 			if (lineDiff > 0) {
@@ -659,6 +673,16 @@ export class TUI extends Container {
 			this.terminal.showCursor();
 		}
 		this.terminal.stop({ preserveAltScreen });
+	}
+
+	/** Close before handing the pty to another reader; keep consuming late input. */
+	releaseNative(): Promise<void> {
+		if (this.nativeRelease) return this.nativeRelease;
+		if (this.fullscreen?.entry !== "native") return Promise.resolve();
+		void this.nativeBackend?.close(true);
+		this.terminal.native?.beginDrain();
+		this.nativeRelease = new Promise((resolve) => setTimeout(resolve, 50));
+		return this.nativeRelease;
 	}
 
 	requestRender(force = false): void {
@@ -715,7 +739,10 @@ export class TUI extends Container {
 		this.fullscreenLeftMouseDragged = false;
 		this.fullscreenPressedHyperlink = null;
 		this.fullscreenPressedClick = null;
+		const probe = options.native ? this.terminal.native?.probe : undefined;
+		const entry = probe?.state.kind === "pending" ? "pending" : probe?.state.kind === "available" ? "native" : "ansi";
 		this.fullscreen = {
+			entry,
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
 			dock: options.dock,
@@ -733,10 +760,51 @@ export class TUI extends Container {
 				previousViewportTop: this.previousViewportTop,
 			},
 		};
+		if (entry === "pending" && probe) {
+			this.unsubscribeNativeProbe = probe.subscribe(() => this.completeNativeEntry());
+			return;
+		}
+		this.completeFullscreenEntry();
+		this.requestRender();
+	}
+
+	private completeNativeEntry(): void {
+		if (this.fullscreen?.entry !== "pending") return;
+		this.unsubscribeNativeProbe?.();
+		this.unsubscribeNativeProbe = undefined;
+		this.fullscreen.entry = this.terminal.native?.probe.state.kind === "available" ? "native" : "ansi";
+		this.completeFullscreenEntry();
+		this.requestRender(true);
+	}
+
+	private completeFullscreenEntry(): void {
+		if (this.fullscreen?.entry === "native" && this.terminal.native) {
+			if (this.terminal.altScreenActive) this.terminal.leaveAltScreen();
+			this.nativeBackend = new NativeBackend(
+				this.terminal.native,
+				() => this.nativeChanged(),
+				() => this.endNative(),
+			);
+			this.nativeBackend.open();
+			return;
+		}
 		this.terminal.enterAltScreen();
 		this.terminal.hideCursor();
 		this.syncFullscreenMouseTracking();
+	}
+
+	private nativeChanged(): void {
+		this.invalidate();
 		this.requestRender();
+	}
+
+	private endNative(): void {
+		if (this.fullscreen?.entry !== "native") return;
+		this.nativeBackend?.dispose();
+		this.nativeBackend = undefined;
+		this.fullscreen.entry = "ansi";
+		this.completeFullscreenEntry();
+		this.requestRender(true);
 	}
 
 	/**
@@ -746,11 +814,18 @@ export class TUI extends Container {
 	exitFullscreen(options: ExitFullscreenOptions = {}): void {
 		this.stopSelectionAutoScroll();
 		if (!this.fullscreen) return;
-		const { inlineState } = this.fullscreen;
+		const { inlineState, entry } = this.fullscreen;
+		this.unsubscribeNativeProbe?.();
+		this.unsubscribeNativeProbe = undefined;
+		if (entry === "native") {
+			void this.nativeBackend?.close(false);
+			this.nativeBackend?.dispose();
+			this.nativeBackend = undefined;
+		}
 		this.fullscreen = null;
-		this.syncFullscreenMouseTracking();
-		if (options.leaveAltScreen !== false) {
-			this.terminal.leaveAltScreen();
+		if (entry === "ansi") {
+			this.syncFullscreenMouseTracking();
+			if (options.leaveAltScreen !== false) this.terminal.leaveAltScreen();
 		}
 		this.previousLines = inlineState.previousLines;
 		this.previousKittyImageIds = inlineState.previousKittyImageIds;
@@ -761,8 +836,9 @@ export class TUI extends Container {
 		this.maxLinesRendered = inlineState.maxLinesRendered;
 		this.previousViewportTop = inlineState.previousViewportTop;
 		// synchronous so the flush also happens on shutdown, where a scheduled render never fires
-		if (options.flush !== false && !this.stopped) {
-			this.doRender();
+		if (options.flush !== false && !this.stopped && entry !== "pending") {
+			if (entry === "native") this.requestRender(true);
+			else this.doRender();
 		}
 	}
 
@@ -895,6 +971,7 @@ export class TUI extends Container {
 	}
 
 	private handleInput(data: string): void {
+		if (this.nativeRelease) return;
 		if (this.inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.inputListeners) {
@@ -1053,6 +1130,17 @@ export class TUI extends Container {
 		if (overlayFocused || !fullscreen.viewportControls) return false;
 
 		const keybindings = getKeybindings();
+		if (fullscreen.entry === "native") {
+			if (keybindings.matches(data, "tui.viewport.top")) {
+				this.nativeBackend?.revealTop();
+				return true;
+			}
+			if (keybindings.matches(data, "tui.viewport.follow")) {
+				this.nativeBackend?.revealTail();
+				return true;
+			}
+			return false;
+		}
 		if (keybindings.matches(data, "tui.viewport.pageUp")) {
 			this.scrollBy(-fullscreen.viewport.pageSize());
 			return true;
@@ -1658,6 +1746,17 @@ export class TUI extends Container {
 
 	private doRender(): void {
 		if (this.stopped) return;
+		if (this.fullscreen?.entry === "pending") return;
+		if (this.fullscreen?.entry === "native") {
+			const dock: Component[] = [];
+			if (this.fullscreen.pin) dock.push(this.fullscreen.pin);
+			const overlays = this.overlayStack.filter((entry) => this.isOverlayVisible(entry));
+			overlays.sort((a, b) => a.focusOrder - b.focusOrder);
+			for (const entry of overlays) dock.push(entry.component);
+			dock.push(this.fullscreen.dock);
+			this.nativeBackend?.render(this.fullscreen.scroll, dock);
+			return;
+		}
 		if (this.fullscreen) {
 			this.preserveViewportOnNextRender = false;
 			this.renderFullscreen();

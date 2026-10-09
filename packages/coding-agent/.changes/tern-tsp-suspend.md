@@ -1,0 +1,2 @@
+- Fixed Ctrl+Z freezing Prime when no job-control shell can resume it; Prime now keeps running and shows a status message.
+- Added opt-in Tern native fullscreen for the session view via `PI_TUI_NATIVE=1` (see the terminal setup docs).

@@ -36,6 +36,7 @@
 	},
 	"types": "./dist/index.d.ts",
 	"dependencies": {
+		"@stencil-hq/tern": "0.1.0",
 		"get-east-asian-width": "^1.6.0",
 		"marked": "^18.0.7"
 	},

@@ -1,5 +1,9 @@
 import assert from "node:assert";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
+import { InputParser } from "@stencil-hq/tern";
+import { nativeConnection } from "../src/native/connection.js";
+import { NativeProbe } from "../src/native/probe.js";
+import { StdinBuffer } from "../src/stdin-buffer.js";
 import { ProcessTerminal } from "../src/terminal.js";
 import { parseOscColorResponse } from "../src/terminal-colors.js";
 
@@ -278,3 +282,136 @@ function restoreProperty(object: object, key: PropertyKey, descriptor: PropertyD
 		Reflect.deleteProperty(object, key);
 	}
 }
+
+const nativeHello = '\x1b_tsp;r;{"r":"hello","v":1,"apc":65536,"credits":2,"cols":120}\x1b\\';
+const nativeDa1 = "\x1b[?1;2c";
+function ignoreInput(): void {}
+function nativeTerminal(t: TestContext, gate: string | undefined, term = "tern", tmux = "") {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const savedEnv = {
+		PI_TUI_NATIVE: process.env.PI_TUI_NATIVE,
+		TERM_PROGRAM: process.env.TERM_PROGRAM,
+		TMUX: process.env.TMUX,
+	};
+	if (gate === undefined) delete process.env.PI_TUI_NATIVE;
+	else process.env.PI_TUI_NATIVE = gate;
+	process.env.TERM_PROGRAM = term;
+	process.env.TMUX = tmux;
+	const savedProbe = nativeConnection.probe;
+	Reflect.set(nativeConnection, "probe", new NativeProbe());
+	const inputs: string[] = [];
+	const writes: string[] = [];
+	t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => writes.push(String(chunk)) > 0);
+	t.mock.method(process.stdin, "resume", () => process.stdin);
+	t.mock.method(process.stdin, "pause", () => process.stdin);
+	t.mock.method(process.stdin, "setEncoding", () => process.stdin);
+	t.mock.method(process, "kill", () => true);
+	const terminal = new ProcessTerminal();
+	t.after(() => {
+		terminal.stop();
+		Reflect.set(nativeConnection, "probe", savedProbe);
+		for (const [key, value] of Object.entries(savedEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+	terminal.start((text) => inputs.push(text), ignoreInput);
+	return { terminal, inputs, writes };
+}
+describe("ProcessTerminal native probe gate", () => {
+	for (const [gate, term, tmux] of [
+		["1", "tern", ""],
+		["1", "WarpTerminal", ""],
+		["1", "tern", "/tmp/tmux"],
+		[undefined, "tern", ""],
+		["0", "tern", ""],
+		["true", "tern", ""],
+		["", "tern", ""],
+	] as const) {
+		it(`probes only for exact gate ${JSON.stringify(gate)}, terminal ${term}, tmux ${tmux}`, (t) => {
+			const { terminal, writes } = nativeTerminal(t, gate, term, tmux);
+			const probeWrites = writes.filter((text) => text.includes("tsp;") || text === "\x1b[c");
+			assert.deepEqual(
+				probeWrites,
+				gate === "1"
+					? ['\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"0.9.8+fork.3"}\x1b\\', "\x1b[c"]
+					: [],
+			);
+			terminal.stop();
+			writes.length = 0;
+			terminal.start(ignoreInput, ignoreInput);
+			assert.deepEqual(
+				writes.filter((text) => text.includes("tsp;") || text === "\x1b[c"),
+				[],
+			);
+		});
+	}
+});
+describe("ProcessTerminal native stdin hookup", () => {
+	for (const [name, reads, expected, kitty] of [
+		["hello and DA1 together", [nativeHello + nativeDa1], [], false],
+		[
+			"keys and bracketed paste around TSP",
+			[`a\x1b[200~before\x1b[201~${nativeHello}\x1b[200~after\x1b[201~b`],
+			["a", "\x1b[200~before\x1b[201~", "\x1b[200~after\x1b[201~", "b"],
+			false,
+		],
+		["Unicode beside TSP", [`é界${nativeHello}ñ文`], ["é", "界", "ñ", "文"], false],
+		["Kitty reply", [`${nativeHello}\x1b[?7u`], [], true],
+		["split Kitty reply", [`${nativeHello}\x1b[?`, "7u"], [], true],
+		["OSC 11 reply", [`${nativeHello}\x1b]11;rgb:00/5f/87\x07`], [], false],
+	] as const) {
+		it(`preserves ${name}`, (t) => {
+			const stdin = t.mock.method(StdinBuffer.prototype, "process");
+			const { terminal, inputs, writes } = nativeTerminal(t, "1");
+			for (const read of reads) process.stdin.emit("data", read);
+			assert.equal(terminal.native?.probe.state.kind, "available");
+			assert.deepEqual(inputs, expected);
+			assert.equal(terminal.kittyProtocolActive, kitty);
+			assert.equal(writes.includes("\x1b[>7u"), kitty);
+			if (name === "OSC 11 reply")
+				assert.deepEqual(
+					stdin.mock.calls.map((call) => call.arguments[0]),
+					["\x1b]11;rgb:00/5f/87\x07"],
+				);
+		});
+	}
+	it("keeps a recognized TSP reply open past the idle flush", (t) => {
+		const { terminal, inputs } = nativeTerminal(t, "1");
+		process.stdin.emit("data", nativeHello.slice(0, 7));
+		t.mock.timers.tick(11);
+		process.stdin.emit("data", nativeHello.slice(7) + nativeDa1);
+		assert.equal(terminal.native?.probe.state.kind, "available");
+		assert.deepEqual(inputs, []);
+	});
+	it("flushes a lone Escape through both timeouts exactly once", (t) => {
+		const { inputs } = nativeTerminal(t, "1");
+		process.stdin.emit("data", `${nativeHello}\x1b`);
+		t.mock.timers.tick(9);
+		assert.deepEqual(inputs, []);
+		t.mock.timers.tick(1);
+		assert.deepEqual(inputs, []);
+		t.mock.timers.tick(10);
+		assert.deepEqual(inputs, ["\x1b"]);
+		t.mock.timers.tick(10);
+		assert.deepEqual(inputs, ["\x1b"]);
+	});
+	it("routes reads directly after DA1 fallback and flushes held keys last", (t) => {
+		const { terminal, inputs } = nativeTerminal(t, "1");
+		process.stdin.emit("data", `${nativeDa1}a\x1b`);
+		assert.equal(terminal.native?.probe.state.kind, "off");
+		t.mock.timers.tick(10);
+		assert.deepEqual(inputs, ["a", "\x1b"]);
+		process.stdin.emit("data", "\x1b[?1;2c");
+		assert.deepEqual(inputs, ["a", "\x1b", "\x1b[?1;2c"]);
+	});
+	it("clears the parser flush timer on stop", (t) => {
+		const { terminal } = nativeTerminal(t, "1");
+		const flush = t.mock.method(InputParser.prototype, "flush");
+		process.stdin.emit("data", `${nativeHello}\x1b`);
+		terminal.stop();
+		const callsAtStop = flush.mock.callCount();
+		t.mock.timers.tick(20);
+		assert.equal(flush.mock.callCount(), callsAtStop);
+	});
+});

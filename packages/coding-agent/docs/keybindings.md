@@ -176,7 +176,7 @@ Create `~/.prime/agent/keybindings.json`:
 
 Each action can have a single key or an array of keys. User config overrides defaults.
 
-On native Windows, `app.suspend` has no default binding because Windows terminals do not support Unix job control. If you bind it manually, Prime Agent shows a status message instead of suspending. In WSL, the normal Linux `ctrl+z`/`fg` behavior still applies.
+On native Windows, `app.suspend` has no default binding because Windows terminals do not support Unix job control. If you bind it manually, Prime Agent shows a status message instead of suspending. In WSL, the normal Linux `ctrl+z`/`fg` behavior still applies. Where no shell has job control (for example a Tern agent block or a tmux pane command), Ctrl+Z shows a status message and Prime keeps running.
 
 ### Emacs Example
 

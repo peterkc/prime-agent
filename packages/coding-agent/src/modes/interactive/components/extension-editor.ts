@@ -89,14 +89,14 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 		}
 
 		if (this.keybindings.matches(keyData, "app.editor.external")) {
-			this.openExternalEditor();
+			void this.openExternalEditor();
 			return;
 		}
 
 		this.editor.handleInput(keyData);
 	}
 
-	private openExternalEditor(): void {
+	private async openExternalEditor(): Promise<void> {
 		const editorCmd = process.env.VISUAL || process.env.EDITOR;
 		if (!editorCmd) {
 			return;
@@ -107,6 +107,7 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 
 		try {
 			fs.writeFileSync(tmpFile, currentText, "utf-8");
+			await this.tui.releaseNative();
 			this.tui.stop();
 
 			const [editor, ...editorArgs] = editorCmd.split(" ");

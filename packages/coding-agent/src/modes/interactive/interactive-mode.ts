@@ -3464,6 +3464,7 @@ export class InteractiveMode {
 		const message = error instanceof Error ? error.message : String(error);
 		this.showError(`${prefix}: ${message}`);
 		stopThemeWatcher();
+		await this.ui.releaseNative();
 		this.stop();
 		process.exit(1);
 	}
@@ -4679,7 +4680,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.interrupt", () => this.handleInterruptKey());
 		this.defaultEditor.onAction("app.shortcuts", () => this.showShortcutGuide());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
-		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
+		this.defaultEditor.onAction("app.suspend", () => void this.handleCtrlZ());
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => {
@@ -4693,7 +4694,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			this.showHeartbeatManager();
 		});
-		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
+		this.defaultEditor.onAction("app.editor.external", () => void this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.navigateOlder", () => this.browseQueueSelection(-1));
@@ -7577,6 +7578,7 @@ export class InteractiveMode {
 
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
+		await this.ui.releaseNative();
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
@@ -7599,6 +7601,7 @@ export class InteractiveMode {
 	 * call from a crash path too; idempotent via stop().
 	 */
 	async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {
+		await this.ui.releaseNative();
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 		this.releasePromptStashSession();
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
@@ -7712,7 +7715,7 @@ export class InteractiveMode {
 		this.signalCleanupHandlers = [];
 	}
 
-	private handleCtrlZ(): void {
+	private async handleCtrlZ(): Promise<void> {
 		if (process.platform === "win32") {
 			this.showStatus("Suspend to background is not supported on Windows");
 			return;
@@ -7728,8 +7731,11 @@ export class InteractiveMode {
 		const ignoreSigint = () => {};
 		process.on("SIGINT", ignoreSigint);
 
-		// Set up handler to restore TUI when resumed
-		process.once("SIGCONT", () => {
+		let suspendTimer: ReturnType<typeof setTimeout> | undefined;
+		let resumed = false;
+		const resume = () => {
+			if (resumed) return;
+			resumed = true;
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
 			this.ui.start();
@@ -7738,14 +7744,26 @@ export class InteractiveMode {
 				this.applyFullscreen(true);
 			}
 			this.ui.requestRender(true);
-		});
+		};
+		const onSigcont = () => {
+			clearTimeout(suspendTimer);
+			resume();
+		};
+		process.once("SIGCONT", onSigcont);
 
 		try {
 			// Stop the TUI (restore terminal to normal mode)
+			await this.ui.releaseNative();
 			this.ui.stop();
 
 			// Send SIGTSTP to process group (pid=0 means all processes in group)
 			process.kill(0, "SIGTSTP");
+			suspendTimer = setTimeout(() => {
+				if (resumed) return;
+				process.removeListener("SIGCONT", onSigcont);
+				resume();
+				this.showStatus("Suspend needs a shell with job control; Prime kept running");
+			}, 250);
 		} catch (error) {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
@@ -8027,6 +8045,7 @@ export class InteractiveMode {
 				],
 				dock: this.promptDock,
 				pin: this.topBar,
+				native: true,
 				mouse: this.settingsManager.getFullscreenMouse(),
 			});
 		} else {
@@ -8155,7 +8174,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private openExternalEditor(): void {
+	private async openExternalEditor(): Promise<void> {
 		// Determine editor (respect $VISUAL, then $EDITOR)
 		const editorCmd = process.env.VISUAL || process.env.EDITOR;
 		if (!editorCmd) {
@@ -8171,6 +8190,7 @@ export class InteractiveMode {
 			fs.writeFileSync(tmpFile, currentText, "utf-8");
 
 			// Stop TUI to release terminal
+			await this.ui.releaseNative();
 			this.ui.stop();
 
 			// Split by space to support editor arguments (e.g., "code --wait")
@@ -11216,6 +11236,7 @@ export class InteractiveMode {
 		);
 		const updateChildArgs = includesSelf ? buildUpdateChildArgs(updateArgs, daemonSocketPath) : updateArgs;
 		this.stopWorkingLoader();
+		await this.ui.releaseNative();
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 		this.ui.stop();
 
