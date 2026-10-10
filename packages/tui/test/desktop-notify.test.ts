@@ -16,7 +16,7 @@ test("desktop delivery uses libnotify first or the freedesktop gdbus signature",
 	const method = "org.freedesktop.Notifications.Notify";
 	const gdbus = [
 		"call|--session|--dest|org.freedesktop.Notifications|--object-path|/org/freedesktop/Notifications|--method",
-		`${method}|Prime|0||--help|Waiting for input|[]|{"urgency": <byte 2>}|5000`,
+		`${method}|--|Prime|0||--help|Waiting for input|[]|{"urgency": <byte 2>}|5000`,
 	].join("|");
 	assert.deepEqual(desktopNotificationArgs("gdbus", notification), gdbus.split("|"));
 });

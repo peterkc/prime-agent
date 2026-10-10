@@ -240,21 +240,20 @@ describe("client terminal notifications", () => {
 		}
 	});
 
-	test.each([true, false])("overflow compaction drops the held error only when willRetry=%s", async (willRetry) => {
+	test.each([
+		[true, false],
+		[false, true],
+		[false, false],
+	])("overflow compaction drops the held error when willRetry=%s or aborted=%s", async (willRetry, aborted) => {
 		const { mode, event } = fakeMode();
 		mode.connectionState = { sessionActions: { active: { kind: "turn" } } };
 		const notify = mode.ui.terminal.notify;
 		await event({ type: "agent_start" });
 		await event({ type: "agent_end", messages: [assistant("error")] });
 		await event({ type: "compaction_start", reason: "overflow" });
-		await event({ type: "compaction_end", reason: "overflow", willRetry, result: {}, aborted: false });
+		await event({ type: "compaction_end", reason: "overflow", willRetry, result: {}, aborted });
 		await event({ type: "session_action_update", actions: {} });
-		expect(notify).toHaveBeenCalledTimes(willRetry ? 0 : 1);
-		if (willRetry) {
-			await event({ type: "agent_start" });
-			await event({ type: "agent_end", messages: [assistant("stop")] });
-		}
-		expect(notify.mock.calls[0][0].type).toBe(willRetry ? "completion" : "error");
+		expect(notify.mock.calls.map(([n]: [{ type: string }]) => n.type)).toEqual(willRetry || aborted ? [] : ["error"]);
 	});
 
 	test.each([

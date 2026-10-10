@@ -6569,7 +6569,8 @@ export class InteractiveMode {
 			}
 
 			case "compaction_end": {
-				if (event.willRetry) this.pendingErrorNotification = false;
+				// A retried or cancelled recovery is not the run's final failure.
+				if (event.willRetry || event.aborted) this.pendingErrorNotification = false;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}

@@ -50,6 +50,8 @@ export function desktopNotificationArgs(kind: DesktopNotifier, notification: Ter
 		"/org/freedesktop/Notifications",
 		"--method",
 		"org.freedesktop.Notifications.Notify",
+		// Ends gdbus options, so a title such as "--help" stays a method argument.
+		"--",
 		"Prime",
 		"0",
 		"",
