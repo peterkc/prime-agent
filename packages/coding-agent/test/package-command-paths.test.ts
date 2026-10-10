@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as ConfigModule from "../src/config.js";
 import {
 	ENV_AGENT_DIR,
 	PACKAGE_NAME,
@@ -11,6 +12,8 @@ import {
 } from "../src/config.js";
 import { main } from "../src/main.js";
 import { handlePackageCommand } from "../src/package-manager-cli.js";
+
+vi.mock("../src/config.js", async (orig) => ({ ...(await orig<object>()), VERSION: "0.9.8" }));
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -263,6 +266,19 @@ ${options.failInstall ? 'if(args.includes("install")) process.exit(23);' : ""}
 			ranNpm: () => existsSync(recordPath),
 		};
 	}
+
+	it.each(["", "--internal-update-restart-coordinator"])(
+		"keeps fork self-update refusal separate from restart dispatch with %j",
+		async (flag) => {
+			vi.spyOn(ConfigModule, "VERSION", "get").mockReturnValue("0.9.8+fork.b91d4b026");
+			const fixture = setupSelfUpdate({ manifest: { version: "0.10.0" }, failInstall: true });
+			await main(["update", ...(flag ? [flag] : [])]);
+			expect(process.exitCode).toBe(1);
+			expect(fixture.stderr()).toContain(flag ? "Invalid daemon update restart" : "local fork build");
+			expect(fixture.fetchMock).not.toHaveBeenCalled();
+			expect([fixture.ranNpm(), existsSync(join(agentDir, "update-restarts"))]).toEqual([false, false]);
+		},
+	);
 
 	it("uses global npmCommand and the release manifest install spec for forced self updates", async () => {
 		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-current.tgz";

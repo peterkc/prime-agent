@@ -41,6 +41,8 @@ describe("version checks", () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
 		vi.stubGlobal("fetch", fetchMock);
 
+		await expect(checkForNewPiVersion("0.9.8+fork.b91d4b026")).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
 		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
 		await expect(checkForNewPiVersion("1.2.2")).resolves.toBe("1.2.3");
 	});
