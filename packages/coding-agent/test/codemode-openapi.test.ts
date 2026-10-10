@@ -37,6 +37,7 @@ const authCases: {
 	sensitive: string[];
 	expected: Record<string, string>;
 	expectedCount?: string;
+	token?: string;
 }[] = readFileSync(new URL("./fixtures/codemode/openapi-auth.jsonl", import.meta.url), "utf8")
 	.trim()
 	.split("\n")
@@ -208,17 +209,18 @@ describe("codemode OpenAPI", () => {
 	});
 	it.each(authCases)("TM-10 call-time $type auth/header override and reflected-value redaction", async (row) => {
 		const values = {
-			PRIME_OPENAPI_TEST_TOKEN: row.type === "short" ? "1" : "dummy auth+secret*",
+			PRIME_OPENAPI_TEST_TOKEN: row.token ?? "dummy auth+secret*",
 			PRIME_OPENAPI_TEST_USER: "dummy-user-secret",
 			PRIME_OPENAPI_TEST_PASSWORD: "dummy-password-secret",
 			PRIME_OPENAPI_TEST_DEFAULT: "dummy-default-secret",
 		};
 		for (const [name, value] of Object.entries(values)) vi.stubEnv(name, value);
+		const count = Number(row.token ?? 1);
 		const seen: unknown[] = [];
 		const base = await api((req, res) => {
 			seen.push(req.headers);
 			res.writeHead(seen.length === 1 ? 503 : 200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ count: 1, stable: 12, echo: row.sensitive, padding: "E".repeat(2000) }));
+			res.end(JSON.stringify({ count, stable: 12, echo: row.sensitive, padding: "E".repeat(2000) }));
 		});
 		const document = {
 			...spec(),
@@ -247,7 +249,7 @@ describe("codemode OpenAPI", () => {
 		expect(text(success)).toContain('"stable":12');
 		for (const result of [failure, success])
 			expect(text(result)).toContain(`"echo":${JSON.stringify(row.sensitive.map(() => "[REDACTED]"))}`);
-		if (row.type !== "short")
+		if (row.expectedCount === undefined)
 			for (const value of row.sensitive) expect(JSON.stringify([failure, success])).not.toContain(value);
 	});
 	it.each(["same-origin", "cross-origin"])("TM-10 %s redirects never follow the response", async (kind) => {

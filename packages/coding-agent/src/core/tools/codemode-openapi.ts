@@ -185,11 +185,14 @@ class OpenAPIRefusal extends Error {}
 /** Only the checked executor and request boundary resolve credentials; never catalog construction. */
 class Credentials {
 	private readonly secrets = new Set<string>();
+	private readonly numericSecrets = new Set<number>();
 	constructor(readonly entry: CodemodeOpenAPIEntry) {}
 	value(name: string): string {
 		const value = process.env[name];
 		if (!value) throw new OpenAPIRefusal(`Missing OpenAPI environment variable ${name}`);
 		this.secrets.add(value);
+		const numeric = Number(value);
+		if (Number.isFinite(numeric)) this.numericSecrets.add(numeric);
 		this.secrets.add(encodeURIComponent(value));
 		this.secrets.add(new URLSearchParams({ value }).toString().slice("value=".length));
 		this.secrets.add(JSON.stringify(value).slice(1, -1));
@@ -223,8 +226,8 @@ class Credentials {
 	}
 	json(value: unknown): unknown {
 		if (typeof value === "string") return this.redact(value);
-		if ((typeof value === "number" || typeof value === "boolean") && this.secrets.has(String(value)))
-			return "[REDACTED]";
+		if (typeof value === "number" && this.numericSecrets.has(value)) return "[REDACTED]";
+		if (typeof value === "boolean" && this.secrets.has(String(value))) return "[REDACTED]";
 		if (Array.isArray(value)) return value.map((item) => this.json(item));
 		if (record(value))
 			return Object.fromEntries(Object.entries(value).map(([key, item]) => [this.redact(key), this.json(item)]));
