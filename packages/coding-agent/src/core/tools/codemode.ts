@@ -40,6 +40,7 @@ export interface CodemodeGeneratedTool {
 	readonly tool: AgentTool;
 	readonly output: Tool.SchemaType;
 	readonly redact?: (text: string) => string;
+	readonly redactValue?: (value: unknown) => unknown;
 	readonly namespace?: { readonly path: string; readonly description: string };
 }
 
@@ -192,16 +193,20 @@ class CodemodeRun {
 			);
 			const native = generated.find((entry) => entry.tool === tool);
 			const raw = resultText(outcome.result);
-			const text = native?.redact?.(raw) ?? raw;
 			if (signal.aborted) throw new Error("Tool call aborted");
-			if (outcome.isError) throw new Error(text || `Tool "${tool.name}" failed`);
+			if (outcome.isError) {
+				const text = native?.redact?.(raw) ?? raw;
+				throw new Error(text || `Tool "${tool.name}" failed`);
+			}
 			record.status = "ok";
-			if (!native) return text;
+			if (!native) return raw;
+			let value: unknown;
 			try {
-				return JSON.parse(text);
+				value = JSON.parse(raw);
 			} catch {
 				throw new Error(`OpenAPI tool_result hook must return valid JSON for ${tool.name}`);
 			}
+			return native.redactValue ? native.redactValue(value) : value;
 		} catch (error) {
 			record.status = signal.aborted ? "cancelled" : "error";
 			record.error = cut(errorText(error), 500);

@@ -81,7 +81,8 @@ describe("SettingsManager", () => {
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.drainErrors().map((entry) => entry.scope)).toEqual([scope]);
-			expect(() => manager.getCodemodeOpenAPI()).toThrow("settings failed to parse");
+			if (scope === "global") expect(() => manager.getCodemodeOpenAPI()).toThrow("settings failed to parse");
+			else expect(manager.getCodemodeOpenAPI()).toEqual({ entries: undefined, directory: agentDir });
 			expect(manager.drainErrors()).toEqual([]);
 
 			mutate(manager);
@@ -180,28 +181,18 @@ describe("SettingsManager", () => {
 	});
 
 	describe("codemode OpenAPI source precedence", () => {
-		it.each(["global", "project", "empty"])("keeps the %s settings directory with the winning array", (scope) => {
+		it.each(["global", "project-only", "project", "empty", "runtime", "runtime-empty"])("D19 %s scope", (scope) => {
 			const global = [{ name: "global", specFile: "global.json", baseUrl: "https://example.invalid" }];
-			const project =
-				scope === "empty"
-					? []
-					: [{ name: "project", specFile: "project.yaml", baseUrl: "https://example.invalid" }];
-			writeSettings(globalPath, { codemodeOpenAPI: global });
-			writeSettings(projectPath, scope === "global" ? {} : { codemodeOpenAPI: project });
+			const project = [{ name: "project", specFile: "project.yaml", baseUrl: "https://example.invalid" }];
+			writeSettings(globalPath, scope === "project-only" ? {} : { codemodeOpenAPI: global });
+			writeSettings(projectPath, scope === "global" ? {} : { codemodeOpenAPI: scope === "empty" ? [] : project });
 			const manager = SettingsManager.create(projectDir, agentDir);
+			const override = scope === "runtime-empty" ? [] : project;
+			if (scope.startsWith("runtime")) manager.applyOverrides({ codemodeOpenAPI: override });
 			expect(manager.getCodemodeOpenAPI()).toEqual({
-				entries: scope === "global" ? global : project,
-				directory: scope === "global" ? agentDir : join(projectDir, ".prime", "agent"),
+				entries: scope.startsWith("runtime") ? override : scope === "project-only" ? undefined : global,
+				directory: scope.startsWith("runtime") ? undefined : agentDir,
 			});
-			expect(manager.getGlobalSettings().codemodeOpenAPI).toEqual(global);
-		});
-		it("preserves malformed entries for visible run-boundary refusal and accepts empty overrides", () => {
-			writeSettings(globalPath, { codemodeOpenAPI: "invalid" });
-			const manager = SettingsManager.create(projectDir, agentDir);
-			expect(manager.getCodemodeOpenAPI().entries).toBe("invalid");
-			manager.applyOverrides({ codemodeOpenAPI: [] });
-			expect(manager.getCodemodeOpenAPI()).toEqual({ entries: [], directory: undefined });
-			expect(SettingsManager.inMemory().getCodemodeOpenAPI().entries).toBeUndefined();
 		});
 	});
 

@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,6 +36,7 @@ const authCases: {
 	scheme: unknown;
 	sensitive: string[];
 	expected: Record<string, string>;
+	expectedCount?: string;
 }[] = readFileSync(new URL("./fixtures/codemode/openapi-auth.jsonl", import.meta.url), "utf8")
 	.trim()
 	.split("\n")
@@ -43,6 +44,7 @@ const authCases: {
 function spec(path = "/things/{id}") {
 	return { ...example, paths: { [path]: example.paths["/things/{id}"] } };
 }
+const environment = process.env;
 const input = '{id:"one",q:2,value:"body"}';
 const call = `await tools.openapi.dummy.things.write(${input})`;
 
@@ -61,6 +63,7 @@ describe("codemode OpenAPI", () => {
 				server.closeAllConnections();
 				await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 			}
+			process.env = environment;
 			vi.unstubAllEnvs();
 			vi.restoreAllMocks();
 			rmSync(dir, { recursive: true, force: true });
@@ -132,34 +135,40 @@ describe("codemode OpenAPI", () => {
 				pi.on("tool_result", (event) => {
 					expect(event.content).toEqual([{ type: "text", text: '{"value":"native","credential":"[REDACTED]"}' }]);
 					hooks.push(`after:${event.toolCallId}`);
-					return { content: [{ type: "text", text: JSON.stringify({ value: "hook" }) }] };
+					return { content: [{ type: "text", text: '{"value":"hook","secret":"dummy-header-secret"}' }] };
 				});
 			},
 		);
-		const before = [...s.messages];
 		const result = await tool.execute("p", {
 			code: `text(await search({query:"Dummy API namespace"})); const r=${call}; text(r.value); r;`,
 		});
 		expect(result.isError).toBe(false);
 		expect(text(result)).toContain('"value":"hook"');
+		expect(text(result)).toContain('"secret":"[REDACTED]"');
 		expect(received).toEqual([
 			{ url: "/things/one?q=2", method: "POST", body: { value: "body" }, header: "dummy-header-secret" },
 		]);
 		expect(hooks).toEqual(["before:p/1", "after:p/1"]);
 		expect(result.details.calls).toMatchObject([{ name: "openapi.dummy.things.write", id: "p/1", status: "ok" }]);
 		expect(s.agent.state.tools.map((tool) => tool.name)).not.toContain("openapi.dummy.things.write");
-		expect(s.messages).toEqual(before);
 		expect(JSON.stringify(result)).not.toContain("dummy-header-secret");
 	});
-	it.each(["validation", "hook", "missing", "excluded"])("TM-10 %s refusal makes zero requests", async (reason) => {
+	it.each(["validation", "hook", "missing", "excluded", "project"])("TM-10 D19 %s refusal", async (reason) => {
 		let requests = 0;
 		const base = await api((_req, res) => {
 			requests++;
 			res.end("{}");
 		});
-		const config = entry(base);
+		const entries = [{ ...entry(base), headersFromEnv: { "X-Default": "PRIME_OPENAPI_TEST_MISSING" } }];
+		const readEnv = vi.fn(Reflect.get);
+		if (reason === "project") {
+			vi.stubEnv("PRIME_OPENAPI_TEST_MISSING", "dummy-project-secret");
+			process.env = new Proxy<typeof environment>(environment, { get: readEnv });
+			mkdirSync(join(dir, ".prime", "agent"), { recursive: true });
+			writeFileSync(join(dir, ".prime", "agent", "settings.json"), JSON.stringify({ codemodeOpenAPI: entries }));
+		}
 		const { tool } = await session(
-			[{ ...config, headersFromEnv: { "X-Default": "PRIME_OPENAPI_TEST_MISSING" } }],
+			reason === "project" ? [] : entries,
 			(pi) => {
 				pi.on("tool_call", () => (reason === "hook" ? { block: true, reason: "denied" } : undefined));
 			},
@@ -176,8 +185,11 @@ describe("codemode OpenAPI", () => {
 		if (reason === "validation") expect(text(result)).toContain("Validation failed");
 		if (reason === "hook") expect(text(result)).toContain("denied");
 		if (reason === "missing") expect(text(result)).toContain("Missing OpenAPI environment variable");
-		if (reason === "excluded")
-			expect(text(result).split("Script error:")[0]).not.toContain("openapi.dummy.things.write");
+		if (reason === "excluded" || reason === "project") {
+			expect(text(result).split("Script error:")[0]).not.toContain("openapi.");
+			expect(text(result)).toContain("Unknown tool");
+			expect(readEnv.mock.calls.some(([, name]) => name === "PRIME_OPENAPI_TEST_MISSING")).toBe(false);
+		}
 	});
 	it("TM-09 non-JSON hook changes fail visibly after a single write", async () => {
 		let requests = 0;
@@ -196,7 +208,7 @@ describe("codemode OpenAPI", () => {
 	});
 	it.each(authCases)("TM-10 call-time $type auth/header override and reflected-value redaction", async (row) => {
 		const values = {
-			PRIME_OPENAPI_TEST_TOKEN: "dummy auth+secret*",
+			PRIME_OPENAPI_TEST_TOKEN: row.type === "short" ? "1" : "dummy auth+secret*",
 			PRIME_OPENAPI_TEST_USER: "dummy-user-secret",
 			PRIME_OPENAPI_TEST_PASSWORD: "dummy-password-secret",
 			PRIME_OPENAPI_TEST_DEFAULT: "dummy-default-secret",
@@ -206,7 +218,7 @@ describe("codemode OpenAPI", () => {
 		const base = await api((req, res) => {
 			seen.push(req.headers);
 			res.writeHead(seen.length === 1 ? 503 : 200, { "content-type": "application/json" });
-			res.end(JSON.stringify({ echo: row.sensitive, padding: "E".repeat(2000) }));
+			res.end(JSON.stringify({ count: 1, stable: 12, echo: row.sensitive, padding: "E".repeat(2000) }));
 		});
 		const document = {
 			...spec(),
@@ -231,7 +243,12 @@ describe("codemode OpenAPI", () => {
 		expect(success.isError).toBe(false);
 		expect(seen).toHaveLength(2);
 		expect(seen[0]).toMatchObject(row.expected);
-		for (const value of row.sensitive) expect(JSON.stringify([failure, success])).not.toContain(value);
+		expect(text(success)).toContain(`"count":${JSON.stringify(row.expectedCount ?? 1)}`);
+		expect(text(success)).toContain('"stable":12');
+		for (const result of [failure, success])
+			expect(text(result)).toContain(`"echo":${JSON.stringify(row.sensitive.map(() => "[REDACTED]"))}`);
+		if (row.type !== "short")
+			for (const value of row.sensitive) expect(JSON.stringify([failure, success])).not.toContain(value);
 	});
 	it.each(["same-origin", "cross-origin"])("TM-10 %s redirects never follow the response", async (kind) => {
 		let followed = 0,

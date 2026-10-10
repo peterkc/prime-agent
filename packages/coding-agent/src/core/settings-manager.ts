@@ -1157,18 +1157,14 @@ export class SettingsManager {
 		return this.settings.codemode ?? true;
 	}
 
+	/** OpenAPI execution uses only global settings or explicit SDK overrides, never project settings. */
 	getCodemodeOpenAPI(): CodemodeOpenAPISettings {
-		if (this.globalSettingsLoadError || this.projectSettingsLoadError)
+		if (this.globalSettingsLoadError)
 			throw new Error("codemodeOpenAPI settings failed to parse; fix the settings file before execution");
-		const source =
-			this.runtimeOverrides.codemodeOpenAPI !== undefined
-				? undefined
-				: this.projectSettings.codemodeOpenAPI !== undefined
-					? "project"
-					: "global";
+		const override = this.runtimeOverrides.codemodeOpenAPI;
 		return {
-			entries: structuredClone(this.settings.codemodeOpenAPI),
-			directory: source ? this.storage.getDirectory?.(source) : undefined,
+			entries: structuredClone(override !== undefined ? override : this.globalSettings.codemodeOpenAPI),
+			directory: override !== undefined ? undefined : this.storage.getDirectory?.("global"),
 		};
 	}
 

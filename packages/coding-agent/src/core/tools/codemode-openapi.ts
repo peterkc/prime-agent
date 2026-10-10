@@ -223,6 +223,8 @@ class Credentials {
 	}
 	json(value: unknown): unknown {
 		if (typeof value === "string") return this.redact(value);
+		if ((typeof value === "number" || typeof value === "boolean") && this.secrets.has(String(value)))
+			return "[REDACTED]";
 		if (Array.isArray(value)) return value.map((item) => this.json(item));
 		if (record(value))
 			return Object.fromEntries(Object.entries(value).map(([key, item]) => [this.redact(key), this.json(item)]));
@@ -292,7 +294,12 @@ function generatedTools(tools: OpenAPI.Tools, prefix: string, credentials: Crede
 				}
 			},
 		};
-		entries.push({ tool, output: native.output, redact: credentials.redact.bind(credentials) });
+		entries.push({
+			tool,
+			output: native.output,
+			redact: credentials.redact.bind(credentials),
+			redactValue: credentials.json.bind(credentials),
+		});
 	}
 	return entries;
 }

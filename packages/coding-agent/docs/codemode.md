@@ -122,7 +122,7 @@ Node requires version 24.0.0 or later. The compiled binary uses Bun 1.4.0. Neith
 
 ## OpenAPI operations
 
-Configure a local OpenAPI 3.x JSON or YAML document in global or project settings:
+Configure a local OpenAPI 3.x JSON or YAML document in global settings or explicit SDK runtime overrides. Project `codemodeOpenAPI` settings are ignored, like MCP server settings:
 
 ```json
 {
@@ -136,7 +136,7 @@ Configure a local OpenAPI 3.x JSON or YAML document in global or project setting
 }
 ```
 
-Relative `specFile` paths resolve from the directory containing the declaring settings file. A project array replaces the global array, including an empty array. The catalog is snapshotted at each script's start; changes take effect next run. Invalid settings or specs fail before execution, without a partial catalog. Only local-document `$ref` references are allowed.
+Relative `specFile` paths resolve from the global settings directory. SDK runtime overrides have no defining directory; use an absolute path or `~/` path. The catalog is snapshotted at each script's start; changes take effect next run. Invalid global settings or specs fail before execution, without a partial catalog. Only local-document `$ref` references are allowed.
 
 Operations appear under `tools.openapi.service.<operation>` and native namespace search. They are not direct model-active tools. Native skipped operations remain visible in the result. `codemodeExcludeTools` also applies to generated canonical names. Argument validation and the session's before/after hooks apply to every admitted call; a hook refusal starts no HTTP request.
 
