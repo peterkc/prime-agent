@@ -52,7 +52,7 @@ describe("OSC 7501 program status", () => {
 	});
 
 	test("reports a working run as waiting while a dialog is open, writing each change once", async () => {
-		const { mode, reports, write, settings } = fakeMode();
+		const { mode, reports, write } = fakeMode();
 		mode.setRunStatus({ state: "working" });
 		mode.setRunStatus({ state: "working" });
 		let answer!: (value: string) => void;
@@ -63,7 +63,7 @@ describe("OSC 7501 program status", () => {
 		mode.reportProgramStatus(true);
 		mode.setRunStatus({ state: "done" });
 		expect(reports()).toEqual(["working", "blocked", "working", "working", "done"]);
-		settings.enabled = false;
+		mode.enabled = false;
 		mode.setRunStatus({ state: "working" });
 		expect(write).toHaveBeenCalledTimes(5);
 	});
@@ -90,8 +90,14 @@ describe("OSC 7501 program status", () => {
 		await event({ type: "compaction_end", aborted: false, result: {} });
 		await event({ type: "compaction_start", reason: "manual" });
 		await event({ type: "compaction_end", errorMessage: "Compaction failed", errorSeverity: "error" });
+		mode.syncRunStatus({ isCompacting: true });
+		await event({ type: "compaction_end", aborted: false, result: {} });
+		mode.runAbortRequested = true;
+		proto.resetCurrentSessionRenderState.call(mode);
+		mode.syncRunStatus({ isStreaming: true });
+		await event({ type: "agent_end", messages: [assistant("stop")] });
 		const states = "working done working idle working error working idle done working done working error";
-		expect(reports().join(" ")).toBe(states);
+		expect(reports().join(" ")).toBe(`${states} working idle working done`);
 	});
 
 	test("takes the status from snapshots, drops reset dialogs, and writes nothing without a terminal", async () => {
@@ -115,7 +121,6 @@ function fakeMode() {
 	initTheme("dark");
 	setStdoutTTY(true);
 	const write = vi.fn();
-	const settings = { enabled: true };
 	const ignore: any = new Proxy(() => {}, {
 		get: (_target, key) =>
 			key === "then" ? undefined : key === Symbol.iterator ? () => [][Symbol.iterator]() : ignore,
@@ -125,7 +130,7 @@ function fakeMode() {
 	const fields: Record<string | symbol, unknown> = {
 		...{ runStatus: { state: "idle" }, openDialogs: [], programStatusStopped: false, runAbortRequested: false },
 		...{ isInitialized: true, streaming: false, retryAttempt: 0, statusBeforeCompaction: { state: "idle" } },
-		settingsManager: { getProgramStatus: () => settings.enabled, getShowTerminalProgress: () => false },
+		settingsManager: { getProgramStatus: () => fields.enabled !== false, getShowTerminalProgress: () => false },
 		ui: Object.setPrototypeOf({ terminal: { write } }, ignore),
 		isAgentStreaming: () => fields.streaming,
 		getRetryAttempt: () => fields.retryAttempt,
@@ -136,7 +141,7 @@ function fakeMode() {
 		get: (target, key) => (key in target ? target[key] : own.has(key as string) ? proto[key as string] : ignore),
 	});
 	const reports = () => write.mock.calls.map(([report]) => parse(report).state);
-	return { mode, reports, write, settings, event: (e: object) => mode.handleEvent(e) };
+	return { mode, reports, write, event: (e: object) => mode.handleEvent(e) };
 }
 
 const proto = InteractiveMode.prototype as unknown as Record<string, any>;

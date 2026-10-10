@@ -3556,6 +3556,8 @@ export class InteractiveMode {
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
+		// A stop requested in the previous session must not settle the next one's run.
+		this.runAbortRequested = false;
 	}
 
 	private resetPendingToolState(): void {
@@ -4581,6 +4583,8 @@ export class InteractiveMode {
 
 	/** A snapshot stands in for the start and end events this client missed, so it sets the run status. */
 	private syncRunStatus(state: AgentConnectionState): void {
+		// A compaction adopted from the snapshot started from an unknown status, so it ends idle.
+		this.statusBeforeCompaction = { state: "idle" };
 		this.setRunStatus({ state: state.isStreaming || state.isCompacting ? "working" : "idle" });
 	}
 
@@ -6464,6 +6468,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.setRunStatus(this.runAbortRequested ? { state: "idle" } : settledRunStatus(event.messages));
+				this.runAbortRequested = false;
 				this.turnStartedAt = undefined;
 				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
@@ -6588,6 +6593,7 @@ export class InteractiveMode {
 						this.setRunStatus(
 							this.runAbortRequested ? { state: "idle" } : { state: "error", msg: event.finalError },
 						);
+						this.runAbortRequested = false;
 					}
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				} else if (event.restoredModel) {
