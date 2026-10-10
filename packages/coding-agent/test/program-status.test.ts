@@ -87,6 +87,7 @@ describe("OSC 7501 program status", () => {
 		await event({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" });
 		mode.setRunStatus({ state: "done" });
 		await event({ type: "compaction_start", reason: "threshold" });
+		mode.syncRunStatus({ isCompacting: true }, []);
 		await event({ type: "compaction_end", aborted: false, result: {} });
 		await event({ type: "compaction_start", reason: "manual" });
 		await event({ type: "compaction_end", errorMessage: "Compaction failed", errorSeverity: "error" });
@@ -101,8 +102,20 @@ describe("OSC 7501 program status", () => {
 		mode.syncRunStatus({}, [assistant("error", "lost")]);
 		await event({ type: "compaction_start", reason: "manual" });
 		await event({ type: "compaction_end", aborted: true });
+		// Missed ends: this client's stop, then a run it did not stop, then a compaction outside a run.
+		mode.syncRunStatus({ isStreaming: true });
+		mode.streaming = true;
+		mode.interruptOrClearInput();
+		mode.streaming = false;
+		for (const step of [{}, { isStreaming: true }, {}]) mode.syncRunStatus(step, [assistant("stop")]);
+		await event({ type: "compaction_start", reason: "threshold" });
+		mode.syncRunStatus({}, [assistant("stop")]);
+		for (const step of [{ isCompacting: true }, {}]) mode.syncRunStatus(step, [assistant("stop")]);
+		for (const type of ["compaction_start", "compaction_end", "agent_start"]) await event({ type, aborted: false });
+		mode.syncRunStatus({}, [assistant("stop")]);
 		const states = "working done working idle working error working idle done working done working error";
-		expect(reports().join(" ")).toBe(`${states} working idle working done working error working idle`);
+		const resyncs = "working idle working done working idle working idle working idle working done";
+		expect(reports().join(" ")).toBe(`${states} working idle working done working error working idle ${resyncs}`);
 	});
 
 	test("takes the status from snapshots, drops reset dialogs, and writes nothing without a terminal", async () => {
@@ -134,7 +147,7 @@ function fakeMode() {
 	const own = new Set(["handleEvent", "setRunStatus", "reportProgramStatus", "syncRunStatus", "whileDialogOpen"]);
 	const fields: Record<string | symbol, unknown> = {
 		...{ runStatus: { state: "idle" }, openDialogs: [], programStatusStopped: false, runAbortRequested: false },
-		...{ isInitialized: true, streaming: false, retryAttempt: 0, statusBeforeCompaction: { state: "idle" } },
+		...{ isInitialized: true, streaming: false, retryAttempt: 0, statusBeforeCompaction: undefined },
 		settingsManager: { getProgramStatus: () => fields.enabled !== false, getShowTerminalProgress: () => false },
 		ui: Object.setPrototypeOf({ terminal: { write } }, ignore),
 		isAgentStreaming: () => fields.streaming,

@@ -1450,8 +1450,8 @@ export class InteractiveMode {
 	private runStatus: RunStatus = { state: "idle" };
 	private openDialogs: { readonly title: string }[] = [];
 	private reportedProgramStatus: string | undefined;
-	/** The status a compaction outside a run returns to when it ends without failing. */
-	private statusBeforeCompaction: RunStatus = { state: "idle" };
+	/** Set while a compaction outside a run is running: the status it returns to when it ends without failing. */
+	private statusBeforeCompaction: RunStatus | undefined;
 	/** This client asked to stop the run or its retry, so the run ends idle rather than done or failed. */
 	private runAbortRequested = false;
 	private programStatusStopped = false;
@@ -4587,11 +4587,21 @@ export class InteractiveMode {
 	 * and settles a run whose end it missed from the snapshot's messages.
 	 */
 	private syncRunStatus(state: AgentConnectionState, messages?: readonly AgentMessage[]): void {
-		// A compaction adopted from the snapshot started from an unknown status, so it ends idle.
-		this.statusBeforeCompaction = { state: "idle" };
-		if (state.isStreaming || state.isCompacting) this.setRunStatus({ state: "working" });
-		else if (!messages) this.setRunStatus({ state: "idle" });
-		else if (this.runStatus.state === "working") this.setRunStatus(settledRunStatus(messages));
+		const fromCompaction = this.statusBeforeCompaction !== undefined;
+		if (!state.isCompacting || state.isStreaming) this.statusBeforeCompaction = undefined;
+		// A compaction first seen in a snapshot, or in a new session, started from an unknown status, so it ends idle.
+		else if (!messages || !fromCompaction) this.statusBeforeCompaction = { state: "idle" };
+		if (state.isStreaming || state.isCompacting) {
+			this.setRunStatus({ state: "working" });
+			return;
+		}
+		const stopped = this.runAbortRequested;
+		this.runAbortRequested = false;
+		if (!messages) this.setRunStatus({ state: "idle" });
+		else if (this.runStatus.state === "working") {
+			// A run this client stopped, or a compaction, did not produce the snapshot's last result.
+			this.setRunStatus(stopped || fromCompaction ? { state: "idle" } : settledRunStatus(messages));
+		}
 	}
 
 	/** Reports waiting on the user until the dialog's answer settles. */
@@ -6515,7 +6525,8 @@ export class InteractiveMode {
 				else if (event.aborted) this.setRunStatus({ state: "idle" });
 				else if (event.errorMessage && event.errorSeverity !== "warning") {
 					this.setRunStatus({ state: "error", msg: event.errorMessage });
-				} else this.setRunStatus(this.statusBeforeCompaction);
+				} else this.setRunStatus(this.statusBeforeCompaction ?? { state: "idle" });
+				this.statusBeforeCompaction = undefined;
 				if (this.autoCompactionLoader) {
 					this.autoCompactionLoader.stop();
 					this.autoCompactionLoader = undefined;
