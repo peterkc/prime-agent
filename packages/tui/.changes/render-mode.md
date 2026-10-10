@@ -1,0 +1,1 @@
+- Added settled render-mode getter and settle listeners for native and ANSI terminal views.

@@ -97,6 +97,7 @@ export type {
 	RefinePreparation,
 	RegisteredCommand,
 	RegisteredTool,
+	RenderModeChangeEvent,
 	ResolvedCommand,
 	SessionBeforeCompactEvent,
 	SessionBeforeForkEvent,

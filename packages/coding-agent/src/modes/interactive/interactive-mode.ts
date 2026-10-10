@@ -397,6 +397,26 @@ function hasEditDiffsExpansion(obj: unknown): obj is EditDiffsExpandable {
 	);
 }
 
+class RenderModeText extends Text {
+	private renderedText: string | undefined;
+
+	constructor(
+		private readonly rawText: string,
+		private readonly getRenderMode: () => "native" | "ansi" | undefined,
+	) {
+		super("", 1, 0);
+	}
+
+	override render(width: number): string[] {
+		const text = this.rawText.replaceAll("{renderMode}", this.getRenderMode() ?? "");
+		if (text !== this.renderedText) {
+			this.setText(text);
+			this.renderedText = text;
+		}
+		return super.render(width);
+	}
+}
+
 class ExpandableText extends Text implements Expandable {
 	private expandedState: boolean;
 	private clickRegions: ClickRegion[] = [];
@@ -1385,6 +1405,8 @@ export class InteractiveMode {
 	private nextImageMarkerId = 1;
 
 	private unsubscribe?: () => void;
+	private unsubscribeRenderMode?: () => void;
+	private localRenderMode?: { sessionId: string | undefined; mode: "native" | "ansi" };
 	private mcpConnectionStore?: McpConnectionStore;
 	/**
 	 * MCP changes made while streaming/compacting; activated at the next safe boundary.
@@ -3436,6 +3458,7 @@ export class InteractiveMode {
 			}
 			this.setupAutocompleteProvider();
 		}
+		this.bindRenderMode();
 		this.subscribeToAgent();
 		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
@@ -4059,7 +4082,7 @@ export class InteractiveMode {
 		if (Array.isArray(content)) {
 			const container = new Container();
 			for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) {
-				container.addChild(new Text(line, 1, 0));
+				container.addChild(new RenderModeText(line, () => this.ui.getRenderMode()));
 			}
 			if (content.length > InteractiveMode.MAX_WIDGET_LINES) {
 				container.addChild(new Text(theme.fg("muted", "... (widget truncated)"), 1, 0));
@@ -4192,7 +4215,20 @@ export class InteractiveMode {
 		}
 
 		if (factory) {
-			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
+			const provider = this.footerDataProvider;
+			const footerData: ReadonlyFooterDataProvider = {
+				getGitBranch: () => provider.getGitBranch(),
+				getExtensionStatuses: () =>
+					new Map(
+						[...provider.getExtensionStatuses()].map(([key, text]) => [
+							key,
+							text.replaceAll("{renderMode}", this.ui.getRenderMode() ?? ""),
+						]),
+					),
+				getAvailableProviderCount: () => provider.getAvailableProviderCount(),
+				onBranchChange: (callback) => provider.onBranchChange(callback),
+			};
+			this.customFooter = factory(this.ui, theme, footerData);
 			this.footerSlot.addChild(this.customFooter);
 		} else {
 			this.customFooter = undefined;
@@ -4258,6 +4294,41 @@ export class InteractiveMode {
 		this.extensionTerminalInputUnsubscribers.clear();
 	}
 
+	private bindRenderMode(): void {
+		this.unsubscribeRenderMode?.();
+		this.unsubscribeRenderMode = this.ui.addRenderModeListener((mode) => this.handleRenderModeSettled(mode));
+		this.reportCurrentRenderMode();
+	}
+
+	private handleRenderModeSettled(mode: "native" | "ansi"): void {
+		void this.reportRenderMode(mode);
+		this.ui.requestRender();
+	}
+
+	private reportCurrentRenderMode(): void {
+		const mode = this.ui.getRenderMode();
+		if (mode !== undefined) void this.reportRenderMode(mode);
+	}
+
+	private async reportRenderMode(mode: "native" | "ansi"): Promise<void> {
+		if (this.bindLocalSessionExtensions) {
+			const sessionId = this.connectionState?.sessionId;
+			const previousMode = this.localRenderMode?.sessionId === sessionId ? this.localRenderMode?.mode : undefined;
+			if (mode === previousMode) return;
+			this.localRenderMode = { sessionId, mode };
+			void this.getLocalSessionHost()
+				.getExtensionRunner()
+				.emit({ type: "render_mode_change", mode, previousMode })
+				.catch(() => {});
+		} else {
+			try {
+				await this.agentConnection.reportRenderMode?.(mode);
+			} catch {
+				// Optional window metadata must not interrupt startup or a disconnected session.
+			}
+		}
+	}
+
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
@@ -4310,6 +4381,7 @@ export class InteractiveMode {
 				}
 				return result;
 			},
+			getRenderMode: () => this.ui.getRenderMode(),
 			getToolsExpanded: () => this.toolOutputExpanded,
 			setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),
 		};
@@ -5820,6 +5892,7 @@ export class InteractiveMode {
 						// mid-flight; queue behind it instead.
 						await this.initialRenderPromise?.catch(() => undefined);
 						if (generation !== this.sessionEventGeneration) return false;
+						this.reportCurrentRenderMode();
 						await this.renderResyncedSession(event.snapshot);
 						return true;
 					});
@@ -5842,6 +5915,7 @@ export class InteractiveMode {
 						this.showStatus("Daemon connection lost; reconnecting…", "warning");
 					}
 					if (event.status === "connected") {
+						this.reportCurrentRenderMode();
 						await this.refreshHeartbeatCatalog();
 					}
 				} else if (event.type === "heartbeats_changed") {
@@ -12604,6 +12678,8 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
+		this.unsubscribeRenderMode?.();
+		this.unsubscribeRenderMode = undefined;
 		this.closeConfigurationMenu?.();
 		this.closeServiceCatalogPicker?.();
 		this.unregisterSignalHandlers();

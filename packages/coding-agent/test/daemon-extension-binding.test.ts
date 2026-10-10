@@ -12,10 +12,10 @@ import {
 import { AuthStorage } from "../src/core/auth-storage.js";
 
 import { SessionManager } from "../src/core/session-manager.js";
-import type { ExtensionAPI, ExtensionFactory } from "../src/index.js";
+import type { ExtensionAPI, ExtensionFactory, RenderModeChangeEvent } from "../src/index.js";
 
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
-import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
+import { bindActiveSessionState, reportRenderMode } from "../src/modes/daemon/daemon-extension-binding.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon extension binding", () => {
@@ -98,6 +98,35 @@ describe("daemon extension binding", () => {
 
 		return runtime;
 	}
+
+	it("reports window render-mode changes once with the previous mode", async () => {
+		const events: RenderModeChangeEvent[] = [];
+		const runtime = await createRuntimeForTest((pi) => {
+			pi.on("render_mode_change", (event) => {
+				events.push(event);
+			});
+		}, []);
+		const state: ActiveSessionState = {
+			activeSessionId: "render",
+			runtime,
+			clients: new Set(),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "render",
+			lastEventSequence: 0,
+		};
+		await bindActiveSessionState(state, { broadcast: () => {}, shutdown: () => {} });
+		const ui = runtime.session.extensionRunner.createContext().ui;
+		expect(ui.getRenderMode()).toBeUndefined();
+		reportRenderMode(state, "native");
+		reportRenderMode(state, "native");
+		reportRenderMode(state, "ansi");
+		expect(ui.getRenderMode()).toBe("ansi");
+		expect(events).toEqual([
+			{ type: "render_mode_change", mode: "native", previousMode: undefined },
+			{ type: "render_mode_change", mode: "ansi", previousMode: "native" },
+		]);
+	});
 
 	it("strips the duplicated partial message from broadcast message_update events", async () => {
 		const runtime = await createRuntimeForTest(() => {}, ["streamed reply"]);
