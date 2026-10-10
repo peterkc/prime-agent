@@ -1,0 +1,1 @@
+- Added `ctx.ui.getRenderMode()` and `render_mode_change` for extension logic, with window-local `{renderMode}` display in string-array widgets and custom-footer statuses.

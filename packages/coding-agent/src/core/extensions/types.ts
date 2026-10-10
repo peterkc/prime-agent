@@ -256,6 +256,9 @@ export interface ExtensionUIContext {
 	/** Set the current theme by name or Theme object. */
 	setTheme(theme: string | Theme): { success: boolean; error?: string };
 
+	/** Native Tern view or ANSI terminal rendering; undefined without a terminal report. */
+	getRenderMode(): "native" | "ansi" | undefined;
+
 	/** Get current tool output expansion state. */
 	getToolsExpanded(): boolean;
 
@@ -749,6 +752,13 @@ export interface ThinkingLevelSelectEvent {
 	level: ThinkingLevel;
 	previousLevel: ThinkingLevel;
 }
+/** Fired after the session's reported renderer changes. Daemon windows use last report wins. */
+export interface RenderModeChangeEvent {
+	type: "render_mode_change";
+	mode: "native" | "ansi" | undefined;
+	previousMode: "native" | "ansi" | undefined;
+}
+
 /** Fired when user executes a bash command via ! or !! prefix */
 export interface UserBashEvent {
 	type: "user_bash";
@@ -907,6 +917,7 @@ export type ExtensionEvent =
 	| ToolExecutionEndEvent
 	| ModelSelectEvent
 	| ThinkingLevelSelectEvent
+	| RenderModeChangeEvent
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
@@ -1042,6 +1053,7 @@ export interface ExtensionAPI {
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): void;
+	on(event: "render_mode_change", handler: ExtensionHandler<RenderModeChangeEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;

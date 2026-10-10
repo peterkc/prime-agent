@@ -67,8 +67,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 publishes the last recorded model on saved-session rows.
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-f908f493c9e1";
+// Revision 31 adds capability-gated window render-mode reports.
+export const DAEMON_SCHEMA_REVISION = 31;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-6cf0d25d35af";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -114,7 +115,8 @@ export type DaemonServerCapability =
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
-	| "abort_and_send_queued";
+	| "abort_and_send_queued"
+	| "render_mode";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -160,6 +162,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"abort_and_send_queued",
+	"render_mode",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -669,6 +672,7 @@ export type DaemonCommand =
 			requestId: string;
 			response: DaemonExtensionUIResponse;
 	  }
+	| { id?: string; type: "report_render_mode"; activeSessionId: string; mode: "native" | "ansi" }
 	| { id?: string; type: "ack_result"; commandId: string }
 	| { id?: string; type: "prepare_update_restart" }
 	| { id?: string; type: "retry_worker"; activeSessionId: string }
@@ -841,6 +845,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_tool_definition: LEGACY_DAEMON_COMMAND,
 	set_session_entry_label: LEGACY_DAEMON_COMMAND,
 	extension_ui_response: LEGACY_DAEMON_COMMAND,
+	report_render_mode: { minProtocol: 7, minSchemaRevision: 31, capability: "render_mode" },
 	prepare_update_restart: LEGACY_DAEMON_COMMAND,
 	retry_worker: LEGACY_DAEMON_COMMAND,
 	restart: LEGACY_DAEMON_COMMAND,
@@ -978,6 +983,7 @@ export const DAEMON_COMMAND_PLANE = {
 	get_tool_definition: "session",
 	set_session_entry_label: "session",
 	extension_ui_response: "session",
+	report_render_mode: "session",
 	prepare_update_restart: "control",
 	retry_worker: "control",
 	restart: "control",

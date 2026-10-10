@@ -361,6 +361,7 @@ export class TUI extends Container {
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
 	private nativeBackend: NativeBackend | undefined;
+	private readonly renderModeListeners = new Set<(mode: "native" | "ansi") => void>();
 	private unsubscribeNativeProbe: (() => void) | undefined;
 	private nativeRelease: Promise<void> | undefined;
 	private fullscreenLeftMouseDragged = false;
@@ -417,6 +418,23 @@ export class TUI extends Container {
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
+	}
+
+	/** The settled renderer, or undefined while native entry is pending. */
+	getRenderMode(): "native" | "ansi" | undefined {
+		if (this.fullscreen?.entry === "pending") return undefined;
+		return this.fullscreen?.entry === "native" ? "native" : "ansi";
+	}
+
+	addRenderModeListener(listener: (mode: "native" | "ansi") => void): () => void {
+		this.renderModeListeners.add(listener);
+		return () => this.renderModeListeners.delete(listener);
+	}
+
+	private notifyRenderMode(): void {
+		const mode = this.getRenderMode();
+		if (this.stopped || mode === undefined) return;
+		for (const listener of this.renderModeListeners) listener(mode);
 	}
 
 	getShowHardwareCursor(): boolean {
@@ -649,7 +667,7 @@ export class TUI extends Container {
 			void this.nativeBackend?.close(true);
 			this.terminal.native?.beginDrain();
 		}
-		this.exitFullscreen({ flush: native ? false : flushFullscreen, leaveAltScreen: !preserveAltScreen });
+		this.exitFullscreenInternal({ flush: native ? false : flushFullscreen, leaveAltScreen: !preserveAltScreen });
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
@@ -786,11 +804,13 @@ export class TUI extends Container {
 				() => this.endNative(),
 			);
 			this.nativeBackend.open();
+			this.notifyRenderMode();
 			return;
 		}
 		this.terminal.enterAltScreen();
 		this.terminal.hideCursor();
 		this.syncFullscreenMouseTracking();
+		this.notifyRenderMode();
 	}
 
 	private nativeChanged(): void {
@@ -812,6 +832,11 @@ export class TUI extends Container {
 	 * so content produced while fullscreen flows into native scrollback.
 	 */
 	exitFullscreen(options: ExitFullscreenOptions = {}): void {
+		this.exitFullscreenInternal(options);
+		this.notifyRenderMode();
+	}
+
+	private exitFullscreenInternal(options: ExitFullscreenOptions): void {
 		this.stopSelectionAutoScroll();
 		if (!this.fullscreen) return;
 		const { inlineState, entry } = this.fullscreen;

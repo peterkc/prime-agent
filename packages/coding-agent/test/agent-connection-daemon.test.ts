@@ -52,6 +52,7 @@ class FakeDaemonClient {
 	rlmChildrenEventSequence = 12;
 	rlmChildrenGate: Promise<void> | undefined;
 	abortBashUnknownCommand = false;
+	renderModeUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
 	abortAndSendQueuedUnknownCommand = false;
 	inputPauseAcquireGate: Promise<void> | undefined;
@@ -199,6 +200,10 @@ class FakeDaemonClient {
 						},
 					},
 				};
+			case "report_render_mode":
+				return this.renderModeUnknownCommand
+					? failure(command.id, command.type, "Unknown daemon command: report_render_mode")
+					: success(command.id, command.type);
 			case "replace_acp_mcp_servers":
 				return { type: "response", command: command.type, success: true };
 			case "get_model_catalog":
@@ -899,6 +904,27 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("degrades render reports for old daemons without refetching the transcript", async () => {
+		const client = new FakeDaemonClient();
+		const connection = await DaemonAgentConnection.attach(asDaemonClient(client), "active-1");
+		try {
+			await connection.reportRenderMode("native");
+			expect(client.requests.filter((command) => command.type === "report_render_mode")).toEqual([]);
+			client.serverCapabilities.add("render_mode");
+			const snapshot = await connection.getInitialSnapshot();
+			await connection.reportRenderMode("native");
+			expect(await connection.getInitialSnapshot()).toBe(snapshot);
+			client.renderModeUnknownCommand = true;
+			await expect(connection.reportRenderMode("ansi")).resolves.toBeUndefined();
+			expect(client.requests.filter((command) => command.type === "report_render_mode")).toEqual([
+				{ type: "report_render_mode", activeSessionId: "active-1", mode: "native" },
+				{ type: "report_render_mode", activeSessionId: "active-1", mode: "ansi" },
+			]);
+		} finally {
+			await connection.dispose();
+		}
+	});
+
 	it("falls back to the supervisor when the direct socket closes during initial attach", async () => {
 		const supervisor = new FakeDaemonClient();
 		const closeListeners = new Set<(error: Error) => void>();

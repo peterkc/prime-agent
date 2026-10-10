@@ -64,6 +64,7 @@ export interface ActiveSessionState {
 	/** Attach snapshots in flight: reserved for passivation busyness, but not yet event recipients. */
 	pendingAttaches: number;
 	extensionUiRequests: Map<string, ActiveSessionExtensionUiRequest>;
+	renderMode?: "native" | "ansi";
 	eventGeneration: string;
 	lastEventSequence: DaemonEventSequence;
 	inFlightBash?: Promise<void>;

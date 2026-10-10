@@ -376,6 +376,30 @@ async function nextTui(t: TestContext, h: ReturnType<typeof nativeSetup>): Promi
 	return next;
 }
 
+it("reports completed settles, never pending or stopped rendering", (t) => {
+	const h = nativeSetup(t);
+	const modes: string[] = [];
+	h.tui.exitFullscreen({ flush: false });
+	h.tui.addRenderModeListener((mode) => {
+		if (mode === "native") assert.equal(h.terminal.message("o").id, "prime");
+		modes.push(mode);
+	});
+	h.tui.enterFullscreen(h.layout);
+	assert.equal(h.tui.getRenderMode(), undefined);
+	h.terminal.hello();
+	assert.equal(h.tui.getRenderMode(), "native");
+	h.tui.stop();
+	h.tui.enterFullscreen({ ...h.layout, native: false });
+	h.tui.exitFullscreen({ flush: false });
+	h.tui.start();
+	h.tui.enterFullscreen(h.layout);
+	h.terminal.event({ ev: "error", sf: "prime", msg: "failed" });
+	assert.equal(h.tui.getRenderMode(), "ansi");
+	h.tui.exitFullscreen({ flush: false });
+	assert.equal(h.tui.getRenderMode(), "ansi");
+	assert.deepEqual(modes, ["native", "native", "ansi", "ansi"]);
+});
+
 it("keeps pending entry and exit silent, opens inline without markers, and passes plain PgUp/PgDn", async (t) => {
 	const h = nativeSetup(t);
 	await renderTui(h.tui);
@@ -398,10 +422,13 @@ it("keeps pending entry and exit silent, opens inline without markers, and passe
 for (const rejection of ["DA1", "timeout", "malformed"]) {
 	it(`rejects pending native entry through ${rejection} with one full ANSI repaint`, async (t) => {
 		const h = nativeSetup(t);
+		const modes: string[] = [];
+		h.tui.addRenderModeListener((mode) => modes.push(mode));
 		h.terminal.clearWrites();
 		if (rejection === "timeout") t.mock.timers.tick(1000);
 		else h.terminal.sendInput(rejection === "DA1" ? "\x1b[?1;2c" : '\x1b_tsp;r;{"r":"hello","v":2}\x1b\\');
 		await renderTui(h.tui);
+		assert.deepEqual(modes, ["ansi"]);
 		assert.equal(h.terminal.getWrites().includes("\x1b_tsp;"), false);
 		assert.equal(h.terminal.getWrites().split("\x1b[?1049h").length - 1, 1);
 		assert.equal(h.terminal.getWrites().split("\x1b[2J").length - 1, 1);

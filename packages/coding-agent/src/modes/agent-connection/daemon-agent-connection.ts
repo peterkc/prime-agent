@@ -1217,6 +1217,21 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
+	async reportRenderMode(mode: "native" | "ansi"): Promise<void> {
+		if (!this.client.supportsServerCapability("render_mode")) return;
+		try {
+			await this.requestOk({ type: "report_render_mode", activeSessionId: this.activeSessionId, mode });
+		} catch (error) {
+			if (
+				error instanceof DaemonCapabilityUnavailableError ||
+				isUnknownDaemonCommandError(error, "report_render_mode")
+			) {
+				return;
+			}
+			throw error;
+		}
+	}
+
 	async respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void> {
 		await this.requestOk({
 			type: "extension_ui_response",
@@ -3090,6 +3105,7 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "attach":
 		case "reattach":
 		case "detach":
+		case "report_render_mode":
 		case "list":
 		case "list_saved_sessions":
 		case "wait_for_idle":

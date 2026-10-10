@@ -99,6 +99,13 @@ export async function bindActiveSessionState(
 	});
 }
 
+export function reportRenderMode(state: ActiveSessionState, mode: "native" | "ansi"): void {
+	const previousMode = state.renderMode;
+	if (mode === previousMode) return;
+	state.renderMode = mode;
+	void state.runtime.session.extensionRunner.emit({ type: "render_mode_change", mode, previousMode }).catch(() => {});
+}
+
 function createCommandContextActions(state: ActiveSessionState): ExtensionCommandContextActions {
 	return {
 		waitForIdle: () => state.runtime.session.waitForIdle(),
@@ -244,6 +251,7 @@ function createExtensionUIContext(
 		getAllThemes: () => [],
 		getTheme: () => undefined,
 		setTheme: () => ({ success: false, error: "Theme switching is not supported in daemon mode" }),
+		getRenderMode: () => state.renderMode,
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
 	};

@@ -703,6 +703,25 @@ pi.on("thinking_level_select", async (event, ctx) => {
 
 Use this to update extension UI when `pi.setThinkingLevel()`, model changes, or built-in thinking-level controls change the active thinking level.
 
+#### render_mode_change
+
+Fired after the session's render mode changes. Repeated reports of the same mode do not fire this event. Handler return values are ignored.
+
+```typescript
+pi.on("render_mode_change", (event, ctx) => {
+  // event.mode and event.previousMode: "native" | "ansi" | undefined
+  if (event.mode === "native") {
+    // Enable behavior that needs Tern's native view.
+  }
+});
+```
+
+`"native"` means Tern's native view. `"ansi"` means ANSI fullscreen or inline rendering. Native probing does not fire an event until it settles. Suspend and resume do not report a temporary ANSI mode.
+
+`ctx.ui.getRenderMode()` and `render_mode_change` expose one value per session for extension logic, not a window-local display value. In daemon sessions, the last window report wins. Two windows with different modes can therefore read the same session value. Use `{renderMode}` in display text to show each window's own mode.
+
+The getter returns `undefined` before the first report or with an older daemon that does not support reports. The daemon retains the last report after windows detach; it cannot cheaply distinguish windows from its supervisor transport. Windows re-report on session resync or reconnect. If a worker restarts without a window reconnect or session resync, its last value is lost until the window's next mode change or reconnect.
+
 ### Tool Events
 
 #### tool_call
@@ -2224,6 +2243,15 @@ See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.
 
 ### Widgets, Status, and Footer
 
+The exact token `{renderMode}` shows the current window's settled mode (`native` or `ansi`). It becomes an empty string while the mode is pending or unknown. Each window substitutes it at draw time in string-array widgets, and at read time in `footerData.getExtensionStatuses()` for custom footers. Mode settles redraw the window, so extensions do not need to resend the text. ANSI styling around the token and text without the exact token stay unchanged.
+
+```typescript
+ctx.ui.setWidget("session-metadata", ["Renderer: {renderMode}"], { placement: "belowEditor" });
+ctx.ui.setStatus("renderer", "Renderer: {renderMode}"); // shown only by a custom footer
+```
+
+A widget line that contains only the token is blank while the mode is pending, so it takes no row until the mode settles. Custom footers must read `footerData.getExtensionStatuses()` when they render, rather than cache its returned map. The built-in footer remains hidden except for `/speed`; setting status text does not make it visible. Component-factory widgets render themselves and do not receive token substitution. Titles, messages, and other UI text do not receive it either.
+
 ```typescript
 // Status in footer (persistent until cleared)
 ctx.ui.setStatus("my-ext", "Processing...");
@@ -2294,6 +2322,9 @@ ctx.ui.addAutocompleteProvider((current) => ({
     return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
   },
 }));
+
+// Session-reported renderer for logic: "native" | "ansi" | undefined
+const renderMode = ctx.ui.getRenderMode();
 
 // Tool output expansion (does not change the saved chatDetail setting)
 const wasExpanded = ctx.ui.getToolsExpanded();
@@ -2554,6 +2585,8 @@ const highlighted = highlightCode(code, lang, theme);
 | Print (`-p`) | No-op | Extensions run but can't prompt |
 
 In non-interactive modes, check `ctx.hasUI` before using UI methods.
+
+`ctx.ui.getRenderMode()` returns `undefined` in print, JSON, RPC, and the default runner context. In a local interactive session, it also returns `undefined` while native entry is pending.
 
 ## Examples Reference
 

@@ -4,6 +4,7 @@ import { Container } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
@@ -237,6 +238,7 @@ describe("InteractiveMode connection events", () => {
 			},
 			sessionEventQueue: Promise.resolve(),
 			sessionEventGeneration: 0,
+			reportCurrentRenderMode: vi.fn(),
 			handleEvent: vi.fn(async () => {}),
 			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
 			renderResyncedSession: vi.fn(async () => {}),
@@ -256,6 +258,79 @@ describe("InteractiveMode connection events", () => {
 		);
 		return { fakeThis, emit: (event) => listener?.(event) };
 	}
+
+	test("binds settled modes per session and re-reports on reconnect and session resync, not catalog churn", async () => {
+		const localEmit = vi.fn(() => Promise.reject(new Error("onError listener failed")));
+		const remoteReport = vi.fn(() => Promise.reject(new Error("disconnected")));
+		const unsubscribe = vi.fn();
+		const { fakeThis, emit } = createSubscribeHarness({
+			bindLocalSessionExtensions: true,
+			connectionState: createConnectionState(),
+			getLocalSessionHost: () => ({ getExtensionRunner: () => ({ emit: localEmit }) }),
+			ui: { getRenderMode: () => "native", addRenderModeListener: vi.fn(() => unsubscribe), requestRender: vi.fn() },
+			showStatus: vi.fn(),
+			refreshHeartbeatCatalog: vi.fn(),
+		});
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		delete fakeThis.reportCurrentRenderMode;
+		fakeThis.bindRenderMode();
+		fakeThis.bindRenderMode();
+		expect(unsubscribe).toHaveBeenCalledOnce();
+		fakeThis.connectionState.sessionId = "second";
+		await fakeThis.reportRenderMode("native");
+		fakeThis.ui.addRenderModeListener.mock.calls[1][0]("ansi");
+		expect(localEmit.mock.calls).toEqual([
+			[{ type: "render_mode_change", mode: "native", previousMode: undefined }],
+			[{ type: "render_mode_change", mode: "native", previousMode: undefined }],
+			[{ type: "render_mode_change", mode: "ansi", previousMode: "native" }],
+		]);
+		fakeThis.bindLocalSessionExtensions = false;
+		fakeThis.agentConnection.reportRenderMode = remoteReport;
+		await emit({ type: "connection_status", status: "connected" });
+		await emit({ type: "heartbeats_changed" });
+		expect(remoteReport.mock.calls).toEqual([["native"]]);
+		await emit({ type: "session_resynced", snapshot: { state: createConnectionState(), messages: [] } });
+		fakeThis.ui.getRenderMode = () => undefined;
+		await emit({ type: "connection_status", status: "connected" });
+		expect([fakeThis.showError.mock.calls, remoteReport.mock.calls]).toEqual([[], [["native"], ["native"]]]);
+	});
+
+	test("renders widget and footer status tokens per window without changing shared text", async () => {
+		const lines = ["\x1b[32m{renderMode}/{renderMode}\x1b[0m", "literal {other}"];
+		const statuses = new Map(lines.map((line, index) => [String(index), line]));
+		const windows = [];
+		for (const mode of ["native", "ansi", undefined] as const) {
+			const { fakeThis } = createSubscribeHarness({
+				ui: { getRenderMode: () => mode, addRenderModeListener: vi.fn(() => vi.fn()), requestRender: vi.fn() },
+				footerDataProvider: { getExtensionStatuses: () => statuses },
+				footerSlot: new Container(),
+				extensionWidgetsAbove: new Map(),
+				extensionWidgetsBelow: new Map(),
+				widgetContainerAbove: new Container(),
+				widgetContainerBelow: new Container(),
+			});
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			fakeThis.bindRenderMode();
+			fakeThis.setExtensionWidget("session-metadata", lines, { placement: "belowEditor" });
+			fakeThis.setExtensionFooter((_tui: unknown, _theme: unknown, data: ReadonlyFooterDataProvider) => ({
+				render: () => [...data.getExtensionStatuses().values()],
+				invalidate: vi.fn(),
+			}));
+			const expected = `\x1b[32m${mode ?? ""}/${mode ?? ""}\x1b[0m`;
+			expect(renderAll(fakeThis.widgetContainerBelow)).toContain(expected);
+			expect(renderAll(fakeThis.widgetContainerBelow)).toContain(lines[1]);
+			expect(fakeThis.customFooter.render(120)).toEqual([expected, lines[1]]);
+			windows.push(fakeThis);
+		}
+		const pending = windows[2];
+		pending.ui.getRenderMode = () => "native";
+		pending.ui.requestRender.mockClear();
+		pending.ui.addRenderModeListener.mock.calls[0][0]("native");
+		expect(pending.ui.requestRender).toHaveBeenCalledOnce();
+		expect(renderAll(pending.widgetContainerBelow)).toContain("\x1b[32mnative/native\x1b[0m");
+		expect(pending.customFooter.render(120)).toEqual(["\x1b[32mnative/native\x1b[0m", lines[1]]);
+		expect([...statuses.values()]).toEqual(lines);
+	});
 
 	const callOrder = (mock: unknown): number =>
 		(mock as { mock: { invocationCallOrder: number[] } }).mock.invocationCallOrder[0] as number;
@@ -312,6 +387,7 @@ describe("InteractiveMode connection events", () => {
 			applyRuntimeSettings: vi.fn(),
 			bindLocalSessionExtensions: true,
 			bindCurrentSessionExtensions: vi.fn(async () => {}),
+			bindRenderMode: vi.fn(),
 			subscribeToAgent,
 			subscribeToRosterBar,
 			agentConnection: { getState },
@@ -777,6 +853,7 @@ describe("InteractiveMode session switch command catalog", () => {
 				connectionCommands: await connection.getCommands(),
 				connectionModelsRefreshVersion: 0,
 				bindLocalSessionExtensions: false,
+				bindRenderMode: vi.fn(),
 				uiServices: { getThemes: () => [] },
 				toolDefinitionCache: { clear: vi.fn() },
 				applyRuntimeSettings: vi.fn(),

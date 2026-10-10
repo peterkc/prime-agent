@@ -153,7 +153,7 @@ import {
 	UPDATE_RESTART_PREPARING_ERROR_INFO,
 	UPDATE_RESTART_PREPARING_MESSAGE,
 } from "./daemon-errors.js";
-import { bindActiveSessionState } from "./daemon-extension-binding.js";
+import { bindActiveSessionState, reportRenderMode } from "./daemon-extension-binding.js";
 import {
 	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
@@ -5419,6 +5419,14 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.sessionManager.appendLabelChange(command.entryId, command.label);
 				return success(command.id, "set_session_entry_label");
+			}
+
+			case "report_render_mode": {
+				if (command.mode !== "native" && command.mode !== "ansi") {
+					throw new Error("Invalid render mode");
+				}
+				reportRenderMode(this.getSessionState(command.activeSessionId), command.mode);
+				return success(command.id, command.type);
 			}
 
 			case "extension_ui_response": {

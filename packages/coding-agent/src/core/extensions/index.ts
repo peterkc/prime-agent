@@ -92,6 +92,7 @@ export type {
 	RefinePreparation,
 	RegisteredCommand,
 	RegisteredTool,
+	RenderModeChangeEvent,
 	ReplacedSessionContext,
 	ReplayBuiltInToolName,
 	ResolvedCommand,

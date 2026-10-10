@@ -131,6 +131,7 @@ export function createRpcExtensionUiBridge(output: (request: RpcExtensionUIReque
 		getAllThemes: () => [],
 		getTheme: (_name: string) => undefined,
 		setTheme: (_theme: string | Theme) => ({ success: false, error: "Theme switching not supported in RPC mode" }),
+		getRenderMode: () => undefined,
 		getToolsExpanded: () => false,
 		setToolsExpanded: (_expanded: boolean) => {},
 	};
