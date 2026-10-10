@@ -319,6 +319,8 @@ When it is off, Tern receives only input notifications.
 Warp receives no completion or error notifications while its CLI-agent protocol is active.
 Notifications require a stdout TTY. Idle command dialogs and client-cancelled runs do not notify.
 Error notifications wait for an active session action or retry chain to settle.
+A context-overflow recovery that is retried or cancelled, by any client, sends no error notification.
+A retry cancelled by another client still notifies an error.
 An initial error outside an active session action notifies immediately; an automatic retry could still follow in that case.
 An active-to-active action snapshot can drop a pending error notification. Quota-park heartbeat failures can each notify.
 
