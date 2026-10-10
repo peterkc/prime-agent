@@ -29,7 +29,7 @@ const EMPTY_USAGE: Usage = {
 
 type HandleEventThis = {
 	isInitialized: boolean;
-	settingsManager: { getShowTerminalProgress(): boolean };
+	settingsManager: { getShowTerminalProgress(): boolean; getProgramStatus(): boolean };
 	connectionState: { isStreaming: boolean };
 	toolOutputExpanded: boolean;
 	footer: { invalidate(): void };
@@ -62,7 +62,7 @@ type HandleEvent = (this: HandleEventThis, event: AgentConnectionSessionEvent) =
 function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
 		isInitialized: true,
-		settingsManager: { getShowTerminalProgress: () => false },
+		settingsManager: { getShowTerminalProgress: () => false, getProgramStatus: () => false },
 		connectionState: { isStreaming: false },
 		toolOutputExpanded: false,
 		footer: { invalidate: vi.fn() },

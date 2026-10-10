@@ -109,6 +109,7 @@ describe("back navigation during chat startup", () => {
 			getSessionContextFromConnectionSnapshot: () => harness.session.buildSessionContext(),
 			seedSubagentSummary: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
+			syncRunStatus: vi.fn(),
 			restoreTurnStartFromMessages: vi.fn(),
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot: vi.fn(async () => {}),

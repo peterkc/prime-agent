@@ -59,6 +59,7 @@ export interface TerminalSettings {
 	showImages?: boolean; // default: true (show image type and dimensions)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
+	programStatus?: boolean; // default: true (OSC 7501 run status for terminal tabs and inboxes)
 	fullscreen?: boolean; // default: true (alternate-screen rendering with scrollable transcript)
 	fullscreenMouse?: boolean; // default: true
 }
@@ -1382,6 +1383,11 @@ export class SettingsManager {
 
 	getShowTerminalProgress(): boolean {
 		return this.settings.terminal?.showTerminalProgress ?? false;
+	}
+
+	getProgramStatus(): boolean {
+		const enabled = this.settings.terminal?.programStatus;
+		return typeof enabled === "boolean" ? enabled : true;
 	}
 
 	setShowTerminalProgress(enabled: boolean): void {

@@ -316,6 +316,13 @@ import type {
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
 import { isOnboardingModelReady, type OnboardingStartupState, shouldRunOnboarding } from "./onboarding.js";
+import {
+	formatProgramStatus,
+	PROGRAM_STATUS_CLEAR,
+	type RunStatus,
+	settledRunStatus,
+	withOpenDialog,
+} from "./program-status.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
@@ -1438,6 +1445,16 @@ export class InteractiveMode {
 	private pendingQueueMove = false;
 
 	private shutdownRequested = false;
+
+	/** OSC 7501: the run's status, open dialogs, and the report the terminal holds. */
+	private runStatus: RunStatus = { state: "idle" };
+	private openDialogs: { readonly title: string }[] = [];
+	private reportedProgramStatus: string | undefined;
+	/** Set while a compaction outside a run is running: the status it returns to when it ends without failing. */
+	private statusBeforeCompaction: RunStatus | undefined;
+	/** This client asked to stop the run or its retry, so the run ends idle rather than done or failed. */
+	private runAbortRequested = false;
+	private programStatusStopped = false;
 
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
@@ -3539,6 +3556,8 @@ export class InteractiveMode {
 		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
+		// A stop requested in the previous session must not settle the next one's run.
+		this.runAbortRequested = false;
 	}
 
 	private resetPendingToolState(): void {
@@ -3571,6 +3590,7 @@ export class InteractiveMode {
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
+		this.syncRunStatus(snapshot.state, this.getSessionContextFromConnectionSnapshot(snapshot).messages);
 		this.refreshQueueSelectionFromState();
 		this.restoreTurnStartFromMessages(this.getSessionContextFromConnectionSnapshot(snapshot).messages);
 		this.streamingComponent = undefined;
@@ -3760,7 +3780,10 @@ export class InteractiveMode {
 			model: this.getCurrentModel(),
 			isIdle: () => !this.isAgentStreaming(),
 			signal: localSessionHost.getAbortSignal(),
-			abort: () => this.agentConnection.abort(),
+			abort: () => {
+				this.runAbortRequested = true;
+				return this.agentConnection.abort();
+			},
 			hasPendingMessages: () => this.getQueuedActionCount() > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
@@ -3950,6 +3973,8 @@ export class InteractiveMode {
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(true);
 		}
+		if (this.runStatus.state !== "working") this.statusBeforeCompaction = this.runStatus;
+		this.setRunStatus({ state: "working" });
 		// Keep editor active; submissions are queued during compaction.
 		// Fully stop the working loader (not just detach) so it isn't orphaned.
 		this.stopWorkingLoader();
@@ -4132,6 +4157,9 @@ export class InteractiveMode {
 		if (this.extensionEditor) {
 			this.hideExtensionEditor();
 		}
+		// Hidden dialogs never settle; a new list keeps their late answers from removing newer dialogs.
+		this.openDialogs = [];
+		this.reportProgramStatus();
 		this.ui.hideOverlay();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
@@ -4392,7 +4420,7 @@ export class InteractiveMode {
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		const answer = new Promise<string | undefined>((resolve) => {
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
@@ -4425,6 +4453,7 @@ export class InteractiveMode {
 			this.ui.setFocus(this.extensionSelector);
 			this.ui.requestRender();
 		});
+		return this.whileDialogOpen(title, answer);
 	}
 
 	private hideExtensionSelector(): void {
@@ -4458,7 +4487,7 @@ export class InteractiveMode {
 		placeholder?: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		const answer = new Promise<string | undefined>((resolve) => {
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
@@ -4491,6 +4520,7 @@ export class InteractiveMode {
 			this.ui.setFocus(this.extensionInput);
 			this.ui.requestRender();
 		});
+		return this.whileDialogOpen(title, answer);
 	}
 
 	private hideExtensionInput(): void {
@@ -4503,7 +4533,7 @@ export class InteractiveMode {
 	}
 
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		const answer = new Promise<string | undefined>((resolve) => {
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
@@ -4524,6 +4554,7 @@ export class InteractiveMode {
 			this.ui.setFocus(this.extensionEditor);
 			this.ui.requestRender();
 		});
+		return this.whileDialogOpen(title, answer);
 	}
 
 	private hideExtensionEditor(): void {
@@ -4532,6 +4563,57 @@ export class InteractiveMode {
 		this.extensionEditor = undefined;
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
+	}
+
+	private setRunStatus(status: RunStatus): void {
+		this.runStatus = status;
+		this.reportProgramStatus();
+	}
+
+	/** Writes the OSC 7501 report unless the terminal holds it; `resend` restores one a shell prompt dropped. */
+	private reportProgramStatus(resend = false): void {
+		if (this.programStatusStopped || !this.settingsManager.getProgramStatus()) return;
+		// Interactive mode needs only a stdin TTY; keep the escape out of redirected output.
+		if (process.stdout.isTTY !== true) return;
+		const report = formatProgramStatus(withOpenDialog(this.runStatus, this.openDialogs.at(-1)?.title));
+		if (report === this.reportedProgramStatus && !resend) return;
+		this.ui.terminal.write(report);
+		this.reportedProgramStatus = report;
+	}
+
+	/**
+	 * A snapshot stands in for the start and end events this client missed, so it sets the run status.
+	 * A new session starts idle; a resync of the same session (`messages` given) keeps a settled status
+	 * and settles a run whose end it missed from the snapshot's messages.
+	 */
+	private syncRunStatus(state: AgentConnectionState, messages?: readonly AgentMessage[]): void {
+		const fromCompaction = this.statusBeforeCompaction !== undefined;
+		if (!state.isCompacting || state.isStreaming) this.statusBeforeCompaction = undefined;
+		// A compaction first seen in a snapshot, or in a new session, started from an unknown status, so it ends idle.
+		else if (!messages || !fromCompaction) this.statusBeforeCompaction = { state: "idle" };
+		if (state.isStreaming || state.isCompacting) {
+			this.setRunStatus({ state: "working" });
+			return;
+		}
+		const stopped = this.runAbortRequested;
+		this.runAbortRequested = false;
+		if (!messages) this.setRunStatus({ state: "idle" });
+		else if (this.runStatus.state === "working") {
+			// A run this client stopped, or a compaction, did not produce the snapshot's last result.
+			this.setRunStatus(stopped || fromCompaction ? { state: "idle" } : settledRunStatus(messages));
+		}
+	}
+
+	/** Reports waiting on the user until the dialog's answer settles. */
+	private whileDialogOpen<T>(title: string, answer: Promise<T>): Promise<T> {
+		const dialog = { title };
+		this.openDialogs.push(dialog);
+		this.reportProgramStatus();
+		return answer.finally(() => {
+			const index = this.openDialogs.indexOf(dialog);
+			if (index !== -1) this.openDialogs.splice(index, 1);
+			this.reportProgramStatus();
+		});
 	}
 
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
@@ -4665,7 +4747,7 @@ export class InteractiveMode {
 			this.ui.requestRender();
 		};
 
-		return new Promise((resolve, reject) => {
+		const shown = new Promise<T>((resolve, reject) => {
 			let component: Component & { dispose?(): void };
 			let closed = false;
 
@@ -4717,6 +4799,8 @@ export class InteractiveMode {
 					reject(err);
 				});
 		});
+		// An inline component takes the editor's place, so the run waits on it; an overlay may not.
+		return isOverlay ? shown : this.whileDialogOpen("", shown);
 	}
 
 	/**
@@ -6129,6 +6213,8 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
+				this.runAbortRequested = false;
+				this.setRunStatus({ state: "working" });
 				if (this.retryCountdown) {
 					this.retryCountdown.dispose();
 					this.retryCountdown = undefined;
@@ -6397,6 +6483,8 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
+				this.setRunStatus(this.runAbortRequested ? { state: "idle" } : settledRunStatus(event.messages));
+				this.runAbortRequested = false;
 				this.turnStartedAt = undefined;
 				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
@@ -6433,6 +6521,12 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
+				if (this.isAgentStreaming()) this.setRunStatus({ state: "working" });
+				else if (event.aborted) this.setRunStatus({ state: "idle" });
+				else if (event.errorMessage && event.errorSeverity !== "warning") {
+					this.setRunStatus({ state: "error", msg: event.errorMessage });
+				} else this.setRunStatus(this.statusBeforeCompaction ?? { state: "idle" });
+				this.statusBeforeCompaction = undefined;
 				if (this.autoCompactionLoader) {
 					this.autoCompactionLoader.stop();
 					this.autoCompactionLoader = undefined;
@@ -6460,6 +6554,7 @@ export class InteractiveMode {
 			}
 
 			case "auto_retry_start": {
+				this.setRunStatus({ state: "working" });
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
@@ -6511,6 +6606,13 @@ export class InteractiveMode {
 				this.syncWorkingLoader();
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
+					// A cancelled or failed retry starts no run, so no agent_end will settle the status.
+					if (!this.isAgentStreaming()) {
+						this.setRunStatus(
+							this.runAbortRequested ? { state: "idle" } : { state: "error", msg: event.finalError },
+						);
+						this.runAbortRequested = false;
+					}
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				} else if (event.restoredModel) {
 					this.showStatus(`Primary provider recovered — back on ${event.restoredModel}`);
@@ -7433,6 +7535,7 @@ export class InteractiveMode {
 			this.rlmNodeId = snapshot.parent?.childId;
 			this.seedSubagentSummary(snapshot.children);
 			this.applyConnectionStateSnapshot(state);
+			this.syncRunStatus(state);
 			this.restoreTurnStartFromMessages(context.messages);
 			await this.renderSessionContext(context, {
 				clearChat: true,
@@ -7577,6 +7680,7 @@ export class InteractiveMode {
 			this.abortSideQuestion(this.sideQuestionEvent.id, true);
 		}
 		if (this.getRetryAttempt() > 0) {
+			this.runAbortRequested = true;
 			void this.agentConnection.abortRetry();
 		}
 		if (this.isAgentCompacting()) {
@@ -7587,6 +7691,7 @@ export class InteractiveMode {
 			void this.agentConnection.abortBash();
 		}
 		if (this.isAgentStreaming()) {
+			this.runAbortRequested = true;
 			void this.agentConnection.abortAndSendQueued().catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
@@ -7817,6 +7922,8 @@ export class InteractiveMode {
 			if (this.fullscreenEnabled) {
 				this.applyFullscreen(true);
 			}
+			// The shell prompt shown while suspended dropped a working or waiting record.
+			if (this.runStatus.state === "working" || this.openDialogs.length > 0) this.reportProgramStatus(true);
 			this.ui.requestRender(true);
 		};
 		const onSigcont = () => {
@@ -12688,6 +12795,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
+		// Leave no record behind for the shell that gets the terminal back.
+		if (this.reportedProgramStatus !== undefined) this.ui.terminal.write(PROGRAM_STATUS_CLEAR);
+		this.programStatusStopped = true;
 		this.stopWorkingLoader();
 		this.discardRefineLoader();
 		this.stopWorkingPulse();

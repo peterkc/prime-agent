@@ -13,6 +13,8 @@ type HandleCtrlZThis = {
 	fullscreenEnabled: boolean;
 	applyFullscreen: (enabled: boolean) => void;
 	showStatus: (message: string) => void;
+	runStatus?: { state: string };
+	reportProgramStatus?: (resend: boolean) => void;
 };
 
 type ProcessSignalHandler = () => void;
@@ -81,6 +83,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			requestRender: vi.fn(),
 		};
 		const context: HandleCtrlZThis = { ui, fullscreenEnabled: true, applyFullscreen: vi.fn(), showStatus: vi.fn() };
+		Object.assign(context, { runStatus: { state: "working" }, reportProgramStatus: vi.fn() });
 
 		let sigintHandler: ProcessSignalHandler | undefined;
 		let sigcontHandler: ProcessSignalHandler | undefined;
@@ -133,6 +136,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 		expect(vi.mocked(ui.start)).toHaveBeenCalledAfter(vi.mocked(ui.stop));
 		expect(ui.requestRender).toHaveBeenCalledExactlyOnceWith(true);
 		expect(context.applyFullscreen).toHaveBeenCalledExactlyOnceWith(true);
+		expect(context.reportProgramStatus).toHaveBeenCalledExactlyOnceWith(true);
 	});
 
 	test("cleans up the temporary handlers if suspension fails", async () => {

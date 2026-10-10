@@ -1,0 +1,1 @@
+- Added OSC 7501 run status reports (working, waiting on you, done, failed), so terminals such as Tern show them on the tab and in their inbox; turn them off with `terminal.programStatus`.

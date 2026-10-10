@@ -344,6 +344,7 @@ describe("InteractiveMode connection events", () => {
 	function createResyncHarness(overrides: Record<string, any> = {}): Record<string, any> {
 		const fakeThis: Record<string, any> = {
 			applyConnectionStateSnapshot: vi.fn(),
+			syncRunStatus: vi.fn(),
 			refreshQueueSelectionFromState: vi.fn(),
 			restoreTurnStartFromMessages: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
@@ -560,6 +561,7 @@ describe("InteractiveMode connection events", () => {
 
 		await renderResyncedSession.call(fakeThis, snapshot);
 
+		expect(fakeThis.syncRunStatus).toHaveBeenCalledWith(snapshot.state, expect.any(Array));
 		expect(fakeThis.sideQuestionEvent).toBe(sideQuestion);
 		expect(fakeThis.activeConnectionExtensionUiRequests).toBe(extensionRequests);
 		expect(fakeThis.activeBashComponent).toBe(activeBashComponent);
