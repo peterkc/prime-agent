@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { describe, it, type TestContext } from "node:test";
+import { setImmediate } from "node:timers/promises";
 import { InputParser } from "@stencil-hq/tern";
 import pkg from "../package.json";
 import { nativeConnection } from "../src/native/connection.js";
@@ -412,4 +413,58 @@ describe("ProcessTerminal native stdin hookup", () => {
 		t.mock.timers.tick(20);
 		assert.equal(flush.mock.callCount(), callsAtStop);
 	});
+});
+
+describe("ProcessTerminal native and notification probe coordination", () => {
+	for (const [term, tmux, notifications, probeExpected] of [
+		["tern", "", "on", true],
+		["tern", "mux", "on", false],
+		["WarpTerminal", "", "on", false],
+		["tern", "", "off", false],
+	] as const) {
+		for (const confirmed of [true, false]) {
+			it(`preserves native ${confirmed ? "confirm" : "deny"} in ${term}, tmux=${tmux}, notifications=${notifications}`, (t) => {
+				const env = process.env;
+				const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+				const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+				process.env = { PATH: "", PI_NOTIFICATIONS: notifications };
+				Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+				Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+				const { terminal, inputs, writes } = nativeTerminal(t, "1", term, tmux);
+				t.after(() => {
+					process.env = env;
+					restoreProperty(process.stdin, "isTTY", stdinTTY);
+					restoreProperty(process.stdout, "isTTY", stdoutTTY);
+				});
+				const probe = writes.find((sequence) => sequence.startsWith("\x1b]99;"));
+				assert.equal(Boolean(probe), probeExpected);
+				if (probeExpected) assert.ok(writes.indexOf("\x1b[c") < writes.indexOf(probe!));
+				process.stdin.emit("data", `${confirmed ? nativeHello : ""}${nativeDa1}`);
+				assert.equal(terminal.native?.probe.state.kind, confirmed ? "available" : "off");
+				if (probe) {
+					const id = /i=([^:]+)/u.exec(probe)![1];
+					process.stdin.emit("data", `\x1b]99;i=${id}:p=?;p=title\x1b\\${nativeDa1}`);
+					terminal.notify({ title: "Prime", body: "Complete" });
+					assert.match(writes.at(-1)!, /\x1b\]99;i=prime-/u);
+				}
+				assert.deepEqual(inputs, []);
+			});
+		}
+	}
+});
+
+it("keeps notification write rejections from escaping ProcessTerminal", async (t) => {
+	const env = process.env;
+	t.after(() => (process.env = env));
+	process.env = { PI_NOTIFICATIONS: "on", PI_NO_DESKTOP_NOTIFY: "1" };
+	const stdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+	t.after(() => restoreProperty(process.stdout, "isTTY", stdoutTTY));
+	Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+	const { terminal } = nativeTerminal(t, "0", "ghostty");
+	const write = t.mock.method(terminal, "write", () => {
+		throw new Error("closed stdout");
+	});
+	terminal.notify({ title: "Prime", body: "Complete" });
+	await setImmediate();
+	assert.equal(write.mock.callCount(), 1);
 });

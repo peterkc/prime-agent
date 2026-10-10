@@ -1,0 +1,1 @@
+- Added terminal desktop notification protocols, capability probing, and multiplexer delivery.

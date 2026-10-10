@@ -11,6 +11,7 @@ import {
 	type Rgb,
 	setDefaultTerminalColors,
 } from "./terminal-colors.js";
+import { type TerminalNotification, TerminalNotifications } from "./terminal-notify.js";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -98,6 +99,9 @@ export interface Terminal {
 	// Write output to terminal
 	write(data: string): void;
 
+	// Best-effort desktop notifications, when supported by the terminal implementation.
+	notify?(notification: TerminalNotification): void;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -146,6 +150,7 @@ export interface TerminalStopOptions {
 export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
 	private started = false;
+	private readonly notifications = new TerminalNotifications((sequence) => this.write(sequence));
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
@@ -223,6 +228,7 @@ export class ProcessTerminal implements Terminal {
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.queryAndEnableKittyProtocol();
 		this.nativeConnection?.start(this, (text) => this.stdinBuffer?.process(text));
+		this.notifications.start();
 	}
 
 	/**
@@ -241,7 +247,7 @@ export class ProcessTerminal implements Terminal {
 
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
-			if (this.handleDefaultColorProbeResponse(sequence)) {
+			if (this.notifications.handleResponse(sequence) || this.handleDefaultColorProbeResponse(sequence)) {
 				return;
 			}
 
@@ -429,6 +435,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(options: TerminalStopOptions = {}): void {
+		this.notifications.stop();
 		const wasStarted = this.started;
 		this.started = false;
 		this.finishDefaultColorProbe();
@@ -498,6 +505,18 @@ export class ProcessTerminal implements Terminal {
 			if (process.stdin.setRawMode) {
 				process.stdin.setRawMode(this.wasRaw);
 			}
+		}
+	}
+
+	notify(notification: TerminalNotification): void {
+		void this.sendNotification(notification);
+	}
+
+	private async sendNotification(notification: TerminalNotification): Promise<void> {
+		try {
+			await this.notifications.send(notification);
+		} catch {
+			// A failed best-effort notification must not crash the interactive client.
 		}
 	}
 

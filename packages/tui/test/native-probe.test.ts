@@ -137,3 +137,18 @@ it("adopts the retained Surface, routes ack and gone, and never reopens after na
 	assert.equal(native.open(), undefined);
 	assert.deepEqual(writes, []);
 });
+
+for (const outcome of ["available", "invalid", "timeout"] as const) {
+	it(`keeps the native sentinel separate from a later OSC probe when native is ${outcome}`, (t) => {
+		const { native, keys } = connection(t);
+		if (outcome === "timeout") t.mock.timers.tick(1000);
+		else native.probe.feed(`\x1b_tsp;r;${JSON.stringify({ ...hello, v: outcome === "invalid" ? 2 : 1 })}\x1b\\`);
+		native.probe.feed("a\x1b[Ab");
+		assert.equal(keys.join(""), "a\x1b[Ab");
+		native.probe.feed(da1);
+		native.probe.feed("\x1b]99;i=p:p=?;p=title\x1b\\");
+		native.probe.feed(da1);
+		const sentinel = outcome === "available" ? "\x1b[?c" : da1;
+		assert.equal(keys.join(""), `a\x1b[Ab\x1b]99;i=p:p=?;p=title\x1b\\${sentinel}`);
+	});
+}

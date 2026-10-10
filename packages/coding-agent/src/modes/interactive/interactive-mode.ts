@@ -26,6 +26,7 @@ import type {
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
+	TerminalNotification,
 } from "@earendil-works/pi-tui";
 import {
 	type ClickRegion,
@@ -37,6 +38,7 @@ import {
 	type LoaderIndicatorOptions,
 	Markdown,
 	matchesKey,
+	notificationsSuppressed,
 	ProcessTerminal,
 	Spacer,
 	setKeybindings,
@@ -489,6 +491,12 @@ function mergeSubagentSnapshot(
 		activity: active ? (incoming.activity ?? previous.activity) : incoming.activity,
 	};
 }
+
+const RUN_NOTIFICATIONS = {
+	completion: { setting: "getNotifyOnCompletion", body: "Complete" },
+	error: { setting: "getNotifyOnError", body: "Stopped with error" },
+	ask: { setting: "getNotifyOnInput", body: "Waiting for input" },
+} as const;
 
 export function truncatePathMiddle(value: string, width: number): string {
 	if (visibleWidth(value) <= width) {
@@ -1455,6 +1463,8 @@ export class InteractiveMode {
 	/** This client asked to stop the run or its retry, so the run ends idle rather than done or failed. */
 	private runAbortRequested = false;
 	private programStatusStopped = false;
+	private pendingErrorNotification = false;
+	private notificationsCancelled = false;
 
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
@@ -3558,6 +3568,8 @@ export class InteractiveMode {
 		this.syncGoalTray(this.getGoalState());
 		// A stop requested in the previous session must not settle the next one's run.
 		this.runAbortRequested = false;
+		this.pendingErrorNotification = false;
+		this.notificationsCancelled = false;
 	}
 
 	private resetPendingToolState(): void {
@@ -3782,6 +3794,7 @@ export class InteractiveMode {
 			signal: localSessionHost.getAbortSignal(),
 			abort: () => {
 				this.runAbortRequested = true;
+				this.notificationsCancelled = true;
 				return this.agentConnection.abort();
 			},
 			hasPendingMessages: () => this.getQueuedActionCount() > 0,
@@ -4565,6 +4578,30 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private sendRunNotification(type: NonNullable<TerminalNotification["type"]>): void {
+		if (
+			this.programStatusStopped ||
+			this.runAbortRequested ||
+			this.notificationsCancelled ||
+			notificationsSuppressed(process.env)
+		)
+			return;
+		const env = process.env;
+		if (env.TERM_PROGRAM?.toLowerCase() === "tern") {
+			if (this.settingsManager.getProgramStatus() || type !== "ask") return;
+		}
+		if (type !== "ask" && env.TERM_PROGRAM === "WarpTerminal" && env.WARP_CLI_AGENT_PROTOCOL_VERSION) return;
+		const enabled = this.settingsManager[RUN_NOTIFICATIONS[type].setting]();
+		if (!enabled) return;
+		this.ui.terminal.notify?.({
+			title: this.getCurrentSessionName() || APP_TITLE,
+			body: RUN_NOTIFICATIONS[type].body,
+			type,
+			urgency: "normal",
+			actions: "focus",
+		});
+	}
+
 	private setRunStatus(status: RunStatus): void {
 		this.runStatus = status;
 		this.reportProgramStatus();
@@ -4607,6 +4644,7 @@ export class InteractiveMode {
 	/** Reports waiting on the user until the dialog's answer settles. */
 	private whileDialogOpen<T>(title: string, answer: Promise<T>): Promise<T> {
 		const dialog = { title };
+		if (this.runStatus.state === "working") this.sendRunNotification("ask");
 		this.openDialogs.push(dialog);
 		this.reportProgramStatus();
 		return answer.finally(() => {
@@ -6208,6 +6246,8 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.pendingErrorNotification = false;
+				this.notificationsCancelled = false;
 				this.resetPendingToolState();
 				this.renderRecap();
 				if (this.settingsManager.getShowTerminalProgress()) {
@@ -6231,6 +6271,10 @@ export class InteractiveMode {
 				break;
 
 			case "session_action_update": {
+				if (this.pendingErrorNotification && !event.actions.active) {
+					this.pendingErrorNotification = false;
+					this.sendRunNotification("error");
+				}
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
@@ -6484,6 +6528,13 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.setRunStatus(this.runAbortRequested ? { state: "idle" } : settledRunStatus(event.messages));
+				if (this.runStatus.state === "done") this.sendRunNotification("completion");
+				else if (this.runStatus.state === "error") {
+					// A custom-trigger action can settle before its retry chain ends.
+					if (this.connectionState?.sessionActions.active?.kind === "turn" || this.getRetryAttempt() > 0)
+						this.pendingErrorNotification = true;
+					else this.sendRunNotification("error");
+				}
 				this.runAbortRequested = false;
 				this.turnStartedAt = undefined;
 				this.refreshTopBarCost();
@@ -6518,6 +6569,8 @@ export class InteractiveMode {
 			}
 
 			case "compaction_end": {
+				// A retried or cancelled recovery is not the run's final failure.
+				if (event.willRetry || event.aborted) this.pendingErrorNotification = false;
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
@@ -6554,6 +6607,7 @@ export class InteractiveMode {
 			}
 
 			case "auto_retry_start": {
+				this.pendingErrorNotification = false;
 				this.setRunStatus({ state: "working" });
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
@@ -6593,6 +6647,8 @@ export class InteractiveMode {
 			}
 
 			case "auto_retry_end": {
+				this.pendingErrorNotification = false;
+				if (!event.success) this.sendRunNotification("error");
 				if (this.retryCountdown) {
 					this.retryCountdown.dispose();
 					this.retryCountdown = undefined;
@@ -7681,6 +7737,7 @@ export class InteractiveMode {
 		}
 		if (this.getRetryAttempt() > 0) {
 			this.runAbortRequested = true;
+			this.notificationsCancelled = true;
 			void this.agentConnection.abortRetry();
 		}
 		if (this.isAgentCompacting()) {
@@ -7692,6 +7749,7 @@ export class InteractiveMode {
 		}
 		if (this.isAgentStreaming()) {
 			this.runAbortRequested = true;
+			this.notificationsCancelled = true;
 			void this.agentConnection.abortAndSendQueued().catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
@@ -8548,6 +8606,9 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+					notifyOnCompletion: this.settingsManager.getNotifyOnCompletion(),
+					notifyOnError: this.settingsManager.getNotifyOnError(),
+					notifyOnInput: this.settingsManager.getNotifyOnInput(),
 					fullscreen: this.fullscreenEnabled,
 					warnings: this.settingsManager.getWarnings(),
 				},
@@ -8668,6 +8729,9 @@ export class InteractiveMode {
 						this.settingsManager.setClearOnShrink(enabled);
 						this.ui.setClearOnShrink(enabled);
 					},
+					onNotifyOnCompletionChange: (enabled) => this.settingsManager.setNotifyOnCompletion(enabled),
+					onNotifyOnErrorChange: (enabled) => this.settingsManager.setNotifyOnError(enabled),
+					onNotifyOnInputChange: (enabled) => this.settingsManager.setNotifyOnInput(enabled),
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
 					},
