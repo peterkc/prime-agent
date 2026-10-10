@@ -58,7 +58,6 @@ const result = await build({
 		"koffi",
 		"undici",
 		"@silvia-odwyer/photon-node",
-		"@earendil-works/pi-codemode",
 		"@mariozechner/clipboard",
 		// Preserve Node's CommonJS interop for the AWS SDK's lazy transport imports.
 		"@earendil-works/pi-ai/bedrock-provider",

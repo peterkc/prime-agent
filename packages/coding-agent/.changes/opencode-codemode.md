@@ -1,0 +1,3 @@
+- Changed codemode to the opencode interpreter with native discovery, structured OpenAPI tools and diagnostics; eval, Function, globalThis and the former heap cap are no longer supported.
+- Added native codemode/ipython tool-use guidance and retained checked calls, branch store, partial output and text budgeting.
+- Changed the required Node version to 24.0.0 or later; compiled binaries continue to use Bun 1.4.0.

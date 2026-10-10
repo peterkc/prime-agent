@@ -5261,6 +5261,7 @@ export class AgentSession {
 		name: string,
 		args: Record<string, unknown>,
 		signal?: AbortSignal,
+		additionalTools: readonly AgentTool[] = [],
 	): Promise<{ result: AgentToolResult<unknown>; isError: boolean }> {
 		const assistantMessage = this._findLastAssistantMessage();
 		if (!assistantMessage) {
@@ -5272,7 +5273,10 @@ export class AgentSession {
 		return runToolCall(
 			{ type: "toolCall", id: callId, name, arguments: args },
 			{
-				tools: this.agent.state.tools.filter((tool) => tool.name !== "codemode"),
+				tools: codemodeCallableTools(
+					[...this.agent.state.tools, ...additionalTools],
+					this.settingsManager.getCodemodeExcludeTools(),
+				).filter((tool) => tool.name !== "codemode"),
 				context: this.agent.state,
 				assistantMessage,
 				beforeToolCall: this.agent.beforeToolCall,
@@ -10865,9 +10869,12 @@ export class AgentSession {
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				codemode: {
+					openapi: () => this.settingsManager.getCodemodeOpenAPI(),
+					excludedTools: () => this.settingsManager.getCodemodeExcludeTools(),
 					callableTools: () =>
 						codemodeCallableTools(this.agent.state.tools, this.settingsManager.getCodemodeExcludeTools()),
-					runTool: (callId, name, args, signal) => this.runNestedToolCall(callId, name, args, signal),
+					runTool: (callId, name, args, signal, additionalTools) =>
+						this.runNestedToolCall(callId, name, args, signal, additionalTools),
 					storeEntries: () =>
 						this.sessionManager
 							.getBranch()

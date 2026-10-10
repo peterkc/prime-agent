@@ -1,0 +1,1 @@
+{"openapi":"3.0.3","info":{"title":"faux","version":"1"},"paths":{"/echo":{"get":{"operationId":"echo","parameters":[{"name":"value","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok","content":{"application/json":{"schema":{"type":"object","properties":{"value":{"type":"string"}}}}}}}}}}}

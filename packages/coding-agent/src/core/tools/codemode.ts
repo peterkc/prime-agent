@@ -5,33 +5,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
+import type { CodeMode, Tool } from "@opencode/codemode";
+import { Type } from "typebox";
+import type { ToolDefinition } from "../extensions/types.js";
+import { type CodemodeOpenAPISettings, createCodemodeOpenAPI } from "./codemode-openapi.js";
 import {
-	type CodemodeJsonSchema,
-	type CodemodeResult,
-	CodemodeSandbox,
+	type CodemodeRuntimeResult,
+	type CodemodeRuntimeTool,
 	type CodemodeStoreWrites,
-	type CodemodeTool,
-	loadQuickJSWasm,
+	executeCodemodeRuntime,
 	type ParsedCodemodeSource,
 	parseCodemodeSource,
-} from "@earendil-works/pi-codemode";
-import { renderToolSample, toCodemodeIdentifier } from "@earendil-works/pi-codemode/declarations";
-import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
-import { getCodemodeRuntimeAssets } from "../../config.js";
-import type { ToolDefinition } from "../extensions/types.js";
+} from "./codemode-runtime.js";
 import { getTextOutput, replaceTabs, str } from "./render-utils.js";
 
 export const codemodeSchema = Type.Object({ code: Type.String({ description: "Raw JavaScript source." }) });
-export const CODEMODE_DESCRIPTION = `Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, network, process, or timers.
-- Use codemode only to call several typed tools that ipython cannot reach, such as beads, pr_inspect or ask_jev, in parallel or in a chain, when only a filtered result should reach the context. For one call, call the tool directly. For files, shell, Python skills, MCP servers or state that must last between calls, use ipython; do not wrap tools.ipython in codemode only to run Python.
-- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
-- Use Promise.allSettled for independent calls, chain calls, or filter large results. Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
-- text(value), console.log/info/warn/error/debug(...), and return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
+export const CODEMODE_DESCRIPTION = `Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, process, timers or ambient network access. Configured OpenAPI tools may make approved HTTP calls.
+- Every other tool you can call is also tools.<name>(args), with the same arguments. Ordinary tools return their text joined with newlines; configured OpenAPI tools return structured JSON. Failed calls reject with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
+- Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
+- text(value), console.log/info/warn/error/debug/dir/table(...), and final expressions or return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
 - store(key, value) and load(key) keep JSON values on the current session branch. store(key, undefined) deletes a key; missing keys load as undefined. Only completed scripts persist writes.
 - ALL_TOOLS lists names and TypeScript declarations. await describeTool(name) returns a declaration. Python skills and MCP servers stay reachable through ipython, not as direct tools.
-- Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000}. max_output_tokens is a non-negative safe integer (default 10000, 4 characters per token); timeout_ms is an integer from 1 to 2147483647 (default none). Unknown fields are rejected.
-- The budget applies only to user text; over budget it keeps the head and tail and spills the full text to a temp file. Failure keeps partial output and a list of calls already made. Each run is fresh, with a 256 MiB guest heap, 16777216 output characters, 100000 output items, 262144 JSON characters per store value, and 1048576 total store characters (keys plus values). These do not bound host process memory or tool results.`;
+- Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000, "max_tool_calls": 100}. max_output_tokens is a non-negative safe integer (default 10000, 4 characters per token); timeout_ms is an integer from 1 to 2147483647 (default none); max_tool_calls is a non-negative safe integer (default unlimited), including native search. Unknown fields, including max_output_bytes, are rejected.
+- The budget applies only to user text; over budget it keeps the head and tail and spills the full text to a temp file. Failure keeps partial output and a list of calls already made. Each run uses a fresh in-process interpreter, with no heap cap, 16777216 output characters, 100000 output items, 262144 JSON characters per store value, and 1048576 total store characters (keys plus values). These do not bound host process memory, tool results or synchronous regex steps. search({query}) looks up an exact tool path and search({namespace, limit, offset}) browses a namespace; results include schema-backed signatures. describeTool(name), toolExpression(path), and searchSignature() describe call syntax. Script output also includes diagnostics and warnings.`;
 
 /** The tools a codemode script may call: the active tools minus the names the settings exclude. */
 export function codemodeCallableTools(tools: readonly AgentTool[], excluded: readonly string[]): readonly AgentTool[] {
@@ -39,13 +36,25 @@ export function codemodeCallableTools(tools: readonly AgentTool[], excluded: rea
 	return tools.filter((tool) => !names.has(tool.name));
 }
 
+export interface CodemodeGeneratedTool {
+	readonly tool: AgentTool;
+	readonly output: Tool.SchemaType;
+	readonly redact?: (text: string) => string;
+	readonly redactValue?: (value: unknown) => unknown;
+	readonly namespace?: { readonly path: string; readonly description: string };
+}
+
 export interface CodemodeHost {
+	openapi?(): CodemodeOpenAPISettings;
+	generatedTools?(): readonly CodemodeGeneratedTool[];
+	excludedTools?(): readonly string[];
 	callableTools(): readonly AgentTool[];
 	runTool(
 		callId: string,
 		name: string,
 		args: Record<string, unknown>,
 		signal: AbortSignal,
+		additionalTools?: readonly AgentTool[],
 	): Promise<{ result: AgentToolResult<unknown>; isError: boolean }>;
 	storeEntries(): readonly unknown[];
 	appendStore(delta: CodemodeStoreWrites): void;
@@ -63,6 +72,9 @@ export interface CodemodeNestedCall {
 export interface CodemodeToolDetails {
 	readonly calls: CodemodeNestedCall[];
 	readonly fullOutputPath?: string;
+	readonly diagnostics?: readonly CodeMode.Diagnostic[];
+	readonly toolCalls?: readonly CodeMode.ToolCall[];
+	readonly openapiSkipped?: ReturnType<typeof createCodemodeOpenAPI>["skipped"];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -139,7 +151,12 @@ class CodemodeRun {
 		if (this.state === "running") this.onUpdate?.({ content: [], details: this.snapshot() });
 	}
 
-	async call(tool: AgentTool, args: unknown, callSignal: AbortSignal): Promise<string> {
+	async call(
+		tool: AgentTool,
+		args: unknown,
+		callSignal: AbortSignal,
+		generated: readonly CodemodeGeneratedTool[] = [],
+	): Promise<unknown> {
 		const signal = AbortSignal.any([callSignal, this.controller.signal]);
 		const startedAt = performance.now();
 		const record: CodemodeNestedCall = {
@@ -167,12 +184,29 @@ class CodemodeRun {
 		try {
 			if (tool.executionMode === "sequential") await waitForQueue(previous, signal);
 			if (signal.aborted) throw new Error("Tool call aborted");
-			const outcome = await this.host.runTool(record.id, tool.name, args as Record<string, unknown>, signal);
-			const text = resultText(outcome.result);
+			const outcome = await this.host.runTool(
+				record.id,
+				tool.name,
+				args as Record<string, unknown>,
+				signal,
+				generated.map((entry) => entry.tool),
+			);
+			const native = generated.find((entry) => entry.tool === tool);
+			const raw = resultText(outcome.result);
 			if (signal.aborted) throw new Error("Tool call aborted");
-			if (outcome.isError) throw new Error(text || `Tool "${tool.name}" failed`);
+			if (outcome.isError) {
+				const text = native?.redact?.(raw) ?? raw;
+				throw new Error(text || `Tool "${tool.name}" failed`);
+			}
 			record.status = "ok";
-			return text;
+			if (!native) return raw;
+			let value: unknown;
+			try {
+				value = JSON.parse(raw);
+			} catch {
+				throw new Error(`OpenAPI tool_result hook must return valid JSON for ${tool.name}`);
+			}
+			return native.redactValue ? native.redactValue(value) : value;
 		} catch (error) {
 			record.status = signal.aborted ? "cancelled" : "error";
 			record.error = cut(errorText(error), 500);
@@ -225,59 +259,44 @@ async function executeCodemode(
 		return { content: [{ type: "text", text: errorText(error) }], details: { calls: [] }, isError: true };
 	}
 	const run = new CodemodeRun(parentId, host, onUpdate);
-	const callable = host.callableTools().filter((tool) => tool.name !== "codemode");
-	const samples = new Map(
-		callable.map((tool) => [
-			tool.name,
-			renderToolSample({
-				name: tool.name,
-				description: tool.description,
-				inputSchema: tool.parameters as CodemodeJsonSchema,
-				outputSchema: { type: "string" },
-			}),
-		]),
-	);
-	const tools: CodemodeTool[] = callable.map((tool) => ({
-		name: tool.name,
-		description: samples.get(tool.name),
-		execute: (args, context) => run.call(tool, args, context.signal),
-	}));
-	function describeTool(args: unknown): string | undefined {
-		if (!Array.isArray(args) || typeof args[0] !== "string") throw new Error("describeTool() expects a tool name");
-		const name = args[0];
-		const tool = callable.find(
-			(candidate) => candidate.name === name || toCodemodeIdentifier(candidate.name) === name,
-		);
-		return tool ? samples.get(tool.name) : undefined;
-	}
-	const runtimeAssets = getCodemodeRuntimeAssets();
-	const sandbox = new CodemodeSandbox({
-		tools,
-		globals: [{ name: "describeTool", spread: true, execute: describeTool }],
-		timeoutMs: parsed.options.timeoutMs ?? Number.POSITIVE_INFINITY,
-		memoryLimitBytes: 256 * 1024 * 1024,
-		...(runtimeAssets ? { wasm: loadQuickJSWasm(runtimeAssets.wasmPath), workerUrl: runtimeAssets.workerUrl } : {}),
-	});
-	let result: CodemodeResult;
+	let catalog: ReturnType<typeof createCodemodeOpenAPI>;
 	try {
-		result = await sandbox.execute(parsed.code, {
-			signal: signal ? AbortSignal.any([signal, run.controller.signal]) : run.controller.signal,
-			store: readStore(host.storeEntries()),
-		});
+		catalog = createCodemodeOpenAPI(host.openapi?.() ?? { entries: undefined });
+	} catch (error) {
+		return { content: [{ type: "text", text: errorText(error) }], details: { calls: [] }, isError: true };
+	}
+	const generated = [...catalog.tools, ...(host.generatedTools?.() ?? [])].filter(
+		(entry) => !host.excludedTools?.().includes(entry.tool.name),
+	);
+	const callable = [...host.callableTools(), ...generated.map((entry) => entry.tool)].filter(
+		(tool) => tool.name !== "codemode",
+	);
+	const tools: CodemodeRuntimeTool[] = callable.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		input: tool.parameters,
+		output: generated.find((entry) => entry.tool === tool)?.output,
+		namespace: generated.find((entry) => entry.tool === tool)?.namespace,
+		call: (args, signal) => run.call(tool, args, signal, generated),
+	}));
+	let result: CodemodeRuntimeResult;
+	try {
+		result = await executeCodemodeRuntime(parsed.code, tools, readStore(host.storeEntries()), parsed.options, signal);
+	} catch (error) {
+		result = {
+			ok: false,
+			output: [],
+			storeWrites: { set: {}, delete: [] },
+			diagnostics: [],
+			toolCalls: [],
+			error: errorText(error),
+		};
 	} finally {
 		run.finish();
-		await sandbox.close();
 	}
-	const output = [...result.output];
-	if (result.ok) {
-		const writes = result.storeWrites;
-		if (Object.keys(writes.set).length > 0 || writes.delete.length > 0) host.appendStore(writes);
-		if (result.value !== undefined)
-			output.push({
-				type: "text",
-				text: typeof result.value === "string" ? result.value : JSON.stringify(result.value),
-			});
-	}
+	const output = result.output;
+	if (result.ok && (Object.keys(result.storeWrites.set).length || result.storeWrites.delete.length))
+		host.appendStore(result.storeWrites);
 	const userText = output
 		.filter((item): item is Extract<typeof item, { type: "text" }> => item.type === "text")
 		.map((item) => item.text)
@@ -291,12 +310,19 @@ async function executeCodemode(
 		},
 	];
 	if (truncated.text) content.push({ type: "text", text: truncated.text });
+	if (catalog.skipped.length)
+		content.push({
+			type: "text",
+			text: `OpenAPI skipped operations:\n${catalog.skipped.map((operation) => `${operation.namespace} ${operation.method} ${operation.path}: ${operation.reason}`).join("\n")}`,
+		});
 	content.push(...images);
+	if (result.ok && result.diagnostics.length)
+		content.push({
+			type: "text",
+			text: `Script warnings:\n${result.diagnostics.map((diagnostic) => `${diagnostic.kind}: ${diagnostic.message}`).join("\n")}`,
+		});
 	if (!result.ok) {
-		const error =
-			result.error.kind === "script"
-				? (result.error.stack ?? result.error.message)
-				: `Script ${result.error.kind}: ${result.error.message}`;
+		const error = result.error;
 		const calls = run.calls.map((call) => `${call.name} (${call.status})`).join("\n");
 		content.push({
 			type: "text",
@@ -305,7 +331,13 @@ async function executeCodemode(
 	}
 	return {
 		content,
-		details: { ...run.snapshot(), ...(truncated.fullOutputPath ? { fullOutputPath: truncated.fullOutputPath } : {}) },
+		details: {
+			...run.snapshot(),
+			openapiSkipped: catalog.skipped,
+			diagnostics: result.diagnostics,
+			toolCalls: result.toolCalls,
+			...(truncated.fullOutputPath ? { fullOutputPath: truncated.fullOutputPath } : {}),
+		},
 		isError: !result.ok,
 	};
 }
@@ -318,6 +350,16 @@ export function createCodemodeToolDefinition(
 		name: "codemode",
 		label: "codemode",
 		description: CODEMODE_DESCRIPTION,
+		promptGuidelines: [
+			"Use codemode for chains or parallel calls to typed tools that Python cannot reach, when only a filtered result should reach the context.",
+			"Filter large results before returning them to the model.",
+			"Use Promise.allSettled for independent calls; chain dependent calls with await.",
+			"For one tool call, call the tool directly.",
+			"Do not wrap tools.ipython in codemode only to run Python.",
+			"Call search({query}) to look up an exact tool path, or search({namespace, limit, offset}) to browse a namespace; results include schema-backed signatures.",
+			"toolExpression(path) and searchSignature() describe the call syntax.",
+			"Configured OpenAPI operations are codemode-only tools. Use their structured JSON results.",
+		],
 		parameters: codemodeSchema,
 		executionMode: "sequential",
 		abortResultGraceMs: 5000,

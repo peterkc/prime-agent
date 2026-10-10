@@ -687,6 +687,12 @@ export function createIpythonToolDefinition(
 		description:
 			"Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
 		promptSnippet: "ipython - persistent Python REPL for code, state, and bash() orchestration",
+		promptGuidelines: [
+			"Use ipython for files, shell commands, Python skills, MCP servers, data analysis, long-running work, and state that must last across calls.",
+			"Orchestrate tools and resources reachable through Python in ipython.",
+			"Call typed tools that Python cannot reach directly.",
+			"Run project imports, tests, scripts, CLIs, and dependency checks through the target project's own environment, not by importing the project into the kernel.",
+		],
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,

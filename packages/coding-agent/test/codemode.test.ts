@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,11 @@ import {
 	runToolCall,
 } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { CodeMode, OpenAPI, Tool } from "@opencode/codemode";
+
+import { Deferred, Effect, Fiber, Schema } from "effect";
+import { TestClock } from "effect/testing";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
@@ -19,13 +24,20 @@ import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
+	type CodemodeGeneratedTool,
 	type CodemodeHost,
 	type CodemodeToolDetails,
 	createCodemodeToolDefinition,
 } from "../src/core/tools/codemode.js";
+import { createIpythonToolDefinition } from "../src/core/tools/ipython.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.js";
 import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { assistantMsg, createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
+
+vi.mock("@opencode/codemode", async (original) => {
+	const actual = await original<{ CodeMode: typeof CodeMode; OpenAPI: typeof OpenAPI; Tool: typeof Tool }>();
+	return { ...actual, CodeMode: { ...actual.CodeMode } };
+});
 
 interface Fixture {
 	id: string;
@@ -164,8 +176,10 @@ describe("codemode", () => {
 		for (const absent of fixture.expected.absent ?? []) expect(text(result)).not.toContain(absent);
 		expect(result.details.calls.map(({ name, status }) => ({ name, status }))).toEqual(fixture.expected.calls);
 		expect(result.content.filter((item) => item.type === "image")).toEqual(fixture.expected.images ?? []);
-		if (fixture.expected.fullText !== undefined)
+		if (fixture.expected.fullText !== undefined) {
 			expect(readFileSync(result.details.fullOutputPath!, "utf8")).toBe(fixture.expected.fullText);
+			expect(statSync(result.details.fullOutputPath!).mode & 0o777).toBe(0o600);
+		}
 	});
 
 	it("TM-04 TM-15 applies registered hooks, validation and the active-tool boundary without nested messages", async () => {
@@ -242,7 +256,7 @@ describe("codemode", () => {
 	});
 
 	it("TM-14 creates a fresh VM and TM-06 preserves failure when spilling fails", async () => {
-		expect(text(await execute("globalThis.leaked = 1; text(leaked);"))).toContain("1");
+		expect(text(await execute("const leaked = 1; text(leaked);"))).toContain("1");
 		expect(text(await execute("text(typeof leaked);"))).toContain("undefined");
 		const oldTmp = process.env.TMPDIR;
 		try {
@@ -265,22 +279,44 @@ describe("codemode", () => {
 		}
 	});
 
-	it.each(["completed", "failed"])("TM-07 cancels an unawaited call when the script %s", async (end) => {
+	it.each(["completed", "failed", "exit"])("TM-07 cancels running/queued calls when the script %s", async (end) => {
+		const started = deferred<void>();
 		const cancelled = deferred<void>();
 		const never = deferred<AgentToolResult<unknown>>();
-		const tool = stub("pending", async (_id, _args, signal) => {
-			signal!.addEventListener("abort", () => cancelled.resolve(), { once: true });
-			return never.promise;
+		const starts: string[] = [];
+		const entries: unknown[] = [];
+		const tool = stub(
+			"pending",
+			async (_id, args, signal) => {
+				starts.push(args.value);
+				started.resolve();
+				signal!.addEventListener("abort", () => cancelled.resolve(), { once: true });
+				return never.promise;
+			},
+			true,
+		);
+		const ready = stub("ready", async () => {
+			await started.promise;
+			return reply("ready");
 		});
 		try {
 			const result = await execute(
-				`tools.pending({value:"x"}); text("partial"); ${end === "failed" ? 'throw new Error("failure");' : ""}`,
-				[tool],
+				`tools.pending({value:"one"}); tools.pending({value:"two"}); await tools.ready({value:"gate"}); text("partial"); store("k",1); ${end === "failed" ? 'throw new Error("failure");' : end === "exit" ? 'exit(); text("after");' : ""}`,
+				[tool, ready],
+				undefined,
+				entries,
 			);
 			await cancelled.promise;
 			expect(result.isError).toBe(end === "failed");
 			expect(text(result)).toContain("partial");
-			expect(result.details.calls).toMatchObject([{ name: "pending", status: "cancelled" }]);
+			expect(text(result)).not.toContain("after");
+			expect(starts).toEqual(["one"]);
+			expect(result.details.calls).toMatchObject([
+				{ name: "pending", status: "cancelled" },
+				{ name: "pending", status: "cancelled" },
+				{ name: "ready", status: "ok" },
+			]);
+			expect(entries).toEqual(end === "failed" ? [] : [{ set: { k: 1 }, delete: [] }]);
 		} finally {
 			never.resolve(reply("late"));
 		}
@@ -320,8 +356,6 @@ describe("codemode", () => {
 			try {
 				await first.promise;
 				await queued.promise;
-				vi.useFakeTimers();
-				await vi.advanceTimersByTimeAsync(0);
 				expect(starts).toEqual(["one"]);
 				if (abort) controller.abort();
 				else release.resolve(reply("one"));
@@ -331,7 +365,6 @@ describe("codemode", () => {
 					abort ? ["cancelled", "cancelled"] : ["ok", "ok"],
 				);
 			} finally {
-				vi.useRealTimers();
 				controller.abort();
 				release.resolve(reply("late"));
 				await running;
@@ -352,13 +385,24 @@ describe("codemode", () => {
 			...setup,
 			cwd: dir,
 			agentDir: dir,
-			settingsManager: settings,
 			sessionManager: SessionManager.inMemory(dir),
 			tools,
 			includeGoals: false,
 		});
 		sessions.push(session);
 		expect(session.getActiveToolNames()).toEqual(active);
+	});
+
+	it("TM-19 native active-tool guidelines follow activation without a kernel or model", async () => {
+		const { session } = await makeSession();
+		const tools = [createCodemodeToolDefinition(dir), createIpythonToolDefinition(dir)];
+		for (const active of [["codemode", "ipython"], ["codemode"], ["ipython"], [], ["codemode", "ipython"]]) {
+			session.setActiveToolsByName(active);
+			const prompt = session.agent.state.systemPrompt;
+			const lines = active.flatMap((name) => tools.find((t) => t.name === name)?.promptGuidelines ?? []);
+			expect(prompt.split("# Additional Guidance\n\n")[1] ?? "").toBe(lines.map((t) => `- ${t}`).join("\n"));
+			if (active.includes("ipython")) expect(prompt).toContain("reachable from Python: use Python");
+		}
 	});
 
 	it("leaves tools named in codemodeExcludeTools out of scripts", async () => {
@@ -406,6 +450,12 @@ describe("codemode", () => {
 	it("TM-11 keeps the exact model schema and description in the port doc; host-less execution rejects", async () => {
 		const doc = readFileSync(new URL("../docs/codemode.md", import.meta.url), "utf8");
 		const definition = createCodemodeToolDefinition(dir);
+		for (const tool of [definition, createIpythonToolDefinition(dir)]) {
+			const block = doc
+				.split(`<!-- ${tool.name}-guidelines:start -->\n\`\`\`json\n`)[1]
+				.split(`\n\`\`\`\n<!-- ${tool.name}-guidelines:end -->`)[0];
+			expect(tool.promptGuidelines).toEqual(JSON.parse(block));
+		}
 		expect(doc.split("<!-- description:start -->\n")[1].split("\n<!-- description:end -->")[0]).toBe(
 			definition.description,
 		);
@@ -477,5 +527,337 @@ describe("codemode", () => {
 			await session.abort();
 			await running;
 		}
+	});
+	it("TM-21 combines checked calls, console aliases/dir/table, image, final value and branch writes", async () => {
+		const { session } = await makeSession((pi) =>
+			pi.registerTool(stub("echo", async (_id, args) => reply(args.value))),
+		);
+		session.setActiveToolsByName(["codemode", "echo"]);
+		const result = await sessionTool(session).execute("combined", {
+			code: 'text("first"); const log = console.info; log({a:1},undefined); console.warn("warn"); console.error("error"); console.debug("debug"); console.dir({d:2}); console.table([{t:3}]); image("data:image/png;base64,iVBORw0KGgo="); text(Array.isArray(ALL_TOOLS)); text(await describeTool("echo")); text(await tools.echo({value:"checked"})); store("k",1); 42',
+		});
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain('first\n{"a":1} undefined\nwarn\nerror\ndebug\n{"d":2}\n[{"t":3}]\ntrue');
+		expect(text(result)).toContain("Promise<string>\nchecked\n42");
+		expect(result.content.filter((item) => item.type === "image")).toEqual([
+			{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+		]);
+		expect(session.sessionManager.getBranch().at(-1)).toMatchObject({
+			customType: "codemode-store",
+			data: { set: { k: 1 }, delete: [] },
+		});
+		const exit = await sessionTool(session).execute("exit", {
+			code: 'store("exit",1); text("before"); try { exit(); } catch(e) {text("catch");} finally {text("finally");} store("bad",1); text(await tools.echo({value:"after"}));',
+		});
+		expect(exit.isError).toBe(false);
+		expect(text(exit)).toContain("before");
+		expect(text(exit)).not.toMatch(/catch|finally|after/);
+		expect((exit.details as CodemodeToolDetails).calls).toEqual([]);
+		expect(session.sessionManager.getBranch().at(-1)).toMatchObject({ data: { set: { exit: 1 }, delete: [] } });
+	});
+
+	it("TM-21 generated operation uses actual checked session registry and structured post-hook JSON", async () => {
+		const requests: string[] = [];
+		const hooks: string[] = [];
+		const generated = OpenAPI.fromSpec({
+			baseUrl: "http://127.0.0.1:1",
+			spec: JSON.parse(readFileSync(new URL("./fixtures/codemode/openapi-faux.json", import.meta.url), "utf8")),
+		});
+		const operation = generated.tools.echo;
+		if (!Tool.isTool(operation)) throw new Error("missing generated operation");
+		const client = HttpClient.make((request, url) => {
+			requests.push(url.href);
+			return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ value: "native" })));
+		});
+		const { session } = await makeSession((pi) => {
+			pi.on("tool_call", (event) => {
+				hooks.push(`before:${event.toolName}`);
+				return "value" in event.input && event.input.value === "block"
+					? { block: true, reason: "REFUSED" }
+					: undefined;
+			});
+			pi.on("tool_result", (event) => {
+				hooks.push(`after:${event.toolName}`);
+				return { content: [{ type: "text", text: '{"value":"hook-json"}' }] };
+			});
+		});
+		const tool: AgentTool = {
+			name: "openapi.echo",
+			label: "echo",
+			description: operation.description,
+			parameters: operation.input as AgentTool["parameters"],
+			execute: async (_id, args, signal) => {
+				const value = await Effect.runPromise(
+					operation.execute(args).pipe(Effect.provideService(HttpClient.HttpClient, client)),
+					{ signal },
+				);
+				return reply(JSON.stringify(value));
+			},
+		};
+		const registry: CodemodeGeneratedTool[] = [{ tool, output: operation.output ?? Schema.Unknown }];
+		const host: CodemodeHost = {
+			callableTools: () => [],
+			generatedTools: () => registry,
+			runTool: (id, name, args, signal, extra) => session.runNestedToolCall(id, name, args, signal, extra),
+			storeEntries: () => [],
+			appendStore: () => {
+				throw new Error("unexpected store write");
+			},
+		};
+		const directBefore = session.getActiveToolNames();
+		const adapter = wrapToolDefinition(createCodemodeToolDefinition(dir, host));
+		const success = await adapter.execute("op", { code: 'await tools.openapi.echo({value:"x"})' });
+		expect(success.isError).toBe(false);
+		expect(text(success)).toContain('{"value":"hook-json"}');
+		for (const args of ["{}", '{value:"block"}']) {
+			const rejected = await adapter.execute("no", { code: `await tools.openapi.echo(${args})` });
+			expect(rejected.isError).toBe(true);
+		}
+		expect(requests).toEqual(["http://127.0.0.1:1/echo?value=x"]);
+		expect(hooks).toEqual(["before:openapi.echo", "after:openapi.echo", "before:openapi.echo"]);
+		expect(session.getActiveToolNames()).toEqual(directBefore);
+		host.excludedTools = () => [tool.name];
+		const excluded = await adapter.execute("excluded", {
+			code: 'text(ALL_TOOLS); text(search({})); try {await tools.openapi.echo({value:"x"});} catch(e) {text(e.message);}',
+		});
+		expect(excluded.isError).toBe(false);
+		expect((excluded.details as CodemodeToolDetails).calls).toEqual([]);
+		expect(text(excluded)).toContain('"items":[]');
+		expect(requests).toHaveLength(1);
+	});
+
+	it("TM-21 keeps user coordinates, producer refusal and aborted partial capture without store commits", async () => {
+		const entries: unknown[] = [];
+		const cap = await execute(
+			'store("bad",1); try { const chunk = "x".repeat(8388608); console.log(chunk,chunk); } catch(e) {} text("after");',
+			[],
+			undefined,
+			entries,
+		);
+		expect(cap.isError).toBe(true);
+		expect(text(cap)).toContain("script output exceeded");
+		expect(text(cap)).not.toContain("after");
+		expect(entries).toEqual([]);
+		const located = await execute('// @options: {}\ntext("before");\nmissing();');
+		expect(located.details.diagnostics).toMatchObject([{ location: { line: 3, column: 1 } }]);
+		const started = deferred<void>();
+		const cancelled = deferred<void>();
+		const controller = new AbortController();
+		const pending = stub("pending", async (_id, _args, signal) => {
+			started.resolve();
+			return new Promise((_resolve, reject) =>
+				signal!.addEventListener(
+					"abort",
+					() => {
+						cancelled.resolve();
+						reject(new Error("aborted"));
+					},
+					{ once: true },
+				),
+			);
+		});
+		const running = execute(
+			'text("partial"); console.log("logged"); store("bad",1); await tools.pending({value:"x"});',
+			[pending],
+			controller.signal,
+			entries,
+		);
+		try {
+			await started.promise;
+			controller.abort();
+			const aborted = await running;
+			await cancelled.promise;
+			expect(aborted.isError).toBe(true);
+			expect(text(aborted)).toContain("partial\nlogged");
+			expect(aborted.details.calls).toMatchObject([{ status: "cancelled" }]);
+			expect(entries).toEqual([]);
+		} finally {
+			controller.abort();
+			await running;
+		}
+	});
+
+	it("TM-21 cleanup TimeoutExceeded on native success cannot commit; ordinary warnings can", async () => {
+		const entries: unknown[] = [];
+		const cleanup = Deferred.makeUnsafe<void>();
+		const release = Deferred.makeUnsafe<void>();
+		const make = CodeMode.make;
+		const spy = vi.spyOn(CodeMode, "make").mockImplementation((options) => {
+			expect(options?.limits).not.toHaveProperty("maxOutputBytes");
+			const runtime = make({
+				...options,
+				tools: {
+					slow: Tool.make({
+						description: "cleanup",
+						input: Schema.Struct({}),
+						output: Schema.String,
+						execute: () =>
+							Effect.never.pipe(
+								Effect.onInterrupt(() =>
+									Effect.andThen(Deferred.succeed(cleanup, undefined), Deferred.await(release)),
+								),
+							),
+					}),
+				},
+			});
+			return {
+				...runtime,
+				execute: (code) =>
+					Effect.gen(function* () {
+						const fiber = yield* Effect.forkChild(runtime.execute(code));
+						yield* Deferred.await(cleanup);
+						yield* TestClock.adjust(20);
+						yield* Deferred.succeed(release, undefined);
+						return yield* Fiber.join(fiber);
+					}).pipe(Effect.provide(TestClock.layer())),
+			};
+		});
+		const timedOut = await execute(
+			'// @options: {"timeout_ms":10}\ntext("kept"); store("bad",1); tools.slow({}); 42',
+			[],
+			undefined,
+			entries,
+		);
+		expect(timedOut.details.diagnostics).toMatchObject([{ kind: "TimeoutExceeded" }]);
+		expect(text(timedOut)).toContain("kept\n42");
+		expect(timedOut.isError).toBe(true);
+		expect(entries).toEqual([]);
+		spy.mockImplementation((options) =>
+			make({
+				...options,
+				tools: {
+					fail: Tool.make({
+						description: "ordinary warning",
+						input: Schema.Struct({}),
+						output: Schema.String,
+						execute: () => Effect.fail(new Error("ordinary warning")),
+					}),
+				},
+			}),
+		);
+		const warning = await execute('store("good",1); tools.fail({}); 42', [], undefined, entries);
+		expect(warning.isError).toBe(false);
+		expect(warning.details.diagnostics).toMatchObject([{ kind: "ToolFailure" }]);
+		expect(entries).toEqual([{ set: { good: 1 }, delete: [] }]);
+	});
+
+	it("TM-02 native search, namespaces, pagination and aliases keep canonical effects", async () => {
+		const tools = [
+			stub("math.add", async () => reply("sum")),
+			stub("math.sub", async () => reply("difference")),
+			stub("my-tool", async () => reply("dash")),
+			stub("my_tool", async () => reply("exact")),
+			stub("search", async () => reply("Prime search")),
+		];
+		const result = await execute(
+			'text(search({namespace:"math",limit:1})); text(search({namespace:"math",offset:1,limit:1})); text(search({query:"my-tool"})); text(toolExpression("my-tool")); text(searchSignature()); text(await tools.my_tool({value:"x"})); text(await tools["my-tool"]({value:"x"})); text(await tools.search({value:"x"})); text(ALL_TOOLS.map(t=>t.name)); text(search({query:"math_add"})); await tools.math.add({value:"x"});',
+			tools,
+		);
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain('"remaining":1');
+		expect(text(result)).toContain('tools["my-tool"]');
+		expect(text(result)).toContain("exact\ndash\nPrime search");
+		expect(text(result)).not.toContain("math_add");
+		expect(result.details.calls.map((call) => call.name)).toEqual(["my_tool", "my-tool", "search", "math.add"]);
+		expect(result.details.toolCalls).toHaveLength(8);
+		const duplicate = await execute('text("no effect");', [tools[0], tools[0]]);
+		expect(duplicate.isError).toBe(true);
+		expect(text(duplicate)).toContain("Ambiguous canonical");
+		const prefix = await execute('text("no effect");', [stub("math", async () => reply("root")), tools[0]]);
+		expect(prefix.isError).toBe(true);
+		expect(prefix.details.calls).toEqual([]);
+	});
+
+	it("TM-03 returns native values and preserves user locations with bootstrap and options", async () => {
+		for (const [code, value] of [
+			["42", 42],
+			['return "explicit";', "explicit"],
+			["undefined", null],
+			["return null;", null],
+			['RegExp.escape("a+b")', "\\x61\\+b"],
+			["crypto.randomUUID().length", 36],
+		] as const) {
+			const result = await execute(code);
+			expect(result.isError).toBe(false);
+			expect(result.content.slice(1)).toEqual(value === null ? [] : [{ type: "text", text: value.toString() }]);
+		}
+		const parse = await execute("// @options: {}\nconst = ;");
+		expect(parse.isError).toBe(true);
+		expect(text(parse)).toContain("(2:");
+		const unsupported = await execute("class Example {}");
+		expect(unsupported.isError).toBe(true);
+		expect(unsupported.details.diagnostics).toMatchObject([{ kind: "UnsupportedSyntax", location: { line: 1 } }]);
+	});
+
+	it("TM-05 store copies, quotas, invalid helper inputs and timeout cannot persist failure", async () => {
+		const entries: unknown[] = [];
+		const set = await execute(
+			'store("k",{n:1}); const copy = load("k"); copy.n = 2; text(load("k")); store("max","x".repeat(262142));',
+			[],
+			undefined,
+			entries,
+		);
+		expect(set.isError).toBe(false);
+		expect(text(set)).toContain('{"n":1}');
+		expect(entries).toHaveLength(1);
+		for (const code of [
+			'store("tooBig","x".repeat(262143));',
+			"store(1,1);",
+			"load(1);",
+			'image({type:"text",text:"no"});',
+			'image("data:image/png;base64,AAAA");',
+			"describeTool(1);",
+			"toolExpression(1);",
+		]) {
+			const rejected = await execute(code, [], undefined, entries);
+			expect(rejected.isError).toBe(true);
+			expect(entries).toHaveLength(1);
+		}
+		const total = await execute('for (let i=0;i<4;i++) store(String(i),"x".repeat(262142));', [], undefined, entries);
+		expect(total.isError).toBe(true);
+		expect(text(total)).toContain("store is full");
+		const boundary: unknown[] = [];
+		const full = await execute(
+			'for(let i=0;i<4;i++) store(String(i),"x".repeat(262141)); exit();',
+			[],
+			undefined,
+			boundary,
+		);
+		expect(full.isError).toBe(false);
+		const beyond = await execute('store("extra",1);', [], undefined, boundary);
+		expect(beyond.isError).toBe(true);
+		expect(boundary).toHaveLength(1);
+		const timeout = await execute(
+			'// @options: {"timeout_ms":10}\ntext("partial"); store("bad",1); while(true) {}',
+			[],
+			undefined,
+			entries,
+		);
+		expect(timeout.isError).toBe(true);
+		expect(text(timeout)).toContain("partial");
+		expect(entries).toHaveLength(1);
+	});
+	it("TM-04 unmarked native interruption is never a successful exit", async () => {
+		const make = CodeMode.make;
+		vi.spyOn(CodeMode, "make").mockImplementation((options) => {
+			const runtime = make(options);
+			return { ...runtime, execute: (code) => Effect.andThen(runtime.execute(code), Effect.interrupt) };
+		});
+		const entries: unknown[] = [];
+		const result = await execute('text("kept"); store("bad",1);', [], undefined, entries);
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain("kept");
+		expect(entries).toEqual([]);
+	});
+	it("TM-06 producer character/item boundaries reject only the next output operation", async () => {
+		const accepted = await execute('"x".repeat(16777216)');
+		expect(accepted.isError).toBe(false);
+		expect(accepted.details).not.toHaveProperty("native");
+		expect(readFileSync(accepted.details.fullOutputPath!, "utf8")).toHaveLength(16777216);
+		const items = await execute('for(let i=0;i<100000;i++) console.log("");');
+		expect(items.isError).toBe(false);
+		const excess = await execute('for(let i=0;i<100001;i++) console.log("");');
+		expect(excess.isError).toBe(true);
+		expect(text(excess)).toContain("script output exceeded");
 	});
 });
