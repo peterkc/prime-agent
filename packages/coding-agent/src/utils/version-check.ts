@@ -71,6 +71,10 @@ function parsePackageVersion(version: string): ParsedVersion | undefined {
 	};
 }
 
+export function isForkBuild(version: string): boolean {
+	return version.includes("+fork.");
+}
+
 export function comparePackageVersions(leftVersion: string, rightVersion: string): number | undefined {
 	const left = parsePackageVersion(leftVersion);
 	const right = parsePackageVersion(rightVersion);
@@ -247,6 +251,7 @@ export async function checkForNewPiVersion(
 	currentVersion: string,
 	channel?: UpdateChannel,
 ): Promise<string | undefined> {
+	if (isForkBuild(currentVersion)) return undefined;
 	try {
 		const latestVersion = await getLatestPiVersion(currentVersion, { channel });
 		if (latestVersion && isReleaseUpdateCandidate(latestVersion, currentVersion, channel)) {

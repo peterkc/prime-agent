@@ -79,6 +79,7 @@ import { shouldUseWindowsShell } from "./utils/child-process.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
+	isForkBuild,
 	isReleaseUpdateCandidate,
 	resolveUpdateChannel,
 	type UpdateChannel,
@@ -1557,6 +1558,21 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		console.error(chalk.red(options.conflictingOptions));
 		console.error(chalk.dim(`Usage: ${getPackageCommandUsage(options.command)}`));
 		process.exitCode = 1;
+		return true;
+	}
+
+	if (
+		options.command === "update" &&
+		!options.restartCoordinator &&
+		updateTargetIncludesSelf(options.updateTarget ?? { type: "all" }) &&
+		isForkBuild(VERSION)
+	) {
+		console.error(
+			chalk.red(
+				`This is a local fork build (v${VERSION}). \`update\` would replace it with upstream Prime Agent. Rebuild the fork instead, and use \`package update\` for extensions.`,
+			),
+		);
+		setSelfUpdateAbortedExitCode();
 		return true;
 	}
 

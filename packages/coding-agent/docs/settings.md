@@ -90,7 +90,7 @@ Conversation output starts at the `chatDetail` level (default `details`). Ctrl+O
 
 Stable builds fetch the release manifest at `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json`. Beta builds fetch `beta.json` and continue following beta updates. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`.
 
-Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
+Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Fork builds skip update checks and refuse `update`. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
 
 The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 

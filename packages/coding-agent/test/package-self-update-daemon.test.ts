@@ -29,6 +29,8 @@ import {
 	runDaemonUpdateRestartCoordinator,
 } from "../src/package-manager-cli.js";
 
+vi.mock("../src/config.js", async (orig) => ({ ...(await orig<object>()), VERSION: "0.9.8" }));
+
 interface MockSessionSummary {
 	id: string;
 	activeSessionId?: string;

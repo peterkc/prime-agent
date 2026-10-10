@@ -1,0 +1,1 @@
+- Changed fork builds to refuse `update` and skip update notices, so an upstream release cannot replace them.
