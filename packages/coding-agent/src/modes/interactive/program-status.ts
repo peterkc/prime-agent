@@ -29,10 +29,9 @@ export function settledRunStatus(messages: readonly AgentMessage[]): RunStatus {
 	return { state: "idle" };
 }
 
-/** A working run waits on the user while a dialog is open; other states stand. */
+/** An open dialog waits on the user, whether a run or a command opened it; otherwise the status stands. */
 export function withOpenDialog(status: RunStatus, dialogTitle: string | undefined): RunStatus {
-	if (status.state !== "working" || dialogTitle === undefined) return status;
-	return { state: "blocked", msg: dialogTitle };
+	return dialogTitle === undefined ? status : { state: "blocked", msg: dialogTitle };
 }
 
 export function formatProgramStatus(status: RunStatus): string {

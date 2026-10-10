@@ -1368,7 +1368,8 @@ export class SettingsManager {
 	}
 
 	getProgramStatus(): boolean {
-		return this.settings.terminal?.programStatus ?? true;
+		const enabled = this.settings.terminal?.programStatus;
+		return typeof enabled === "boolean" ? enabled : true;
 	}
 
 	setShowTerminalProgress(enabled: boolean): void {

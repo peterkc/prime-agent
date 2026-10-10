@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { APP_NAME } from "../src/config.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import {
@@ -8,6 +8,7 @@ import {
 	settledRunStatus,
 	withOpenDialog,
 } from "../src/modes/interactive/program-status.js";
+import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function parse(report: string): Record<string, string> {
 	expect(report.startsWith("\x1b]7501;") && report.endsWith("\x1b\\")).toBe(true);
@@ -46,22 +47,12 @@ describe("OSC 7501 program status", () => {
 		expect(settledRunStatus([assistant("aborted")])).toEqual({ state: "idle" });
 		expect(settledRunStatus([])).toEqual({ state: "idle" });
 		expect(withOpenDialog({ state: "working" }, "Pick")).toEqual({ state: "blocked", msg: "Pick" });
-		expect(withOpenDialog({ state: "done" }, "Pick")).toEqual({ state: "done" });
+		expect(withOpenDialog({ state: "done" }, "Pick")).toEqual({ state: "blocked", msg: "Pick" });
 		expect(withOpenDialog({ state: "working" }, undefined)).toEqual({ state: "working" });
 	});
 
 	test("reports a working run as waiting while a dialog is open, writing each change once", async () => {
-		const write = vi.fn();
-		let enabled = true;
-		const mode = {
-			runStatus: { state: "idle" },
-			openDialogTitles: [],
-			programStatusStopped: false,
-			settingsManager: { getProgramStatus: () => enabled },
-			ui: { terminal: { write } },
-		} as any;
-		Object.setPrototypeOf(mode, InteractiveMode.prototype);
-		const reports = () => write.mock.calls.map(([report]) => parse(report).state);
+		const { mode, reports, write, settings } = fakeMode();
 		mode.setRunStatus({ state: "working" });
 		mode.setRunStatus({ state: "working" });
 		let answer!: (value: string) => void;
@@ -72,8 +63,86 @@ describe("OSC 7501 program status", () => {
 		mode.reportProgramStatus(true);
 		mode.setRunStatus({ state: "done" });
 		expect(reports()).toEqual(["working", "blocked", "working", "working", "done"]);
-		enabled = false;
+		settings.enabled = false;
 		mode.setRunStatus({ state: "working" });
 		expect(write).toHaveBeenCalledTimes(5);
 	});
+
+	test("settles runs, retries and compactions from their events", async () => {
+		const { mode, reports, event } = fakeMode();
+		const toolTurn = [assistant("toolUse"), { role: "toolResult", isError: true } as unknown as AgentMessage];
+		await event({ type: "agent_start" });
+		await event({ type: "agent_end", messages: toolTurn });
+		await event({ type: "agent_start" });
+		mode.streaming = true;
+		mode.interruptOrClearInput();
+		await event({ type: "agent_end", messages: toolTurn });
+		mode.streaming = false;
+		await event({ type: "agent_start" });
+		await event({ type: "auto_retry_start", delayMs: 1000 });
+		await event({ type: "auto_retry_end", success: false, finalError: "overloaded" });
+		await event({ type: "auto_retry_start", delayMs: 1000 });
+		mode.retryAttempt = 1;
+		mode.interruptOrClearInput();
+		await event({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" });
+		mode.setRunStatus({ state: "done" });
+		await event({ type: "compaction_start", reason: "threshold" });
+		await event({ type: "compaction_end", aborted: false, result: {} });
+		await event({ type: "compaction_start", reason: "manual" });
+		await event({ type: "compaction_end", errorMessage: "Compaction failed", errorSeverity: "error" });
+		const states = "working done working idle working error working idle done working done working error";
+		expect(reports().join(" ")).toBe(states);
+	});
+
+	test("takes the status from snapshots, drops reset dialogs, and writes nothing without a terminal", async () => {
+		const { mode, reports, write } = fakeMode();
+		mode.syncRunStatus({ isStreaming: true });
+		void mode.whileDialogOpen("Lost", new Promise(() => {}));
+		mode.resetExtensionUI();
+		mode.syncRunStatus({ isStreaming: false, isCompacting: false });
+		expect(reports()).toEqual(["working", "blocked", "working", "idle"]);
+		setStdoutTTY(false);
+		mode.setRunStatus({ state: "working" });
+		setStdoutTTY(true);
+		proto.stop.call(mode);
+		mode.setRunStatus({ state: "done" });
+		expect(write.mock.calls.slice(4)).toEqual([[PROGRAM_STATUS_CLEAR]]);
+	});
+});
+
+/** Runs InteractiveMode's own status code on a stand-in; members a test does not set do nothing. */
+function fakeMode() {
+	initTheme("dark");
+	setStdoutTTY(true);
+	const write = vi.fn();
+	const settings = { enabled: true };
+	const ignore: any = new Proxy(() => {}, {
+		get: (_target, key) =>
+			key === "then" ? undefined : key === Symbol.iterator ? () => [][Symbol.iterator]() : ignore,
+		apply: () => ignore,
+	});
+	const own = new Set(["handleEvent", "setRunStatus", "reportProgramStatus", "syncRunStatus", "whileDialogOpen"]);
+	const fields: Record<string | symbol, unknown> = {
+		...{ runStatus: { state: "idle" }, openDialogs: [], programStatusStopped: false, runAbortRequested: false },
+		...{ isInitialized: true, streaming: false, retryAttempt: 0, statusBeforeCompaction: { state: "idle" } },
+		settingsManager: { getProgramStatus: () => settings.enabled, getShowTerminalProgress: () => false },
+		ui: Object.setPrototypeOf({ terminal: { write } }, ignore),
+		isAgentStreaming: () => fields.streaming,
+		getRetryAttempt: () => fields.retryAttempt,
+		...{ startCompactionLoader: proto.startCompactionLoader, interruptOrClearInput: proto.interruptOrClearInput },
+		...{ resetExtensionUI: proto.resetExtensionUI, extensionSelector: undefined, extensionInput: undefined },
+	};
+	const mode: any = new Proxy(fields, {
+		get: (target, key) => (key in target ? target[key] : own.has(key as string) ? proto[key as string] : ignore),
+	});
+	const reports = () => write.mock.calls.map(([report]) => parse(report).state);
+	return { mode, reports, write, settings, event: (e: object) => mode.handleEvent(e) };
+}
+
+const proto = InteractiveMode.prototype as unknown as Record<string, any>;
+const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+const setStdoutTTY = (value: boolean) => Object.defineProperty(process.stdout, "isTTY", { value, configurable: true });
+afterEach(() => {
+	if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+	else Reflect.deleteProperty(process.stdout, "isTTY");
 });

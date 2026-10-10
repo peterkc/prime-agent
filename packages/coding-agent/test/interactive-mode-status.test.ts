@@ -344,6 +344,7 @@ describe("InteractiveMode connection events", () => {
 	function createResyncHarness(overrides: Record<string, any> = {}): Record<string, any> {
 		const fakeThis: Record<string, any> = {
 			applyConnectionStateSnapshot: vi.fn(),
+			syncRunStatus: vi.fn(),
 			refreshQueueSelectionFromState: vi.fn(),
 			restoreTurnStartFromMessages: vi.fn(),
 			replaceSubagentSummary: vi.fn(),
