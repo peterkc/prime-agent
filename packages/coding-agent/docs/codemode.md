@@ -3,7 +3,7 @@
 `codemode` runs JavaScript that calls the session's active tools. Only the script's output reaches the model.
 
 ```text
-model -> codemode {code} -> fresh QuickJS worker
+model -> codemode {code} -> fresh in-process AST interpreter
                             tools.name(args)
                                    |
                      host argument checks and before/after hooks
@@ -16,10 +16,13 @@ model -> codemode {code} -> fresh QuickJS worker
 JavaScript only. The code is an async function body, so top-level `await` and `return` work.
 
 ```js
-const reply = await tools.ipython({code: "print(6*7)"});
-text(reply);
+const matches = search({query: "echo"});
+text(matches);
+text(await tools.echo({value: "hello"}));
 store("lastAnswer", 42);
 ```
+
+Use this example only when the session has an active `echo` tool. For a single call, call `echo` directly.
 
 The tool is active by default with `ipython`. Set `"codemode": false` in global or project settings to remove it from defaults. Set `"codemodeExcludeTools": ["name", ...]` to keep named tools out of scripts: they are absent from `ALL_TOOLS` and `describeTool()`, and calling them fails as an unknown tool. Use it for tools that need their own turn or a guarded, visible action.
 An explicit CLI `--tools` or SDK tool list decides alone. For example, `--tools ipython` excludes it.
@@ -50,39 +53,96 @@ Name: `codemode`. Schema:
 Description (exact text):
 
 <!-- description:start -->
-Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, network, process, or timers.
-- Use codemode only to call several typed tools that ipython cannot reach, such as beads, pr_inspect or ask_jev, in parallel or in a chain, when only a filtered result should reach the context. For one call, call the tool directly. For files, shell, Python skills, MCP servers or state that must last between calls, use ipython; do not wrap tools.ipython in codemode only to run Python.
-- Every other tool you can call is also tools.<name>(args), with the same arguments. It returns its text joined with newlines, or rejects with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
-- Use Promise.allSettled for independent calls, chain calls, or filter large results. Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
-- text(value), console.log/info/warn/error/debug(...), and return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
+Run JavaScript that calls other tools. Pass {code: "..."} with raw JavaScript as the body of an async function; top-level await and return work. No Node, file system, process, timers or ambient network access. Configured OpenAPI tools may make approved HTTP calls.
+- Every other tool you can call is also tools.<name>(args), with the same arguments. Ordinary tools return their text joined with newlines; configured OpenAPI tools return structured JSON. Failed calls reject with an Error carrying the tool's error text. Only active tools are callable; codemode cannot call itself, and tools named in the codemodeExcludeTools setting are not callable. Use tools["my-tool"] or tools.my_tool for non-identifier names.
+- Sequential tools such as ipython run one at a time. Calls still running or queued when the script ends are cancelled; completed effects are not undone.
+- text(value), console.log/info/warn/error/debug/dir/table(...), and final expressions or return add output in order. image(dataUrlOrImageBlock) adds a PNG, JPEG, GIF, or WebP image; remote URLs are rejected. exit() completes immediately and keeps output and store writes.
 - store(key, value) and load(key) keep JSON values on the current session branch. store(key, undefined) deletes a key; missing keys load as undefined. Only completed scripts persist writes.
 - ALL_TOOLS lists names and TypeScript declarations. await describeTool(name) returns a declaration. Python skills and MCP servers stay reachable through ipython, not as direct tools.
-- Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000}. max_output_tokens is a non-negative safe integer (default 10000, 4 characters per token); timeout_ms is an integer from 1 to 2147483647 (default none). Unknown fields are rejected.
-- The budget applies only to user text; over budget it keeps the head and tail and spills the full text to a temp file. Failure keeps partial output and a list of calls already made. Each run is fresh, with a 256 MiB guest heap, 16777216 output characters, 100000 output items, 262144 JSON characters per store value, and 1048576 total store characters (keys plus values). These do not bound host process memory or tool results.
+- Optional first line: // @options: {"max_output_tokens": 10000, "timeout_ms": 60000, "max_tool_calls": 100}. max_output_tokens is a non-negative safe integer (default 10000, 4 characters per token); timeout_ms is an integer from 1 to 2147483647 (default none); max_tool_calls is a non-negative safe integer (default unlimited), including native search. Unknown fields, including max_output_bytes, are rejected.
+- The budget applies only to user text; over budget it keeps the head and tail and spills the full text to a temp file. Failure keeps partial output and a list of calls already made. Each run uses a fresh in-process interpreter, with no heap cap, 16777216 output characters, 100000 output items, 262144 JSON characters per store value, and 1048576 total store characters (keys plus values). These do not bound host process memory, tool results or synchronous regex steps. search({query}) looks up an exact tool path and search({namespace, limit, offset}) browses a namespace; results include schema-backed signatures. describeTool(name), toolExpression(path), and searchSignature() describe call syntax. Script output also includes diagnostics and warnings.
 <!-- description:end -->
+
+## Native tool-use guidance
+
+The native system prompt includes these ordered guidelines only while the corresponding tool is active. Custom system prompts retain their existing rendering contract.
+
+Codemode:
+
+<!-- codemode-guidelines:start -->
+```json
+[
+  "Use codemode for chains or parallel calls to typed tools that Python cannot reach, when only a filtered result should reach the context.",
+  "Filter large results before returning them to the model.",
+  "Use Promise.allSettled for independent calls; chain dependent calls with await.",
+  "For one tool call, call the tool directly.",
+  "Do not wrap tools.ipython in codemode only to run Python.",
+  "Call search({query}) to look up an exact tool path, or search({namespace, limit, offset}) to browse a namespace; results include schema-backed signatures.",
+  "toolExpression(path) and searchSignature() describe the call syntax.",
+  "Configured OpenAPI operations are codemode-only tools. Use their structured JSON results."
+]
+```
+<!-- codemode-guidelines:end -->
+
+Ipython:
+
+<!-- ipython-guidelines:start -->
+```json
+[
+  "Use ipython for files, shell commands, Python skills, MCP servers, data analysis, long-running work, and state that must last across calls.",
+  "Orchestrate tools and resources reachable through Python in ipython.",
+  "Call typed tools that Python cannot reach directly.",
+  "Run project imports, tests, scripts, CLIs, and dependency checks through the target project's own environment, not by importing the project into the kernel."
+]
+```
+<!-- ipython-guidelines:end -->
 
 ## Script semantics and limits
 
-- Each run has a fresh sandbox. It exposes `tools`, `text`, `console.log/info/warn/error/debug`, `image`, `exit`, `store`, `load`, `ALL_TOOLS`, and `describeTool`.
-- There is no file system, network, process, timer, `models`, or `searchTools` API. `eval` and `Function` only run inside the same VM.
-- A name absent from `ALL_TOOLS` (unknown, inactive, or `codemode`) throws a synchronous `TypeError` at member access, before any call starts. No tool runs. `Promise.allSettled` cannot catch this throw while its input array is being built.
-- `tools.name(args)` takes the direct tool's arguments after a JSON round trip. Results resolve to joined text. Failed calls reject with an `Error` carrying the tool's error text.
-- Non-identifier names support both `tools["my-tool"]` and `tools.my_tool`. `ALL_TOOLS` lists identifier names and declarations from `pi-codemode/declarations`. `await describeTool(name)` returns the same declaration, or `undefined` for a missing name.
-- An optional first line is `// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}`. Invalid JSON, unknown fields, empty source, and an options line without code fail before execution.
-- `timeout_ms` is an integer from 1 to 2,147,483,647. Its default is no deadline, implemented with `Number.POSITIVE_INFINITY`, not the package's 300,000 ms default. The timeout also stops CPU loops.
-- `max_output_tokens` is a non-negative safe integer, default 10000. Four characters estimate one token. The budget covers joined user text only, not the header or failure block.
-- Item 1 is `Script completed` or `Script failed`, then `Wall time <s> seconds` and `Output:`. `text()`, `console.*`, and `return` text stays in output order, joined with newlines. Images follow the text.
+- Each run has fresh lexical state in `@opencode/codemode@2.0.26`'s AST interpreter. It exposes `tools`, native `search`, `text`, `console.log/info/warn/error/debug/dir/table`, `image`, `exit`, `store`, `load`, `ALL_TOOLS`, `describeTool`, `toolExpression`, and `searchSignature`.
+- User code cannot redeclare the lexical prelude names `ALL_TOOLS` or `console`.
+- There is no ambient file system, network, process, timer, `models`, or `searchTools` API. `eval`, `Function`, `globalThis` and unsupported JavaScript syntax, including classes, do not carry over from QuickJS. The interpreter supports a JavaScript subset, not a general JavaScript VM.
+- Native `search({})` browses the callable catalog. `search({query:"echo"})` looks up an exact path. `search({namespace:"math",limit:1,offset:1})` browses a namespace with pagination. Results carry callable paths and schema-backed signatures. `toolExpression(path)` returns callable source; `searchSignature()` describes search arguments.
+- Unknown, inactive, excluded and recursive tools are unavailable. Native diagnostics replace QuickJS's synchronous member-access `TypeError` contract. A missing tool call can be caught in script code; its diagnostic names the unknown tool, and no checked call starts.
+- `tools.name(args)` takes the direct tool's arguments after JSON conversion and host validation. Ordinary tools resolve to joined text. Configured OpenAPI operations resolve to structured JSON after the result hooks; a non-JSON hook result fails visibly. Failed calls reject with a tool error.
+- Canonical dotted identifier paths form namespaces without underscore aliases. Non-identifier names support `tools["my-tool"]` and an unambiguous sanitized alias such as `tools.my_tool`. Canonical names take precedence; ambiguous aliases are omitted. Duplicate or prefix-conflicting canonical registrations fail before effects. `ALL_TOOLS` lists callable paths and native declarations. `await describeTool(name)` returns a declaration, or `undefined` for a missing name.
+- An optional first line is `// @options: {"max_output_tokens": 10000, "timeout_ms": 60000, "max_tool_calls": 100}`. Invalid JSON, unknown fields (including `max_output_bytes`), empty source, and an options line without code fail before execution.
+- `timeout_ms` is an integer from 1 to 2,147,483,647; the default is no deadline. Native cancellation bounds asynchronous work and interpreter loops. Synchronous regular expressions cannot be preempted. `max_tool_calls` is a non-negative safe integer, default unlimited, and counts native search as well as tools. Helpers such as `text` do not count.
+- `max_output_tokens` is a non-negative safe integer, default 10000. Four characters estimate one token. The budget covers joined user text only, not the header, diagnostics, skipped operations or failure block. Prime does not configure the native output-byte limit.
+- Item 1 is `Script completed` or `Script failed`, then `Wall time <s> seconds` and `Output:`. `text()`, `console.*`, final expressions and explicit `return` add output in order, joined with newlines. Only non-null final values add output; scripts without a completion value and explicit `return null` add nothing. Images follow the text. Diagnostics and tool-call metadata also appear in `details`; the native value does not.
 - Over budget, user text keeps the first half and last half of the character budget. With zero, only the truncation notice remains. The full user text goes to a temp file. The notice names `[Full output: <path>]`, and `details.fullOutputPath` holds it.
 - If spilling fails, no path is advertised. The notice says `[Could not save the full output: <error>]`. The output and failure block remain.
-- A failed script has `isError: true`. Its final text item starts `Script error:` and includes the error, then `Calls already made (not undone):` and one name/status line per call. The header and this block are never truncated.
+- A failed script has `isError: true`. Its final text item starts `Script error:` and includes the native diagnostic or host error, then `Calls already made (not undone):` and one name/status line per call. The header and this block are never truncated. Successful native warnings remain visible as `Script warnings:`. A `TimeoutExceeded` cleanup warning still fails the script and prevents store writes.
 - `image()` accepts a base64 `data:` URL, `{image_url}`, or an MCP block `{type:"image",data,mimeType}` for PNG, JPEG, GIF, and WebP. Remote `http(s)` URLs are rejected. Images become image content and are not saved to files.
-- `exit()` completes immediately, keeping output and store writes. `store(key, undefined)` deletes a key. Missing keys load as `undefined`. Loaded values are copies.
-- The guest heap is 256 MiB. This does not bound process memory, tool results, host call records, or queued calls. The sandbox is a capability boundary in the same OS process, not an OS security boundary.
-- Script output is at most 16,777,216 characters (text plus base64 image data) and 100,000 output items. Store values are at most 262,144 JSON characters each. Store keys plus serialized values total at most 1,048,576 characters.
+- `exit()` stops immediately, including catch/finally and queued work, keeping output and store writes. `store(key, undefined)` deletes a key. Missing keys load as `undefined`. Loaded values are copies. Failure, timeout and external abort never persist writes.
+- There is no heap cap. The interpreter runs in the host OS process and is not an OS security boundary. Output limits do not bound host memory, tool results, host call records or synchronous regex steps.
+- Script output is at most 16,777,216 characters (text plus base64 image data) and 100,000 output items. Store values are at most 262,144 JSON characters each. Store keys plus serialized values total at most 1,048,576 characters. Exceeding a producer limit fails before appending that item and prevents a store commit.
 
-Differences from pi's adapter at `6fb2e781`: only active tools are callable; there is no tool-search/loadout/model API; all nested results are text; output keeps console order; failure text is outside the budget; images are not saved; the fork retains aborted partial results for up to 5000 ms.
+Node requires version 24.0.0 or later. The compiled binary uses Bun 1.4.0. Neither runtime needs a codemode WASM asset or worker. The host retains the fork's checked hooks, branch store, text budgeting, image output, call records and 5000 ms aborted-result grace period.
 
-pi-codemode 1.1.0's unknown-tool error text mentions `searchTools(query)`. This fork does not provide that API.
+## OpenAPI operations
+
+Configure a local OpenAPI 3.x JSON or YAML document in global or project settings:
+
+```json
+{
+  "codemodeOpenAPI": [{
+    "name": "service",
+    "specFile": "./openapi.yaml",
+    "baseUrl": "https://api.example.com",
+    "headersFromEnv": {"x-client": "SERVICE_CLIENT"},
+    "authFromEnv": {"bearerAuth": {"type": "bearer", "tokenEnv": "SERVICE_TOKEN"}}
+  }]
+}
+```
+
+Relative `specFile` paths resolve from the directory containing the declaring settings file. A project array replaces the global array, including an empty array. The catalog is snapshotted at each script's start; changes take effect next run. Invalid settings or specs fail before execution, without a partial catalog. Only local-document `$ref` references are allowed.
+
+Operations appear under `tools.openapi.service.<operation>` and native namespace search. They are not direct model-active tools. Native skipped operations remain visible in the result. `codemodeExcludeTools` also applies to generated canonical names. Argument validation and the session's before/after hooks apply to every admitted call; a hook refusal starts no HTTP request.
+
+`baseUrl` approves one exact final origin. Use HTTPS, or explicitly configured loopback HTTP. Spec servers cannot retarget it. Userinfo, authority escapes and redirects are refused; writes are not retried. Already-admitted network effects are not undone by later failure or cancellation.
+
+Settings contain environment variable names, never credential values. Values resolve only inside the checked host executor. `authFromEnv` keys name declared security schemes. Mappings support `bearer` (`tokenEnv`), `apiKey` (`valueEnv`), `basic` (`usernameEnv`, `passwordEnv`), and `header` (`name`, `valueEnv`). Default headers do not overwrite explicit/native headers. Missing environment values fail before a request. The host redacts configured credentials from visible values and errors and disables HTTP tracing. Do not pass credentials in script arguments or embed them in specs.
 
 ## Language-neutral host protocol
 
@@ -108,10 +168,10 @@ Its successful text reply resolves to `"42"`. The script result is:
 Call records hold `id`, `name`, compact JSON `args` cut to 200 characters, `status`, `durationMs`, and optional `error` cut to 500.
 Status is `running` during updates, then `ok`, `error`, or `cancelled`. IDs start at `<parent>/1` for each run.
 
-Error:
+Error (the diagnostic text depends on the native failure):
 
 ```json
-{"content":[{"type":"text","text":"Script failed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"partial output"},{"type":"text","text":"Script error:\nError: permission denied\nCalls already made (not undone):\necho (error)"}],"details":{"calls":[{"id":"outer/1","name":"echo","args":"{}","status":"error","durationMs":12,"error":"permission denied"}]},"isError":true}
+{"content":[{"type":"text","text":"Script failed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"partial output"},{"type":"text","text":"Script error:\n<native diagnostic>\nCalls already made (not undone):\necho (error)"}],"details":{"calls":[{"id":"outer/1","name":"echo","args":"{}","status":"error","durationMs":12,"error":"permission denied"}]},"isError":true}
 ```
 
 Unknown, inactive, invalid, blocked, or recursive calls never execute. Completed effects are not undone if later code fails.
@@ -134,7 +194,7 @@ Timeout and output limit requests:
 {"code":"// @options: {\"max_output_tokens\":0}\ntext(\"large output\"); throw new Error(\"visible\");"}
 ```
 
-Timeout returns `isError: true` with `Script timeout: Execution timed out after 100 ms` in the failure block.
+Timeout returns `isError: true` with `Script timeout: <native TimeoutExceeded message>` in the failure block.
 The zero-budget example still returns the complete failure block and a full-output file or a visible spill error.
 
 ## Store format and older readers
@@ -155,5 +215,5 @@ The daemon protocol is unchanged. Call records stay in the codemode result's `de
 
 [`test/fixtures/codemode/cases.jsonl`](../test/fixtures/codemode/cases.jsonl) has one JSON object per line.
 Each names the script, stubbed tool replies, expected text/image output, error status, and nested name/status records.
-The TS tests execute every case with the real sandbox. Session-hook, branch, sequential-queue, setting, and outer-abort cases live in `test/codemode.test.ts`.
+The TS tests execute every case with the real interpreter. Session-hook, branch, sequential-queue, setting, and outer-abort cases live in `test/codemode.test.ts`.
 The adapter follows pi `packages/coding-agent/src/extensions/codemode/execute.ts`, `tool.ts`, and `renderer.ts` at commit `6fb2e781` (MIT).

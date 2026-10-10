@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { homedir } from "os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
-	const testDir = join(process.cwd(), "test-settings-tmp");
+	const testDir = mkdtempSync(join(tmpdir(), "prime-settings-test-"));
 	const agentDir = join(testDir, "agent");
 	const projectDir = join(testDir, "project");
 	const globalPath = join(agentDir, "settings.json");
@@ -81,6 +81,7 @@ describe("SettingsManager", () => {
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.drainErrors().map((entry) => entry.scope)).toEqual([scope]);
+			expect(() => manager.getCodemodeOpenAPI()).toThrow("settings failed to parse");
 			expect(manager.drainErrors()).toEqual([]);
 
 			mutate(manager);
@@ -101,6 +102,7 @@ describe("SettingsManager", () => {
 			await manager.reload();
 
 			expect(manager.getTheme()).toBe("dark");
+			expect(() => manager.getCodemodeOpenAPI()).toThrow("settings failed to parse");
 		});
 
 		it("drains errors per scope", () => {
@@ -174,6 +176,32 @@ describe("SettingsManager", () => {
 			writeSettings(projectPath, project);
 
 			expect(read(SettingsManager.create(projectDir, agentDir))).toEqual(expected);
+		});
+	});
+
+	describe("codemode OpenAPI source precedence", () => {
+		it.each(["global", "project", "empty"])("keeps the %s settings directory with the winning array", (scope) => {
+			const global = [{ name: "global", specFile: "global.json", baseUrl: "https://example.invalid" }];
+			const project =
+				scope === "empty"
+					? []
+					: [{ name: "project", specFile: "project.yaml", baseUrl: "https://example.invalid" }];
+			writeSettings(globalPath, { codemodeOpenAPI: global });
+			writeSettings(projectPath, scope === "global" ? {} : { codemodeOpenAPI: project });
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getCodemodeOpenAPI()).toEqual({
+				entries: scope === "global" ? global : project,
+				directory: scope === "global" ? agentDir : join(projectDir, ".prime", "agent"),
+			});
+			expect(manager.getGlobalSettings().codemodeOpenAPI).toEqual(global);
+		});
+		it("preserves malformed entries for visible run-boundary refusal and accepts empty overrides", () => {
+			writeSettings(globalPath, { codemodeOpenAPI: "invalid" });
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getCodemodeOpenAPI().entries).toBe("invalid");
+			manager.applyOverrides({ codemodeOpenAPI: [] });
+			expect(manager.getCodemodeOpenAPI()).toEqual({ entries: [], directory: undefined });
+			expect(SettingsManager.inMemory().getCodemodeOpenAPI().entries).toBeUndefined();
 		});
 	});
 

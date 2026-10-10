@@ -6,6 +6,7 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
+import type { CodemodeOpenAPIEntry, CodemodeOpenAPISettings } from "./tools/codemode-openapi.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -240,6 +241,7 @@ export interface Settings {
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	codemode?: boolean;
+	codemodeOpenAPI?: readonly CodemodeOpenAPIEntry[];
 	codemodeExcludeTools?: string[]; // Tool names that codemode scripts cannot call, such as tools that need their own turn
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
@@ -309,6 +311,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
+	getDirectory?(scope: SettingsScope): string;
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
 }
 
@@ -324,6 +327,10 @@ export class FileSettingsStorage implements SettingsStorage {
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+	}
+
+	getDirectory(scope: SettingsScope): string {
+		return dirname(scope === "global" ? this.globalSettingsPath : this.projectSettingsPath);
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -1148,6 +1155,21 @@ export class SettingsManager {
 
 	getCodemode(): boolean {
 		return this.settings.codemode ?? true;
+	}
+
+	getCodemodeOpenAPI(): CodemodeOpenAPISettings {
+		if (this.globalSettingsLoadError || this.projectSettingsLoadError)
+			throw new Error("codemodeOpenAPI settings failed to parse; fix the settings file before execution");
+		const source =
+			this.runtimeOverrides.codemodeOpenAPI !== undefined
+				? undefined
+				: this.projectSettings.codemodeOpenAPI !== undefined
+					? "project"
+					: "global";
+		return {
+			entries: structuredClone(this.settings.codemodeOpenAPI),
+			directory: source ? this.storage.getDirectory?.(source) : undefined,
+		};
 	}
 
 	getCodemodeExcludeTools(): readonly string[] {

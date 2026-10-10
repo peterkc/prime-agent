@@ -417,16 +417,6 @@ export function getExportTemplateDir(): string {
 	return join(packageDir, srcOrDist, "core", "export-html");
 }
 
-// The Bun entry supplies the embedded assets. Node uses the installed package's defaults.
-let runtimeAssets: { wasmPath: string; workerUrl: string } | undefined;
-export function setCodemodeRuntimeAssets(wasmPath: string, workerUrl: string): void {
-	runtimeAssets = { wasmPath, workerUrl };
-}
-
-export function getCodemodeRuntimeAssets(): { wasmPath: string; workerUrl: string } | undefined {
-	return runtimeAssets;
-}
-
 /** Get path to package.json */
 export function getPackageJsonPath(): string {
 	return join(getPackageDir(), "package.json");
