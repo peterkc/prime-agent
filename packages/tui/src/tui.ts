@@ -832,8 +832,9 @@ export class TUI extends Container {
 	 * so content produced while fullscreen flows into native scrollback.
 	 */
 	exitFullscreen(options: ExitFullscreenOptions = {}): void {
+		const wasFullscreen = this.fullscreen !== null;
 		this.exitFullscreenInternal(options);
-		this.notifyRenderMode();
+		if (wasFullscreen) this.notifyRenderMode();
 	}
 
 	private exitFullscreenInternal(options: ExitFullscreenOptions): void {

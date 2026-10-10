@@ -396,6 +396,7 @@ it("reports completed settles, never pending or stopped rendering", (t) => {
 	h.terminal.event({ ev: "error", sf: "prime", msg: "failed" });
 	assert.equal(h.tui.getRenderMode(), "ansi");
 	h.tui.exitFullscreen({ flush: false });
+	h.tui.exitFullscreen({ flush: false });
 	assert.equal(h.tui.getRenderMode(), "ansi");
 	assert.deepEqual(modes, ["native", "native", "ansi", "ansi"]);
 });
