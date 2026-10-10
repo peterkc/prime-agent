@@ -121,6 +121,7 @@ export {
 	setCellDimensions,
 	type TerminalCapabilities,
 } from "./terminal-image.js";
+export { notificationsSuppressed, type TerminalNotification } from "./terminal-notify.js";
 export {
 	type Component,
 	Container,

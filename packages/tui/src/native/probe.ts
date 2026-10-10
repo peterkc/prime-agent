@@ -56,6 +56,7 @@ export class NativeProbe {
 	private probeTimer?: ReturnType<typeof setTimeout>;
 	private flushTimer?: ReturnType<typeof setTimeout>;
 	private reading = false;
+	private awaitingSentinel = false;
 
 	get state(): NativeState {
 		return this.outcome;
@@ -79,6 +80,7 @@ export class NativeProbe {
 			return;
 		}
 		this.outcome = { kind: "pending" };
+		this.awaitingSentinel = true;
 		this.probeTimer = setTimeout(() => this.end(), 1000);
 		write(
 			Buffer.from(encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } })).toString("utf8"),
@@ -88,7 +90,7 @@ export class NativeProbe {
 
 	feed(text: string): void {
 		this.clearFlushTimer();
-		if (this.outcome.kind === "off" || this.outcome.kind === "unprobed") {
+		if ((this.outcome.kind === "off" && !this.awaitingSentinel) || this.outcome.kind === "unprobed") {
 			this.keys?.(text);
 			return;
 		}
@@ -118,6 +120,7 @@ export class NativeProbe {
 	stop(): void {
 		if (this.outcome.kind === "pending") this.end();
 		else this.flush();
+		this.awaitingSentinel = false;
 		this.keys = undefined;
 		this.event = undefined;
 	}
@@ -152,7 +155,13 @@ export class NativeProbe {
 					}
 					break;
 				case "da1":
-					if (this.outcome.kind === "pending") this.end();
+					if (this.awaitingSentinel) {
+						this.awaitingSentinel = false;
+						if (this.outcome.kind === "pending") this.end();
+					} else {
+						// InputParser discards DA1 attributes; downstream probes only need the sentinel.
+						this.keys?.("\x1b[?c");
+					}
 					break;
 				case "event":
 					if (this.outcome.kind === "available") this.event?.(item.event);

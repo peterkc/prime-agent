@@ -302,8 +302,25 @@ available, authenticated model, the bounded wait runs instead.
 | `terminal.showImages` | boolean | `true` | Show image type and dimensions in terminal |
 | `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
 | `terminal.programStatus` | boolean | `true` | Report working, waiting on you, done or failed to the terminal with [OSC 7501](https://mitchellh.com/writing/program-status-osc7501), for tab icons and inboxes such as Tern's |
+| `terminal.notifyOnCompletion` | boolean | `true` | Send a desktop notification when an agent turn finishes |
+| `terminal.notifyOnError` | boolean | `true` | Send a desktop notification when a turn fails after automatic retries |
+| `terminal.notifyOnInput` | boolean | `true` | Send a desktop notification when a working agent opens an input dialog |
 | `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
+
+Notifications use the terminal's OSC 9 or OSC 99 protocol, or BEL for other terminals.
+Tmux uses DCS passthrough plus BEL. Zellij receives OSC plus BEL.
+On Linux, BEL also uses `notify-send`, or `gdbus` if `notify-send` is unavailable, when a desktop session bus exists.
+Set `PI_NOTIFICATIONS=off`, `0`, or `false` to disable all notifications.
+Set `PI_NO_DESKTOP_NOTIFY=1` to disable only the Linux desktop fallback.
+
+Tern receives no notifications while `terminal.programStatus` is on because OSC 7501 already signals run status.
+When it is off, Tern receives only input notifications.
+Warp receives no completion or error notifications while its CLI-agent protocol is active.
+Notifications require a stdout TTY. Idle command dialogs and client-cancelled runs do not notify.
+Error notifications wait for an active session action or retry chain to settle.
+An initial error outside an active session action notifies immediately; an automatic retry could still follow in that case.
+An active-to-active action snapshot can drop a pending error notification. Quota-park heartbeat failures can each notify.
 
 ### Shell
 

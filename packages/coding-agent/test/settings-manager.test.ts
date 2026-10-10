@@ -25,6 +25,32 @@ describe("SettingsManager", () => {
 	const readSettings = (path: string): Record<string, unknown> =>
 		JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 
+	it("notification settings default on, reject non-booleans, and persist independently", async () => {
+		writeSettings(globalPath, { terminal: { notifyOnCompletion: "off", notifyOnError: 0, notifyOnInput: false } });
+		writeSettings(projectPath, { terminal: { notifyOnCompletion: false } });
+		const manager = SettingsManager.create(projectDir, agentDir);
+		expect([manager.getNotifyOnCompletion(), manager.getNotifyOnError(), manager.getNotifyOnInput()]).toEqual([
+			false,
+			true,
+			false,
+		]);
+		manager.setNotifyOnCompletion(true);
+		manager.setNotifyOnError(false);
+		manager.setNotifyOnInput(true);
+		await manager.flush();
+		expect(readSettings(globalPath).terminal).toEqual({
+			notifyOnCompletion: true,
+			notifyOnError: false,
+			notifyOnInput: true,
+		});
+		const defaults = SettingsManager.inMemory();
+		expect([defaults.getNotifyOnCompletion(), defaults.getNotifyOnError(), defaults.getNotifyOnInput()]).toEqual([
+			true,
+			true,
+			true,
+		]);
+	});
+
 	describe("on-disk settings file", () => {
 		it("preserves keys it does not own, including ones written after load", async () => {
 			writeSettings(globalPath, { theme: "dark", defaultModel: "claude-sonnet" });

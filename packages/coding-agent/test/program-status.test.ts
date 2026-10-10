@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { APP_NAME } from "../src/config.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import {
@@ -144,14 +144,33 @@ function fakeMode() {
 			key === "then" ? undefined : key === Symbol.iterator ? () => [][Symbol.iterator]() : ignore,
 		apply: () => ignore,
 	});
-	const own = new Set(["handleEvent", "setRunStatus", "reportProgramStatus", "syncRunStatus", "whileDialogOpen"]);
+	const own = new Set(
+		"handleEvent setRunStatus reportProgramStatus syncRunStatus whileDialogOpen sendRunNotification updateConnectionStateFromEvent patchConnectionState".split(
+			" ",
+		),
+	);
 	const fields: Record<string | symbol, unknown> = {
-		...{ runStatus: { state: "idle" }, openDialogs: [], programStatusStopped: false, runAbortRequested: false },
+		...{
+			runStatus: { state: "idle" },
+			openDialogs: [],
+			programStatusStopped: false,
+			runAbortRequested: false,
+			notificationsCancelled: false,
+			pendingErrorNotification: false,
+		},
 		...{ isInitialized: true, streaming: false, retryAttempt: 0, statusBeforeCompaction: undefined },
-		settingsManager: { getProgramStatus: () => fields.enabled !== false, getShowTerminalProgress: () => false },
-		ui: Object.setPrototypeOf({ terminal: { write } }, ignore),
+		connectionState: undefined,
+		settingsManager: {
+			getProgramStatus: () => fields.enabled !== false,
+			getShowTerminalProgress: () => false,
+			getNotifyOnCompletion: () => fields.completion !== false,
+			getNotifyOnError: () => fields.error !== false,
+			getNotifyOnInput: () => fields.input !== false,
+		},
+		getCurrentSessionName: () => "Test session",
+		ui: Object.setPrototypeOf({ terminal: { write, notify: vi.fn() } }, ignore),
 		isAgentStreaming: () => fields.streaming,
-		getRetryAttempt: () => fields.retryAttempt,
+		getRetryAttempt: () => mode.connectionState?.retryAttempt ?? fields.retryAttempt,
 		...{ startCompactionLoader: proto.startCompactionLoader, interruptOrClearInput: proto.interruptOrClearInput },
 		...{ resetExtensionUI: proto.resetExtensionUI, extensionSelector: undefined, extensionInput: undefined },
 	};
@@ -166,6 +185,103 @@ const proto = InteractiveMode.prototype as unknown as Record<string, any>;
 const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const setStdoutTTY = (value: boolean) => Object.defineProperty(process.stdout, "isTTY", { value, configurable: true });
 afterEach(() => {
+	vi.unstubAllEnvs();
+	vi.useRealTimers();
 	if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
 	else Reflect.deleteProperty(process.stdout, "isTTY");
+});
+
+describe("client terminal notifications", () => {
+	beforeEach(() => {
+		vi.stubEnv("TERM_PROGRAM", "ghostty");
+		vi.stubEnv("PI_NOTIFICATIONS", "on");
+	});
+	test("notifies on completion, failure, and working input dialogs, not idle dialogs or cancellation", async () => {
+		const { mode, event } = fakeMode();
+		const notify = mode.ui.terminal.notify;
+		await mode.whileDialogOpen("Idle", Promise.resolve("a"));
+		await event({ type: "agent_start" });
+		await mode.whileDialogOpen("Question", Promise.resolve("a"));
+		await event({ type: "agent_end", messages: [assistant("stop")] });
+		await event({ type: "agent_start" });
+		await event({ type: "agent_end", messages: [assistant("error")] });
+		await event({ type: "agent_start" });
+		mode.streaming = true;
+		mode.interruptOrClearInput();
+		await event({ type: "agent_end", messages: [assistant("stop")] });
+		await event({ type: "auto_retry_end", success: false });
+		await event({ type: "agent_start" });
+		await event({ type: "agent_end", messages: [assistant("error")] });
+		const types = notify.mock.calls.map(([n]: [{ type: string }]) => n.type);
+		expect(types).toEqual(["ask", "completion", "error", "error"]);
+	});
+
+	test.each([true, false])("settles retry notifications with waiting action=%s", async (waiting) => {
+		vi.useFakeTimers();
+		const { mode, event } = fakeMode();
+		const notify = mode.ui.terminal.notify;
+		for (const success of [false, true]) {
+			notify.mockClear();
+			mode.connectionState = { sessionActions: { active: { kind: "turn" } }, retryAttempt: 0 };
+			await event({ type: "agent_start" });
+			await event({ type: "agent_end", messages: [assistant("error")] });
+			for (const attempt of [1, 2]) {
+				await event({ type: "auto_retry_start", delayMs: 1000, attempt });
+				if (!waiting) await event({ type: "session_action_update", actions: {} });
+				await event({ type: "agent_start" });
+				if (!success || attempt === 1) await event({ type: "agent_end", messages: [assistant("error")] });
+				expect(notify).not.toHaveBeenCalled();
+			}
+			await event({ type: "auto_retry_end", success, finalError: success ? undefined : "failed" });
+			if (success) await event({ type: "agent_end", messages: [assistant("stop")] });
+			await event({ type: "session_action_update", actions: {} });
+			expect(notify).toHaveBeenCalledTimes(1);
+			expect(notify.mock.calls[0][0].type).toBe(success ? "completion" : "error");
+		}
+	});
+
+	test.each([true, false])("overflow compaction drops the held error only when willRetry=%s", async (willRetry) => {
+		const { mode, event } = fakeMode();
+		mode.connectionState = { sessionActions: { active: { kind: "turn" } } };
+		const notify = mode.ui.terminal.notify;
+		await event({ type: "agent_start" });
+		await event({ type: "agent_end", messages: [assistant("error")] });
+		await event({ type: "compaction_start", reason: "overflow" });
+		await event({ type: "compaction_end", reason: "overflow", willRetry, result: {}, aborted: false });
+		await event({ type: "session_action_update", actions: {} });
+		expect(notify).toHaveBeenCalledTimes(willRetry ? 0 : 1);
+		if (willRetry) {
+			await event({ type: "agent_start" });
+			await event({ type: "agent_end", messages: [assistant("stop")] });
+		}
+		expect(notify.mock.calls[0][0].type).toBe(willRetry ? "completion" : "error");
+	});
+
+	test.each([
+		["tern", true, "", [false, false, false]],
+		["tern", false, "", [false, false, true]],
+		["WarpTerminal", true, "1", [false, false, true]],
+		["WarpTerminal", true, "", [true, true, true]],
+	])("terminal suppression for %s programStatus=%s Warp protocol=%s", (terminal, status, warp, allowed) => {
+		vi.stubEnv("TERM_PROGRAM", terminal);
+		vi.stubEnv("WARP_CLI_AGENT_PROTOCOL_VERSION", warp);
+		vi.stubEnv("PI_NOTIFICATIONS", "on");
+		const { mode } = fakeMode();
+		mode.enabled = status;
+		for (const [index, type] of ["completion", "error", "ask"].entries()) {
+			mode.sendRunNotification(type);
+			expect(mode.ui.terminal.notify.mock.calls.length).toBe(allowed.slice(0, index + 1).filter(Boolean).length);
+		}
+	});
+
+	test.each(["settings", "env", "tty", "stopped"])("no notifications when %s disables them", (reason) => {
+		vi.stubEnv("TERM_PROGRAM", "ghostty");
+		vi.stubEnv("PI_NOTIFICATIONS", reason === "env" ? "off" : "on");
+		const { mode } = fakeMode();
+		if (reason === "settings") mode.completion = mode.error = mode.input = false;
+		if (reason === "tty") setStdoutTTY(false);
+		if (reason === "stopped") proto.stop.call(mode);
+		for (const type of ["completion", "error", "ask"]) mode.sendRunNotification(type);
+		expect(mode.ui.terminal.notify).not.toHaveBeenCalled();
+	});
 });

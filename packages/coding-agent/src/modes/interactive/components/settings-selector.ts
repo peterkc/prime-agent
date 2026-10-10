@@ -61,6 +61,9 @@ export interface SettingsConfig {
 	quietStartup: boolean;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
+	notifyOnCompletion: boolean;
+	notifyOnError: boolean;
+	notifyOnInput: boolean;
 	fullscreen: boolean;
 	warnings: WarningSettings;
 }
@@ -88,6 +91,9 @@ export interface SettingsCallbacks {
 	onQuietStartupChange: (enabled: boolean) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
+	onNotifyOnCompletionChange: (enabled: boolean) => void;
+	onNotifyOnErrorChange: (enabled: boolean) => void;
+	onNotifyOnInputChange: (enabled: boolean) => void;
 	onFullscreenChange: (enabled: boolean) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
@@ -455,6 +461,30 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
+		items.push({
+			id: "notify-on-finished",
+			label: "Notify when finished",
+			description: "Notify when an agent turn finishes",
+			currentValue: config.notifyOnCompletion ? "true" : "false",
+			values: ["true", "false"],
+		});
+
+		items.push({
+			id: "notify-on-failed",
+			label: "Notify when failed",
+			description: "Notify when an agent turn fails after retries",
+			currentValue: config.notifyOnError ? "true" : "false",
+			values: ["true", "false"],
+		});
+
+		items.push({
+			id: "notify-on-waiting",
+			label: "Notify when waiting",
+			description: "Notify when a working agent asks for input",
+			currentValue: config.notifyOnInput ? "true" : "false",
+			values: ["true", "false"],
+		});
+
 		this.addChild(new DynamicBorder());
 
 		this.settingsList = new SettingsList(
@@ -518,6 +548,15 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "clear-on-shrink":
 						callbacks.onClearOnShrinkChange(newValue === "true");
+						break;
+					case "notify-on-finished":
+						callbacks.onNotifyOnCompletionChange(newValue === "true");
+						break;
+					case "notify-on-failed":
+						callbacks.onNotifyOnErrorChange(newValue === "true");
+						break;
+					case "notify-on-waiting":
+						callbacks.onNotifyOnInputChange(newValue === "true");
 						break;
 					case "terminal-progress":
 						callbacks.onShowTerminalProgressChange(newValue === "true");

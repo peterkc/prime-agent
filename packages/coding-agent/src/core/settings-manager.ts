@@ -60,6 +60,9 @@ export interface TerminalSettings {
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
 	programStatus?: boolean; // default: true (OSC 7501 run status for terminal tabs and inboxes)
+	notifyOnCompletion?: boolean; // default: true
+	notifyOnError?: boolean; // default: true
+	notifyOnInput?: boolean; // default: true
 	fullscreen?: boolean; // default: true (alternate-screen rendering with scrollable transcript)
 	fullscreenMouse?: boolean; // default: true
 }
@@ -1383,6 +1386,48 @@ export class SettingsManager {
 
 	getShowTerminalProgress(): boolean {
 		return this.settings.terminal?.showTerminalProgress ?? false;
+	}
+
+	getNotifyOnCompletion(): boolean {
+		const enabled = this.settings.terminal?.notifyOnCompletion;
+		return typeof enabled === "boolean" ? enabled : true;
+	}
+
+	setNotifyOnCompletion(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.notifyOnCompletion = enabled;
+		this.markModified("terminal", "notifyOnCompletion");
+		this.save();
+	}
+
+	getNotifyOnError(): boolean {
+		const enabled = this.settings.terminal?.notifyOnError;
+		return typeof enabled === "boolean" ? enabled : true;
+	}
+
+	setNotifyOnError(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.notifyOnError = enabled;
+		this.markModified("terminal", "notifyOnError");
+		this.save();
+	}
+
+	getNotifyOnInput(): boolean {
+		const enabled = this.settings.terminal?.notifyOnInput;
+		return typeof enabled === "boolean" ? enabled : true;
+	}
+
+	setNotifyOnInput(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.notifyOnInput = enabled;
+		this.markModified("terminal", "notifyOnInput");
+		this.save();
 	}
 
 	getProgramStatus(): boolean {

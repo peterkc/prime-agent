@@ -1,0 +1,1 @@
+- Added terminal desktop notifications for finished turns, failed turns, and requests for input.
