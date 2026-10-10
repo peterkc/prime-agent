@@ -561,7 +561,7 @@ describe("InteractiveMode connection events", () => {
 
 		await renderResyncedSession.call(fakeThis, snapshot);
 
-		expect(fakeThis.syncRunStatus).toHaveBeenCalledWith(snapshot.state);
+		expect(fakeThis.syncRunStatus).toHaveBeenCalledWith(snapshot.state, expect.any(Array));
 		expect(fakeThis.sideQuestionEvent).toBe(sideQuestion);
 		expect(fakeThis.activeConnectionExtensionUiRequests).toBe(extensionRequests);
 		expect(fakeThis.activeBashComponent).toBe(activeBashComponent);

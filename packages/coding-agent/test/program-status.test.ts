@@ -96,8 +96,13 @@ describe("OSC 7501 program status", () => {
 		proto.resetCurrentSessionRenderState.call(mode);
 		mode.syncRunStatus({ isStreaming: true });
 		await event({ type: "agent_end", messages: [assistant("stop")] });
+		mode.syncRunStatus({}, []);
+		mode.syncRunStatus({ isStreaming: true });
+		mode.syncRunStatus({}, [assistant("error", "lost")]);
+		await event({ type: "compaction_start", reason: "manual" });
+		await event({ type: "compaction_end", aborted: true });
 		const states = "working done working idle working error working idle done working done working error";
-		expect(reports().join(" ")).toBe(`${states} working idle working done`);
+		expect(reports().join(" ")).toBe(`${states} working idle working done working error working idle`);
 	});
 
 	test("takes the status from snapshots, drops reset dialogs, and writes nothing without a terminal", async () => {

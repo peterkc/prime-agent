@@ -3590,7 +3590,7 @@ export class InteractiveMode {
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
-		this.syncRunStatus(snapshot.state);
+		this.syncRunStatus(snapshot.state, this.getSessionContextFromConnectionSnapshot(snapshot).messages);
 		this.refreshQueueSelectionFromState();
 		this.restoreTurnStartFromMessages(this.getSessionContextFromConnectionSnapshot(snapshot).messages);
 		this.streamingComponent = undefined;
@@ -4581,11 +4581,17 @@ export class InteractiveMode {
 		this.reportedProgramStatus = report;
 	}
 
-	/** A snapshot stands in for the start and end events this client missed, so it sets the run status. */
-	private syncRunStatus(state: AgentConnectionState): void {
+	/**
+	 * A snapshot stands in for the start and end events this client missed, so it sets the run status.
+	 * A new session starts idle; a resync of the same session (`messages` given) keeps a settled status
+	 * and settles a run whose end it missed from the snapshot's messages.
+	 */
+	private syncRunStatus(state: AgentConnectionState, messages?: readonly AgentMessage[]): void {
 		// A compaction adopted from the snapshot started from an unknown status, so it ends idle.
 		this.statusBeforeCompaction = { state: "idle" };
-		this.setRunStatus({ state: state.isStreaming || state.isCompacting ? "working" : "idle" });
+		if (state.isStreaming || state.isCompacting) this.setRunStatus({ state: "working" });
+		else if (!messages) this.setRunStatus({ state: "idle" });
+		else if (this.runStatus.state === "working") this.setRunStatus(settledRunStatus(messages));
 	}
 
 	/** Reports waiting on the user until the dialog's answer settles. */
@@ -6506,6 +6512,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				if (this.isAgentStreaming()) this.setRunStatus({ state: "working" });
+				else if (event.aborted) this.setRunStatus({ state: "idle" });
 				else if (event.errorMessage && event.errorSeverity !== "warning") {
 					this.setRunStatus({ state: "error", msg: event.errorMessage });
 				} else this.setRunStatus(this.statusBeforeCompaction);
