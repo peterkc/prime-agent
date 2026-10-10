@@ -180,12 +180,12 @@ describe("SettingsManager", () => {
 		});
 	});
 
-	describe("codemode OpenAPI source precedence", () => {
-		it.each(["global", "project-only", "project", "empty", "runtime", "runtime-empty"])("D19 %s scope", (scope) => {
+	describe("codemode OpenAPI source scope", () => {
+		it.each(["global", "project-only", "ignored", "ignored[]", "runtime", "runtime-empty"])("D19 %s", (scope) => {
 			const global = [{ name: "global", specFile: "global.json", baseUrl: "https://example.invalid" }];
 			const project = [{ name: "project", specFile: "project.yaml", baseUrl: "https://example.invalid" }];
 			writeSettings(globalPath, scope === "project-only" ? {} : { codemodeOpenAPI: global });
-			writeSettings(projectPath, scope === "global" ? {} : { codemodeOpenAPI: scope === "empty" ? [] : project });
+			writeSettings(projectPath, scope === "global" ? {} : { codemodeOpenAPI: scope.endsWith("[]") ? [] : project });
 			const manager = SettingsManager.create(projectDir, agentDir);
 			const override = scope === "runtime-empty" ? [] : project;
 			if (scope.startsWith("runtime")) manager.applyOverrides({ codemodeOpenAPI: override });
