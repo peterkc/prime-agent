@@ -301,6 +301,7 @@ available, authenticated model, the bounded wait runs instead.
 |---------|------|---------|-------------|
 | `terminal.showImages` | boolean | `true` | Show image type and dimensions in terminal |
 | `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
+| `terminal.programStatus` | boolean | `true` | Report working, waiting on you, done or failed to the terminal with [OSC 7501](https://mitchellh.com/writing/program-status-osc7501), for tab icons and inboxes such as Tern's |
 | `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
 
