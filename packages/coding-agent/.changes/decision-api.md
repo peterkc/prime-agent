@@ -1,0 +1,1 @@
+- Added the experimental Decision API: the bundled `decision-api` skill (`decide()` and `Loop`) uses the model in `decisionApi.systemOneModel`, such as TypeSafe Jev, as System 1 and logs each decision to `logs/decision-api.jsonl`.

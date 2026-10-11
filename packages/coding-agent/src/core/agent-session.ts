@@ -134,6 +134,7 @@ import {
 	type AgentRlmHeartbeatStatusUpdate,
 	normalizeHeartbeatDeliveryMode,
 } from "./cron-jobs.js";
+import { createDecisionApiHostHandler } from "./decision-api.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -11003,6 +11004,11 @@ export class AgentSession {
 
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
+			"decision_api.decide": createDecisionApiHostHandler({
+				getReference: () => this.settingsManager.getDecisionApiSystemOneModel(),
+				modelRegistry: this._modelRegistry,
+				sessionId: this.sessionId,
+			}),
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),

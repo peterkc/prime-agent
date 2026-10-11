@@ -19,6 +19,7 @@ Edit directly or use `/settings` for common options.
 | `defaultModel` | string | - | Default model ID |
 | `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
 | `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
+| `decisionApi.systemOneModel` | string | none | Decision model reference (`"provider/model-id"` or a bare id) using `api: "systemone"` |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
@@ -38,6 +39,37 @@ model fail with an actionable error instead of silently dropping the images:
 switch the session model with `/model` or configure `imageModel`. Set
 `images.blockImages: true` to drop images everywhere instead of routing or
 refusing.
+
+`decisionApi.systemOneModel` selects the model for `decision_api.decide()` and
+`decision_api.Loop`. The bundled `decision-api` skill is hidden while this setting
+is unset. The model must use `api: "systemone"`. Jev accepts text only: omit images.
+
+For TypeSafe, add this provider to `~/.prime/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "typesafe": {
+      "api": "systemone",
+      "baseUrl": "https://api.typesafe.ai/v1",
+      "apiKey": "!doppler secrets get TYPESAFE_API_KEY --plain",
+      "models": [{ "id": "jev-1.13.0", "input": ["text"] }]
+    }
+  }
+}
+```
+
+Then set `"decisionApi": { "systemOneModel": "typesafe/jev-1.13.0" }` in
+`settings.json` and run `/reload`. The host resolves the Doppler command once per
+runtime and reuses the credential until a decision fails or the setting changes.
+Edits to `models.json` or auth under the same reference need `/reload` to take
+effect immediately.
+
+Each call appends one record to `~/.prime/agent/logs/decision-api.jsonl`, including
+the full `state` and decision result. Images are recorded only as counts and
+SHA-256 hashes. Keep `state` limited to the control task's observations; do not
+send code, file contents, secrets, or personal data. If writing the log fails, a
+successful decision includes `log_error`; the decision is not retried.
 
 ### Autonomous Runs
 

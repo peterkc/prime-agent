@@ -241,6 +241,7 @@ export interface Settings {
 	 * configuration hint instead of silently dropping the images.
 	 */
 	imageModel?: string;
+	decisionApi?: { systemOneModel?: string };
 	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -1143,6 +1144,12 @@ export class SettingsManager {
 		// Same shape as providerBackupModel: malformed values behave as unset
 		// and the image-turn refusal names the setting instead.
 		const reference = this.settings.imageModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
+	}
+
+	getDecisionApiSystemOneModel(): string | undefined {
+		const reference = this.settings.decisionApi?.systemOneModel;
 		if (typeof reference !== "string") return undefined;
 		return reference.trim() ? reference.trim() : undefined;
 	}

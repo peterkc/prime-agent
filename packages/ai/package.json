@@ -26,6 +26,10 @@
 			"types": "./dist/providers/google-vertex.d.ts",
 			"import": "./dist/providers/google-vertex.js"
 		},
+		"./systemone": {
+			"types": "./dist/providers/systemone.d.ts",
+			"import": "./dist/providers/systemone.js"
+		},
 		"./mistral": {
 			"types": "./dist/providers/mistral.d.ts",
 			"import": "./dist/providers/mistral.js"

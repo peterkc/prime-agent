@@ -19,6 +19,7 @@ import type { MistralOptions } from "./mistral.js";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses.js";
 import type { OpenAICompletionsOptions } from "./openai-completions.js";
 import type { OpenAIResponsesOptions } from "./openai-responses.js";
+import { streamSimpleSystemOne, streamSystemOne } from "./systemone.js";
 
 interface LazyProviderModule<
 	TApi extends Api,
@@ -340,6 +341,12 @@ const streamBedrockLazy = createLazyStream(loadBedrockProviderModule);
 const streamSimpleBedrockLazy = createLazySimpleStream(loadBedrockProviderModule);
 
 export function registerBuiltInApiProviders(): void {
+	registerApiProvider({
+		api: "systemone",
+		stream: streamSystemOne,
+		streamSimple: streamSimpleSystemOne,
+	});
+
 	registerApiProvider({
 		api: "anthropic-messages",
 		stream: streamAnthropic,
