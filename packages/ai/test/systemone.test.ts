@@ -41,7 +41,7 @@ async function checkTransport(scenario: string): Promise<void> {
 		const chunks: Buffer[] = [];
 		for await (const chunk of req) chunks.push(Buffer.from(chunk));
 		seen.push({ req, body: JSON.parse(Buffer.concat(chunks).toString()) });
-		if (scenario === "string" || scenario === "blocks") res.end(replyBody);
+		if (["string", "blocks", "trailing assistant"].includes(scenario)) res.end(replyBody);
 		if (scenario === "HTTP 422") res.writeHead(422).end("x".repeat(500) + "y".repeat(100));
 		if (scenario === "abort") controller.abort();
 	}
@@ -62,6 +62,25 @@ async function checkTransport(scenario: string): Promise<void> {
 			{ role: "user", content: '{"old":true}', timestamp: 0 },
 			{ role: "user", content, timestamp: 1 },
 		];
+		if (scenario === "trailing assistant") {
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: "not JSON" }],
+				api: "systemone",
+				provider: "loopback",
+				model: "decision",
+				stopReason: "stop",
+				timestamp: 2,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			});
+		}
 		const stream = streamSimple(
 			model(base),
 			{ messages },
@@ -75,7 +94,7 @@ async function checkTransport(scenario: string): Promise<void> {
 		const events = [];
 		for await (const event of stream) events.push(event.type);
 		const output = await stream.result();
-		if (scenario === "string" || scenario === "blocks") {
+		if (["string", "blocks", "trailing assistant"].includes(scenario)) {
 			expect(events).toEqual(["start", "done"]);
 			expect(output.stopReason).toBe("stop");
 			expect(seen).toHaveLength(1);
@@ -106,7 +125,7 @@ async function checkTransport(scenario: string): Promise<void> {
 		await close(server);
 	}
 }
-it.each(["string", "blocks", "HTTP 422", "network", "timeout", "abort", "invalid JSON"])(
+it.each(["string", "blocks", "trailing assistant", "HTTP 422", "network", "timeout", "abort", "invalid JSON"])(
 	"systemone: %s",
 	checkTransport,
 );

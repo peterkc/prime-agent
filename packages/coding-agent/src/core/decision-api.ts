@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
+import { mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Api, completeSimple, type Model, parseJsonWithRepair } from "@earendil-works/pi-ai";
+import lockfile from "proper-lockfile";
 import { getDecisionApiLogPath } from "../config.js";
 import type { HostRequestHandler } from "./kernel/shared.js";
 import type { ModelRegistry } from "./model-registry.js";
@@ -71,6 +72,14 @@ function parseDecisionRequest(request: unknown): DecisionRequest {
 	if (!Object.hasOwn(request, "state")) invalidRequest('decision_api.decide needs a "state" value');
 	if (!isObject(request.questions) || !Object.hasOwn(request.questions, "action")) {
 		invalidRequest('decision_api.decide needs a "questions" object with an "action" question');
+	}
+	const unsupportedQuestions = Object.keys(request.questions)
+		.filter((key) => key !== "action")
+		.sort();
+	if (unsupportedQuestions.length) {
+		invalidRequest(
+			`decision_api.decide got unsupported questions: ${unsupportedQuestions.map((key) => JSON.stringify(key)).join(", ")}. Only the "action" question is supported.`,
+		);
 	}
 	const question = isObject(request.questions.action) ? request.questions.action : {};
 	if (question.type !== undefined && question.type !== "choice") {
@@ -302,11 +311,41 @@ export function createDecisionApiHostHandler(deps: DecisionApiDependencies): Hos
 		});
 		let logError: string | undefined;
 		try {
-			await mkdir(dirname(logPath), { recursive: true });
-			const line = JSON.stringify(record, (_key, value: unknown) =>
-				typeof value === "string" ? redact(value, secrets) : value,
+			await mkdir(dirname(logPath), { recursive: true, mode: 0o700 });
+			const line = redact(
+				JSON.stringify(record, (_key, value: unknown) =>
+					typeof value === "string" ? redact(value, secrets) : value,
+				),
+				secrets,
 			);
-			await appendFile(logPath, `${line}\n`, "utf8");
+			let compromised: Error | undefined;
+			const release = await lockfile.lock(logPath, {
+				realpath: false,
+				stale: 30000,
+				retries: { retries: 9, factor: 1, minTimeout: 20, maxTimeout: 20 },
+				onCompromised: (error) => {
+					compromised = error;
+				},
+			});
+			try {
+				if (compromised) throw compromised;
+				const file = await open(logPath, "a", 0o600);
+				try {
+					await file.chmod(0o600);
+					const { size } = await file.stat();
+					try {
+						await file.appendFile(`${line}\n`, "utf8");
+					} catch (error) {
+						await file.truncate(size);
+						throw error;
+					}
+					if (compromised) throw compromised;
+				} finally {
+					await file.close();
+				}
+			} finally {
+				await release();
+			}
 		} catch (error) {
 			logError = redact(error instanceof Error ? error.message : String(error), secrets);
 		}

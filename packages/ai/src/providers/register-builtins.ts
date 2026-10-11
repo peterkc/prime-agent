@@ -19,7 +19,6 @@ import type { MistralOptions } from "./mistral.js";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses.js";
 import type { OpenAICompletionsOptions } from "./openai-completions.js";
 import type { OpenAIResponsesOptions } from "./openai-responses.js";
-import { streamSimpleSystemOne, streamSystemOne } from "./systemone.js";
 
 interface LazyProviderModule<
 	TApi extends Api,
@@ -52,6 +51,11 @@ interface GoogleProviderModule {
 interface GoogleVertexProviderModule {
 	streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOptions>;
 	streamSimpleGoogleVertex: StreamFunction<"google-vertex", SimpleStreamOptions>;
+}
+
+interface SystemOneProviderModule {
+	streamSystemOne: StreamFunction<"systemone", StreamOptions>;
+	streamSimpleSystemOne: StreamFunction<"systemone", SimpleStreamOptions>;
 }
 
 interface MistralProviderModule {
@@ -100,6 +104,9 @@ let googleProviderModulePromise:
 	| undefined;
 let googleVertexProviderModulePromise:
 	| Promise<LazyProviderModule<"google-vertex", GoogleVertexOptions, SimpleStreamOptions>>
+	| undefined;
+let systemOneProviderModulePromise:
+	| Promise<LazyProviderModule<"systemone", StreamOptions, SimpleStreamOptions>>
 	| undefined;
 let mistralProviderModulePromise:
 	| Promise<LazyProviderModule<"mistral-conversations", MistralOptions, SimpleStreamOptions>>
@@ -253,6 +260,17 @@ function loadGoogleVertexProviderModule(): Promise<
 	return googleVertexProviderModulePromise;
 }
 
+function loadSystemOneProviderModule(): Promise<LazyProviderModule<"systemone", StreamOptions, SimpleStreamOptions>> {
+	systemOneProviderModulePromise ||= import("./systemone.js").then((module) => {
+		const provider = module as SystemOneProviderModule;
+		return {
+			stream: provider.streamSystemOne,
+			streamSimple: provider.streamSimpleSystemOne,
+		};
+	});
+	return systemOneProviderModulePromise;
+}
+
 function loadMistralProviderModule(): Promise<
 	LazyProviderModule<"mistral-conversations", MistralOptions, SimpleStreamOptions>
 > {
@@ -329,6 +347,8 @@ export const streamGoogle = createLazyStream(loadGoogleProviderModule);
 export const streamSimpleGoogle = createLazySimpleStream(loadGoogleProviderModule);
 export const streamGoogleVertex = createLazyStream(loadGoogleVertexProviderModule);
 export const streamSimpleGoogleVertex = createLazySimpleStream(loadGoogleVertexProviderModule);
+export const streamSystemOne = createLazyStream(loadSystemOneProviderModule);
+export const streamSimpleSystemOne = createLazySimpleStream(loadSystemOneProviderModule);
 export const streamMistral = createLazyStream(loadMistralProviderModule);
 export const streamSimpleMistral = createLazySimpleStream(loadMistralProviderModule);
 export const streamOpenAICodexResponses = createLazyStream(loadOpenAICodexResponsesProviderModule);

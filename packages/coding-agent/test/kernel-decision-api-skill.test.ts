@@ -26,7 +26,7 @@ loop = decision_api.Loop(lambda: {"ball": "left"}, acted.append, actions,
                          objective="Catch the ball", max_steps=3)
 `;
 
-describe("decision-api skill over the kernel host bridge", () => {
+describe("decision-api skill over the kernel host bridge", { tags: ["kernel-heavy"] }, () => {
 	let dir: string;
 	let provisioner: IpythonKernelProvisioner | undefined;
 	let handler: HostRequestHandler;

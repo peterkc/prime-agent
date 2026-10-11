@@ -1,16 +1,20 @@
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createDecisionApiHostHandler } from "../src/core/decision-api.js";
+import type { HostRequestHandlers } from "../src/core/kernel/index.js";
 import type { HostRequestHandler } from "../src/core/kernel/shared.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { createHarness } from "./suite/harness.js";
 
 const KEY = "decision-test-key";
 const HEADER = "decision-test-header";
@@ -196,6 +200,11 @@ describe("decision_api.decide", () => {
 			{ state: {}, questions: { move: {} } },
 			'decision_api.decide needs a "questions" object with an "action" question',
 		],
+		[
+			"PR #14 extra questions",
+			{ ...question(), questions: { ...question().questions, score: { type: "score" }, rank: { type: "rank" } } },
+			'decision_api.decide got unsupported questions: "rank", "score". Only the "action" question is supported.',
+		],
 		["scalar action", question(7), 'the "action" question needs a "criteria" object of action names to descriptions'],
 		[
 			"wrong type",
@@ -282,6 +291,7 @@ describe("decision_api.decide", () => {
 		expect(logs()).toEqual([
 			expect.objectContaining({ outcome: "rejected", error: invalid ? "invalid_request" : "not_configured" }),
 		]);
+		if (invalid) expect(lookups()).toBe(0);
 		if (invalid) expect(logs()[0]).not.toHaveProperty("state");
 		if (invalid) expect(logs()[0]).not.toHaveProperty("images");
 		expect(readFileSync(logPath, "utf8")).not.toMatch(/private-image|data:image|AA==/);
@@ -378,14 +388,14 @@ describe("decision_api.decide", () => {
 		]);
 		expect(readFileSync(logPath, "utf8")).not.toMatch(/decision-test-key|decision-test-header|body-marker/);
 	});
-	it("redacts cached credentials in parse errors and state strings without corrupting JSON", async () => {
+	it("redacts cached credentials in parse errors, state strings and keys without corrupting JSON", async () => {
 		await handler({ request: question() });
 		await expect(handler({ request: question({ instructions: [KEY, HEADER] }) })).rejects.toMatchObject({
 			message: 'the "action" question\'s instructions must be a string, not ["[redacted]","[redacted]"].',
 		});
-		await handler({ request: { ...question(), state: { secret: KEY, numeric: 12 } } });
+		await handler({ request: { ...question(), state: { secret: KEY, numeric: 12, [KEY]: 1 } } });
 		expect(logs()).toHaveLength(3);
-		expect(logs()[2]).toMatchObject({ state: { secret: "[redacted]", numeric: 12 } });
+		expect(logs()[2]).toMatchObject({ state: { secret: "[redacted]", numeric: 12, "[redacted]": 1 } });
 		expect(readFileSync(logPath, "utf8")).not.toMatch(/decision-test-key|decision-test-header/);
 	});
 	it("logs image payload hashes without image data and accepts syntax without decoding", async () => {
@@ -398,6 +408,84 @@ describe("decision_api.decide", () => {
 		});
 		expect(readFileSync(logPath, "utf8")).not.toContain("not-base64!");
 	});
+	it("PR #14 invokes the decision handler registered by a real AgentSession", async () => {
+		const harness = await createHarness({ settings: { decisionApi: { systemOneModel: LABEL } } });
+		vi.stubEnv(ENV_AGENT_DIR, dir);
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("loopback port missing");
+			const model = registry
+				.getAvailable()
+				.find((candidate) => candidate.id === "decision-model" && candidate.provider === "typesafe-test");
+			if (!model) throw new Error("loopback model missing");
+			harness.session.modelRegistry.registerProvider("typesafe-test", {
+				baseUrl: `http://127.0.0.1:${address.port}`,
+				api: "systemone",
+				apiKey: KEY,
+				models: [model],
+			});
+			const handlers = (
+				harness.session as unknown as {
+					_createKernelHostHandlers(): HostRequestHandlers;
+				}
+			)._createKernelHostHandlers();
+			const decide = handlers["decision_api.decide"];
+			if (!decide) throw new Error("Missing decision_api.decide host handler");
+			expect(await decide({ request: question() })).toMatchObject({
+				model: LABEL,
+				answers: { action: { choice: "left" } },
+			});
+			expect(requests).toHaveLength(1);
+			expect(logs()).toEqual([expect.objectContaining({ session_id: harness.session.sessionId, outcome: "ok" })]);
+		} finally {
+			vi.unstubAllEnvs();
+			harness.cleanup();
+		}
+	});
+	it.each(["new", "existing"])("PR #14 creates owner-only log modes for %s files", async (mode) => {
+		if (mode === "existing") {
+			mkdirSync(join(dir, "logs"), { mode: 0o700 });
+			writeFileSync(logPath, "", { mode: 0o644 });
+		}
+		await handler({ request: question() });
+		expect(statSync(join(dir, "logs")).mode & 0o777).toBe(0o700);
+		expect(statSync(logPath).mode & 0o777).toBe(0o600);
+	});
+	it("PR #14 serializes concurrent large calls as complete JSON lines", async () => {
+		const states = ["a".repeat(2 * 1024 * 1024), "b".repeat(2 * 1024 * 1024)];
+		const results = await Promise.all(states.map((state) => handler({ request: { ...question(), state } })));
+		expect(results.map((result) => result.log_error)).toEqual([undefined, undefined]);
+		expect(
+			logs()
+				.map((record) => record.state)
+				.sort(),
+		).toEqual(states);
+		expect(requests).toHaveLength(2);
+	});
+	it.each(["success", "refusal"])(
+		"PR #14 reports a held log lock on %s without repeating the decision",
+		async (mode) => {
+			mkdirSync(join(dir, "logs"), { mode: 0o700 });
+			const release = await lockfile.lock(logPath, { realpath: false });
+			try {
+				if (mode === "refusal") {
+					reference = undefined;
+					await expect(handler({ request: question() })).rejects.toThrow(
+						`${UNSET} (the decision log write also failed:`,
+					);
+				} else {
+					expect(await handler({ request: question() })).toMatchObject({
+						answers: { action: { choice: "left" } },
+						log_error: expect.stringContaining("already being held"),
+					});
+				}
+				expect(requests).toHaveLength(mode === "success" ? 1 : 0);
+				expect(existsSync(logPath)).toBe(false);
+			} finally {
+				await release();
+			}
+		},
+	);
 	it.each(["success", "refusal"])("reports a log write failure on %s without repeating the decision", async (mode) => {
 		const blocked = join(dir, "blocked");
 		writeFileSync(blocked, "not a directory");
