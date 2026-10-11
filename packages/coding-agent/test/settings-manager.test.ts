@@ -156,6 +156,22 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	it.each([
+		["unset", {}, {}, "off"],
+		["global idle", { autoReload: "idle" }, { autoReload: "off" }, "idle"],
+		["project only", {}, { autoReload: "idle" }, "off"],
+		["invalid", { autoReload: true }, { autoReload: "idle" }, "off"],
+	])("TM-12 autoReload scope: %s", async (_label, global, project, expected) => {
+		writeSettings(globalPath, global);
+		writeSettings(projectPath, project);
+		const manager = SettingsManager.create(projectDir, agentDir);
+		manager.applyOverrides({ autoReload: "idle" });
+		expect(manager.getAutoReload()).toBe(expected);
+		writeFileSync(globalPath, "{ malformed");
+		await manager.reload();
+		expect(manager.getAutoReload()).toBe("off");
+	});
+
 	describe("project vs global precedence", () => {
 		it.each<[string, unknown, unknown, (manager: SettingsManager) => unknown, unknown]>([
 			[

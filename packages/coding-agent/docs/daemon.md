@@ -94,6 +94,50 @@ Due ticks are claimed and advanced before prompt delivery. A crash therefore doe
 
 Resident workers keep scheduling across supervisor replacement. Worker recovery marks uncertain claims interrupted, keeps the advanced schedule, and resumes future ticks only. The supervisor routes schedule commands and merges worker summaries for global listing.
 
+## Automatic Runtime Reload
+
+Set `"autoReload": "idle"` in global `settings.json` to reload runtime files automatically.
+The default is `"off"`. Project settings cannot enable it. This applies to every
+session in a daemon worker, including its child agents, but not in-process SDK sessions.
+
+Each worker checks every 15 seconds. It compares the loader's input snapshot with
+current file paths, sizes and modification times. A change must stay the same across
+two enabled checks before an idle session enters the queue. Reloads run one at a time
+per worker. Busy sessions wait until their own work and running children end.
+Queued actions, next-turn messages and accepted prompts also defer reload.
+The session checks again after holding input, so work or a runtime replacement that
+arrives while it waits prevents the reload.
+
+Inputs include default and configured resource roots, local package directories and
+manifests, context files, `SYSTEM.md`, `APPEND_SYSTEM.md`, explicit prompt files, and
+resources added by extensions. The reload-relevant settings are `packages`,
+`extensions`, `skills`, `prompts`, `themes`, `enableSkillCommands`, `enableBuiltinSkills`,
+`bundledSkills`, `codemode`, `codemodeOpenAPI`, `codemodeExcludeTools`, `mcpServers`,
+`mcpCatalogSources`, `shellPath` and `shellCommandPrefix`.
+Other settings do not trigger reload. Neither do `auth.json`, `models.json`,
+`keybindings.json`, transitive extension imports or npm package internals.
+Dot entries, `node_modules`, `.git`, `__pycache__` and `.venv` below watched roots are excluded.
+Unreadable inputs, inventories above 20,000 entries or trees deeper than 12 disable
+automatic reload for that session. Edits that preserve size and modification time
+can be missed. Two-check settling reduces, but cannot prevent, loading a partial update.
+
+**Every automatic reload restarts the Python kernel.** Values that cannot be saved,
+values above 16 MiB each, or values above the 256 MiB total limit can be lost.
+A visible transcript entry names the changed areas and kernel restart. Restore
+notices name lost values. A failed reload can leave a partly rebuilt runtime;
+it adds a failure entry and is not retried until its inputs change.
+
+Turning the setting off takes effect at the next check. It drops reloads that have
+not started and clears pending comparisons. Turning it back on needs two checks.
+Graceful worker shutdown waits without a time limit for a started reload, with a
+warning every 30 seconds. Update restart keeps its existing preparation limit.
+If that limit ends during a reload, the update fails with an error naming that
+reload, rolls back, and can be retried. The reload keeps running. A hung extension
+can therefore block graceful worker shutdown and make updates fail until it ends.
+The supervisor can finish shutdown while marking the worker for recovery.
+Use `prime-agent restart --force` or send SIGKILL to the worker if a reload cannot finish.
+Repeated edits can cause repeated reloads; turn `autoReload` off to stop that churn.
+
 ## Public Daemon Protocol v4
 
 The public local socket is JSONL-framed. The current protocol provides:

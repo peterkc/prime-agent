@@ -655,6 +655,7 @@ export type AgentConnectionEvent =
 			daemonVersion?: string;
 	  }
 	| { type: "heartbeats_changed" }
+	| { type: "session_runtime_reloaded"; activeSessionId: string }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;

@@ -218,6 +218,7 @@ export interface Settings {
 	defaultServiceTier?: ServiceTier;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
+	autoReload?: "off" | "idle"; // global daemon policy; default: off
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -522,7 +523,7 @@ export class SettingsManager {
 	}
 
 	/** Migrate old settings format to new format */
-	private static migrateSettings(settings: Record<string, unknown>): Settings {
+	static migrateSettings(settings: Record<string, unknown>): Settings {
 		if ("queueMode" in settings && !("steeringMode" in settings)) {
 			settings.steeringMode = settings.queueMode;
 			delete settings.queueMode;
@@ -1170,6 +1171,11 @@ export class SettingsManager {
 			entries: structuredClone(override !== undefined ? override : this.globalSettings.codemodeOpenAPI),
 			directory: override !== undefined ? undefined : this.storage.getDirectory?.("global"),
 		};
+	}
+
+	/** Automatic reload is a global daemon policy, not a project or SDK override. */
+	getAutoReload(): "off" | "idle" {
+		return !this.globalSettingsLoadError && this.globalSettings.autoReload === "idle" ? "idle" : "off";
 	}
 
 	getCodemodeExcludeTools(): readonly string[] {
