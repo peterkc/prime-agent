@@ -85,7 +85,7 @@ export async function bindActiveSessionState(
 
 	await session.bindExtensions({
 		uiContext: createExtensionUIContext(state, callbacks.broadcast),
-		commandContextActions: createCommandContextActions(state),
+		commandContextActions: createCommandContextActions(state, callbacks.broadcast),
 		shutdownHandler: callbacks.shutdown,
 		onError: (error) => {
 			callbacks.broadcast(state, {
@@ -106,7 +106,10 @@ export function reportRenderMode(state: ActiveSessionState, mode: "native" | "an
 	void state.runtime.session.extensionRunner.emit({ type: "render_mode_change", mode, previousMode }).catch(() => {});
 }
 
-function createCommandContextActions(state: ActiveSessionState): ExtensionCommandContextActions {
+function createCommandContextActions(
+	state: ActiveSessionState,
+	broadcast: ActiveSessionBindingCallbacks["broadcast"],
+): ExtensionCommandContextActions {
 	return {
 		waitForIdle: () => state.runtime.session.waitForIdle(),
 		newSession: async (options) => state.runtime.newSession(options),
@@ -128,6 +131,7 @@ function createCommandContextActions(state: ActiveSessionState): ExtensionComman
 			// Reload re-evaluates extension modules, which capture client env
 			// (e.g. herdr pane identity) synchronously at load.
 			await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
+			broadcast(state, { type: "session_runtime_reloaded", activeSessionId: state.activeSessionId });
 		},
 	};
 }

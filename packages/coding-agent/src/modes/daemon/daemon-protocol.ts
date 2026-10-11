@@ -68,8 +68,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 29 adds the capability-gated abort_and_send_queued command.
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
 // Revision 31 adds capability-gated window render-mode reports.
-export const DAEMON_SCHEMA_REVISION = 31;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-6cf0d25d35af";
+// Revision 32 adds opt-in session runtime reload notifications.
+export const DAEMON_SCHEMA_REVISION = 32;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-95c8d5ad108e";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -89,7 +90,8 @@ export type DaemonClientCapability =
 	| "chunked_snapshot"
 	| "client_owned_sessions"
 	// Client declaration, not a command gate: attach with it opts into heartbeats_changed pushes.
-	| "heartbeat_catalog";
+	| "heartbeat_catalog"
+	| "runtime_reload_events";
 export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "delete_rlm_subagent"
@@ -143,6 +145,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"chunked_snapshot",
 	"client_owned_sessions",
 	"heartbeat_catalog",
+	"runtime_reload_events",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -1133,6 +1136,7 @@ export type DaemonOutbound =
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
+	| { type: "session_runtime_reloaded"; activeSessionId: string }
 	| { type: "roster_update"; changed: AgentRosterEntry[]; removed?: string[]; resync?: true }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
@@ -1209,14 +1213,15 @@ export type DaemonOutbound =
 			meta?: DaemonEventMeta;
 	  };
 
-// Compile-time only: forces every DaemonOutbound type to declare its compatibility.
-const _DAEMON_OUTBOUND_COMPATIBILITY = {
+// Forces every DaemonOutbound type to declare its compatibility.
+export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	response: LEGACY_DAEMON_COMMAND,
 	session_list_progress: LEGACY_DAEMON_COMMAND,
 	session_list_item: LEGACY_DAEMON_COMMAND,
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
+	session_runtime_reloaded: { minProtocol: 7, minSchemaRevision: 32, capability: "runtime_reload_events" },
 	roster_update: { minProtocol: 7, capability: "agent_roster" },
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,

@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import type { AgentConnectionEvent } from "../src/modes/agent-connection/types.js";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import type { DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
+import { shouldSendDaemonOutboundToClient } from "../src/modes/daemon/daemon-mode.js";
 
 import {
 	createDaemonCommandEnvelope,
@@ -8,13 +13,19 @@ import {
 	DAEMON_COMMAND_PLANE,
 	DAEMON_COMMAND_TYPES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonCommand,
+	type DaemonOutbound,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isSessionPlaneDaemonCommand,
 	isSessionSummary,
 	salvageDaemonCommandId,
+	success,
 	WORKER_DAEMON_COMMAND_TYPES,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -23,6 +34,61 @@ import {
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
+	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(32);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-32-/);
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 32,
+			capability: "runtime_reload_events",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.reload).toEqual({ minProtocol: 7 });
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("runtime_reload_events");
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain("runtime_reload_events");
+		const oldClient = { capabilities: new Set(["attach_snapshot", "event_sequence"]) } as DaemonSocketClient;
+		expect(
+			shouldSendDaemonOutboundToClient(oldClient, { type: "session_runtime_reloaded", activeSessionId: "active-1" }),
+		).toBe(false);
+	});
+
+	it.each([false, true])("TM-18 new client attaches and reloads with runtime capability %s", async (capable) => {
+		const request = vi.fn(async (command: DaemonCommand) =>
+			success(
+				command.id,
+				command.type,
+				command.type === "attach"
+					? { id: "active-1", activeSessionId: "active-1", sessionId: "session-1", cwd: "/tmp" }
+					: undefined,
+			),
+		);
+		const client = {
+			request,
+			onMessage: () => () => {},
+			onClose: () => () => {},
+			supportsServerCapability: (capability: string) => capable && capability === "runtime_reload_events",
+		} as unknown as DaemonTransportClient;
+		const connection = new DaemonAgentConnection(client, "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		try {
+			await connection.attach();
+			await connection.reload();
+			expect(request.mock.calls[0]![0]).toMatchObject({
+				type: "attach",
+				capabilities: expect.arrayContaining(["runtime_reload_events"]),
+			});
+			expect(request.mock.calls[1]![0]).toMatchObject({ type: "reload" });
+			const receive = connection as unknown as { handleDaemonMessage(message: DaemonOutbound): Promise<void> };
+			await receive.handleDaemonMessage({ type: "session_runtime_reloaded", activeSessionId: "other" });
+			await receive.handleDaemonMessage({ type: "session_runtime_reloaded", activeSessionId: "active-1" });
+			expect(events).toEqual(capable ? [{ type: "session_runtime_reloaded", activeSessionId: "active-1" }] : []);
+		} finally {
+			await connection.dispose();
+		}
+	});
+
 	// One table for the static command-compatibility gates: protocol floor, schema revision,
 	// capability name, and whether a default server advertises that capability.
 	it.each([

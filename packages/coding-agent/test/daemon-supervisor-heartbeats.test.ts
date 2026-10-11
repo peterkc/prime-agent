@@ -611,6 +611,71 @@ describe("daemon supervisor passive scheduled-jobs snapshot", () => {
 	});
 });
 
+describe("daemon supervisor runtime reload delivery", () => {
+	it.each(["automatic", "overlapping command"] as const)(
+		"TM-13 relays %s reload only to capable non-requesters",
+		async (path) => {
+			const supervisor = createSupervisorHarness();
+			const requestWorker = vi.fn(async () => success(undefined, "attach"));
+			const target = { ...worker("ready"), client: { requestWorker }, snapshotCache: new Map() };
+			await (
+				supervisor as unknown as { subscribeWorker(worker: unknown, id: string): Promise<void> }
+			).subscribeWorker(target, "active-1");
+			expect(requestWorker.mock.calls[0]).toEqual([
+				expect.objectContaining({ capabilities: expect.arrayContaining(["runtime_reload_events"]) }),
+			]);
+			const clients = [true, true, false, true].map((capable, i) => ({
+				socket: { destroyed: false, write: vi.fn(() => true) },
+				capabilities: new Set(capable ? ["runtime_reload_events"] : []),
+				attachedActiveSessionIds: new Set([i === 3 ? "other" : "active-1"]),
+			}));
+			for (const client of clients) supervisor.clients.add(client);
+			const frame = {
+				header: { kind: "outbound", outboundType: "session_runtime_reloaded", activeSessionId: "active-1" },
+				payload: Buffer.from('{"type":"session_runtime_reloaded","activeSessionId":"active-1"}\n'),
+			};
+			const deliver = () => supervisor.handleWorkerFrame(target, frame);
+			const requested = path === "overlapping command";
+			const reloadCount = 2;
+			if (requested) {
+				supervisor.findWorkerForClient = vi.fn(async () => ({ worker: target, summary: { id: "active-1" } }));
+				const finishes: Array<() => void> = [];
+				supervisor.forwardToWorker = vi.fn(
+					(_worker, command) =>
+						new Promise<DaemonResponse>((resolve) => {
+							finishes.push(() => resolve(success(command.id, command.type)));
+						}),
+				);
+				const pending = Array.from({ length: reloadCount }, () =>
+					supervisor.handleCommand(clients[1] as unknown as DaemonSocketClient, {
+						type: "reload",
+						activeSessionId: "active-1",
+					}),
+				);
+				try {
+					await flushAsyncWork();
+					for (let i = 0; i < reloadCount; i++) {
+						deliver();
+						finishes[i]!();
+						await pending[i];
+					}
+				} finally {
+					for (const finish of finishes) finish();
+					await Promise.all(pending);
+				}
+			} else deliver();
+			expect(clients.map((client) => client.socket.write.mock.calls.length)).toEqual(
+				requested ? [reloadCount, 0, 0, 0] : [1, 1, 0, 0],
+			);
+			// The requester exclusion ends with the command, so a later automatic reload reaches both.
+			if (requested) {
+				deliver();
+				expect(clients.map((client) => client.socket.write.mock.calls.length)).toEqual([reloadCount + 1, 1, 0, 0]);
+			}
+		},
+	);
+});
+
 describe("daemon supervisor heartbeats_changed delivery", () => {
 	function socketClient(): {
 		socket: { destroyed: boolean; write: ReturnType<typeof vi.fn> };
