@@ -364,13 +364,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const resourceAreas = ["extensions", "skills", "prompts", "themes"] as const;
 		const trees: ReloadInputPath[] = [];
 		const candidates: ReloadInputPath[] = [];
+		// Local packages resolve from the same scope base as DefaultPackageManager.getBaseDirForScope.
 		const scopes = [
-			{ base: this.agentDir, settings: this.settingsManager.getGlobalSettings(), packagesBase: this.agentDir },
-			{
-				base: join(this.cwd, CONFIG_DIR_NAME),
-				settings: this.settingsManager.getProjectSettings(),
-				packagesBase: this.cwd,
-			},
+			{ base: this.agentDir, settings: this.settingsManager.getGlobalSettings() },
+			{ base: join(this.cwd, CONFIG_DIR_NAME), settings: this.settingsManager.getProjectSettings() },
 		];
 		for (const scope of scopes) {
 			for (const area of resourceAreas) {
@@ -383,7 +380,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			for (const pkg of scope.settings.packages ?? []) {
 				const path = typeof pkg === "string" ? pkg : pkg.source;
 				if (!isLocalPath(path)) continue;
-				const root = resolveUserPath(path, scope.packagesBase);
+				const root = resolveUserPath(path, scope.base);
 				trees.push({ path: root, areas: resourceAreas });
 				candidates.push({ path: join(root, "package.json"), areas: resourceAreas });
 			}

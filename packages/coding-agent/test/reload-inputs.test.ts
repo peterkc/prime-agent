@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { CONFIG_DIR_NAME } from "../src/config.js";
 import { collectReloadInputs, digestReloadInputs, RELOAD_AREAS } from "../src/core/reload-inputs.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -33,6 +34,7 @@ async function loaderFixture() {
 		join(agentDir, "settings.json"),
 		JSON.stringify({ prompts: [external], packages: [local], enableBuiltinSkills: false }),
 	);
+	write(join(cwd, CONFIG_DIR_NAME, "settings.json"), JSON.stringify({ packages: ["./project-pkg"] }));
 	const loader = new DefaultResourceLoader({
 		cwd,
 		agentDir,
@@ -55,6 +57,12 @@ describe("reload input inventory", () => {
 			"local manifest",
 			["local", "package.json"],
 			'{"pi":{"prompts":["prompts"]}}',
+			"extensions,prompts,skills,themes",
+		],
+		[
+			"project-relative manifest",
+			["repo", "nested", CONFIG_DIR_NAME, "project-pkg", "package.json"],
+			"{}",
 			"extensions,prompts,skills,themes",
 		],
 		["node_modules", ["local", "node_modules", "helper.js"], undefined, ""],
