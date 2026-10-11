@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME, getBundledSkillsDir } from "../config.js";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
@@ -8,13 +8,20 @@ import type { ResourceDiagnostic } from "./diagnostics.js";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 
-import { canonicalizePath, isLocalPath, isUnderPath } from "../utils/paths.js";
+import { canonicalizePath, isLocalPath, isUnderPath, resolveUserPath } from "../utils/paths.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
 import { DefaultPackageManager, type PathMetadata } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
+import {
+	addReloadInputs,
+	collectReloadInputs,
+	type ReloadInputPath,
+	type ReloadInputSnapshot,
+	type ReloadInputSpec,
+} from "./reload-inputs.js";
 import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
@@ -35,6 +42,8 @@ export interface ResourceLoader {
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
+	getReloadInputSnapshot?(): ReloadInputSnapshot | undefined;
+	snapshotExtensionResources?(paths: ResourceExtensionPaths): Promise<void>;
 	reload(): Promise<void>;
 }
 
@@ -194,6 +203,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private extensionsResult: LoadExtensionsResult;
 	private loadedExtensionPaths: string[] = [];
+	private reloadInputSnapshot?: ReloadInputSnapshot;
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -333,12 +343,102 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 	}
 
+	getReloadInputSnapshot(): ReloadInputSnapshot | undefined {
+		return this.reloadInputSnapshot;
+	}
+
+	async snapshotExtensionResources(paths: ResourceExtensionPaths): Promise<void> {
+		if (!this.reloadInputSnapshot) return;
+		const trees: ReloadInputPath[] = [];
+		for (const [area, entries] of [
+			["skills", paths.skillPaths],
+			["prompts", paths.promptPaths],
+			["themes", paths.themePaths],
+		] as const) {
+			for (const entry of entries ?? []) trees.push({ path: this.resolveResourcePath(entry.path), areas: [area] });
+		}
+		this.reloadInputSnapshot = await addReloadInputs(this.reloadInputSnapshot, trees);
+	}
+
+	private reloadInputSpec(): ReloadInputSpec {
+		const resourceAreas = ["extensions", "skills", "prompts", "themes"] as const;
+		const trees: ReloadInputPath[] = [];
+		const candidates: ReloadInputPath[] = [];
+		const scopes = [
+			{ base: this.agentDir, settings: this.settingsManager.getGlobalSettings(), packagesBase: this.agentDir },
+			{
+				base: join(this.cwd, CONFIG_DIR_NAME),
+				settings: this.settingsManager.getProjectSettings(),
+				packagesBase: this.cwd,
+			},
+		];
+		for (const scope of scopes) {
+			for (const area of resourceAreas) {
+				trees.push({ path: join(scope.base, area), areas: [area] });
+				// Settings patterns are overrides, not resource roots (package-manager splitPatterns).
+				for (const path of scope.settings[area] ?? []) {
+					if (!/^[!+-]|[*?]/.test(path)) trees.push({ path: resolveUserPath(path, scope.base), areas: [area] });
+				}
+			}
+			for (const pkg of scope.settings.packages ?? []) {
+				const path = typeof pkg === "string" ? pkg : pkg.source;
+				if (!isLocalPath(path)) continue;
+				const root = resolveUserPath(path, scope.packagesBase);
+				trees.push({ path: root, areas: resourceAreas });
+				candidates.push({ path: join(root, "package.json"), areas: resourceAreas });
+			}
+			for (const name of ["SYSTEM.md", "APPEND_SYSTEM.md"]) {
+				candidates.push({ path: join(scope.base, name), areas: ["system prompt"] });
+			}
+		}
+		for (const [area, paths] of [
+			["extensions", this.additionalExtensionPaths],
+			["skills", this.additionalSkillPaths],
+			["prompts", this.additionalPromptTemplatePaths],
+			["themes", this.additionalThemePaths],
+		] as const) {
+			for (const path of paths) {
+				if (isLocalPath(path)) trees.push({ path: this.resolveResourcePath(path), areas: [area] });
+			}
+		}
+		if (this.bundledSkillsDir) trees.push({ path: this.bundledSkillsDir, areas: ["skills"] });
+		trees.push({ path: join(homedir(), ".agents", "skills"), areas: ["skills"] });
+		let dir = resolve(this.cwd);
+		let insideSkillScope = true;
+		while (true) {
+			for (const name of ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]) {
+				candidates.push({ path: join(dir, name), areas: ["context files"] });
+			}
+			if (insideSkillScope) trees.push({ path: join(dir, ".agents", "skills"), areas: ["skills"] });
+			if (existsSync(join(dir, ".git"))) insideSkillScope = false;
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+		for (const name of ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]) {
+			candidates.push({ path: join(this.agentDir, name), areas: ["context files"] });
+		}
+		for (const source of [this.systemPromptSource, ...(this.appendSystemPromptSource ?? [])]) {
+			if (!source) continue;
+			const path = resolve(source);
+			// resolvePromptInput treats non-files as literal prompt text. Retain known files after deletion.
+			if (existsSync(source) || this.reloadInputSnapshot?.spec.candidates.some((entry) => entry.path === path)) {
+				candidates.push({ path, areas: ["system prompt"] });
+			}
+		}
+		return { trees, candidates, settingsFiles: scopes.map((scope) => join(scope.base, "settings.json")) };
+	}
+
 	async reload(): Promise<void> {
 		await this.settingsManager.reload();
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
 		});
+		this.reloadInputSnapshot = await collectReloadInputs(this.reloadInputSpec(), undefined, [
+			{ ...this.settingsManager.getGlobalSettings() },
+			{ ...this.settingsManager.getProjectSettings() },
+		]);
 		const metadataByPath = new Map<string, PathMetadata>();
 
 		this.extensionSkillSourceInfos = new Map();

@@ -146,6 +146,7 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
+import { DaemonAutoReloadScheduler } from "./daemon-auto-reload.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import {
 	deserializeDaemonError,
@@ -526,6 +527,7 @@ export class AgentDaemon {
 	private readonly cronStore: AgentCronJobStore;
 	private readonly agentDir: string;
 	private readonly cronScheduler: AgentCronScheduler;
+	private readonly autoReloadScheduler: DaemonAutoReloadScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
 	// Sessions inserted into `sessions` but still awaiting extension binding;
 	// visible to host controllers during bind, excluded from targeting.
@@ -592,6 +594,24 @@ export class AgentDaemon {
 			throw new Error("Daemon config is missing agentDir");
 		}
 		this.agentDir = options.defaultSessionConfig.agentDir;
+		this.autoReloadScheduler = new DaemonAutoReloadScheduler({
+			settingsPath: join(this.agentDir, "settings.json"),
+			sessions: () => this.sessions,
+			onReloaded: (state) =>
+				this.broadcastToSession(state, {
+					type: "session_runtime_reloaded",
+					activeSessionId: state.activeSessionId,
+				}),
+			isAvailable: (state) =>
+				!this.shuttingDown &&
+				!this.updateRestart &&
+				!this.bindingSessions.has(state.activeSessionId) &&
+				!this.closingSessions.has(state.activeSessionId),
+			log: (level, message, details) => {
+				if (level === "debug") structuredLog.debug(message, { socketPath: this.socketPath, ...details });
+				else this.log(message);
+			},
+		});
 		// Hosted extensions get ctx.ui.theme; init it headlessly (no TTY, watcher off) or their first access kills the worker.
 		initTheme(
 			SettingsManager.create(options.defaultSessionConfig.cwd ?? process.cwd(), this.agentDir).getTheme(),
@@ -688,6 +708,7 @@ export class AgentDaemon {
 
 		this.registerSignalHandlers();
 		this.summarizer.start();
+		this.autoReloadScheduler.start();
 		this.log(`Prime Agent daemon listening on ${this.socketPath}`);
 		// No startup restore: on-disk sessions return only via --resume or the agents view.
 		if (!this.shuttingDown) {
@@ -4065,6 +4086,7 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_archive_and_shutdown": {
+					await this.autoReloadScheduler.stop();
 					// Close sessions first so direct peers read session_closed "killed", not a daemon shutdown.
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
@@ -5286,6 +5308,11 @@ export class AgentDaemon {
 				// Reload re-evaluates extension modules, which capture client env
 				// (e.g. herdr pane identity) synchronously at load.
 				await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
+				this.broadcastToSession(
+					state,
+					{ type: "session_runtime_reloaded", activeSessionId: state.activeSessionId },
+					client.authenticationRole === "supervisor" ? undefined : client,
+				);
 				return success(command.id, "reload");
 			}
 
@@ -6615,6 +6642,7 @@ export class AgentDaemon {
 		};
 		this.updateRestart = transaction;
 		this.cronScheduler.stop();
+		void this.autoReloadScheduler.stop();
 		transaction.deadline = setTimeout(() => {
 			transaction.abort.abort();
 			this.cancelPreparedUpdateRestart(transaction.id);
@@ -6627,6 +6655,20 @@ export class AgentDaemon {
 		transaction: NonNullable<AgentDaemon["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest> {
 		try {
+			// The supervisor's checkpoint budget leaves time to report the reload blocker before its RPC expires.
+			const budget = new AbortController();
+			const timer =
+				transaction.checkpointTimeoutMs === undefined
+					? undefined
+					: setTimeout(() => budget.abort(), transaction.checkpointTimeoutMs);
+			timer?.unref();
+			const signal = AbortSignal.any([transaction.abort.signal, budget.signal]);
+			try {
+				await this.autoReloadScheduler.stop(signal);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+			this.assertUpdateRestartNotCancelled(transaction);
 			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
 			this.assertUpdateRestartNotCancelled(transaction);
 			transaction.phase = "fencing";
@@ -6738,6 +6780,7 @@ export class AgentDaemon {
 		if (!this.shuttingDown) {
 			this.peerAdmissionsFenced = false;
 			this.cronScheduler.start();
+			this.autoReloadScheduler.start();
 		}
 	}
 
@@ -7021,7 +7064,11 @@ export class AgentDaemon {
 		return cascadeError;
 	}
 
-	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
+	private broadcastToSession(
+		state: ActiveSessionState,
+		message: DaemonOutbound,
+		excludedClient?: DaemonSocketClient,
+	): void {
 		if (message.type === "session_event") {
 			const eventType = message.event.type;
 			// A finished turn/compaction is the cue to refresh status.
@@ -7046,7 +7093,12 @@ export class AgentDaemon {
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		let serialized: string | undefined;
 		for (const client of state.clients) {
-			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
+			if (client === excludedClient || !shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
+				continue;
+			}
+			// Runtime notifications must precede the reload response even during snapshot transfer.
+			if (sequencedMessage.type === "session_runtime_reloaded") {
+				this.write(client, sequencedMessage);
 				continue;
 			}
 			// Snapshots cannot recover extension requests, so never defer or drop them.
@@ -7904,6 +7956,7 @@ export class AgentDaemon {
 
 	private async shutdown(exitCode: number): Promise<never> {
 		if (this.shuttingDown) {
+			await this.autoReloadScheduler.stop();
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
@@ -7931,6 +7984,7 @@ export class AgentDaemon {
 		}
 
 		this.summarizer.stop();
+		await this.autoReloadScheduler.stop();
 		for (const cleanup of this.signalCleanupHandlers) {
 			cleanup();
 		}
@@ -8150,6 +8204,9 @@ function isSequencedSessionOutbound(message: DaemonOutbound): message is Sequenc
 }
 
 export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, message: DaemonOutbound): boolean {
+	if (message.type === "session_runtime_reloaded") {
+		return daemonClientCapabilitiesForSession(client, message.activeSessionId).has("runtime_reload_events");
+	}
 	return (
 		message.type !== "extension_ui_request" ||
 		!isDaemonDialogExtensionUiRequest(message.method) ||

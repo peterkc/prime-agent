@@ -2926,7 +2926,14 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"extension_ui",
+				"slim_attach",
+				"chunked_snapshot",
+				"runtime_reload_events",
+			],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",

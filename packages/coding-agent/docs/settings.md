@@ -347,6 +347,12 @@ Normally the package manager's global modules location is queried using `root -g
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+| `autoReload` | `"off"` or `"idle"` | `"off"` | Reload changed runtime files when daemon sessions are idle. |
+
+`autoReload` reads only global settings; project settings and SDK overrides cannot enable it.
+The daemon reads the file every 15 seconds, so changing this setting needs no `/reload`.
+Invalid values or unreadable global settings disable automatic reload.
+See [automatic runtime reload](daemon.md#automatic-runtime-reload) for timing and kernel-state limits.
 
 `idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
 
