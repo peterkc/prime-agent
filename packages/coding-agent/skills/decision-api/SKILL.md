@@ -139,6 +139,8 @@ newer is required.
 Stay in your turn while a loop runs: poll with `loop.wait(timeout=...)`, read
 `history`, `goal_updates`, and `errors`, adjust, and stop it when done. The
 loop keeps running between cells, but nothing wakes you once your turn ends.
+With `autoReload` set to `"idle"`, an automatic reload can also restart the
+kernel after your turn ends and stop the loop, so keep loops inside your turn.
 
 For a single System 1 decision without a loop, `await
 decision_api.decide(observation, actions, goal="...", images=None)` returns
