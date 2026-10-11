@@ -6040,6 +6040,22 @@ export class InteractiveMode {
 						this.reportCurrentRenderMode();
 						await this.refreshHeartbeatCatalog();
 					}
+				} else if (event.type === "session_runtime_reloaded") {
+					const generation = this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(async () => {
+						if (
+							generation !== this.sessionEventGeneration ||
+							event.activeSessionId !== this.connectionState?.activeSessionId
+						)
+							return;
+						await this.initialRenderPromise?.catch(() => undefined);
+						if (generation !== this.sessionEventGeneration) return;
+						await this.settingsManager.reload();
+						await this.refreshAfterRuntimeReload();
+						this.ui.requestRender();
+					});
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
@@ -11640,52 +11656,56 @@ export class InteractiveMode {
 
 		try {
 			await this.agentConnection.reload();
-			this.pendingPostRunActivation = undefined;
-			this.toolDefinitionCache.clear();
-			this.keybindings.reload();
-			const activeHeader = this.customHeader ?? this.builtInHeader;
-			if (isExpandable(activeHeader)) {
-				activeHeader.setExpanded(this.toolOutputExpanded);
-			}
-			setRegisteredThemes(this.uiServices.getThemes());
-			const themeName = this.settingsManager.getTheme();
-			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
-			if (!themeResult.success) {
-				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
-			}
-			const editorPaddingX = this.settingsManager.getEditorPaddingX();
-			const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
-			this.defaultEditor.setPaddingX(editorPaddingX);
-			this.defaultEditor.setAutocompleteMaxVisible(autocompleteMaxVisible);
-			if (this.editor !== this.defaultEditor) {
-				this.editor.setPaddingX?.(editorPaddingX);
-				this.editor.setAutocompleteMaxVisible?.(autocompleteMaxVisible);
-			}
-			this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
-			this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
-			await this.refreshConnectionCatalog();
-			this.setupAutocompleteProvider();
-			if (this.bindLocalSessionExtensions) {
-				const runner = this.getLocalSessionHost().getExtensionRunner();
-				this.setupExtensionShortcuts(runner);
-			}
-			await this.rebuildChatFromMessages();
+			await this.refreshAfterRuntimeReload();
 			dismissReloadBox(this.editor as Component);
-			this.showLoadedResources({
-				force: false,
-				showDiagnosticsWhenQuiet: true,
-			});
-			const modelsJsonError = this.modelRegistry.getError();
-			if (modelsJsonError) {
-				this.showError(`models.json error: ${modelsJsonError}`);
-			}
-			this.showStatus("Reloaded keybindings, extensions, skills, prompts, themes");
 			return true;
 		} catch (error) {
 			dismissReloadBox(previousEditor as Component);
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
 			return false;
 		}
+	}
+
+	private async refreshAfterRuntimeReload(): Promise<void> {
+		this.pendingPostRunActivation = undefined;
+		this.toolDefinitionCache.clear();
+		this.keybindings.reload();
+		const activeHeader = this.customHeader ?? this.builtInHeader;
+		if (isExpandable(activeHeader)) {
+			activeHeader.setExpanded(this.toolOutputExpanded);
+		}
+		setRegisteredThemes(this.uiServices.getThemes());
+		const themeName = this.settingsManager.getTheme();
+		const themeResult = themeName ? setTheme(themeName, true) : { success: true };
+		if (!themeResult.success) {
+			this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
+		}
+		const editorPaddingX = this.settingsManager.getEditorPaddingX();
+		const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
+		this.defaultEditor.setPaddingX(editorPaddingX);
+		this.defaultEditor.setAutocompleteMaxVisible(autocompleteMaxVisible);
+		if (this.editor !== this.defaultEditor) {
+			this.editor.setPaddingX?.(editorPaddingX);
+			this.editor.setAutocompleteMaxVisible?.(autocompleteMaxVisible);
+		}
+		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
+		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+		await this.refreshConnectionCatalog();
+		this.setupAutocompleteProvider();
+		if (this.bindLocalSessionExtensions) {
+			const runner = this.getLocalSessionHost().getExtensionRunner();
+			this.setupExtensionShortcuts(runner);
+		}
+		await this.rebuildChatFromMessages();
+		this.showLoadedResources({
+			force: false,
+			showDiagnosticsWhenQuiet: true,
+		});
+		const modelsJsonError = this.modelRegistry.getError();
+		if (modelsJsonError) {
+			this.showError(`models.json error: ${modelsJsonError}`);
+		}
+		this.showStatus("Reloaded keybindings, extensions, skills, prompts, themes");
 	}
 
 	private async handleExportCommand(text: string): Promise<void> {

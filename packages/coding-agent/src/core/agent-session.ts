@@ -185,7 +185,7 @@ import {
 } from "./goals.js";
 import { resolveImageModelOverride } from "./image-model-routing.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
-import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import { manifestPathIn, type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -264,6 +264,7 @@ import {
 	reviewAutoRefine,
 	saveHarnessState,
 } from "./refinement/index.js";
+import { digestReloadInputs, type ReloadArea, type ReloadLoadRecord } from "./reload-inputs.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
@@ -736,6 +737,13 @@ interface PreparedPromptPreparation {
 class DeferredSessionInputError extends Error {}
 
 class SessionInputAdmissionPausedError extends Error {}
+
+export class SessionBusyError extends Error {
+	constructor() {
+		super("Cannot reload: session is busy (streaming, compacting or retrying).");
+		this.name = "SessionBusyError";
+	}
+}
 
 function oncePreflight(
 	preflightResult: ((success: boolean, queued?: boolean) => void) | undefined,
@@ -1676,6 +1684,8 @@ export class AgentSession {
 	private _modelSelectEmitContext = new AsyncLocalStorage<boolean>();
 
 	private _resourceLoader: ResourceLoader;
+	private _reloadQueue: Promise<void> = Promise.resolve();
+	private _loadRecord?: ReloadLoadRecord;
 	private _customTools: ToolDefinition[];
 	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
@@ -1884,6 +1894,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._commitLoadRecord();
 		this._ensureHarnessDigestContext();
 	}
 
@@ -8695,6 +8706,34 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
+	private _onReloadIpythonStateRestored(result: RestoreResult): void {
+		let skipped: Array<{ name: string; reason: string }> = [];
+		if (this._ipythonKernelSnapshotDir) {
+			try {
+				const manifest: unknown = JSON.parse(readFileSync(manifestPathIn(this._ipythonKernelSnapshotDir), "utf8"));
+				if (manifest && typeof manifest === "object" && "skipped" in manifest && Array.isArray(manifest.skipped)) {
+					skipped = manifest.skipped.filter(
+						(entry): entry is { name: string; reason: string } =>
+							entry !== null &&
+							typeof entry === "object" &&
+							typeof entry.name === "string" &&
+							typeof entry.reason === "string",
+					);
+				}
+			} catch (error) {
+				void this.sendCustomMessage(
+					{
+						customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+						content: `Kernel snapshot diagnostics could not be read: ${error instanceof Error ? error.message : String(error)}. Names lost during snapshot are unknown.`,
+						display: true,
+					},
+					{ deliverAs: "nextTurn" },
+				).catch(() => {});
+			}
+		}
+		this._onIpythonStateRestored({ ...result, failed: [...result.failed, ...skipped] });
+	}
+
 	private _onIpythonStateRestored(result: RestoreResult): void {
 		const lines = ["[python-state-restored]", ""];
 		if (result.restored.length > 0) {
@@ -10520,6 +10559,7 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		this._commitLoadRecord();
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -10542,6 +10582,7 @@ export class AgentSession {
 			themePaths: this.buildExtensionResourcePaths(themePaths),
 		};
 
+		await this._resourceLoader.snapshotExtensionResources?.(extensionPaths);
 		this._resourceLoader.extendResources(extensionPaths);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
@@ -10831,6 +10872,7 @@ export class AgentSession {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
 		includeAllExtensionTools?: boolean;
+		notifyRestore?: boolean;
 	}): void {
 		const pythonSkills = getPythonSkillRuntimeInfo(this._modelVisibleSkills());
 		let configuredBaseToolDefinitions: Record<string, ToolDefinition>;
@@ -10848,10 +10890,7 @@ export class AgentSession {
 			// reload can't restore from a snapshot the old kernel is still writing.
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
-			// Only surface the "revived from your previous session" notice on the first
-			// build (a genuine resume). A later rebuild (/reload) restores state silently
-			// for continuity — the conversation is unchanged, so there's nothing to flag.
-			const notifyRestore = !this._ipythonRuntimeBuilt;
+			const notifyRestore = !this._ipythonRuntimeBuilt || options.notifyRestore === true;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				commandPrefix: this.settingsManager.getShellCommandPrefix(),
@@ -10861,7 +10900,12 @@ export class AgentSession {
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
-				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
+				onRestore: notifyRestore
+					? (result) =>
+							options.notifyRestore
+								? this._onReloadIpythonStateRestored(result)
+								: this._onIpythonStateRestored(result)
+					: undefined,
 				onUnavailableSkills: (errors) => this._onPythonSkillsUnavailable(errors),
 				onBackgroundWorkSettled: () => {
 					this._maybeResumeGoalContinuationAfterRlmWork();
@@ -11150,7 +11194,80 @@ export class AgentSession {
 		return handlers;
 	}
 
+	get loadRecord(): ReloadLoadRecord | undefined {
+		return this._loadRecord;
+	}
+
+	private _commitLoadRecord(): void {
+		const snapshot = this._resourceLoader.getReloadInputSnapshot?.();
+		if (snapshot) this._loadRecord = { digests: digestReloadInputs(snapshot), snapshot };
+	}
+
 	async reload(): Promise<void> {
+		await this._serializeReload();
+	}
+
+	async autoReload(options: {
+		changedAreas: readonly ReloadArea[];
+		isIdle: () => boolean;
+	}): Promise<"reloaded" | "skipped"> {
+		return this._serializeReload(options);
+	}
+
+	private async _serializeReload(options?: {
+		changedAreas: readonly ReloadArea[];
+		isIdle: () => boolean;
+	}): Promise<"reloaded" | "skipped"> {
+		const previous = this._reloadQueue;
+		let release = () => {};
+		this._reloadQueue = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		const pause = this.acquireQueuedWorkPause();
+		let fence: { release(): void } | undefined;
+		let started = false;
+		try {
+			fence = await this._acquireSessionActionCommitFence();
+			if (options) {
+				if (!options.isIdle()) return "skipped";
+				started = true;
+			} else if (this.isStreaming || this.isCompacting || this.isRetrying) {
+				throw new SessionBusyError();
+			}
+			// Lifecycle sends must wait for the fence, not inherit its owner.
+			await this._sessionActionCommitContext.exit(() => this._reloadRuntime(options !== undefined));
+			if (options) {
+				const errors = this._resourceLoader.getExtensions().errors;
+				await this.sendCustomMessage({
+					customType: "runtime-auto-reload",
+					content: `Runtime automatically reloaded: ${options.changedAreas.join(", ")}. The Python kernel restarted.${
+						errors.length
+							? `\nExtension load errors:\n${errors.map((error) => `- ${error.path}: ${error.error}`).join("\n")}`
+							: ""
+					}`,
+					display: true,
+				});
+			}
+			this._commitLoadRecord();
+			return "reloaded";
+		} catch (error) {
+			if (options && started) {
+				await this.sendCustomMessage({
+					customType: "runtime-auto-reload",
+					content: `Automatic runtime reload failed (${options.changedAreas.join(", ")}): ${error instanceof Error ? error.message : String(error)}. The runtime may be partly rebuilt.`,
+					display: true,
+				});
+			}
+			throw error;
+		} finally {
+			fence?.release();
+			pause.release();
+			release();
+		}
+	}
+
+	private async _reloadRuntime(notifyRestore: boolean): Promise<void> {
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, {
 			type: "session_shutdown",
@@ -11167,6 +11284,7 @@ export class AgentSession {
 			activeToolNames: this.getActiveToolNames(),
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
+			notifyRestore,
 		});
 
 		const hasBindings =

@@ -696,6 +696,7 @@ export class DaemonSupervisor {
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
+	private readonly reloadRequesters = new Map<string, Map<DaemonSocketClient, number>>();
 	private readonly connectionIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly sessionInputPauseEpochs = new WeakMap<DaemonSocketClient, number>();
 	private readonly detachingInputPauseSessions = new WeakMap<DaemonSocketClient, Set<string>>();
@@ -2935,9 +2936,27 @@ export class DaemonSupervisor {
 				(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
 			if (!isRootKill) {
 				const forward = async () => {
-					const response = await this.forwardToWorker(match.worker, resolvedCommand);
-					if (admission && response.success) admission.status = "owned";
-					return response;
+					const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+					const requesters =
+						command.type === "reload"
+							? (this.reloadRequesters.get(activeSessionId) ?? new Map<DaemonSocketClient, number>())
+							: undefined;
+					if (requesters) {
+						requesters.set(client, (requesters.get(client) ?? 0) + 1);
+						this.reloadRequesters.set(activeSessionId, requesters);
+					}
+					try {
+						const response = await this.forwardToWorker(match.worker, resolvedCommand);
+						if (admission && response.success) admission.status = "owned";
+						return response;
+					} finally {
+						if (requesters) {
+							const remaining = requesters.get(client)! - 1;
+							if (remaining === 0) requesters.delete(client);
+							else requesters.set(client, remaining);
+							if (requesters.size === 0) this.reloadRequesters.delete(activeSessionId);
+						}
+					}
 				};
 				if (command.type === "rename" || command.type === "set_session_name") {
 					const reservation = this.summaryNameReservationInput(match.summary, command.name.trim());
@@ -3732,8 +3751,15 @@ export class DaemonSupervisor {
 			type: "worker_subscribe",
 			activeSessionId,
 			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				? [
+						"attach_snapshot",
+						"event_sequence",
+						"extension_ui",
+						"slim_attach",
+						"chunked_snapshot",
+						"runtime_reload_events",
+					]
+				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "runtime_reload_events"],
 			supportsExtensionUi,
 		});
 		if (!response.success) {
@@ -5454,8 +5480,14 @@ export class DaemonSupervisor {
 							type: "attach",
 							activeSessionId,
 							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
+								? [
+										"attach_snapshot",
+										"event_sequence",
+										"slim_attach",
+										"chunked_snapshot",
+										"runtime_reload_events",
+									]
+								: ["attach_snapshot", "event_sequence", "slim_attach", "runtime_reload_events"],
 							supportsExtensionUi: false,
 							env: command.env ?? collectDaemonClientEnv(),
 						});
@@ -6291,6 +6323,15 @@ export class DaemonSupervisor {
 		);
 		for (const client of this.clients) {
 			if (!client.attachedActiveSessionIds.has(activeSessionId)) {
+				continue;
+			}
+			if (outboundType === "session_runtime_reloaded") {
+				if (
+					!client.capabilities.has("runtime_reload_events") ||
+					this.reloadRequesters.get(activeSessionId)?.has(client)
+				)
+					continue;
+				this.writeSerialized(client, publicPayload);
 				continue;
 			}
 			if (replacementSnapshotFollows && !client.capabilities.has("chunked_snapshot")) {

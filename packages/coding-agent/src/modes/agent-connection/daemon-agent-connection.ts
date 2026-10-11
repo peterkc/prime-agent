@@ -503,6 +503,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
+					"runtime_reload_events",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 					...(this.options.tracksHeartbeats ? (["heartbeat_catalog"] as const) : []),
 				],
@@ -1704,6 +1705,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
+					"runtime_reload_events",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 					...(this.options.tracksHeartbeats ? (["heartbeat_catalog"] as const) : []),
 				],
@@ -2063,6 +2065,14 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (!this.isMessageForActiveSession(message)) {
+			return;
+		}
+		if (message.type === "session_runtime_reloaded") {
+			if (!this.client.supportsServerCapability("runtime_reload_events")) return;
+			this.latestSnapshotIsFresh = false;
+			this.latestSnapshotStateIsFresh = false;
+			this.stateFreshnessGeneration++;
+			await this.emit({ type: "session_runtime_reloaded", activeSessionId: message.activeSessionId });
 			return;
 		}
 		// Requests bypass snapshot deferral and must not advance the replay cursor.

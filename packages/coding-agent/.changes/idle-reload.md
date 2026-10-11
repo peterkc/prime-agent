@@ -1,0 +1,2 @@
+- Added the global `autoReload` setting. With `"idle"`, the daemon reloads idle sessions after their skills, extensions, prompts, settings or context files change, and windows that support it refresh without a second reload.
+- Changed manual reload to fail with a busy error while the session is streaming, compacting or retrying.
