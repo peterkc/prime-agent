@@ -510,6 +510,8 @@ export interface SessionStartEvent {
 	reason: "startup" | "reload" | "new" | "resume" | "fork";
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
+	/** Present for "reload": "auto" when the daemon reloaded an idle session on its own (autoReload), else "manual". */
+	trigger?: "manual" | "auto";
 }
 
 /** Fired before switching to another session (can be cancelled) */

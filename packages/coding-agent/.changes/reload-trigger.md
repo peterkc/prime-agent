@@ -1,0 +1,1 @@
+- Added `trigger` to the `session_start` event for reloads: `"auto"` after an automatic reload, `"manual"` otherwise, so extensions can tell them apart.

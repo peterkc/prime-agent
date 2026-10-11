@@ -113,7 +113,7 @@ manifests, context files, `SYSTEM.md`, `APPEND_SYSTEM.md`, explicit prompt files
 resources added by extensions. The reload-relevant settings are `packages`,
 `extensions`, `skills`, `prompts`, `themes`, `enableSkillCommands`, `enableBuiltinSkills`,
 `bundledSkills`, `codemode`, `codemodeOpenAPI`, `codemodeExcludeTools`, `mcpServers`,
-`mcpCatalogSources`, `shellPath` and `shellCommandPrefix`.
+`mcpCatalogSources`, `shellPath`, `shellCommandPrefix` and `decisionApi`.
 Other settings do not trigger reload. Neither do `auth.json`, `models.json`,
 `keybindings.json`, transitive extension imports or npm package internals.
 Dot entries, `node_modules`, `.git`, `__pycache__` and `.venv` below watched roots are excluded.
@@ -123,7 +123,8 @@ can be missed. Two-check settling reduces, but cannot prevent, loading a partial
 
 **Every automatic reload restarts the Python kernel.** Values that cannot be saved,
 values above 16 MiB each, or values above the 256 MiB total limit can be lost.
-A visible transcript entry names the changed areas and kernel restart. Restore
+A visible transcript entry names the changed areas and kernel restart. Extensions
+receive `session_start` with `reason: "reload"` and `trigger: "auto"`. Restore
 notices name lost values. A failed reload can leave a partly rebuilt runtime;
 it adds a failure entry and is not retried until its inputs change.
 
