@@ -6,6 +6,7 @@ export type { AssistantMessageEventStream } from "./utils/event-stream.js";
 export type KnownApi =
 	| "openai-completions"
 	| "mistral-conversations"
+	| "systemone"
 	| "openai-responses"
 	| "azure-openai-responses"
 	| "openai-codex-responses"

@@ -1,0 +1,15 @@
+# Kernel-side package. prime-agent-runtime is installed before skills and
+# provides rlm.host_request; it is intentionally not a PyPI dependency.
+[project]
+name = "decision-api"
+version = "0.1.0"
+description = "Prime Agent decision API: System 1 / System 2 control over the host bridge"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/decision_api"]

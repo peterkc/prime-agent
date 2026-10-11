@@ -1,0 +1,1 @@
+- Added the `systemone` API, which sends one decision request as JSON to a model's `/systemone` endpoint and returns the reply with token usage.

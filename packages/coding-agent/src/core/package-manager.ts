@@ -2099,6 +2099,7 @@ export class DefaultPackageManager implements PackageManager {
 				...userOverrides.skills,
 				// Web search stays disabled until explicitly enabled.
 				...(this.settingsManager.getBundledWebsearchEnabled() ? [] : ["-websearch/SKILL.md"]),
+				...(this.settingsManager.getDecisionApiSystemOneModel() ? [] : ["-decision-api/SKILL.md"]),
 				// MCP integration skills stay disabled until their authentication is available.
 				...this.extraBuiltinSkillOverrides(),
 			];

@@ -111,6 +111,15 @@ describe("reload input inventory", () => {
 		const changed = digestReloadInputs(await collectReloadInputs(spec));
 		expect(RELOAD_AREAS.filter((area) => changed[area] !== digestReloadInputs(before)[area])).toEqual(["settings"]);
 	});
+	it("tracks decisionApi.systemOneModel as a settings input", async () => {
+		const settings = join(temporary(), "settings.json");
+		const spec = { trees: [], candidates: [], settingsFiles: [settings] };
+		write(settings, JSON.stringify({ decisionApi: { systemOneModel: "typesafe/jev-1.13.0" } }));
+		const before = digestReloadInputs(await collectReloadInputs(spec));
+		write(settings, JSON.stringify({ decisionApi: { systemOneModel: "typesafe/other" } }));
+		const after = digestReloadInputs(await collectReloadInputs(spec));
+		expect(RELOAD_AREAS.filter((area) => after[area] !== before[area])).toEqual(["settings"]);
+	});
 	it("TM-10 bounds the inventory and distinguishes an unreadable candidate from absence", async () => {
 		const root = temporary(),
 			tree = join(root, "tree"),

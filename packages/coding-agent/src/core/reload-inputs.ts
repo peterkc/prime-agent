@@ -30,6 +30,7 @@ export const RELOAD_SETTINGS_KEYS = [
 	"mcpCatalogSources",
 	"shellPath",
 	"shellCommandPrefix",
+	"decisionApi",
 ] as const;
 export const RELOAD_INPUT_ENTRY_LIMIT = 20_000;
 const MAX_DEPTH = 12;
