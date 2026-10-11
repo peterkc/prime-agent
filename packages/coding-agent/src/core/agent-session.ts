@@ -11236,7 +11236,7 @@ export class AgentSession {
 				throw new SessionBusyError();
 			}
 			// Lifecycle sends must wait for the fence, not inherit its owner.
-			await this._sessionActionCommitContext.exit(() => this._reloadRuntime(options !== undefined));
+			await this._sessionActionCommitContext.exit(() => this._reloadRuntime(options ? "auto" : "manual"));
 			if (options) {
 				const errors = this._resourceLoader.getExtensions().errors;
 				await this.sendCustomMessage({
@@ -11267,7 +11267,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _reloadRuntime(notifyRestore: boolean): Promise<void> {
+	private async _reloadRuntime(trigger: "manual" | "auto"): Promise<void> {
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, {
 			type: "session_shutdown",
@@ -11284,7 +11284,7 @@ export class AgentSession {
 			activeToolNames: this.getActiveToolNames(),
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
-			notifyRestore,
+			notifyRestore: trigger === "auto",
 		});
 
 		const hasBindings =
@@ -11296,6 +11296,7 @@ export class AgentSession {
 			await this._extensionRunner.emit({
 				type: "session_start",
 				reason: "reload",
+				trigger,
 			});
 			await this.extendResourcesFromExtensions("reload");
 		}

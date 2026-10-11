@@ -42,7 +42,7 @@ async function fixture(shutdownSend = false) {
 	const compactEntered = createDeferred<void>(),
 		compactRelease = createDeferred<void>();
 	const loader = makeLoader(root, (pi) => {
-		pi.on("session_start", (event) => void lifecycle.push(`start:${event.reason}`));
+		pi.on("session_start", (e) => void lifecycle.push(["start", e.reason, e.trigger].filter(Boolean).join(":")));
 		pi.on("session_shutdown", (event) => {
 			lifecycle.push(`shutdown:${event.reason}`);
 			if (shutdownSend) pi.sendUserMessage("shutdown");
@@ -124,9 +124,11 @@ describe("AgentSession guarded reload", () => {
 			await second;
 			expect(f.lifecycle).toEqual(
 				fail
-					? ["start:startup", "shutdown:reload", "shutdown:reload", "start:reload"]
-					: ["start:startup", "shutdown:reload", "start:reload", "shutdown:reload", "start:reload"],
+					? ["start:startup", "shutdown:reload", "shutdown:reload", "start:reload:manual"]
+					: ["start:startup", "shutdown:reload", "start:reload:manual", "shutdown:reload", "start:reload:manual"],
 			);
+			expect(await f.h.session.autoReload({ changedAreas: ["skills"], isIdle: () => true })).toBe("reloaded");
+			expect(f.lifecycle.at(-1)).toBe("start:reload:auto");
 			f.h.setResponses([fauxAssistantMessage("after reload")]);
 			await f.h.session.prompt("after");
 			await f.h.session.waitForIdle();
