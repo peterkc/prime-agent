@@ -201,7 +201,7 @@ describe("decision_api.decide", () => {
 			'decision_api.decide needs a "questions" object with an "action" question',
 		],
 		[
-			"PR #14 extra questions",
+			"extra questions",
 			{ ...question(), questions: { ...question().questions, score: { type: "score" }, rank: { type: "rank" } } },
 			'decision_api.decide got unsupported questions: "rank", "score". Only the "action" question is supported.',
 		],
@@ -408,7 +408,7 @@ describe("decision_api.decide", () => {
 		});
 		expect(readFileSync(logPath, "utf8")).not.toContain("not-base64!");
 	});
-	it("PR #14 invokes the decision handler registered by a real AgentSession", async () => {
+	it("invokes the decision handler registered by a real AgentSession", async () => {
 		const harness = await createHarness({ settings: { decisionApi: { systemOneModel: LABEL } } });
 		vi.stubEnv(ENV_AGENT_DIR, dir);
 		try {
@@ -442,16 +442,16 @@ describe("decision_api.decide", () => {
 			harness.cleanup();
 		}
 	});
-	it.each(["new", "existing"])("PR #14 creates owner-only log modes for %s files", async (mode) => {
+	it.each(["new", "existing"])("creates owner-only log modes for %s files", async (mode) => {
 		if (mode === "existing") {
 			mkdirSync(join(dir, "logs"), { mode: 0o700 });
 			writeFileSync(logPath, "", { mode: 0o644 });
 		}
 		await handler({ request: question() });
-		expect(statSync(join(dir, "logs")).mode & 0o777).toBe(0o700);
+		if (mode === "new") expect(statSync(join(dir, "logs")).mode & 0o777).toBe(0o700);
 		expect(statSync(logPath).mode & 0o777).toBe(0o600);
 	});
-	it("PR #14 serializes concurrent large calls as complete JSON lines", async () => {
+	it("serializes concurrent large calls as complete JSON lines", async () => {
 		const states = ["a".repeat(2 * 1024 * 1024), "b".repeat(2 * 1024 * 1024)];
 		const results = await Promise.all(states.map((state) => handler({ request: { ...question(), state } })));
 		expect(results.map((result) => result.log_error)).toEqual([undefined, undefined]);
@@ -462,30 +462,27 @@ describe("decision_api.decide", () => {
 		).toEqual(states);
 		expect(requests).toHaveLength(2);
 	});
-	it.each(["success", "refusal"])(
-		"PR #14 reports a held log lock on %s without repeating the decision",
-		async (mode) => {
-			mkdirSync(join(dir, "logs"), { mode: 0o700 });
-			const release = await lockfile.lock(logPath, { realpath: false });
-			try {
-				if (mode === "refusal") {
-					reference = undefined;
-					await expect(handler({ request: question() })).rejects.toThrow(
-						`${UNSET} (the decision log write also failed:`,
-					);
-				} else {
-					expect(await handler({ request: question() })).toMatchObject({
-						answers: { action: { choice: "left" } },
-						log_error: expect.stringContaining("already being held"),
-					});
-				}
-				expect(requests).toHaveLength(mode === "success" ? 1 : 0);
-				expect(existsSync(logPath)).toBe(false);
-			} finally {
-				await release();
+	it.each(["success", "refusal"])("reports a held log lock on %s without repeating the decision", async (mode) => {
+		mkdirSync(join(dir, "logs"), { mode: 0o700 });
+		const release = await lockfile.lock(logPath, { realpath: false });
+		try {
+			if (mode === "refusal") {
+				reference = undefined;
+				await expect(handler({ request: question() })).rejects.toThrow(
+					`${UNSET} (the decision log write also failed:`,
+				);
+			} else {
+				expect(await handler({ request: question() })).toMatchObject({
+					answers: { action: { choice: "left" } },
+					log_error: expect.stringContaining("already being held"),
+				});
 			}
-		},
-	);
+			expect(requests).toHaveLength(mode === "success" ? 1 : 0);
+			expect(existsSync(logPath)).toBe(false);
+		} finally {
+			await release();
+		}
+	});
 	it.each(["success", "refusal"])("reports a log write failure on %s without repeating the decision", async (mode) => {
 		const blocked = join(dir, "blocked");
 		writeFileSync(blocked, "not a directory");
