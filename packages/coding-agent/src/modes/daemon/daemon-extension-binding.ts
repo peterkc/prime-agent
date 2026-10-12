@@ -7,6 +7,7 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.js";
 import type { SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import { parseQuestionnaireOutcome } from "../../core/tools/questionnaire.js";
 import { createAgentConnectionState } from "../agent-connection/snapshot.js";
 import type { AgentConnectionState } from "../agent-connection/types.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
@@ -165,7 +166,7 @@ function createExtensionUIContext(
 		if (!hasExtensionUiClientForMethod(state, method)) {
 			return Promise.resolve(fallback);
 		}
-		const requestId = emitUiRequest(method, payload);
+		const requestId = randomUUID();
 		return new Promise((resolveDialog) => {
 			let timeoutId: ReturnType<typeof setTimeout> | undefined;
 			const cleanup = () => {
@@ -181,16 +182,32 @@ function createExtensionUIContext(
 			};
 			const onAbort = () => finish(fallback);
 			state.extensionUiRequests.set(requestId, {
+				method,
 				resolve: (response) => finish(resolveResponse(response)),
 			});
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts?.timeout !== undefined) {
 				timeoutId = setTimeout(() => finish(fallback), opts.timeout);
 			}
+			broadcast(state, {
+				type: "extension_ui_request",
+				activeSessionId: state.activeSessionId,
+				id: requestId,
+				method,
+				payload,
+			});
 		});
 	};
 
 	return {
+		questionnaire: (form, opts) =>
+			dialogRequest(
+				"questionnaire",
+				{ questions: form.questions, answers: form.answers },
+				opts,
+				undefined,
+				(response) => ("cancelled" in response ? undefined : parseQuestionnaireOutcome(form.questions, response)),
+			),
 		select: (title, values, opts) =>
 			dialogRequest("select", { title, options: values, timeout: opts?.timeout }, opts, undefined, (response) =>
 				"cancelled" in response && response.cancelled
@@ -262,6 +279,21 @@ function createExtensionUIContext(
 }
 
 function hasExtensionUiClientForMethod(state: ActiveSessionState, method: string): boolean {
+	if (method === "questionnaire") {
+		const uiClients = [...state.clients].filter(
+			(client) =>
+				client.capabilitiesByActiveSessionId?.get(state.activeSessionId)?.has("extension_ui") ??
+				client.supportsExtensionUi,
+		);
+		return (
+			uiClients.length > 0 &&
+			uiClients.every((client) =>
+				(client.capabilitiesByActiveSessionId?.get(state.activeSessionId) ?? client.capabilities).has(
+					"questionnaire_ui",
+				),
+			)
+		);
+	}
 	if (!isDaemonDialogExtensionUiRequest(method)) {
 		return state.clients.size > 0;
 	}

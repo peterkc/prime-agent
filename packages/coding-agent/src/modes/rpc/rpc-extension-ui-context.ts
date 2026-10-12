@@ -109,6 +109,7 @@ export function createRpcExtensionUiBridge(output: (request: RpcExtensionUIReque
 		setHeader: (_factory: unknown) => {},
 		setTitle: (title) => fireAndForget({ method: "setTitle", title }),
 		custom: async () => undefined as never,
+		questionnaire: async () => undefined,
 		pasteToEditor(text) {
 			this.setEditorText(text);
 		},

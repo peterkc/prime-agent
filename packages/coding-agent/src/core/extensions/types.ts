@@ -69,6 +69,7 @@ import type {
 	IpythonToolDetails,
 	IpythonToolInput,
 } from "../tools/index.js";
+import type { QuestionnaireForm, QuestionnaireOutcome } from "../tools/questionnaire.js";
 
 export type { ExecOptions, ExecResult } from "../exec.js";
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.js";
@@ -111,6 +112,8 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  * Each mode (interactive, RPC, print) provides its own implementation.
  */
 export interface ExtensionUIContext {
+	/** Show a native form, or return undefined to use the standard dialogs. */
+	questionnaire(form: QuestionnaireForm, opts?: ExtensionUIDialogOptions): Promise<QuestionnaireOutcome | undefined>;
 	/** Show a selector and return the user's choice. */
 	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
 

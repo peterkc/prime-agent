@@ -214,6 +214,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setHeader: () => {},
 	setTitle: () => {},
 	custom: async () => undefined as never,
+	questionnaire: async () => undefined,
 	pasteToEditor: () => {},
 	setEditorText: () => {},
 	getEditorText: () => "",

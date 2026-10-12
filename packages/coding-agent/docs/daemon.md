@@ -160,6 +160,32 @@ Protocol v1 is retained only for the one-release update handoff that prepares an
 
 JSON and RPC client modes do not expose daemon greetings, envelopes, snapshot records, lifecycle events, or connection metadata.
 
+## Questionnaire UI
+
+Schema revision 33 adds the optional `questionnaire_ui` capability. This is a
+capability-gated addition to protocol version 7, not an RPC wire change.
+Only the interactive TUI opts its daemon connection into this capability.
+The supervisor passes it to a worker only when every attached UI client
+advertises it and the worker supports it. Standard dialogs remain available
+when any client or daemon lacks the capability.
+
+A native form uses one `extension_ui_request` with `method: "questionnaire"`.
+Its `payload` contains parsed `questions` and saved `answers` keyed by question
+ID. Each answer contains `value` and `wasCustom`.
+The `extension_ui_response` carries `status` (`submitted`, `deferred`, or
+`cancelled`) and answers in the same keyed format. Structured replies require
+schema revision 33 and the negotiated capability. Standard dialog replies
+remain unchanged.
+
+The worker checks replies against the requested form. Unknown questions,
+unoffered values, forbidden typed answers, and incomplete Submit replies end
+cancelled with an error note. They never submit answers. A client-set change,
+disconnect, or abort cancels a pending native request. The tool falls back to
+standard dialogs unless the call was aborted.
+
+See [Questionnaire](questionnaire.md) for tool parameters, controls, saved
+progress, and extension cutover.
+
 ## Reconnect, Replay, and Snapshots
 
 Every sequenced event belongs to a worker generation. Clients retain the last `{ generation, sequence }` cursor and present it on attach. The server reports whether the requested interval is complete, partial, or unavailable.

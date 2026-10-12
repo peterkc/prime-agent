@@ -26,6 +26,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import {
 	type DaemonWorkerDescriptor,
@@ -306,7 +307,143 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 	await waitForCondition(() => existsSync(readyPath), `Blocking bash process did not become ready: ${readyPath}`);
 }
 
+function waitForSupervisorReady(child: ChildProcess, socketPath: string): Promise<void> {
+	return new Promise((resolveReady, reject) => {
+		function finish(error?: Error): void {
+			child.stderr?.off("data", ready);
+			child.off("exit", exited);
+			if (error) reject(error);
+			else resolveReady();
+		}
+		function ready(): void {
+			if (childDiagnostics.get(child)?.stderr.includes(`listening on ${socketPath}`)) finish();
+		}
+		function exited(): void {
+			finish(new Error(`Supervisor exited before readiness: ${childDiagnostics.get(child)?.stderr}`));
+		}
+		child.stderr?.on("data", ready);
+		child.once("exit", exited);
+		ready();
+	});
+}
+
 describe("daemon supervisor resident workers", () => {
+	it.each([true, false])(
+		"TM-14 TM-15 real supervisor relays a native form only when all UI clients are capable: %s",
+		async (allCapable) => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			mkdirSync(projectDir, { recursive: true });
+			const socketPath = join(tmpdir(), `prime-form-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			const extensionPath = join(root, "form-extension.ts");
+			const questionnaireSource = resolve(__dirname, "../src/core/tools/questionnaire.ts");
+			writeFileSync(
+				extensionPath,
+				`import { createQuestionnaireToolDefinition } from ${JSON.stringify(questionnaireSource)};
+export default function(pi) {
+ pi.registerCommand("native-form", { description: "Test form", handler: async (_args, ctx) => {
+  const tool = createQuestionnaireToolDefinition(ctx.cwd, { entries: () => ctx.sessionManager.getBranch(), appendEntry: (data) => pi.appendEntry("questionnaire_retry_state", data), needsInput: () => {} });
+  const result = await tool.execute("relay", { questions: [
+   { id: "scope", prompt: "Choose scope", options: [{ value: "small", label: "Small" }], allowOther: false },
+   { id: "priority", prompt: "Choose priority", options: [{ value: "now", label: "Now" }] }
+  ] }, undefined, undefined, ctx);
+  ctx.ui.notify(JSON.stringify(result.details));
+ } });
+}`,
+			);
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = new DaemonClient(socketPath);
+			const watcher = new DaemonClient(socketPath);
+			const requests: Extract<DaemonOutbound, { type: "extension_ui_request" }>[] = [];
+			const responses: Promise<unknown>[] = [];
+			const unsubscribe = client.onMessage((message) => {
+				if (message.type !== "extension_ui_request") return;
+				requests.push(message);
+				if (message.method === "questionnaire" || message.method === "select")
+					responses.push(
+						client.request({
+							type: "extension_ui_response",
+							activeSessionId: message.activeSessionId,
+							requestId: message.id,
+							response:
+								message.method === "questionnaire"
+									? {
+											status: "submitted",
+											answers: {
+												scope: { value: "small", wasCustom: false },
+												priority: { value: "later", wasCustom: true },
+											},
+										}
+									: { value: (message.payload.options as string[])[0] },
+						}),
+					);
+			});
+			try {
+				await waitForSupervisorReady(supervisor, socketPath);
+				await client.connect();
+				await client.waitForHello();
+				const created = await client.request({
+					type: "create",
+					config: {
+						cwd: projectDir,
+						agentDir,
+						sessionDir: join(root, "sessions"),
+						extensions: [extensionPath],
+						noSkills: true,
+						noPromptTemplates: true,
+						noThemes: true,
+					},
+				});
+				if (!created.success) throw new Error(created.error);
+				const summary = requireSummary(created.data);
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				const attached = await client.request({
+					type: "attach",
+					activeSessionId,
+					supportsExtensionUi: true,
+					capabilities: ["extension_ui", "questionnaire_ui"],
+				});
+				if (!attached.success) throw new Error(attached.error);
+				if (!allCapable) {
+					await watcher.connect();
+					await watcher.waitForHello();
+					const attachedWatcher = await watcher.request({
+						type: "attach",
+						activeSessionId,
+						supportsExtensionUi: true,
+						capabilities: ["extension_ui"],
+					});
+					if (!attachedWatcher.success) throw new Error(attachedWatcher.error);
+				}
+				const completed = await client.request({
+					type: "prompt_and_wait",
+					activeSessionId,
+					message: "/native-form",
+				});
+				if (!completed.success) throw new Error(completed.error);
+				await Promise.all(responses);
+				expect(requests.filter((request) => request.method === "questionnaire")).toHaveLength(allCapable ? 1 : 0);
+				expect(requests.filter((request) => request.method === "select")).toHaveLength(allCapable ? 0 : 3);
+				const notification = requests.find((request) => request.method === "notify");
+				if (!notification) throw new Error("Form result was not reported");
+				expect(JSON.parse(String(notification.payload.message))).toMatchObject({
+					cancelled: false,
+					answers: [
+						{ id: "scope", value: "small", wasCustom: false },
+						{ id: "priority", value: allCapable ? "later" : "now", wasCustom: allCapable },
+					],
+				});
+			} finally {
+				unsubscribe();
+				watcher.close();
+				await client.request({ type: "shutdown", force: true });
+				client.close();
+				await waitForExit(supervisor);
+			}
+		},
+	);
+
 	it("accepts the canonical socket path when launched with duplicate slashes", async () => {
 		if (process.platform === "win32") return;
 		const root = tempDir();

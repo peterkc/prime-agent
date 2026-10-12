@@ -8,6 +8,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { createEventBus, type EventBus } from "./event-bus.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
@@ -65,6 +66,8 @@ export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
+	/** When supplying resourceLoader, pass its event bus here too so native questionnaire events share it. */
+	eventBus?: EventBus;
 
 	/** MCP integration manager. When omitted, MCP host handlers are not wired. */
 	mcpManager?: McpManager;
@@ -152,6 +155,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
+	const eventBus = options.eventBus ?? createEventBus();
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
@@ -170,6 +174,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({
+			eventBus,
 			cwd,
 			agentDir,
 			settingsManager,
@@ -253,7 +258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? [...options.tools]
 			: options.noTools
 				? []
-				: ["ipython", ...(settingsManager.getCodemode() ? ["codemode"] : [])]);
+				: ["ipython", "questionnaire", ...(settingsManager.getCodemode() ? ["codemode"] : [])]);
 
 	let agent: Agent;
 
@@ -372,6 +377,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentDir: options.agentDir,
 		scopedModels: options.scopedModels,
 		resourceLoader,
+		eventBus,
 		customTools: options.customTools,
 		modelRegistry,
 		mcpManager,
