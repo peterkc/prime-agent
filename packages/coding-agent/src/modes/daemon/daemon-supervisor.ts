@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, st
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
+import type { CotalMessage } from "@cotal-ai/core";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -20,6 +21,7 @@ import {
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	formatAgentSessionNameUnavailable,
+	normalizeAgentSessionMessage,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
@@ -75,6 +77,8 @@ import {
 } from "./agent-roster.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
+import type { EnrollmentRecord } from "./cotal/enrollment.js";
+import { MeshEndpoints } from "./cotal/mesh-endpoints.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import {
 	DaemonSessionRecoveringError,
@@ -146,6 +150,7 @@ import {
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_INSTANCE_ID_ENV,
+	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -199,6 +204,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"agent_roster",
 	"direct_peer_transport",
+	"mesh_send",
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -300,6 +306,7 @@ interface ResidentWorker {
 	rosterStale?: boolean;
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
 	peerTransportCapable?: boolean;
+	meshDeliveryCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
 	pendingClient?: DaemonWorkerClient;
 	/** Consecutive defer->probe rounds against a live-but-silent worker; bounded by MAX_DEFERRED_RECOVERY_ROUNDS. */
@@ -332,6 +339,8 @@ interface DaemonSupervisorOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
 	descriptorDir?: string;
+	/** Internal source-test seam for credential-expiry checks; production defaults to one hour. */
+	meshCredentialLifetimeSeconds?: number;
 }
 
 interface PersistedSupervisorConfig {
@@ -546,6 +555,12 @@ function workerAuthAdvertisesPeerTransport(data: unknown): boolean {
 	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY);
 }
 
+function workerAuthAdvertisesMeshDelivery(data: unknown): boolean {
+	if (typeof data !== "object" || data === null) return false;
+	const capabilities = (data as { capabilities?: unknown }).capabilities;
+	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_MESH_DELIVERY_CAPABILITY);
+}
+
 function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[] {
 	if (!response.success || !response.data || typeof response.data !== "object" || !("sessions" in response.data)) {
 		throw new Error("Session worker returned an invalid list response");
@@ -726,6 +741,9 @@ export class DaemonSupervisor {
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
+	private readonly agentMessageTransport: "native" | "cotal";
+	private readonly meshCredentialLifetimeSeconds?: number;
+	private mesh?: MeshEndpoints;
 	private rosterStore?: AgentRoster;
 	private readonly pendingRosterChanged = new Set<string>();
 	private readonly pendingRosterRemoved = new Set<string>();
@@ -782,6 +800,8 @@ export class DaemonSupervisor {
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
+		this.agentMessageTransport = this.settingsManager.getAgentMessageTransport();
+		this.meshCredentialLifetimeSeconds = options.meshCredentialLifetimeSeconds;
 	}
 
 	async start(): Promise<void> {
@@ -838,6 +858,16 @@ export class DaemonSupervisor {
 				this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
 			}
 			this.assertSocketLeaseHeld();
+			if (this.agentMessageTransport === "cotal") {
+				this.mesh = new MeshEndpoints({
+					meshRoot: join(agentDir, "mesh"),
+					homeSocket: this.socketPath,
+					credentialLifetimeSeconds: this.meshCredentialLifetimeSeconds,
+					log: (message) => this.log(message),
+					handoff: (record, message, count, bind) => this.handoffMeshMessage(record, message, count, bind),
+				});
+				await this.mesh.start();
+			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
@@ -1576,6 +1606,7 @@ export class DaemonSupervisor {
 		supervisorPid: number;
 		supervisorProcessStartId?: string;
 		supervisorSocketPath: string;
+		agentMessageTransport: "native" | "cotal";
 	} {
 		const record = this.ownership?.record;
 		if (!record) {
@@ -1586,6 +1617,7 @@ export class DaemonSupervisor {
 			supervisorPid: record.pid,
 			...(record.processStartId ? { supervisorProcessStartId: record.processStartId } : {}),
 			supervisorSocketPath: record.socketPath,
+			agentMessageTransport: this.agentMessageTransport,
 		};
 	}
 
@@ -2828,7 +2860,29 @@ export class DaemonSupervisor {
 				break;
 		}
 
+		if (command.type === "mesh_send") {
+			if (!this.mesh) throw new Error("Message was not stored: Cotal transport is not enabled");
+			const source = await this.findWorkerForClient(client, command.fromActiveSessionId);
+			if (!source.worker.meshDeliveryCapable)
+				throw new Error("Message was not stored: restart that session to use mesh messaging");
+			if (!source.summary.sessionFile || !source.summary.sessionId)
+				throw new Error("Message was not stored: sender has no session file");
+			const receipt = await this.mesh.send(
+				{
+					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
+					sessionId: source.summary.sessionId,
+					sessionName: source.summary.sessionName,
+					runtimeKind: source.summary.runtimeKind ?? "top-level",
+				},
+				command.targetSessionId,
+				normalizeAgentSessionMessage(command.message),
+			);
+			return success(command.id, command.type, receipt);
+		}
+
 		if (command.type === "send_message") {
+			if (this.mesh)
+				throw new Error("Message was not stored: native forwarding is disabled on the mesh; restart that session");
 			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
@@ -3603,6 +3657,9 @@ export class DaemonSupervisor {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
+			if (this.mesh && summary.sessionFile && summary.sessionId) {
+				await this.mesh.enroll(summary.sessionId, summary.sessionFile);
+			}
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
@@ -3714,6 +3771,7 @@ export class DaemonSupervisor {
 						throw new PreRosterWorkerError("Session worker predates the roster protocol and must be restarted");
 					}
 					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
+					worker.meshDeliveryCapable = workerAuthAdvertisesMeshDelivery(authResponse.data);
 					worker.lastFrameAt = Date.now();
 					worker.client?.close();
 					worker.client = client;
@@ -3738,6 +3796,45 @@ export class DaemonSupervisor {
 			}
 		}
 		throw new DaemonWorkerProbeTimeoutError(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+	}
+
+	private async handoffMeshMessage(
+		record: EnrollmentRecord,
+		message: CotalMessage,
+		deliveryCount: number,
+		bindRecipient: (recipient: object) => void,
+	): Promise<void> {
+		if (this.shuttingDown) throw new Error("Mesh is shutting down");
+		const worker = await this.createOrReuseWorker("mesh", {
+			type: "create",
+			sessionPath: record.sessionFile,
+			continueRecent: false,
+		});
+		if (this.shuttingDown) throw new Error("Mesh is shutting down");
+		if (!worker.meshDeliveryCapable) throw new Error("Restart that session to receive mesh messages");
+		const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
+		const summary =
+			this.findSummaryInWorker(worker, record.sessionFile) ??
+			(root ? sessionSummaryFromRosterEntry(root) : undefined);
+		if (!summary || summary.sessionId !== record.sessionId)
+			throw new Error("Woken worker has no matching mesh session");
+		const recipient = this.requireAvailableWorkerClient(worker);
+		bindRecipient(recipient);
+		const response = await recipient.requestWorker(
+			{
+				type: "worker_deliver_message",
+				targetActiveSessionId: summary.activeSessionId ?? summary.id,
+				message: message.parts
+					.flatMap((part) =>
+						part.kind === "text" && "text" in part && typeof part.text === "string" ? [part.text] : [],
+					)
+					.join("\n"),
+				sender: { sessionName: message.from.name, clientId: message.from.id },
+				cotal: { id: message.id, deliveryCount },
+			},
+			WORKER_REQUEST_TIMEOUT_MS,
+		);
+		if (!response.success) throw new Error("Mesh worker rejected delivery");
 	}
 
 	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
@@ -3892,6 +3989,7 @@ export class DaemonSupervisor {
 			return;
 		}
 		worker.client = undefined;
+		this.mesh?.disconnect(client);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
 		for (const [activeSessionId, generations] of worker.snapshotGenerations ?? []) {
@@ -4665,6 +4763,11 @@ export class DaemonSupervisor {
 	): AgentRosterEntry {
 		const previousDirect = this.roster().get(entry.agentId)?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
+		if (this.mesh && worker && entry.summary.sessionFile && entry.summary.sessionId) {
+			void this.mesh.enroll(entry.summary.sessionId, entry.summary.sessionFile).catch(() => {
+				this.log(`Mesh session ${entry.summary.sessionId}: enrollment failed`);
+			});
+		}
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {
@@ -5965,6 +6068,25 @@ export class DaemonSupervisor {
 			return;
 		}
 		if (outboundType === "roster_heartbeat") {
+			return;
+		}
+		if (outboundType === "agent_message_persisted") {
+			if (this.shuttingDown || !source || source !== worker.client || !worker.meshDeliveryCapable) return;
+			try {
+				const persisted: unknown = JSON.parse(frame.payload.toString("utf8"));
+				if (
+					persisted &&
+					typeof persisted === "object" &&
+					"type" in persisted &&
+					persisted.type === "agent_message_persisted" &&
+					"cotalId" in persisted &&
+					typeof persisted.cotalId === "string"
+				) {
+					this.mesh?.confirmPersisted(persisted.cotalId, source);
+				}
+			} catch {
+				this.log("Mesh worker sent an invalid persistence frame");
+			}
 			return;
 		}
 		if (outboundType === "heartbeats_changed") {
@@ -7410,6 +7532,7 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		await this.mesh?.stop();
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();
 		this.clearScheduledWakeTimer();
@@ -7513,6 +7636,7 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		await this.mesh?.stop();
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();
 		this.clearScheduledWakeTimer();

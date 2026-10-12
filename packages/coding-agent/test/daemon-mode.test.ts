@@ -18,10 +18,14 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { AGENT_FAMILY_REACH_ERROR, type AgentSessionMessageController } from "../src/core/agent-messages.js";
+import {
+	AGENT_FAMILY_REACH_ERROR,
+	type AgentSessionMessage,
+	type AgentSessionMessageController,
+} from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import { type CreateAgentSessionRuntimeFactory, rlmSubagentRuntimeSpec } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
@@ -38,6 +42,7 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
 import {
 	AgentDaemon,
@@ -54,7 +59,11 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
-import { type DaemonWorkerFrameHeader, isDaemonWorkerFrameHeader } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	type DaemonWorkerCommand,
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import {
 	createSnapshotTranscriptChunks,
@@ -4301,5 +4310,191 @@ describe("update restart checkpoint wait", () => {
 				undefined,
 			),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe("mesh worker persistence", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+	function harness() {
+		const root = mkdtempSync(join(tmpdir(), "prime-mesh-worker-"));
+		roots.push(root);
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unused");
+			},
+			worker: { authenticationToken: "token" },
+		});
+		const internals = daemon as unknown as {
+			agentMessageTransport: "native" | "cotal";
+			supervisorClaims: Map<DaemonSocketClient, unknown>;
+			sessions: Map<string, ActiveSessionState>;
+			assertSupervisorClaimCurrent(): Promise<string>;
+			scheduleSupervisorFenceCheck(): void;
+			scheduleRosterFlush(): void;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			getOrHydrateBoundSessionState(): Promise<ActiveSessionState>;
+			receiveMeshMessage(
+				client: DaemonSocketClient,
+				command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+			): Promise<void>;
+		};
+		internals.assertSupervisorClaimCurrent = async () => "fingerprint";
+		internals.scheduleSupervisorFenceCheck = () => undefined;
+		internals.scheduleRosterFlush = () => undefined;
+		const written: Buffer[] = [];
+		const socket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			write: (data: Buffer) => {
+				written.push(data);
+				return true;
+			},
+			end: vi.fn(),
+		});
+		const client = {
+			...makeClient("supervisor", "target"),
+			socket,
+			transport: "private-framed",
+		} as unknown as DaemonSocketClient;
+		const frames = () =>
+			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(written))
+				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+		const authenticate = (mode?: string) =>
+			internals.handleLine(
+				client,
+				JSON.stringify({
+					id: "auth",
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "generation",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(root, "supervisor.sock"),
+					...(mode ? { agentMessageTransport: mode } : {}),
+				}),
+			);
+		return { root, internals, client, socket, written, frames, authenticate };
+	}
+
+	it.each(["cotal", "native", undefined])(
+		"follows authenticated mode %s rather than edited worker settings",
+		async (mode) => {
+			const h = harness();
+			writeFileSync(
+				join(h.root, "settings.json"),
+				JSON.stringify({ agentMessageTransport: mode === "cotal" ? "native" : "cotal" }),
+			);
+			await h.authenticate(mode);
+			expect(h.internals.agentMessageTransport).toBe(mode ?? "native");
+			expect(h.frames()[0]).toMatchObject({
+				command: "worker_auth",
+				success: true,
+				data: { capabilities: expect.arrayContaining(["mesh_delivery"]) },
+			});
+			writeFileSync(join(h.root, "settings.json"), "{}");
+			expect(h.internals.agentMessageTransport).toBe(mode ?? "native");
+		},
+	);
+
+	it("returns not stored for an old supervisor without trying a native send", async () => {
+		const h = harness();
+		await h.authenticate("cotal");
+		const worker = h.internals as unknown as {
+			createAgentFamily(): Promise<unknown[]>;
+			supervisorLink(): unknown;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState: ActiveSessionState;
+				origin: "agent";
+			}): Promise<unknown>;
+		};
+		worker.createAgentFamily = async () => [
+			{ relationship: "sibling", entry: { id: "session-b", sessionPath: join(h.root, "b.jsonl") } },
+		];
+		const request = vi.fn(async () => {
+			throw new DaemonCapabilityUnavailableError("mesh_send", "mesh_send");
+		});
+		worker.supervisorLink = () => ({ ensureConnected: async () => undefined, request });
+		const source = makeState("a");
+		source.runtime = {
+			session: { sessionFile: join(h.root, "a.jsonl") },
+		} as unknown as ActiveSessionState["runtime"];
+		await expect(
+			worker.sendAgentSessionMessage({
+				targetSelector: "session-b",
+				message: "hello",
+				fromState: source,
+				origin: "agent",
+			}),
+		).rejects.toThrow("not stored");
+		expect(request).toHaveBeenCalledExactlyOnceWith(
+			{ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "session-b", message: "hello" },
+			35_000,
+		);
+	});
+
+	it("answers acceptance, rejects an unrelated write notice after its own failed append, then reports its own rewrite once and detects repeats", async () => {
+		const h = harness();
+		await h.authenticate("cotal");
+		h.written.length = 0;
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		let accepted!: AgentSessionMessage;
+		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
+			expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
+			accepted = options.customMessage;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), { acceptAgentMessagePrompt: accept }),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const command = {
+			id: "delivery",
+			type: "worker_deliver_message",
+			targetActiveSessionId: "target",
+			message: "hello",
+			sender: { sessionName: "sender" },
+			cotal: { id: "stable", deliveryCount: 2 },
+		} as const;
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
+		expect(accepted.details.id).toBe("agentmsg_stable");
+		expect(accepted.content).toContain("Possibly repeated");
+		expect(accepted.content).toContain("sender");
+		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
+			throw new Error("append failed");
+		});
+		expect(() =>
+			manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details),
+		).toThrow("append failed");
+		manager.appendCustomEntry("unrelated");
+		expect(h.frames()).toHaveLength(1);
+		(manager as unknown as { _rewriteFile(): void })._rewriteFile();
+		expect(h.frames()[1]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		manager.appendCustomEntry("later");
+		expect(h.frames()).toHaveLength(2);
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(h.frames()[3]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		accept.mockRejectedValueOnce(new Error("accept failed"));
+		await expect(
+			h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "error", deliveryCount: 1 } }),
+		).rejects.toThrow("accept failed");
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		await h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "closed", deliveryCount: 1 } });
+		const count = h.frames().length;
+		h.socket.emit("close");
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
+		expect(h.frames()).toHaveLength(count);
 	});
 });

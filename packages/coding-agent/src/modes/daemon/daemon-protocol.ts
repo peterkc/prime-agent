@@ -69,8 +69,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
 // Revision 31 adds capability-gated window render-mode reports.
 // Revision 32 adds opt-in session runtime reload notifications.
-export const DAEMON_SCHEMA_REVISION = 32;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-95c8d5ad108e";
+// Revision 33 adds capability-gated mesh sends and stored agent-message receipts.
+export const DAEMON_SCHEMA_REVISION = 33;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-85b2e9ad3187";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -117,6 +118,7 @@ export type DaemonServerCapability =
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
+	| "mesh_send"
 	| "abort_and_send_queued"
 	| "render_mode";
 
@@ -520,6 +522,7 @@ export type DaemonCommand =
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
+	| { id?: string; type: "mesh_send"; fromActiveSessionId: string; targetSessionId: string; message: string }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
@@ -768,6 +771,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	mesh_send: { minProtocol: 7, minSchemaRevision: 33, capability: "mesh_send" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -860,6 +864,7 @@ const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
 	"complete_owned_session",
 	"get_direct_worker_transport",
 	"list_agent_peers",
+	"mesh_send",
 	"promote_owned_session",
 	"reattach",
 	"roster_subscribe",
@@ -906,6 +911,7 @@ export const DAEMON_COMMAND_PLANE = {
 	append_custom_message: "session",
 	resume_queue: "session",
 	send_message: "control",
+	mesh_send: "control",
 	agent_messages_status: "control",
 	agent_messages_pause: "control",
 	agent_messages_resume: "control",

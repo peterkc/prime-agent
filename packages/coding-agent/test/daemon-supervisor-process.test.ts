@@ -13,7 +13,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
@@ -25,8 +25,11 @@ import {
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
@@ -1863,5 +1866,140 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 				env: { LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
 			});
 		}
+	});
+});
+
+describe("mesh supervisor compatibility", () => {
+	it("finishes mesh shutdown before daemon_closing and before worker stop", async () => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const events: string[] = [];
+		let finish: () => void = () => undefined;
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			shuttingDown: boolean;
+			workers: Map<string, unknown>;
+			clients: Set<unknown>;
+			descriptorDir: string;
+			stopWorker(): Promise<void>;
+			shutdown(
+				code: number,
+				stopWorkers: boolean,
+				relaunch: boolean,
+				force: boolean,
+				reason: "shutdown",
+			): Promise<never>;
+		};
+		mkdirSync(internals.descriptorDir, { recursive: true });
+		internals.mesh = {
+			stop: async () => {
+				events.push("mesh-start");
+				await new Promise<void>((resolve) => {
+					finish = resolve;
+				});
+				events.push("mesh-finished");
+			},
+		};
+		internals.workers.set("worker", {});
+		internals.stopWorker = async () => {
+			events.push("worker-stop");
+		};
+		internals.clients.add({
+			detachInput: vi.fn(),
+			socket: {
+				write: (data: string) => {
+					events.push(JSON.parse(data).type);
+				},
+				end: vi.fn(),
+			},
+		});
+		const exited = new Error("isolated exit");
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw exited;
+		});
+		const stopped = internals.shutdown(0, true, false, false, "shutdown");
+		try {
+			expect(internals.shuttingDown).toBe(true);
+			expect(events).toEqual(["mesh-start"]);
+			finish();
+			await expect(stopped).rejects.toBe(exited);
+			expect(events).toEqual(["mesh-start", "mesh-finished", "daemon_closing", "worker-stop"]);
+		} finally {
+			finish();
+			await stopped.catch(() => undefined);
+			exit.mockRestore();
+		}
+	});
+
+	it("refuses native forwarding and old-worker mesh sends, and accepts persistence only from the current mesh-capable worker before shutdown", async () => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const confirm = vi.fn();
+		const publish = vi.fn();
+		const recipient = { requestWorker: vi.fn() };
+		const worker = { client: recipient, meshDeliveryCapable: false, descriptor: { workerId: "worker" } };
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			shuttingDown: boolean;
+			clearRosterStaleness(): void;
+			createOrReuseWorker(): Promise<unknown>;
+			handoffMeshMessage(
+				record: { sessionFile: string; sessionId: string },
+				message: unknown,
+				count: number,
+				bind: (recipient: object) => void,
+			): Promise<void>;
+			findWorkerForClient(): Promise<unknown>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			handleWorkerFrame(worker: unknown, frame: unknown, source: unknown): void;
+		};
+		internals.mesh = { confirmPersisted: confirm, send: publish };
+		internals.clearRosterStaleness = () => undefined;
+		internals.findWorkerForClient = async () => ({
+			worker,
+			summary: { id: "a", sessionId: "a", sessionFile: "a.jsonl" },
+		});
+		await expect(
+			internals.handleCommand({} as DaemonSocketClient, {
+				type: "send_message",
+				targetActiveSessionId: "b",
+				message: "hello",
+			}),
+		).rejects.toThrow("restart that session");
+		await expect(
+			internals.handleCommand({} as DaemonSocketClient, {
+				type: "mesh_send",
+				fromActiveSessionId: "a",
+				targetSessionId: "b",
+				message: "hello",
+			}),
+		).rejects.toThrow("restart that session");
+		expect(publish).not.toHaveBeenCalled();
+		internals.createOrReuseWorker = async () => worker;
+		const bind = vi.fn();
+		await expect(
+			internals.handoffMeshMessage({ sessionFile: "a.jsonl", sessionId: "a" }, {}, 1, bind),
+		).rejects.toThrow("Restart that session");
+		expect(bind).not.toHaveBeenCalled();
+		expect(recipient.requestWorker).not.toHaveBeenCalled();
+		const frame = {
+			header: { kind: "outbound", outboundType: "agent_message_persisted" },
+			payload: Buffer.from(JSON.stringify({ type: "agent_message_persisted", cotalId: "message" })),
+		};
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).not.toHaveBeenCalled();
+		worker.meshDeliveryCapable = true;
+		internals.handleWorkerFrame(worker, frame, {});
+		expect(confirm).not.toHaveBeenCalled();
+		internals.shuttingDown = true;
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).not.toHaveBeenCalled();
+		internals.shuttingDown = false;
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient);
 	});
 });

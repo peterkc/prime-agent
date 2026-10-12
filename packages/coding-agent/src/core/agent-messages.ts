@@ -22,7 +22,7 @@ export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 
 /** Legacy daemon wire input accepted and ignored for compatibility. */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
-export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
+export type AgentSessionMessageDeliveryStatus = "delivered" | "queued" | "stored";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
 export type AgentFamilyStatus = "running" | "idle" | "inactive";
 export type AgentFamilyRelationship = "parent" | "sibling" | "child";
@@ -127,6 +127,7 @@ export interface AgentSessionMessagePayload {
 	from?: AgentSessionMessageSender;
 	/** Sender relationship from the receiver's point of view. */
 	fromRelationship?: AgentFamilyRelationship;
+	possiblyRepeated?: boolean;
 	target: AgentSessionMessageEndpoint;
 }
 
@@ -152,6 +153,9 @@ export interface AgentSessionMessageReceipt {
 	message: string;
 	// Not named "status": the kernel host bridge envelope reserves that key.
 	deliveryStatus: AgentSessionMessageDeliveryStatus;
+	/** Broker storage proof, not recipient delivery proof. Present only for stored mesh messages. */
+	sequence?: number;
+	cotalId?: string;
 	/** Present only for delivered messages: when the target context received it. */
 	deliveredAt?: string;
 	/** Present only for queued messages: when it was placed behind current work. */
@@ -404,7 +408,8 @@ export function createAgentSessionMessagePrompt(payload: AgentSessionMessagePayl
 				"unknown",
 		) || "unknown";
 	const sender = payload.fromRelationship ? `${payload.fromRelationship}:${senderName}` : senderName;
-	return `[agent-message from ${sender}]\n\n${payload.message}`;
+	const repeat = payload.possiblyRepeated ? "Possibly repeated agent message.\n\n" : "";
+	return `[agent-message from ${sender}]\n\n${repeat}${payload.message}`;
 }
 
 export function createAgentSessionMessage(
@@ -463,7 +468,7 @@ export function createAgentSessionMessageReceipt(
 		from: payload.from,
 		message: payload.message,
 		deliveryStatus: status,
-		...(status === "delivered" ? { deliveredAt: at } : { queuedAt: at }),
+		...(status === "delivered" ? { deliveredAt: at } : status === "queued" ? { queuedAt: at } : {}),
 		deliveryMode: "steer",
 	};
 }

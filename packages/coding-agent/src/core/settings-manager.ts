@@ -219,6 +219,7 @@ export interface Settings {
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	autoReload?: "off" | "idle"; // global daemon policy; default: off
+	agentMessageTransport?: "native" | "cotal"; // global daemon policy; default: native
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -1183,6 +1184,12 @@ export class SettingsManager {
 	/** Automatic reload is a global daemon policy, not a project or SDK override. */
 	getAutoReload(): "off" | "idle" {
 		return !this.globalSettingsLoadError && this.globalSettings.autoReload === "idle" ? "idle" : "off";
+	}
+
+	getAgentMessageTransport(): "native" | "cotal" {
+		return !this.globalSettingsLoadError && this.globalSettings.agentMessageTransport === "cotal"
+			? "cotal"
+			: "native";
 	}
 
 	getCodemodeExcludeTools(): readonly string[] {

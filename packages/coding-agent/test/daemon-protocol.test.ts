@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionEvent } from "../src/modes/agent-connection/types.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
-import type { DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
+import {
+	DaemonCapabilityUnavailableError,
+	DaemonClient,
+	type DaemonTransportClient,
+} from "../src/modes/daemon/daemon-client.js";
 import { shouldSendDaemonOutboundToClient } from "../src/modes/daemon/daemon-mode.js";
 
 import {
@@ -34,9 +38,30 @@ import {
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
+	it("refuses mesh_send before writing to an old daemon and preserves old commands against a new daemon", async () => {
+		const client = new DaemonClient("unused");
+		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
+		const state = client as unknown as {
+			socket: { destroyed: boolean };
+			helloMessage: { protocol: typeof DAEMON_PROTOCOL_INFO; schemaRevision: number; serverCapabilities: string[] };
+			requestWire: typeof wire;
+		};
+		state.socket = { destroyed: false };
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 32, serverCapabilities: [] };
+		state.requestWire = wire;
+		const command = { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" } as const;
+		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(wire).not.toHaveBeenCalled();
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
+		await expect(client.request({ type: "list" })).resolves.toMatchObject({ command: "list", success: true });
+		expect(wire.mock.calls[0]![0]).toEqual({ type: "list" });
+		await expect(client.request(command)).resolves.toMatchObject({ command: "mesh_send", success: true });
+		expect(wire).toHaveBeenCalledTimes(2);
+	});
+
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(32);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-32-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(33);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-33-/);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -92,6 +117,7 @@ describe("daemon protocol helpers", () => {
 	// One table for the static command-compatibility gates: protocol floor, schema revision,
 	// capability name, and whether a default server advertises that capability.
 	it.each([
+		["mesh_send", { minProtocol: 7, minSchemaRevision: 33, capability: "mesh_send" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
 		["replace_acp_mcp_servers", { minProtocol: 7, minSchemaRevision: 22, capability: "acp_mcp_servers" }, true],
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],
@@ -274,6 +300,7 @@ describe("daemon protocol helpers", () => {
 			"complete_owned_session",
 			"get_direct_worker_transport",
 			"list_agent_peers",
+			"mesh_send",
 			"promote_owned_session",
 			"reattach",
 			"roster_subscribe",

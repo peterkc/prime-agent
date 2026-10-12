@@ -23,6 +23,8 @@ import {
 } from "../../config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	AGENT_MESSAGE_CUSTOM_TYPE,
+	AGENT_MESSAGE_ID_PREFIX,
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyMember,
@@ -147,6 +149,7 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonAutoReloadScheduler } from "./daemon-auto-reload.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import {
 	deserializeDaemonError,
@@ -211,6 +214,7 @@ import {
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -548,6 +552,8 @@ export class AgentDaemon {
 	private supervisorLaunchInProgress = false;
 	private supervisorAbsentSince?: number;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
+	// Keep the last authenticated mode while disconnected; never fall back from Cotal to native.
+	private agentMessageTransport: "native" | "cotal" = "native";
 	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
 	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
 	private peerAdmissionsFenced = false;
@@ -3748,6 +3754,7 @@ export class AgentDaemon {
 				supervisorPid?: unknown;
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
+				agentMessageTransport?: unknown;
 				activeSessionId?: unknown;
 				admissionId?: unknown;
 				capabilities?: unknown;
@@ -3823,7 +3830,10 @@ export class AgentDaemon {
 					!Number.isInteger(parsed.supervisorPid) ||
 					(parsed.supervisorPid as number) <= 0 ||
 					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
-					typeof parsed.supervisorSocketPath !== "string"
+					typeof parsed.supervisorSocketPath !== "string" ||
+					(parsed.agentMessageTransport !== undefined &&
+						parsed.agentMessageTransport !== "native" &&
+						parsed.agentMessageTransport !== "cotal")
 				) {
 					clearParsedAdmission();
 					this.write(client, failure(commandId, "worker_auth", "Worker authentication failed"));
@@ -3837,6 +3847,7 @@ export class AgentDaemon {
 						? { supervisorProcessStartId: parsed.supervisorProcessStartId }
 						: {}),
 					supervisorSocketPath: parsed.supervisorSocketPath,
+					agentMessageTransport: parsed.agentMessageTransport === "cotal" ? "cotal" : "native",
 				};
 				let ownerFingerprint: string;
 				try {
@@ -3855,6 +3866,7 @@ export class AgentDaemon {
 				client.authenticated = true;
 				client.authenticationRole = "supervisor";
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
+				this.agentMessageTransport = claim.agentMessageTransport ?? "native";
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
 				this.write(client, {
@@ -3865,6 +3877,7 @@ export class AgentDaemon {
 					data: {
 						capabilities: [
 							DAEMON_WORKER_ROSTER_CAPABILITY,
+							DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 							...(this.options.worker.workerInstanceId !== undefined
 								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
 								: []),
@@ -4102,6 +4115,10 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_deliver_message": {
+					if (command.cotal) {
+						await this.receiveMeshMessage(client, command);
+						return;
+					}
 					const receipt = await this.sendAgentSessionMessage({
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
@@ -6283,6 +6300,10 @@ export class AgentDaemon {
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+		if (this.agentMessageTransport === "cotal") {
+			if (!options.fromState) throw new Error("Message was not stored: sender has no session endpoint");
+			return this.sendMeshMessage(options.fromState, targetSelector, message);
+		}
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
@@ -6354,6 +6375,132 @@ export class AgentDaemon {
 			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw error;
+		}
+	}
+
+	private async sendMeshMessage(
+		fromState: ActiveSessionState,
+		selector: string,
+		message: string,
+	): Promise<AgentSessionMessageReceipt> {
+		if (!fromState.runtime.session.sessionFile) throw new Error("Message was not stored: sender has no session file");
+		const family = await this.createAgentFamily(fromState);
+		const matches = family.filter(
+			({ entry }) =>
+				entry.id === selector ||
+				entry.name === selector ||
+				entry.activeSessionId === selector ||
+				entry.rlmChildId === selector,
+		);
+		if (matches.length !== 1)
+			throw new Error(
+				`Message was not stored: ${matches.length ? "ambiguous" : "unknown"} family target ${selector}`,
+			);
+		const target = matches[0]!.entry;
+		if (!target.sessionPath) throw new Error(`Message was not stored: target ${target.id} has no session file`);
+		const link = this.supervisorLink();
+		if (!link) throw new Error("Message was not stored: supervisor link is unavailable");
+		const rateLimitKey = `${fromState.activeSessionId}->${target.id}`;
+		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
+		if (!rateLimit.ok)
+			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
+		try {
+			await link.ensureConnected();
+		} catch {
+			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw new Error("Message was not stored: supervisor connection failed");
+		}
+		let response: DaemonResponse;
+		try {
+			// Leave room for the supervisor's 30-second publish deadline to return its error.
+			response = await link.request(
+				{ type: "mesh_send", fromActiveSessionId: fromState.activeSessionId, targetSessionId: target.id, message },
+				35_000,
+			);
+		} catch (error) {
+			if (error instanceof DaemonCapabilityUnavailableError) {
+				throw new Error("Message was not stored: supervisor does not support mesh_send; restart the daemon");
+			}
+			throw new Error(
+				"Message storage outcome is unknown: supervisor request failed; a resend can show the message twice",
+			);
+		}
+		if (!response.success) throw deserializeDaemonError(response);
+		if (!response.data || typeof response.data !== "object")
+			throw new Error("Supervisor returned an invalid mesh receipt; storage outcome is unknown");
+		return response.data as AgentSessionMessageReceipt;
+	}
+
+	private async receiveMeshMessage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+	): Promise<void> {
+		if (this.agentMessageTransport !== "cotal" || !command.cotal)
+			throw new Error("Mesh delivery requires the authenticated Cotal transport mode");
+		let target: ActiveSessionState;
+		try {
+			target = await this.getOrHydrateBoundSessionState(command.targetActiveSessionId);
+		} catch (error) {
+			const passive = await this.findPassiveRlmSubagent(command.targetActiveSessionId);
+			if (!passive) throw error;
+			target = await this.hydratePassiveRlmSubagent(passive);
+		}
+		const manager = target.runtime.session.sessionManager;
+		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
+		const payload: AgentSessionMessagePayload = {
+			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
+			source: AGENT_MESSAGE_SOURCE,
+			message: normalizeAgentSessionMessage(command.message),
+			from: command.sender,
+			target: this.createAgentSessionMessageEndpoint(target),
+			possiblyRepeated: command.cotal.deliveryCount > 1,
+		};
+		const ownEntry = () =>
+			manager
+				.getEntries()
+				.find(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === AGENT_MESSAGE_CUSTOM_TYPE &&
+						entry.details !== null &&
+						typeof entry.details === "object" &&
+						"id" in entry.details &&
+						entry.details.id === payload.id,
+				);
+		let accepted = false;
+		let sent = false;
+		let unsubscribe: (() => void) | undefined;
+		const cleanup = () => {
+			unsubscribe?.();
+			client.socket.off("close", cleanup);
+		};
+		const check = () => {
+			if (!accepted || sent) return;
+			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
+				cleanup();
+				return;
+			}
+			const entry = ownEntry();
+			if (!entry || !manager.isEntryPersisted(entry.id)) return;
+			sent = true;
+			cleanup();
+			client.socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "outbound", outboundType: "agent_message_persisted" },
+					Buffer.from(serializeJsonLine({ type: "agent_message_persisted", cotalId: command.cotal!.id })),
+				),
+			);
+		};
+		unsubscribe = manager.onPersist(check);
+		client.socket.once("close", cleanup);
+		try {
+			const status = ownEntry() ? "delivered" : (await this.acceptAgentSessionMessage(target, payload)).status;
+			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
+			accepted = true;
+			check();
+		} catch (error) {
+			cleanup();
 			throw error;
 		}
 	}

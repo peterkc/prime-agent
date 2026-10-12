@@ -33,6 +33,14 @@ export const DAEMON_WORKER_ROSTER_CAPABILITY = "agent_roster";
 /** Advertised in the worker_auth response by workers that accept peer transport grants. */
 export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
 
+/** Advertised by workers that report persistence before mesh acknowledgement. */
+export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
+
+export interface DaemonWorkerPersistenceOutbound {
+	type: "agent_message_persisted";
+	cotalId: string;
+}
+
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -45,7 +53,10 @@ export type DaemonWorkerFrameHeader =
 	| {
 			kind: "outbound";
 			requestId?: string;
-			outboundType: DaemonOutbound["type"] | DaemonWorkerRosterOutbound["type"];
+			outboundType:
+				| DaemonOutbound["type"]
+				| DaemonWorkerRosterOutbound["type"]
+				| DaemonWorkerPersistenceOutbound["type"];
 			activeSessionId?: string;
 			snapshotId?: string;
 			sessionEventType?: string;
@@ -107,6 +118,7 @@ export type DaemonWorkerCommand =
 			supervisorPid: number;
 			supervisorProcessStartId?: string;
 			supervisorSocketPath: string;
+			agentMessageTransport?: "native" | "cotal";
 	  }
 	| {
 			id?: string;
@@ -131,6 +143,7 @@ export type DaemonWorkerCommand =
 			message: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			cotal?: { id: string; deliveryCount: number };
 	  }
 	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }
