@@ -186,7 +186,7 @@ export class QuestionnaireComponent extends Container implements Focusable {
 			for (const question of questions) {
 				const answer = this.answers.get(question.id);
 				const option = answer && question.options.find((option) => option.value === answer.value);
-				const label = !answer ? "Unanswered" : answer.wasCustom ? answer.value : option?.label;
+				const label = !answer ? "Unanswered" : answer.wasCustom ? answer.value : (option?.label ?? answer.value);
 				panel.addChild(new Text(`${question.label}: ${label}`, 0, 0));
 			}
 		}

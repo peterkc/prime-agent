@@ -6094,13 +6094,11 @@ export class InteractiveMode {
 				if (!pending.questionnaire) continue;
 				this.activeConnectionExtensionUiRequests.delete(id);
 				pending.cancelLocal();
-				try {
-					await this.agentConnection.respondToExtensionUiRequest(id, { cancelled: true });
-				} catch (error) {
+				void this.agentConnection.respondToExtensionUiRequest(id, { cancelled: true }).catch((error) => {
 					if (!(error instanceof Error && error.message === `Unknown extension UI request: ${id}`)) {
 						this.showError(error instanceof Error ? error.message : String(error));
 					}
-				}
+				});
 			}
 		}
 		let response: AgentConnectionExtensionUiResponse | undefined;
@@ -6182,7 +6180,10 @@ export class InteractiveMode {
 			case "questionnaire": {
 				const parsed = parseQuestionnaireQuestions(payload.questions);
 				if ("error" in parsed) return { status: "cancelled", answers: {} };
-				const saved = parseQuestionnaireOutcome(parsed.questions, { status: "deferred", answers: payload.answers });
+				const saved = parseQuestionnaireOutcome(parsed.questions, {
+					status: "deferred",
+					answers: payload.answers === undefined ? {} : payload.answers,
+				});
 				if (saved.error) return { status: "cancelled", answers: {} };
 				return this.showQuestionnaire({ questions: parsed.questions, answers: saved.answers }, signal);
 			}

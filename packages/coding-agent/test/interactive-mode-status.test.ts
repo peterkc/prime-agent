@@ -702,6 +702,25 @@ describe("InteractiveMode connection extension UI", () => {
 	const prototype = InteractiveMode.prototype as unknown as ConnectionExtensionUiHandlerHarness;
 
 	test.each([
+		["omitted", undefined, 1],
+		["malformed", null, 0],
+	] as const)("PR-19 connection form handles %s saved answers", async (_name, answers, shown) => {
+		const showQuestionnaire = vi.fn(async () => ({ status: "cancelled" as const, answers: {} }));
+		await prototype.resolveConnectionExtensionUiRequest.call(
+			{ showQuestionnaire },
+			{
+				id: "form",
+				method: "questionnaire",
+				payload: {
+					questions: [{ id: "scope", prompt: "Choose scope", options: [{ value: "small", label: "Small" }] }],
+					...(answers === undefined ? {} : { answers }),
+				},
+			},
+		);
+		expect(showQuestionnaire).toHaveBeenCalledTimes(shown);
+	});
+
+	test.each([
 		["pending form", undefined, []],
 		["already cancelled form", "Unknown extension UI request: form", []],
 		["transport failure", "Connection closed", [["Connection closed"]]],

@@ -548,15 +548,15 @@ async function executeQuestionnaire(
 		: await ctx.ui.questionnaire({ questions, answers: savedAnswers }, { signal });
 	const outcome =
 		native === undefined ? undefined : native.error ? native : parseQuestionnaireOutcome(questions, native);
+	if (outcome?.error) {
+		clearRetryState();
+		return errorResult(outcome.error, questions);
+	}
 	let result =
 		outcome === undefined
 			? await runDialogFallback(questions, restoredRetryState.answers, ctx.ui, signal)
 			: resultFromOutcome(questions, outcome);
 	if (signal?.aborted) result = { questions, answers: result.answers, cancelled: true };
-	if (outcome?.error) {
-		clearRetryState();
-		return errorResult(outcome.error, questions);
-	}
 	if (result.deferred) {
 		const retry = persistRetryState(result.answers);
 		return {
