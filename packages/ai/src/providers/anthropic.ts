@@ -1248,6 +1248,63 @@ function shouldUseFineGrainedToolStreamingBeta(model: Model<"anthropic-messages"
 	return !!context.tools?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
 }
 
+type JsonObject = Record<string, unknown>;
+
+interface InputSchemaFields {
+	readonly properties: JsonObject;
+	readonly required: string[];
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// The schemas a field can take. A bare `{ anyOf }` is opened up so that literal
+// options from different branches end up in one flat list.
+function fieldOptions(schema: unknown): unknown[] {
+	if (isJsonObject(schema) && Object.keys(schema).length === 1 && Array.isArray(schema.anyOf)) {
+		return schema.anyOf;
+	}
+	return [schema];
+}
+
+/**
+ * The fields of a tool's input_schema. Anthropic rejects anyOf, oneOf and allOf at the
+ * top level of input_schema, so a top-level union of object schemas (TypeBox Type.Union
+ * of Type.Object) is merged into one object: every field of every branch, required only
+ * when every branch requires it. Tool calls are still validated against the full union.
+ */
+function inputSchemaFields(parameters: unknown): InputSchemaFields {
+	const schema = isJsonObject(parameters) ? parameters : {};
+	const required = Array.isArray(schema.required) ? (schema.required as string[]) : [];
+	if (isJsonObject(schema.properties)) return { properties: schema.properties, required };
+
+	const branches = schema.anyOf ?? schema.oneOf;
+	const isObjectUnion =
+		Array.isArray(branches) &&
+		branches.length > 0 &&
+		branches.every((branch) => isJsonObject(branch) && isJsonObject(branch.properties));
+	if (!isObjectUnion) return { properties: {}, required };
+	const objects = branches as readonly { properties: JsonObject; required?: unknown }[];
+
+	const fields = new Map<string, unknown[]>();
+	for (const branch of objects) {
+		for (const [name, fieldSchema] of Object.entries(branch.properties)) {
+			const known = fields.get(name) ?? [];
+			const seen = new Set(known.map((option) => JSON.stringify(option)));
+			const added = fieldOptions(fieldSchema).filter((option) => !seen.has(JSON.stringify(option)));
+			fields.set(name, [...known, ...added]);
+		}
+	}
+	const properties = Object.fromEntries(
+		[...fields].map(([name, options]) => [name, options.length === 1 ? options[0] : { anyOf: options }]),
+	);
+	const requiredByAll = [...fields.keys()].filter((name) =>
+		objects.every((branch) => Array.isArray(branch.required) && branch.required.includes(name)),
+	);
+	return { properties, required: requiredByAll };
+}
+
 function convertTools(
 	tools: Tool[],
 	isOAuthToken: boolean,
@@ -1257,7 +1314,7 @@ function convertTools(
 	if (!tools) return [];
 
 	return tools.map((tool, index) => {
-		const schema = tool.parameters as { properties?: unknown; required?: string[] };
+		const fields = inputSchemaFields(tool.parameters);
 
 		return {
 			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
@@ -1265,8 +1322,8 @@ function convertTools(
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			input_schema: {
 				type: "object",
-				properties: schema.properties ?? {},
-				required: schema.required ?? [],
+				properties: fields.properties,
+				required: fields.required,
 			},
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};
