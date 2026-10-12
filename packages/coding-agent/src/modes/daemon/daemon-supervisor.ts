@@ -3164,7 +3164,7 @@ export class DaemonSupervisor {
 		if (hydrated.seededCwd === true) return entry;
 		const current = this.roster().get(entry.agentId);
 		if (current !== entry) return current ?? entry;
-		return this.roster().write(hydrated, entry.workerId, entry.statusLabel);
+		return this.writeRosterEntry(hydrated, undefined, entry.statusLabel);
 	}
 
 	private matchesListSessionDir(
@@ -5005,7 +5005,7 @@ export class DaemonSupervisor {
 				this.writeRosterEntry(rest, worker);
 				continue;
 			}
-			this.roster().write(seededEntries.get(entry.agentId) ?? { ...entry, seededCwd: true });
+			this.writeRosterEntry(seededEntries.get(entry.agentId) ?? { ...entry, seededCwd: true });
 		}
 	}
 

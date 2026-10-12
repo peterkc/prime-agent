@@ -2022,6 +2022,7 @@ describe("mesh supervisor compatibility", () => {
 		const worker = {
 			descriptor: { workerId: "w", rootActiveSessionId: "a", lifecycle: "ready", sessionFile: "saved.jsonl" },
 			summaries: new Map([["a", summary]]),
+			client: {},
 		};
 		const internals = supervisor as unknown as {
 			mesh: unknown;
@@ -2031,6 +2032,7 @@ describe("mesh supervisor compatibility", () => {
 			writeRosterEntry(entry: unknown, worker?: unknown, label?: undefined, queueMeshEnrollment?: boolean): unknown;
 			enrollMeshSession(sessionId: string, file?: string): Promise<void>;
 			seedRosterLedger(): Promise<void>;
+			applyWorkerRosterSnapshot(worker: unknown, delta: unknown): Promise<void>;
 			rlmSpawnLedger(): unknown;
 			hydratedSeedEntry(entry: unknown): Promise<unknown>;
 			assertWorkerCreateOwner(): void;
@@ -2096,6 +2098,20 @@ describe("mesh supervisor compatibility", () => {
 		internals.hydratedSeedEntry = async (entry) => entry;
 		await internals.seedRosterLedger();
 		expect(enqueueEnrollment).toHaveBeenLastCalledWith("adopted", "adopted.jsonl");
+		internals.rlmSpawnLedger = () => ({
+			liveEdges: async () => [{ parent: "saved.jsonl", child: "snapshot.jsonl", depth: 1, childId: "snapshot" }],
+		});
+		enqueueEnrollment.mockClear();
+		await internals.applyWorkerRosterSnapshot(worker, {
+			type: "roster_delta",
+			snapshot: true,
+			entries: [{ agentId: "a", summary }],
+		});
+		expect(enqueueEnrollment).toHaveBeenCalledExactlyOnceWith("snapshot", "snapshot.jsonl");
+		const passive = roster.bySessionFile("snapshot.jsonl")!;
+		expect(passive.summary).toMatchObject({ sessionId: "snapshot", sessionFile: "snapshot.jsonl" });
+		internals.writeRosterEntry({ ...passive, summary: { ...passive.summary, isSessionActive: true } }, worker);
+		expect(enqueueEnrollment).toHaveBeenCalledTimes(1);
 		enqueueEnrollment.mockClear();
 		enroll.mockClear().mockRejectedValue(new Error("launch refused"));
 		vi.mocked(internals.log).mockClear();
