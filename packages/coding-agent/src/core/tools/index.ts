@@ -42,21 +42,24 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "../extensions/types.js";
 import { type CodemodeHost, createCodemodeToolDefinition } from "./codemode.js";
 import { createIpythonToolDefinition, type IpythonToolOptions } from "./ipython.js";
+import { createQuestionnaireToolDefinition, type QuestionnaireHost } from "./questionnaire.js";
 
 export { type CodemodeHost, createCodemodeToolDefinition } from "./codemode.js";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "ipython" | "codemode";
+export type ToolName = "ipython" | "codemode" | "questionnaire";
 
 export interface ToolsOptions {
 	ipython?: IpythonToolOptions;
 	codemode?: CodemodeHost;
+	questionnaire?: QuestionnaireHost;
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
 	return {
 		ipython: createIpythonToolDefinition(cwd, options?.ipython),
 		codemode: createCodemodeToolDefinition(cwd, options?.codemode),
+		questionnaire: createQuestionnaireToolDefinition(cwd, options?.questionnaire),
 	};
 }

@@ -15,6 +15,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { QuestionnaireForm, QuestionnaireOutcome } from "../../core/tools/questionnaire.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
@@ -69,9 +70,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
 // Revision 31 adds capability-gated window render-mode reports.
 // Revision 32 adds opt-in session runtime reload notifications.
-// Revision 33 adds capability-gated mesh sends and stored agent-message receipts.
-export const DAEMON_SCHEMA_REVISION = 33;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-85b2e9ad3187";
+// Revision 33 adds capability-gated native questionnaire forms.
+// Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
+export const DAEMON_SCHEMA_REVISION = 34;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-add8a0791f06";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -92,7 +94,8 @@ export type DaemonClientCapability =
 	| "client_owned_sessions"
 	// Client declaration, not a command gate: attach with it opts into heartbeats_changed pushes.
 	| "heartbeat_catalog"
-	| "runtime_reload_events";
+	| "runtime_reload_events"
+	| "questionnaire_ui";
 export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "delete_rlm_subagent"
@@ -148,6 +151,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"client_owned_sessions",
 	"heartbeat_catalog",
 	"runtime_reload_events",
+	"questionnaire_ui",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -771,7 +775,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
-	mesh_send: { minProtocol: 7, minSchemaRevision: 33, capability: "mesh_send" },
+	mesh_send: { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -1005,6 +1009,9 @@ export function isSessionPlaneDaemonCommand(type: string): boolean {
 
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
+	if (command.type === "extension_ui_response" && "status" in command.response) {
+		requirements.push(DAEMON_EXTENSION_UI_COMPATIBILITY.questionnaire);
+	}
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
 	}
@@ -1062,10 +1069,34 @@ export type DaemonErrorInfo =
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";
 
-export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
+export type DaemonQuestionnaireUIResponse = Omit<QuestionnaireOutcome, "error">;
+export interface DaemonQuestionnaireUIRequest {
+	type: "extension_ui_request";
+	activeSessionId: string;
+	id: string;
+	method: "questionnaire";
+	payload: QuestionnaireForm;
+	meta?: DaemonEventMeta;
+}
+
+export const DAEMON_EXTENSION_UI_COMPATIBILITY = {
+	questionnaire: { minProtocol: 7, minSchemaRevision: 33, capability: "questionnaire_ui" },
+} as const satisfies Record<string, DaemonCommandCompatibility>;
+
+export type DaemonExtensionUIResponse =
+	| { value: string }
+	| { confirmed: boolean }
+	| { cancelled: true }
+	| DaemonQuestionnaireUIResponse;
 
 export function isDaemonDialogExtensionUiRequest(method: string): boolean {
-	return method === "select" || method === "confirm" || method === "input" || method === "editor";
+	return (
+		method === "select" ||
+		method === "confirm" ||
+		method === "input" ||
+		method === "editor" ||
+		method === "questionnaire"
+	);
 }
 
 /**

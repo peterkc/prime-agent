@@ -19,6 +19,7 @@ import {
 	DAEMON_COMMAND_PLANE,
 	DAEMON_COMMAND_TYPES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_EXTENSION_UI_COMPATIBILITY,
 	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
@@ -39,9 +40,11 @@ import {
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-context.js";
+import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
-	it("accepts the revision-32 client command envelope on a revision-33 supervisor", async () => {
+	it("accepts the revision-33 client command envelope on a revision-34 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { cwd: root, agentDir: root },
@@ -59,7 +62,7 @@ describe("daemon protocol helpers", () => {
 		} as DaemonSocketClient;
 		try {
 			await supervisor.start();
-			// Revision 32 uses protocol 7. Schema revision is in the server hello, not in client commands.
+			// Revision 33 uses protocol 7. Schema revision is in the server hello, not in client commands.
 			const envelope = {
 				type: "command",
 				id: "old-list",
@@ -79,7 +82,7 @@ describe("daemon protocol helpers", () => {
 		}
 	});
 
-	it("checks a new client against schema revisions 32 and 33 before sending mesh_send", async () => {
+	it("checks a new client against schema revisions 33 and 34 before sending mesh_send", async () => {
 		const client = new DaemonClient("unused");
 		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
 		const state = client as unknown as {
@@ -88,21 +91,155 @@ describe("daemon protocol helpers", () => {
 			requestWire: typeof wire;
 		};
 		state.socket = { destroyed: false };
-		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 32, serverCapabilities: [] };
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
 		state.requestWire = wire;
 		const command = { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" } as const;
 		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
 		expect(wire).not.toHaveBeenCalled();
-		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
 		await expect(client.request({ type: "list" })).resolves.toMatchObject({ command: "list", success: true });
 		expect(wire.mock.calls[0]![0]).toEqual({ type: "list" });
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: [] };
+		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(wire).toHaveBeenCalledTimes(1);
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: ["mesh_send"] };
 		await expect(client.request(command)).resolves.toMatchObject({ command: "mesh_send", success: true });
 		expect(wire).toHaveBeenCalledTimes(2);
 	});
 
+	it.each([
+		["new TUI / old daemon", true, false, false],
+		["old client / new daemon", false, true, false],
+		["new TUI / new daemon", true, true, true],
+		["RPC owner / new daemon", undefined, true, false],
+	] as const)(
+		"TM-17 negotiates questionnaire UI for %s without changing standard dialogs",
+		async (_name, ownerOptIn, serverCapable, expected) => {
+			const request = vi.fn(async (command: DaemonCommand) =>
+				success(
+					command.id,
+					command.type,
+					command.type === "attach"
+						? { id: "form-session", activeSessionId: "form-session", sessionId: "session", cwd: "/tmp" }
+						: undefined,
+				),
+			);
+			const client = {
+				request,
+				onMessage: () => () => {},
+				onClose: () => () => {},
+				supportsServerCapability: (capability: string) => serverCapable && capability === "questionnaire_ui",
+			} as unknown as DaemonTransportClient;
+			const connection = new DaemonAgentConnection(client, "form-session", {
+				supportsExtensionUi: true,
+				supportsQuestionnaireUi: ownerOptIn,
+				directTransport: false,
+			});
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			const formRequest: Extract<DaemonOutbound, { type: "extension_ui_request" }> = {
+				type: "extension_ui_request",
+				activeSessionId: "form-session",
+				id: "form",
+				method: "questionnaire",
+				payload: {
+					questions: [
+						{ id: "q", label: "Q1", prompt: "Choose", options: [{ value: "a", label: "A" }], allowOther: false },
+					],
+					answers: {},
+				},
+			};
+			try {
+				await connection.attach();
+				const attach = request.mock.calls[0][0];
+				if (attach.type !== "attach") throw new Error("Expected attach");
+				expect(attach.capabilities?.includes("questionnaire_ui")).toBe(expected);
+				expect(attach.capabilities).toContain("extension_ui");
+				const receive = connection as unknown as { handleDaemonMessage(message: DaemonOutbound): Promise<void> };
+				await receive.handleDaemonMessage(formRequest);
+				expect(events).toEqual(
+					expected
+						? [
+								{
+									type: "extension_ui_request",
+									request: { id: "form", method: "questionnaire", payload: formRequest.payload },
+								},
+							]
+						: [],
+				);
+				const oldClient = {
+					supportsExtensionUi: true,
+					capabilities: new Set(["extension_ui"]),
+				} as DaemonSocketClient;
+				expect(shouldSendDaemonOutboundToClient(oldClient, formRequest)).toBe(false);
+				expect(shouldSendDaemonOutboundToClient(oldClient, { ...formRequest, method: "select" })).toBe(true);
+			} finally {
+				await connection.dispose();
+			}
+		},
+	);
+
+	it("TM-17 gates structured replies at schema 33 and leaves old replies compatible", () => {
+		expect(DAEMON_EXTENSION_UI_COMPATIBILITY.questionnaire).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 33,
+			capability: "questionnaire_ui",
+		});
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "extension_ui_response",
+				activeSessionId: "form",
+				requestId: "request",
+				response: { status: "submitted", answers: { q: { value: "a", wasCustom: false } } },
+			}),
+		).toEqual([{ minProtocol: 7, minSchemaRevision: 33, capability: "questionnaire_ui" }, { minProtocol: 7 }]);
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "extension_ui_response",
+				activeSessionId: "form",
+				requestId: "request",
+				response: { value: "A" },
+			}),
+		).toEqual([{ minProtocol: 7 }]);
+	});
+
+	it("TM-15 RPC returns undefined for forms and keeps its select wire shape", async () => {
+		const requests: RpcExtensionUIRequest[] = [];
+		const bridge = createRpcExtensionUiBridge((request) => {
+			requests.push(request);
+		});
+		try {
+			expect(
+				await bridge.uiContext.questionnaire({
+					questions: [
+						{ id: "q", label: "Q1", prompt: "Choose", options: [{ value: "a", label: "A" }], allowOther: false },
+					],
+					answers: {},
+				}),
+			).toBeUndefined();
+			expect(requests).toEqual([]);
+			const choice = bridge.uiContext.select("Choose", ["A"]);
+			expect(requests).toEqual([
+				{
+					type: "extension_ui_request",
+					id: expect.any(String),
+					method: "select",
+					title: "Choose",
+					options: ["A"],
+					timeout: undefined,
+				},
+			]);
+			bridge.handleResponse({ type: "extension_ui_response", id: requests[0].id, value: "A" });
+			expect(await choice).toBe("A");
+		} finally {
+			bridge.close();
+		}
+	});
+
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(33);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-33-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(34);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-34-/);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -158,7 +295,7 @@ describe("daemon protocol helpers", () => {
 	// One table for the static command-compatibility gates: protocol floor, schema revision,
 	// capability name, and whether a default server advertises that capability.
 	it.each([
-		["mesh_send", { minProtocol: 7, minSchemaRevision: 33, capability: "mesh_send" }, false],
+		["mesh_send", { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
 		["replace_acp_mcp_servers", { minProtocol: 7, minSchemaRevision: 22, capability: "acp_mcp_servers" }, true],
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],

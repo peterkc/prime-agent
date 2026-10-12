@@ -3853,6 +3853,13 @@ export class DaemonSupervisor {
 		const supportsExtensionUi = [...this.clients].some(
 			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
 		);
+		const uiClients = [...this.clients].filter(
+			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
+		);
+		const supportsQuestionnaireUi =
+			uiClients.length > 0 &&
+			uiClients.every((client) => client.capabilities.has("questionnaire_ui")) &&
+			worker.client.supportsServerCapability("questionnaire_ui");
 		const response = await worker.client.requestWorker({
 			type: "worker_subscribe",
 			activeSessionId,
@@ -3861,6 +3868,7 @@ export class DaemonSupervisor {
 						"attach_snapshot",
 						"event_sequence",
 						"extension_ui",
+						...(supportsQuestionnaireUi ? (["questionnaire_ui"] as const) : []),
 						"slim_attach",
 						"chunked_snapshot",
 						"runtime_reload_events",
@@ -6437,7 +6445,8 @@ export class DaemonSupervisor {
 			sessionEventType === "message_end" ||
 			outboundType === "session_replaced" ||
 			outboundType === "session_resynced" ||
-			outboundType === "session_closed"
+			outboundType === "session_closed" ||
+			outboundType === "extension_ui_request"
 		) {
 			try {
 				decodedOutbound = JSON.parse(frame.payload.toString("utf8")) as DaemonOutbound;
@@ -6471,7 +6480,13 @@ export class DaemonSupervisor {
 			if (replacementSnapshotFollows && !client.capabilities.has("chunked_snapshot")) {
 				continue;
 			}
-			if (outboundType === "extension_ui_request" && !client.supportsExtensionUi) {
+			if (
+				outboundType === "extension_ui_request" &&
+				(!client.supportsExtensionUi ||
+					(decodedOutbound?.type === "extension_ui_request" &&
+						decodedOutbound.method === "questionnaire" &&
+						!client.capabilities.has("questionnaire_ui")))
+			) {
 				continue;
 			}
 			// Snapshots cannot recover extension requests, so never defer or drop them.

@@ -136,6 +136,7 @@ import {
 } from "./cron-jobs.js";
 import { createDecisionApiHostHandler } from "./decision-api.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import type { EventBus } from "./event-bus.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -515,6 +516,7 @@ export interface AgentSessionConfig {
 	agentDir?: string;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	resourceLoader: ResourceLoader;
+	eventBus?: EventBus;
 	customTools?: ToolDefinition[];
 	modelRegistry: ModelRegistry;
 	initialActiveToolNames?: string[];
@@ -1703,6 +1705,7 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
+	private readonly _eventBus?: EventBus;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
@@ -1813,6 +1816,7 @@ export class AgentSession {
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
+		this._eventBus = config.eventBus;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._agentDir = config.agentDir;
@@ -10913,6 +10917,11 @@ export class AgentSession {
 				},
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
+				questionnaire: {
+					entries: () => this.sessionManager.getBranch(),
+					appendEntry: (state) => this.sessionManager.appendCustomEntry("questionnaire_retry_state", state),
+					needsInput: (ctx) => this._eventBus?.emit("questionnaire:needs_input", { ctx }),
+				},
 				codemode: {
 					openapi: () => this.settingsManager.getCodemodeOpenAPI(),
 					excludedTools: () => this.settingsManager.getCodemodeExcludeTools(),
@@ -10994,7 +11003,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["ipython", ...(this.settingsManager.getCodemode() ? ["codemode"] : [])];
+			: ["ipython", "questionnaire", ...(this.settingsManager.getCodemode() ? ["codemode"] : [])];
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
 		if (this._goalState.status === "active" && this._includeGoals) {
 			// An active goal needs ipython so the model can reach the goal skill.

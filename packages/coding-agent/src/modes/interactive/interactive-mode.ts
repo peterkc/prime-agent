@@ -179,6 +179,12 @@ import {
 	captureOnboardingCompleted,
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
+import {
+	parseQuestionnaireOutcome,
+	parseQuestionnaireQuestions,
+	type QuestionnaireForm,
+	type QuestionnaireOutcome,
+} from "../../core/tools/questionnaire.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_COMPACT_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
@@ -271,6 +277,7 @@ import { OnboardingPickerComponent } from "./components/onboarding-picker.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { PromptContextLine } from "./components/prompt-context-line.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
+import { QuestionnaireComponent } from "./components/questionnaire.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -1244,6 +1251,7 @@ function mcpDisconnectionState(result: McpRemoveAccountResult): McpDisconnection
 }
 
 export class InteractiveMode {
+	static readonly supportsQuestionnaireUi = true;
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
 	private static readonly ESCAPE_REPEAT_WINDOW_MS = 500;
 
@@ -1470,7 +1478,10 @@ export class InteractiveMode {
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
-	private activeConnectionExtensionUiRequests = new Map<string, { cancelLocal: () => void }>();
+	private activeConnectionExtensionUiRequests = new Map<
+		string,
+		{ cancelLocal: () => void; questionnaire?: boolean }
+	>();
 
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
 	private extensionWidgetsBelow = new Map<string, Component & { dispose?(): void }>();
@@ -4370,8 +4381,17 @@ export class InteractiveMode {
 		}
 	}
 
+	private showQuestionnaire(form: QuestionnaireForm, signal?: AbortSignal): Promise<QuestionnaireOutcome> {
+		if (signal?.aborted) return Promise.resolve({ status: "cancelled", answers: {} });
+		return this.showExtensionCustom(
+			(_tui, _theme, _kb, done) =>
+				new QuestionnaireComponent(form, done, { signal, getRows: () => this.ui.terminal.rows }),
+		);
+	}
+
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
+			questionnaire: (form, opts) => this.showQuestionnaire(form, opts?.signal),
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
 			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
@@ -6068,6 +6088,19 @@ export class InteractiveMode {
 	}
 
 	private async handleConnectionExtensionUiRequest(request: AgentConnectionExtensionUiRequest): Promise<void> {
+		// The worker may have cancelled the form already, but unrelated dialogs must cancel it too.
+		if (this.expectsConnectionExtensionUiResponse(request)) {
+			for (const [id, pending] of this.activeConnectionExtensionUiRequests) {
+				if (!pending.questionnaire) continue;
+				this.activeConnectionExtensionUiRequests.delete(id);
+				pending.cancelLocal();
+				void this.agentConnection.respondToExtensionUiRequest(id, { cancelled: true }).catch((error) => {
+					if (!(error instanceof Error && error.message === `Unknown extension UI request: ${id}`)) {
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
+				});
+			}
+		}
 		let response: AgentConnectionExtensionUiResponse | undefined;
 		const expectsResponse = this.expectsConnectionExtensionUiResponse(request);
 
@@ -6077,10 +6110,18 @@ export class InteractiveMode {
 				const cancelled = new Promise<AgentConnectionExtensionUiResponse>((resolve) => {
 					cancelLocal = resolve;
 				});
+				const controller = new AbortController();
 				this.activeConnectionExtensionUiRequests.set(request.id, {
-					cancelLocal: () => cancelLocal({ cancelled: true }),
+					questionnaire: request.method === "questionnaire",
+					cancelLocal: () => {
+						controller.abort();
+						cancelLocal({ cancelled: true });
+					},
 				});
-				response = await Promise.race([this.resolveConnectionExtensionUiRequest(request), cancelled]);
+				response = await Promise.race([
+					this.resolveConnectionExtensionUiRequest(request, controller.signal),
+					cancelled,
+				]);
 			} else {
 				response = await this.resolveConnectionExtensionUiRequest(request);
 			}
@@ -6110,7 +6151,8 @@ export class InteractiveMode {
 			request.method === "select" ||
 			request.method === "confirm" ||
 			request.method === "input" ||
-			request.method === "editor"
+			request.method === "editor" ||
+			request.method === "questionnaire"
 		);
 	}
 
@@ -6131,9 +6173,20 @@ export class InteractiveMode {
 
 	private async resolveConnectionExtensionUiRequest(
 		request: AgentConnectionExtensionUiRequest,
+		signal?: AbortSignal,
 	): Promise<AgentConnectionExtensionUiResponse | undefined> {
 		const { payload } = request;
 		switch (request.method) {
+			case "questionnaire": {
+				const parsed = parseQuestionnaireQuestions(payload.questions);
+				if ("error" in parsed) return { status: "cancelled", answers: {} };
+				const saved = parseQuestionnaireOutcome(parsed.questions, {
+					status: "deferred",
+					answers: payload.answers === undefined ? {} : payload.answers,
+				});
+				if (saved.error) return { status: "cancelled", answers: {} };
+				return this.showQuestionnaire({ questions: parsed.questions, answers: saved.answers }, signal);
+			}
 			case "select": {
 				const title = getPayloadString(payload, "title");
 				const options = getPayloadStringArray(payload, "options");

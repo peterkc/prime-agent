@@ -9,6 +9,7 @@ import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
+import { createEventBus, type EventBus } from "./event-bus.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
@@ -96,6 +97,7 @@ export interface AgentSessionServices {
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
+	eventBus?: EventBus;
 	mcpManager: McpManager;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 	/**
@@ -178,6 +180,7 @@ export async function createAgentSessionServices(
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerAllProviders());
 
+	const eventBus = options.resourceLoaderOptions?.eventBus ?? createEventBus();
 	const userExtensionFactories = options.resourceLoaderOptions?.extensionFactories ?? [];
 	// The built-in Herdr reporter defers to Herdr's own file-based integration
 	// when the loader actually loaded it; two reporters would race on the same
@@ -193,6 +196,7 @@ export async function createAgentSessionServices(
 	const resourceLoader: DefaultResourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		extensionFactories: [...builtinExtensionFactories, ...userExtensionFactories],
+		eventBus,
 		cwd,
 		agentDir,
 		settingsManager,
@@ -239,6 +243,7 @@ export async function createAgentSessionServices(
 		settingsManager,
 		modelRegistry,
 		resourceLoader,
+		eventBus,
 		mcpManager,
 		diagnostics,
 		ownsMcpManager: mcpManager === ownedMcpManager,
@@ -263,6 +268,7 @@ export async function createAgentSessionFromServices(
 		settingsManager: options.services.settingsManager,
 		modelRegistry: options.services.modelRegistry,
 		resourceLoader: options.services.resourceLoader,
+		eventBus: options.services.eventBus,
 		mcpManager: options.services.mcpManager,
 		sessionManager: options.sessionManager,
 		model: options.model,

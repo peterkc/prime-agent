@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -12,10 +13,11 @@ import {
 import { AuthStorage } from "../src/core/auth-storage.js";
 
 import { SessionManager } from "../src/core/session-manager.js";
+import type { QuestionnaireResult } from "../src/core/tools/questionnaire.js";
 import type { ExtensionAPI, ExtensionFactory, RenderModeChangeEvent } from "../src/index.js";
-
-import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState, reportRenderMode } from "../src/modes/daemon/daemon-extension-binding.js";
+import { detachClientFromActiveSession } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon extension binding", () => {
@@ -98,6 +100,104 @@ describe("daemon extension binding", () => {
 
 		return runtime;
 	}
+
+	function uiClient(id: string): DaemonSocketClient {
+		const socket = new Socket();
+		cleanups.push(() => {
+			socket.destroy();
+		});
+		return {
+			id,
+			socket,
+			attachedActiveSessionIds: new Set(["questionnaire"]),
+			detachInput: () => {},
+			supportsExtensionUi: true,
+			capabilities: new Set(["extension_ui", "questionnaire_ui"]),
+		};
+	}
+
+	async function questionnaireState() {
+		const runtime = await createRuntimeForTest(() => {}, []);
+		const state: ActiveSessionState = {
+			activeSessionId: "questionnaire",
+			runtime,
+			clients: new Set([uiClient("primary")]),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "form",
+			lastEventSequence: 0,
+		};
+		return state;
+	}
+	const form = {
+		questions: [
+			{ id: "scope", prompt: "Choose scope", options: [{ value: "small", label: "Small" }], allowOther: false },
+		],
+	};
+
+	it.each([
+		[
+			"unknown question",
+			{
+				status: "submitted",
+				answers: { scope: { value: "small", wasCustom: false }, other: { value: "small", wasCustom: false } },
+			},
+		],
+		["unknown option", { status: "submitted", answers: { scope: { value: "large", wasCustom: false } } }],
+		["forbidden custom text", { status: "submitted", answers: { scope: { value: "custom", wasCustom: true } } }],
+		["unanswered Submit", { status: "submitted", answers: {} }],
+	] as const)("TM-16 cancels %s with an error and saves nothing submitted", async (_name, response) => {
+		const state = await questionnaireState();
+		const requests: DaemonOutbound[] = [];
+		await bindActiveSessionState(state, {
+			shutdown: () => {},
+			broadcast: (_state, message) => {
+				if (message.type !== "extension_ui_request") return;
+				requests.push(message);
+				state.extensionUiRequests.get(message.id)?.resolve(response);
+			},
+		});
+		const tool = state.runtime.session.agent.state.tools.find((tool) => tool.name === "questionnaire");
+		if (!tool) throw new Error("Questionnaire missing");
+		const result = await tool.execute("malformed", form);
+		expect(result.isError).toBe(true);
+		expect(result.details).toMatchObject({ cancelled: true, answers: [] });
+		expect(result.content).toEqual([{ type: "text", text: expect.stringContaining("Invalid questionnaire reply") }]);
+		expect(requests).toMatchObject([{ method: "questionnaire" }]);
+		expect(
+			state.runtime.session.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType === "questionnaire_retry_state"),
+		).toEqual([]);
+		expect(state.extensionUiRequests.size).toBe(0);
+	});
+
+	it.each(["client detached", "abort"])("TM-19 cancels a pending form on %s without submitting", async (change) => {
+		const state = await questionnaireState();
+		const controller = new AbortController();
+		const methods: string[] = [];
+		await bindActiveSessionState(state, {
+			shutdown: () => {},
+			broadcast: (_state, message) => {
+				if (message.type !== "extension_ui_request") return;
+				methods.push(message.method);
+				if (message.method === "questionnaire") {
+					if (change === "abort") controller.abort();
+					else {
+						state.clients.add(uiClient("remaining"));
+						detachClientFromActiveSession([...state.clients][0], state);
+					}
+				} else if (message.method === "select")
+					state.extensionUiRequests.get(message.id)?.resolve({ cancelled: true });
+			},
+		});
+		const tool = state.runtime.session.agent.state.tools.find((tool) => tool.name === "questionnaire");
+		if (!tool) throw new Error("Questionnaire missing");
+		const result = await tool.execute("changed", form, controller.signal);
+		expect(result.details as QuestionnaireResult).toMatchObject({ cancelled: true, answers: [] });
+		expect(methods).toEqual(change === "abort" ? ["questionnaire"] : ["questionnaire", "select"]);
+		expect(state.extensionUiRequests.size).toBe(0);
+	});
 
 	it("reports window render-mode changes once with the previous mode", async () => {
 		const events: RenderModeChangeEvent[] = [];

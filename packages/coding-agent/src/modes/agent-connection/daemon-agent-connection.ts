@@ -244,6 +244,8 @@ export interface DaemonAgentConnectionOptions {
 	sendClientEnv?: boolean;
 	/** Advertise support for interactive extension dialogs. */
 	supportsExtensionUi?: boolean;
+	/** Opt in only when the owner can render native forms (the interactive TUI). */
+	supportsQuestionnaireUi?: boolean;
 	/** Attaching opts the client into heartbeats_changed pushes without a scheduled-job command (ACP). */
 	tracksHeartbeats?: boolean;
 	/** Dispose the connection by stopping its hidden worker instead of detaching. */
@@ -501,6 +503,11 @@ export class DaemonAgentConnection implements AgentConnection {
 					"attach_snapshot",
 					"event_sequence",
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+					...(supportsExtensionUi &&
+					this.options.supportsQuestionnaireUi &&
+					this.client.supportsServerCapability("questionnaire_ui")
+						? (["questionnaire_ui"] as const)
+						: []),
 					"slim_attach",
 					"chunked_snapshot",
 					"runtime_reload_events",
@@ -1703,6 +1710,11 @@ export class DaemonAgentConnection implements AgentConnection {
 					"attach_snapshot",
 					"event_sequence",
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+					...(supportsExtensionUi &&
+					this.options.supportsQuestionnaireUi &&
+					this.client.supportsServerCapability("questionnaire_ui")
+						? (["questionnaire_ui"] as const)
+						: []),
 					"slim_attach",
 					"chunked_snapshot",
 					"runtime_reload_events",
@@ -2077,6 +2089,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		// Requests bypass snapshot deferral and must not advance the replay cursor.
 		if (message.type === "extension_ui_request") {
+			if (
+				message.method === "questionnaire" &&
+				(!this.options.supportsQuestionnaireUi || !this.client.supportsServerCapability("questionnaire_ui"))
+			)
+				return;
 			const cursor = getDaemonMessageCursor(message);
 			if (cursor && this.retiredEventGenerations.has(cursor.generation)) return;
 			// Retain attach-time requests until the UI subscribes; snapshots cannot restore them.

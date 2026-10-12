@@ -4088,6 +4088,7 @@ export class AgentDaemon {
 				}
 				case "worker_subscribe": {
 					const state = this.getBoundSessionState(command.activeSessionId);
+					cancelPendingQuestionnaireRequests(state);
 					setDaemonClientSessionCapabilities(
 						client,
 						state.activeSessionId,
@@ -4346,6 +4347,7 @@ export class AgentDaemon {
 				} finally {
 					state.pendingAttaches--;
 				}
+				if (!state.clients.has(client)) cancelPendingQuestionnaireRequests(state);
 				state.clients.add(client);
 				client.attachedActiveSessionIds.add(state.activeSessionId);
 				// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.
@@ -8214,6 +8216,7 @@ export function getChildActiveSessionStates(
 }
 
 export function detachClientFromActiveSession(client: DaemonSocketClient, state: ActiveSessionState): void {
+	if (state.clients.has(client)) cancelPendingQuestionnaireRequests(state);
 	state.clients.delete(client);
 	client.attachedActiveSessionIds.delete(state.activeSessionId);
 	client.deferredSessionFramesDropped?.delete(state.activeSessionId);
@@ -8300,6 +8303,14 @@ export function finishClientSnapshotStreaming(client: DaemonSocketClient, active
 	client.snapshotStreaming = (client.snapshotActiveSessionIds?.size ?? 0) > 0;
 }
 
+export function cancelPendingQuestionnaireRequests(state: ActiveSessionState): void {
+	for (const [id, pending] of state.extensionUiRequests) {
+		if (pending.method !== "questionnaire") continue;
+		state.extensionUiRequests.delete(id);
+		pending.resolve({ cancelled: true });
+	}
+}
+
 export function cancelPendingExtensionUiRequests(state: ActiveSessionState): void {
 	const pendingRequests = [...state.extensionUiRequests.values()];
 	state.extensionUiRequests.clear();
@@ -8351,6 +8362,12 @@ function isSequencedSessionOutbound(message: DaemonOutbound): message is Sequenc
 }
 
 export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, message: DaemonOutbound): boolean {
+	if (message.type === "extension_ui_request" && message.method === "questionnaire") {
+		return (
+			daemonClientSupportsExtensionUi(client, message.activeSessionId) &&
+			daemonClientCapabilitiesForSession(client, message.activeSessionId).has("questionnaire_ui")
+		);
+	}
 	if (message.type === "session_runtime_reloaded") {
 		return daemonClientCapabilitiesForSession(client, message.activeSessionId).has("runtime_reload_events");
 	}

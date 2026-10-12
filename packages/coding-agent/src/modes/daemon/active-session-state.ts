@@ -82,6 +82,7 @@ export interface ActiveSessionState {
 }
 
 export interface ActiveSessionExtensionUiRequest {
+	method?: string;
 	resolve: (response: DaemonExtensionUIResponse) => void;
 }
 

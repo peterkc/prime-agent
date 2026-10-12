@@ -1,0 +1,1 @@
+- Added a built-in questionnaire with tabbed TUI forms, saved deferred answers, and standard-dialog fallback for RPC and older daemon clients.
