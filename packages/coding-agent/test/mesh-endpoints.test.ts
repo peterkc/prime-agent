@@ -19,7 +19,7 @@ vi.mock("../src/modes/daemon/cotal/enrollment.js", async (original) => ({
 	...(await original<typeof enrollment>()),
 	loadMeshConfiguration: () => ({ space: "prime", server: "nats://127.0.0.1:1" }),
 	readSigner: vi.fn(),
-	homeEnrollments: () => [],
+	homeEnrollments: vi.fn(() => []),
 	claimEnrollment: vi.fn(() => ({ release: releaseClaim })),
 	ensureEnrollmentRecord: (_: string, id: string, path: string) => ({
 		sessionId: id,
@@ -70,6 +70,7 @@ afterEach(async () => {
 	Endpoint.onStart = undefined;
 	directories.clear();
 	releaseClaim.mockClear();
+	vi.mocked(enrollment.provisionEnrollment).mockReset().mockResolvedValue(undefined);
 	vi.clearAllMocks();
 });
 
@@ -150,9 +151,13 @@ describe("mesh endpoints", () => {
 		vi.useFakeTimers();
 		const first = delivery("early-first");
 		const second = delivery("early-second");
+		const duringStop = delivery("during-stop");
 		Endpoint.onStart = (endpoint) => {
 			if (endpoint.options.card?.id !== "b") return;
 			for (const item of [first, second]) endpoint.emit("message", item.message, item.delivery, { kind: "dm" });
+			endpoint.stop.mockImplementationOnce(async () => {
+				endpoint.emit("message", duringStop.message, duringStop.delivery, { kind: "dm" });
+			});
 			directories.delete("b");
 		};
 		await expect(fixture()).rejects.toThrow("directory entry disappeared");
@@ -163,6 +168,48 @@ describe("mesh endpoints", () => {
 			expect(item.working).toHaveBeenCalledTimes(1);
 			expect(item.ack).not.toHaveBeenCalled();
 		}
+		expect(duringStop.working).not.toHaveBeenCalled();
+		expect(duringStop.ack).not.toHaveBeenCalled();
+	});
+
+	it("F15 defers and serializes adopted, home and bound enrollment, continuing after a failure", async () => {
+		const { mesh, root, log } = await fixture();
+		for (const id of ["home", "bound"])
+			directories.set(id, { sessionId: id, name: id, principal: `local.${id}`, homeSocket: "home" });
+		vi.mocked(enrollment.homeEnrollments).mockReturnValueOnce([
+			enrollment.ensureEnrollmentRecord(root, "home", join(root, "home.json")),
+		]);
+		vi.mocked(enrollment.claimEnrollment).mockClear();
+		let rejectFirst!: (error: Error) => void;
+		vi.mocked(enrollment.provisionEnrollment)
+			.mockClear()
+			.mockImplementation(async (_root, _config, record) => {
+				if (record.sessionId === "adopted")
+					await new Promise<void>((_resolve, reject) => {
+						rejectFirst = reject;
+					});
+			});
+		const adopted = mesh.enqueueEnrollment("adopted", join(root, "adopted.json"));
+		const inlineClaims = vi.mocked(enrollment.claimEnrollment).mock.calls.length;
+		const refused = expect(adopted).rejects.toThrow("first refused");
+		const home = mesh.start();
+		const bound = mesh.enqueueEnrollment("bound", join(root, "bound.json"));
+		try {
+			await Promise.resolve();
+			expect(inlineClaims).toBe(0);
+			expect(enrollment.claimEnrollment).toHaveBeenCalledTimes(1);
+			expect(enrollment.provisionEnrollment).toHaveBeenCalledTimes(1);
+		} finally {
+			rejectFirst(new Error("first refused"));
+			await refused;
+			await Promise.all([home, bound]);
+		}
+		expect(vi.mocked(enrollment.provisionEnrollment).mock.calls.map((call) => call[2].sessionId)).toEqual([
+			"adopted",
+			"home",
+			"bound",
+		]);
+		expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Mesh home enrollment: 1 sessions in \d+ ms$/));
 	});
 
 	it("bounds in-flight enrollment during stop and releases the late claim without opening an endpoint", async () => {

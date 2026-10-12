@@ -51,6 +51,7 @@ interface SessionEndpoint {
 	readonly queue: QueuedDelivery[];
 	handoff?: Promise<void>;
 	current?: QueuedDelivery;
+	failed?: boolean;
 }
 
 interface PendingPersistence {
@@ -67,6 +68,7 @@ export class MeshEndpoints {
 	private readonly enrollmentFailures = new Map<string, string>();
 	private readonly sessions = new Map<string, SessionEndpoint>();
 	private readonly enrolling = new Map<string, Promise<void>>();
+	private enrollmentQueue = Promise.resolve();
 	private readonly pending = new Map<string, PendingPersistence>();
 	private closing = false;
 	private stopping?: Promise<void>;
@@ -95,7 +97,7 @@ export class MeshEndpoints {
 				if (this.closing) break;
 				count++;
 				try {
-					await this.enroll(record.sessionId, record.sessionFile);
+					await this.enqueueEnrollment(record.sessionId, record.sessionFile);
 				} catch (error) {
 					this.options.log(`Mesh session ${record.sessionId}: ${redactMeshError(error)}`);
 				}
@@ -109,6 +111,14 @@ export class MeshEndpoints {
 		const reason = `enrollment failed: ${redactMeshError(error)}`;
 		this.enrollmentFailures.set(sessionId, reason);
 		return reason;
+	}
+
+	enqueueEnrollment(sessionId: string, sessionFile?: string): Promise<void> {
+		const work = this.enrollmentQueue.then(() => {
+			if (!this.closing) return this.enroll(sessionId, sessionFile);
+		});
+		this.enrollmentQueue = work.catch(() => undefined);
+		return work;
 	}
 
 	enroll(sessionId: string, sessionFile?: string): Promise<void> {
@@ -192,6 +202,7 @@ export class MeshEndpoints {
 			this.drain(session);
 		} catch (error) {
 			if (session) {
+				session.failed = true;
 				for (const item of session.queue) {
 					if (item.workingTimer) clearInterval(item.workingTimer);
 					if (item.stallTimer) clearTimeout(item.stallTimer);
@@ -275,7 +286,7 @@ export class MeshEndpoints {
 	}
 
 	private enqueue(session: SessionEndpoint, message: CotalMessage, delivery: Delivery): void {
-		if (this.closing) return;
+		if (this.closing || session.failed) return;
 		const redelivery = delivery.redelivery;
 		const deliveryCount = redelivery?.deliveryCount ?? 1;
 		const working = () => {

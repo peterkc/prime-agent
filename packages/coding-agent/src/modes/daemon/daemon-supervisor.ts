@@ -3667,7 +3667,7 @@ export class DaemonSupervisor {
 			if ((summary.activeSessionId ?? summary.id) !== rootActiveSessionId) {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
-			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
+			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
 			if (summary.sessionId) await this.enrollMeshSession(summary.sessionId, summary.sessionFile);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
@@ -4773,9 +4773,10 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
-	private async enrollMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
+	private async enrollMeshSession(sessionId: string, sessionFile?: string, queued = false): Promise<void> {
 		try {
-			await this.mesh?.enroll(sessionId, sessionFile);
+			if (queued) await this.mesh?.enqueueEnrollment(sessionId, sessionFile);
+			else await this.mesh?.enroll(sessionId, sessionFile);
 		} catch (error) {
 			this.log(`Mesh session ${sessionId}: enrollment failed: ${redactMeshError(error)}`);
 		}
@@ -4785,12 +4786,19 @@ export class DaemonSupervisor {
 		entry: WorkerRosterEntry,
 		worker?: ResidentWorker,
 		statusLabel?: AgentRosterEntry["statusLabel"],
+		queueMeshEnrollment = true,
 	): AgentRosterEntry {
 		const previous = this.roster().get(entry.agentId);
 		const previousDirect = previous?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
-		if (!previous && entry.summary.sessionId && entry.summary.sessionFile)
-			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile);
+		if (
+			queueMeshEnrollment &&
+			entry.summary.sessionId &&
+			entry.summary.sessionFile &&
+			(previous?.summary.sessionId !== entry.summary.sessionId ||
+				previous.summary.sessionFile !== entry.summary.sessionFile)
+		)
+			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile, true);
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {
@@ -4824,7 +4832,7 @@ export class DaemonSupervisor {
 				const entry = this.rosterEntryForSpawnLedgerEdge(edge);
 				if (this.roster().has(entry.agentId)) continue;
 				if (this.roster().hasSessionFile(canonicalSessionPath(edge.child))) continue;
-				this.roster().write(await this.hydratedSeedEntry(entry));
+				this.writeRosterEntry(await this.hydratedSeedEntry(entry));
 			}
 		} catch (error) {
 			this.log(`Could not seed the agent roster from the spawn ledger: ${String(error)}`);

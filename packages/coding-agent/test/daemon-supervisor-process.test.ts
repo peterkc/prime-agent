@@ -2013,14 +2013,14 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 });
 
 describe("mesh supervisor compatibility", () => {
-	it("F12 enrolls a new child once, retries only on explicit reopen, and preserves native reuse on mesh failure", async () => {
+	it("F12 F14 enrolls queued-to-bound and adopted children, with direct reopen and one failure log on launch", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
 		});
 		const summary = { id: "a", sessionId: "saved", sessionFile: "saved.jsonl" };
 		const worker = {
-			descriptor: { workerId: "w", rootActiveSessionId: "a", lifecycle: "ready" },
+			descriptor: { workerId: "w", rootActiveSessionId: "a", lifecycle: "ready", sessionFile: "saved.jsonl" },
 			summaries: new Map([["a", summary]]),
 		};
 		const internals = supervisor as unknown as {
@@ -2028,7 +2028,11 @@ describe("mesh supervisor compatibility", () => {
 			workers: Map<string, unknown>;
 			log(message: string): void;
 			roster(): unknown;
-			writeRosterEntry(entry: unknown, worker: unknown): unknown;
+			writeRosterEntry(entry: unknown, worker?: unknown, label?: undefined, queueMeshEnrollment?: boolean): unknown;
+			enrollMeshSession(sessionId: string, file?: string): Promise<void>;
+			seedRosterLedger(): Promise<void>;
+			rlmSpawnLedger(): unknown;
+			hydratedSeedEntry(entry: unknown): Promise<unknown>;
 			assertWorkerCreateOwner(): void;
 			canRetryFailedWorker(): boolean;
 			isWorkerReadyForCreate(): boolean;
@@ -2042,7 +2046,8 @@ describe("mesh supervisor compatibility", () => {
 		const roster = new AgentRoster((path) => path);
 		internals.roster = () => roster;
 		internals.writeRosterEntry({ agentId: "a", summary }, worker);
-		internals.mesh = { enroll };
+		const enqueueEnrollment = vi.fn((id: string, file?: string) => enroll(id, file));
+		internals.mesh = { enroll, enqueueEnrollment };
 		internals.log = vi.fn();
 		internals.assertWorkerCreateOwner = () => undefined;
 		internals.canRetryFailedWorker = () => false;
@@ -2059,6 +2064,11 @@ describe("mesh supervisor compatibility", () => {
 				parentActiveSessionId: "a",
 			},
 		};
+		internals.writeRosterEntry(
+			{ ...child, queuedChild: true, summary: { ...child.summary, sessionFile: undefined } },
+			worker,
+		);
+		expect(enroll).not.toHaveBeenCalled();
 		for (let n = 0; n < 3; n++) {
 			internals.writeRosterEntry(child, worker);
 			internals.writeRosterEntry({ agentId: "a", summary }, worker);
@@ -2074,6 +2084,30 @@ describe("mesh supervisor compatibility", () => {
 		await internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl");
 		expect(enroll).toHaveBeenCalledTimes(3);
 		expect(enroll).toHaveBeenLastCalledWith("saved", "saved.jsonl");
+		const movedChild = { ...child, summary: { ...child.summary, sessionFile: "child-next.jsonl" } };
+		internals.writeRosterEntry(movedChild, worker);
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("child-saved", "child-next.jsonl");
+		internals.writeRosterEntry({ ...movedChild, summary: { ...movedChild.summary, sessionId: "switched" } }, worker);
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("switched", "child-next.jsonl");
+		expect(enqueueEnrollment).toHaveBeenCalledTimes(3);
+		internals.rlmSpawnLedger = () => ({
+			liveEdges: async () => [{ parent: "saved.jsonl", child: "adopted.jsonl", depth: 1, childId: "adopted" }],
+		});
+		internals.hydratedSeedEntry = async (entry) => entry;
+		await internals.seedRosterLedger();
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("adopted", "adopted.jsonl");
+		enqueueEnrollment.mockClear();
+		enroll.mockClear().mockRejectedValue(new Error("launch refused"));
+		vi.mocked(internals.log).mockClear();
+		roster.delete("a");
+		for (let attempt = 0; attempt < 2; attempt++) {
+			internals.writeRosterEntry({ agentId: "a", summary }, worker, undefined, false);
+			await internals.enrollMeshSession(summary.sessionId, summary.sessionFile);
+		}
+		expect(enqueueEnrollment).not.toHaveBeenCalled();
+		expect(enroll).toHaveBeenCalledTimes(2);
+		expect(internals.log).toHaveBeenCalledTimes(2);
+		for (const [message] of vi.mocked(internals.log).mock.calls) expect(message).toContain("launch refused");
 	});
 
 	it.each(["shutdown", "reject-shutdown", "cleanup"])("orders mesh stop and teardown (%s)", async (mode) => {
