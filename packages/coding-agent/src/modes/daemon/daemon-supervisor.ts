@@ -77,7 +77,7 @@ import {
 } from "./agent-roster.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
-import type { EnrollmentRecord } from "./cotal/enrollment.js";
+import { type EnrollmentRecord, redactMeshError } from "./cotal/enrollment.js";
 import { MeshEndpoints } from "./cotal/mesh-endpoints.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import {
@@ -866,7 +866,6 @@ export class DaemonSupervisor {
 					log: (message) => this.log(message),
 					handoff: (record, message, count, bind) => this.handoffMeshMessage(record, message, count, bind),
 				});
-				await this.mesh.start();
 			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
@@ -899,6 +898,12 @@ export class DaemonSupervisor {
 			this.startupComplete = true;
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
+			setImmediate(() => {
+				if (!this.shuttingDown)
+					void this.mesh
+						?.start()
+						.catch((error: unknown) => this.log(`Mesh home enrollment failed: ${redactMeshError(error)}`));
+			});
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
 			this.log(`Daemon supervisor startup failed: ${startupError.stack ?? startupError.message}`);
@@ -2882,7 +2887,11 @@ export class DaemonSupervisor {
 
 		if (command.type === "send_message") {
 			if (this.mesh)
-				throw new Error("Message was not stored: native forwarding is disabled on the mesh; restart that session");
+				throw new Error(
+					command.agentOrigin === true
+						? "Message was not stored: native forwarding is disabled on the mesh; restart that session"
+						: 'agent messages from daemon clients are not supported while agentMessageTransport is "cotal"',
+				);
 			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
@@ -3344,6 +3353,8 @@ export class DaemonSupervisor {
 			const detail = current.descriptor.lastError ? `: ${current.descriptor.lastError}` : "";
 			throw new Error(`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`);
 		}
+		const root = current.summaries.get(current.descriptor.rootActiveSessionId);
+		if (root?.sessionId) await this.enrollMeshSession(root.sessionId, root.sessionFile);
 		return current;
 	}
 
@@ -3657,9 +3668,7 @@ export class DaemonSupervisor {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
-			if (this.mesh && summary.sessionFile && summary.sessionId) {
-				await this.mesh.enroll(summary.sessionId, summary.sessionFile);
-			}
+			if (summary.sessionId) await this.enrollMeshSession(summary.sessionId, summary.sessionFile);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
@@ -4756,6 +4765,14 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
+	private async enrollMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
+		try {
+			await this.mesh?.enroll(sessionId, sessionFile);
+		} catch (error) {
+			this.log(`Mesh session ${sessionId}: enrollment failed: ${redactMeshError(error)}`);
+		}
+	}
+
 	private writeRosterEntry(
 		entry: WorkerRosterEntry,
 		worker?: ResidentWorker,
@@ -4763,11 +4780,6 @@ export class DaemonSupervisor {
 	): AgentRosterEntry {
 		const previousDirect = this.roster().get(entry.agentId)?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
-		if (this.mesh && worker && entry.summary.sessionFile && entry.summary.sessionId) {
-			void this.mesh.enroll(entry.summary.sessionId, entry.summary.sessionFile).catch(() => {
-				this.log(`Mesh session ${entry.summary.sessionId}: enrollment failed`);
-			});
-		}
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {
@@ -7532,7 +7544,7 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
-		await this.mesh?.stop();
+		await this.runCleanupStep("mesh endpoints", () => this.mesh?.stop());
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();
 		this.clearScheduledWakeTimer();
@@ -7636,7 +7648,7 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
-		await this.mesh?.stop();
+		await this.runCleanupStep("mesh endpoints", () => this.mesh?.stop());
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();
 		this.clearScheduledWakeTimer();

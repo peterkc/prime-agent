@@ -9,6 +9,7 @@ import {
 	mintLifecycleUid,
 	mkSecretDir,
 	newIdentity,
+	parsePrincipalKey,
 	provisionAgent,
 	type SpaceAuth,
 	writeSecretFileCreateOnly,
@@ -47,6 +48,22 @@ function object(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+/** Preserve diagnostic fields, never a request-bearing cause or credential material. */
+export function redactMeshError(error: unknown, includeMessage = true): string {
+	const fields = object(error);
+	const redact = (value: string) =>
+		value
+			.replace(/-----BEGIN NATS USER JWT-----[\s\S]*?-----END USER NKEY SEED-----/g, "[redacted credentials]")
+			.replace(/S[A-Z2-7]{57}/g, "[redacted seed]")
+			.replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted JWT]")
+			.replace(/[\r\n]+/g, " ")
+			.slice(0, 512);
+	const name = redact(typeof fields?.name === "string" ? fields.name : "Error");
+	const code = typeof fields?.code === "string" ? ` (${redact(fields.code)})` : "";
+	const message = typeof error === "string" ? error : fields?.message;
+	return `${name}${code}${includeMessage && typeof message === "string" ? `: ${redact(message)}` : ""}`;
 }
 
 function readJson(path: string): unknown {
@@ -112,6 +129,7 @@ export function directoryPath(meshRoot: string, sessionId: string): string {
 
 export function claimEnrollment(meshRoot: string, sessionId: string, sessionFile?: string): SessionLease {
 	if (!sessionFile) throw new Error(`Session ${sessionId} has no session file and cannot be enrolled`);
+	mkSecretDir(join(meshRoot, "enrollments"));
 	const claim = acquireSessionLease(enrollmentPath(meshRoot, sessionId), meshRoot, {
 		[SESSION_LEASES_ENABLED_ENV]: "1",
 		[SESSION_LEASE_OWNER_ID_ENV]: sessionId,
@@ -149,13 +167,18 @@ export function ensureEnrollmentRecord(meshRoot: string, sessionId: string, sess
 	const path = enrollmentPath(meshRoot, sessionId);
 	if (existsSync(path)) return readEnrollment(meshRoot, sessionId);
 	mkSecretDir(join(meshRoot, "enrollments"));
-	const record: EnrollmentRecord = {
-		sessionId,
-		sessionFile,
-		identity: newIdentity(),
-		lifecycleUid: mintLifecycleUid(),
-		allowSubscribe: [],
-	};
+	let record: EnrollmentRecord;
+	try {
+		record = {
+			sessionId,
+			sessionFile,
+			identity: newIdentity(),
+			lifecycleUid: mintLifecycleUid(),
+			allowSubscribe: [],
+		};
+	} catch (error) {
+		throw new Error(`Mesh session ${sessionId}: identity creation failed: ${redactMeshError(error, false)}`);
+	}
 	try {
 		writeSecretFileCreateOnly(path, `${JSON.stringify(record)}\n`);
 		return record;
@@ -179,8 +202,10 @@ export function credentialSource(
 				allowSubscribe: record.allowSubscribe,
 				expiresInSeconds,
 			});
-		} catch {
-			throw new Error(`Mesh signer ${join(meshRoot, "signer.json")}: credential mint failed`);
+		} catch (error) {
+			throw new Error(
+				`Mesh signer ${join(meshRoot, "signer.json")}: credential mint failed: ${redactMeshError(error, false)}`,
+			);
 		}
 	};
 }
@@ -194,8 +219,10 @@ export async function provisionEnrollment(
 	let creds: string;
 	try {
 		creds = await mintCreds(auth, newIdentity(), "provisioner");
-	} catch {
-		throw new Error(`Mesh signer ${join(meshRoot, "signer.json")}: provisioner mint failed`);
+	} catch (error) {
+		throw new Error(
+			`Mesh signer ${join(meshRoot, "signer.json")}: provisioner mint failed: ${redactMeshError(error, false)}`,
+		);
 	}
 	const provisioner = new CotalEndpoint({
 		space: config.space,
@@ -208,8 +235,10 @@ export async function provisionEnrollment(
 		watchChannels: false,
 		card: { name: "prime-mesh-provisioner", role: "provisioner", kind: "endpoint" },
 	});
-	provisioner.on("error", () => undefined);
 	let failure: Error | undefined;
+	provisioner.on("error", (error: unknown) => {
+		failure ??= new Error(`Mesh session ${record.sessionId}: provisioner error: ${redactMeshError(error)}`);
+	});
 	try {
 		await provisioner.start();
 		await provisionAgent(provisioner, auth, record.identity, {
@@ -217,13 +246,13 @@ export async function provisionEnrollment(
 			allowSubscribe: record.allowSubscribe,
 			subscribe: record.allowSubscribe,
 		});
-	} catch {
-		failure = new Error(`Mesh session ${record.sessionId}: provisioning failed`);
+	} catch (error) {
+		failure = new Error(`Mesh session ${record.sessionId}: provisioning failed: ${redactMeshError(error)}`);
 	}
 	try {
 		await provisioner.stop();
-	} catch {
-		failure ??= new Error(`Mesh session ${record.sessionId}: provisioner stop failed`);
+	} catch (error) {
+		failure ??= new Error(`Mesh session ${record.sessionId}: provisioner stop failed: ${redactMeshError(error)}`);
 	}
 	if (failure) throw failure;
 }
@@ -305,21 +334,30 @@ export function readDirectory(meshRoot: string, sessionId: string): MeshDirector
 		value?.sessionId !== sessionId ||
 		typeof value.name !== "string" ||
 		typeof value.principal !== "string" ||
+		!parsePrincipalKey(value.principal) ||
 		typeof value.homeSocket !== "string"
 	)
 		throw new Error(`Mesh directory ${path}: invalid entry`);
 	return { sessionId, name: value.name, principal: value.principal, homeSocket: value.homeSocket };
 }
 
-export function homeEnrollments(meshRoot: string, homeSocket: string): EnrollmentRecord[] {
+export function homeEnrollments(
+	meshRoot: string,
+	homeSocket: string,
+	onFailure: (sessionId: string, error: unknown) => void,
+): EnrollmentRecord[] {
 	const directory = join(meshRoot, "directory");
 	if (!existsSync(directory)) return [];
 	const result: EnrollmentRecord[] = [];
 	for (const file of readdirSync(directory)) {
 		if (!file.endsWith(".json")) continue;
 		const sessionId = file.slice(0, -5);
-		if (readDirectory(meshRoot, sessionId)?.homeSocket === homeSocket) {
-			result.push(readEnrollment(meshRoot, sessionId));
+		try {
+			if (readDirectory(meshRoot, sessionId)?.homeSocket === homeSocket) {
+				result.push(readEnrollment(meshRoot, sessionId));
+			}
+		} catch (error) {
+			onFailure(sessionId, error);
 		}
 	}
 	return result;

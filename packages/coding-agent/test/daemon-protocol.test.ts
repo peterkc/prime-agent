@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionEvent } from "../src/modes/agent-connection/types.js";
@@ -8,7 +11,6 @@ import {
 	type DaemonTransportClient,
 } from "../src/modes/daemon/daemon-client.js";
 import { shouldSendDaemonOutboundToClient } from "../src/modes/daemon/daemon-mode.js";
-
 import {
 	createDaemonCommandEnvelope,
 	createDaemonEventMeta,
@@ -32,13 +34,52 @@ import {
 	success,
 	WORKER_DAEMON_COMMAND_TYPES,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
-	it("refuses mesh_send before writing to an old daemon and preserves old commands against a new daemon", async () => {
+	it("accepts the revision-32 client command envelope on a revision-33 supervisor", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+		});
+		const internals = supervisor as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			write(client: DaemonSocketClient, outbound: DaemonOutbound): void;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		const write = vi.spyOn(internals, "write").mockImplementation(() => undefined);
+		const client = {
+			id: "legacy",
+			capabilities: new Set(),
+			attachedActiveSessionIds: new Set(),
+		} as DaemonSocketClient;
+		try {
+			await supervisor.start();
+			// Revision 32 uses protocol 7. Schema revision is in the server hello, not in client commands.
+			const envelope = {
+				type: "command",
+				id: "old-list",
+				clientId: "legacy",
+				protocol: { name: DAEMON_PROTOCOL_INFO.name, version: 7 },
+				command: { type: "list" },
+			};
+			await internals.handleLine(client, JSON.stringify(envelope));
+			expect(write).toHaveBeenCalledWith(
+				client,
+				expect.objectContaining({ id: "old-list", command: "list", success: true }),
+			);
+			expect(JSON.stringify(write.mock.calls)).not.toContain("mesh_send");
+		} finally {
+			await internals.cleanupSupervisorResources();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("checks a new client against schema revisions 32 and 33 before sending mesh_send", async () => {
 		const client = new DaemonClient("unused");
 		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
 		const state = client as unknown as {

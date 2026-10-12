@@ -1870,13 +1870,49 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 });
 
 describe("mesh supervisor compatibility", () => {
-	it("finishes mesh shutdown before daemon_closing and before worker stop", async () => {
+	it("enrolls only on explicit reopen, not roster updates, and preserves native session reuse on mesh failure", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
 		});
-		const events: string[] = [];
-		let finish: () => void = () => undefined;
+		const summary = { id: "a", sessionId: "saved", sessionFile: "saved.jsonl" };
+		const worker = {
+			descriptor: { workerId: "w", rootActiveSessionId: "a", lifecycle: "ready" },
+			summaries: new Map([["a", summary]]),
+		};
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			workers: Map<string, unknown>;
+			log(message: string): void;
+			roster(): unknown;
+			writeRosterEntry(entry: unknown, worker: unknown): unknown;
+			assertWorkerCreateOwner(): void;
+			canRetryFailedWorker(): boolean;
+			isWorkerReadyForCreate(): boolean;
+			reuseWorkerForCreate(worker: unknown, owner: undefined, path: string): Promise<unknown>;
+		};
+		const enroll = vi.fn().mockRejectedValueOnce(new Error("provisioning refused")).mockResolvedValue(undefined);
+		internals.mesh = { enroll };
+		internals.log = vi.fn();
+		internals.roster = () => ({ get: () => undefined, write: (entry: unknown) => entry });
+		internals.assertWorkerCreateOwner = () => undefined;
+		internals.canRetryFailedWorker = () => false;
+		internals.isWorkerReadyForCreate = () => true;
+		internals.workers.set("w", worker);
+		for (let n = 0; n < 3; n++) internals.writeRosterEntry({ agentId: "a", summary }, worker);
+		expect(enroll).not.toHaveBeenCalled();
+		await expect(internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl")).resolves.toBe(worker);
+		expect(internals.log).toHaveBeenCalledWith(expect.stringContaining("provisioning refused"));
+		await internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl");
+		expect(enroll).toHaveBeenCalledTimes(2);
+		expect(enroll).toHaveBeenLastCalledWith("saved", "saved.jsonl");
+	});
+
+	it.each(["shutdown", "reject-shutdown", "cleanup"])("orders mesh stop and teardown (%s)", async (mode) => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
 		const internals = supervisor as unknown as {
 			mesh: unknown;
 			shuttingDown: boolean;
@@ -1884,6 +1920,8 @@ describe("mesh supervisor compatibility", () => {
 			clients: Set<unknown>;
 			descriptorDir: string;
 			stopWorker(): Promise<void>;
+			log(message: string): void;
+			cleanupSupervisorResources(): Promise<void>;
 			shutdown(
 				code: number,
 				stopWorkers: boolean,
@@ -1892,6 +1930,8 @@ describe("mesh supervisor compatibility", () => {
 				reason: "shutdown",
 			): Promise<never>;
 		};
+		const events: string[] = [];
+		let finish: () => void = () => undefined;
 		mkdirSync(internals.descriptorDir, { recursive: true });
 		internals.mesh = {
 			stop: async () => {
@@ -1900,40 +1940,60 @@ describe("mesh supervisor compatibility", () => {
 					finish = resolve;
 				});
 				events.push("mesh-finished");
+				if (mode !== "shutdown") throw new Error("mesh stop failed");
 			},
 		};
-		internals.workers.set("worker", {});
+		if (mode !== "shutdown") {
+			internals.log = () => {
+				throw new Error("log sink failed");
+			};
+			vi.spyOn(console, "error").mockImplementation(() => undefined);
+		}
+		if (mode !== "cleanup") internals.workers.set("worker", {});
 		internals.stopWorker = async () => {
 			events.push("worker-stop");
 		};
+		const destroy = vi.fn();
 		internals.clients.add({
+			id: "test",
+			attachedActiveSessionIds: new Set(),
 			detachInput: vi.fn(),
 			socket: {
 				write: (data: string) => {
 					events.push(JSON.parse(data).type);
 				},
 				end: vi.fn(),
+				destroy,
 			},
 		});
 		const exited = new Error("isolated exit");
 		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
 			throw exited;
 		});
-		const stopped = internals.shutdown(0, true, false, false, "shutdown");
+		const stopped =
+			mode === "cleanup"
+				? internals.cleanupSupervisorResources()
+				: internals.shutdown(0, true, false, false, "shutdown");
 		try {
 			expect(internals.shuttingDown).toBe(true);
 			expect(events).toEqual(["mesh-start"]);
 			finish();
-			await expect(stopped).rejects.toBe(exited);
-			expect(events).toEqual(["mesh-start", "mesh-finished", "daemon_closing", "worker-stop"]);
+			if (mode === "cleanup") {
+				await stopped;
+				expect(destroy).toHaveBeenCalledTimes(1);
+			} else {
+				await expect(stopped).rejects.toBe(exited);
+				expect(events).toEqual(["mesh-start", "mesh-finished", "daemon_closing", "worker-stop"]);
+			}
 		} finally {
 			finish();
 			await stopped.catch(() => undefined);
 			exit.mockRestore();
+			vi.restoreAllMocks();
 		}
 	});
 
-	it("refuses native forwarding and old-worker mesh sends, and accepts persistence only from the current mesh-capable worker before shutdown", async () => {
+	it.each([true, false, undefined])("guards native and mesh compatibility for origin=%s", async (agentOrigin) => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
@@ -1968,8 +2028,13 @@ describe("mesh supervisor compatibility", () => {
 				type: "send_message",
 				targetActiveSessionId: "b",
 				message: "hello",
+				agentOrigin,
 			}),
-		).rejects.toThrow("restart that session");
+		).rejects.toThrow(
+			agentOrigin === true
+				? "restart that session"
+				: 'agent messages from daemon clients are not supported while agentMessageTransport is "cotal"',
+		);
 		await expect(
 			internals.handleCommand({} as DaemonSocketClient, {
 				type: "mesh_send",

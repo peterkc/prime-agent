@@ -24,7 +24,9 @@ import {
 	enrollmentPath,
 	ensureEnrollmentRecord,
 	publishDirectory,
+	readDirectory,
 	readSigner,
+	redactMeshError,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
@@ -82,6 +84,152 @@ async function fixture() {
 }
 
 describe("mesh enrollment", () => {
+	it.each(["mesh.json", "signer.json", "invalid mesh.json", "signer mode"])(
+		"keeps the supervisor ready with refusing Cotal mode for %s",
+		async (missing) => {
+			const { root, meshRoot } = await fixture();
+			writeFileSync(join(root, "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
+			const file =
+				missing === "invalid mesh.json" ? "mesh.json" : missing === "signer mode" ? "signer.json" : missing;
+			if (missing === "invalid mesh.json") writeFileSync(join(meshRoot, file), "{");
+			else if (missing === "signer mode") chmodSync(join(meshRoot, file), 0o644);
+			else rmSync(join(meshRoot, file));
+			const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+				defaultSessionConfig: { cwd: root, agentDir: root },
+			});
+			const internals = supervisor as unknown as {
+				startupComplete: boolean;
+				mesh: MeshEndpoints;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			try {
+				await supervisor.start();
+				expect(internals.startupComplete).toBe(true);
+				await expect(internals.mesh.send({ sessionId: "absent" }, "target", "hello")).rejects.toThrow(
+					"not stored: mesh unavailable: Error: Mesh",
+				);
+				await expect(internals.mesh.send({ sessionId: "absent" }, "target", "hello")).rejects.toThrow(
+					join(meshRoot, file),
+				);
+				expect(FakeEndpoint.instances).toHaveLength(0);
+			} finally {
+				await internals.cleanupSupervisorResources();
+			}
+		},
+	);
+
+	it.each(["record", "provisioning"])(
+		"starts home enrollment after readiness and continues past a failed home %s",
+		async (failure) => {
+			const { root, meshRoot, sessionId, sessionFile } = await fixture();
+			const socket = join(root, "daemon.sock");
+			writeFileSync(join(root, "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
+			const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+			await publishDirectory(meshRoot, record, socket);
+			writeFileSync(
+				directoryPath(meshRoot, "0"),
+				JSON.stringify({ sessionId: "0", name: "bad", principal: "local.bad", homeSocket: socket }),
+			);
+			const badRecord = { ...record, sessionId: "0" };
+			writeFileSync(enrollmentPath(meshRoot, "0"), failure === "record" ? "{" : JSON.stringify(badRecord), {
+				mode: 0o600,
+			});
+			const enroll = MeshEndpoints.prototype.enroll;
+			vi.spyOn(MeshEndpoints.prototype, "enroll").mockImplementation(async function (this: MeshEndpoints, id, file) {
+				expect(ready).toHaveBeenCalledTimes(1);
+				if (failure === "provisioning" && id === "0") FakeEndpoint.failStart = true;
+				try {
+					return await enroll.call(this, id, file);
+				} finally {
+					FakeEndpoint.failStart = false;
+				}
+			});
+			const start = vi.spyOn(MeshEndpoints.prototype, "start");
+			const supervisor = new DaemonSupervisor(socket, { defaultSessionConfig: { cwd: root, agentDir: root } });
+			const internals = supervisor as unknown as {
+				startupComplete: boolean;
+				mesh: MeshEndpoints;
+				log(message: string): void;
+				markReady(): void;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			const log = vi.spyOn(internals, "log");
+			const ready = vi.spyOn(internals, "markReady");
+			try {
+				await supervisor.start();
+				expect(internals.startupComplete).toBe(true);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				await start.mock.results[0]!.value;
+				expect(FakeEndpoint.instances).toHaveLength(failure === "record" ? 2 : 3);
+				await expect(internals.mesh.send({ sessionId: "0" }, sessionId, "hello")).rejects.toThrow(
+					"enrollment failed",
+				);
+				expect(log).toHaveBeenCalledWith(expect.stringContaining("Mesh session 0:"));
+				const claim = claimEnrollment(meshRoot, "0", sessionFile);
+				claim.release();
+				expect(log).toHaveBeenCalledWith(expect.stringMatching(/Mesh home enrollment: 2 sessions in \d+ ms/));
+			} finally {
+				await internals.cleanupSupervisorResources();
+			}
+		},
+	);
+
+	it("uses the same fresh enrollment claim through a symlink alias and its real path", async () => {
+		const { root, meshRoot, sessionId, sessionFile } = await fixture();
+		const alias = join(root, "alias");
+		symlinkSync(meshRoot, alias);
+		const claim = claimEnrollment(alias, sessionId, sessionFile);
+		try {
+			ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+			expect(() => claimEnrollment(meshRoot, sessionId, sessionFile)).toThrow("already active");
+		} finally {
+			claim.release();
+		}
+	});
+
+	it.each(["owner", "local.*", "local.a.b", "local.a-b", ".a", "local."])(
+		"rejects malformed directory principal %s",
+		async (principal) => {
+			const { meshRoot, sessionId, sessionFile } = await fixture();
+			const entry = await publishDirectory(
+				meshRoot,
+				ensureEnrollmentRecord(meshRoot, sessionId, sessionFile),
+				"home",
+			);
+			expect(readDirectory(meshRoot, sessionId)).toEqual(entry);
+			writeFileSync(directoryPath(meshRoot, sessionId), JSON.stringify({ ...entry, principal }));
+			expect(() => readDirectory(meshRoot, sessionId)).toThrow("invalid entry");
+		},
+	);
+
+	it.each(["mint", "identity"])(
+		"retains safe %s error fields and bounds redacted diagnostic messages",
+		async (boundary) => {
+			const { auth, meshRoot, sessionId, sessionFile } = await fixture();
+			const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+			const error = Object.assign(
+				new Error(`nkeys failed ${auth.account.signingSeed} ${record.identity.seed} opaque-private-fragment`),
+				{ name: "MintError", code: "EKEY" },
+			);
+			if (boundary === "mint") {
+				vi.spyOn(core, "mintCreds").mockRejectedValueOnce(error);
+				await expect(credentialSource(meshRoot, "prime", record)()).rejects.toMatchObject({
+					message: `Mesh signer ${join(meshRoot, "signer.json")}: credential mint failed: MintError (EKEY)`,
+				});
+			} else {
+				vi.spyOn(core, "newIdentity").mockImplementationOnce(() => {
+					throw error;
+				});
+				expect(() => ensureEnrollmentRecord(meshRoot, "fresh", sessionFile)).toThrow(
+					/^Mesh session fresh: identity creation failed: MintError \(EKEY\)$/,
+				);
+			}
+			expect(redactMeshError(error, false)).toBe("MintError (EKEY)");
+			expect(redactMeshError(new Error("x".repeat(1000)))).toHaveLength(519);
+			expect(redactMeshError(error)).not.toContain(record.identity.seed);
+		},
+	);
+
 	it("reuses one private identity across concurrent enrollment and restart, and provisions before publication", async () => {
 		const { mesh, meshRoot, sessionId, sessionFile } = await fixture();
 		await Promise.all([mesh.enroll(sessionId, sessionFile), mesh.enroll(sessionId, sessionFile)]);
@@ -116,10 +264,17 @@ describe("mesh enrollment", () => {
 	it("recovers after a stop at the record or at provisioning, and refuses fileless sessions", async () => {
 		const { mesh, meshRoot, sessionId, sessionFile } = await fixture();
 		await expect(mesh.enroll("memory")).rejects.toThrow("no session file");
+		await expect(mesh.send({ sessionId: "never" }, sessionId, "hello")).rejects.toThrow("is not enrolled");
+		await expect(mesh.send({ sessionId: "memory" }, sessionId, "hello")).rejects.toThrow(
+			"enrollment failed: Error: Session memory has no session file",
+		);
 		expect(existsSync(enrollmentPath(meshRoot, "memory"))).toBe(false);
 		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
 		FakeEndpoint.failStart = true;
 		await expect(mesh.enroll(sessionId, sessionFile)).rejects.toThrow();
+		await expect(mesh.send({ sessionId }, "memory", "hello")).rejects.toThrow(
+			"enrollment failed: Error: Mesh session",
+		);
 		expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);
 		FakeEndpoint.failStart = false;
 		const publish = vi.spyOn(FakeEndpoint.prototype, "emit");
@@ -228,7 +383,7 @@ describe("mesh enrollment", () => {
 	});
 
 	it("leaves a live claim in another process alone and reclaims it after that process exits", async () => {
-		const { meshRoot, sessionId, sessionFile } = await fixture();
+		const { mesh, meshRoot, sessionId, sessionFile } = await fixture();
 		const script = `import { claimEnrollment } from ${JSON.stringify(resolve("src/modes/daemon/cotal/enrollment.ts"))}; claimEnrollment(...JSON.parse(process.argv[1])); console.log("claimed"); process.stdin.resume();`;
 		const child = spawn(
 			process.execPath,
@@ -243,6 +398,8 @@ describe("mesh enrollment", () => {
 				child.once("exit", () => reject(new Error("claim child exited before receipt")));
 			});
 			expect(() => claimEnrollment(meshRoot, sessionId, sessionFile)).toThrow("already active");
+			await mesh.enroll(sessionId, sessionFile);
+			await expect(mesh.send({ sessionId }, "target", "hello")).rejects.toThrow("claimed by another daemon");
 		} finally {
 			child.kill("SIGTERM");
 			await closed;

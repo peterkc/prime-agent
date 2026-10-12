@@ -2,10 +2,10 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type * as core from "@cotal-ai/core";
+import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentFamilyMember, createAgentMessageHostHandlers } from "../src/core/agent-messages.js";
-import type * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
+import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 
 vi.mock("@cotal-ai/core", async (original) => ({
@@ -15,11 +15,12 @@ vi.mock("@cotal-ai/core", async (original) => ({
 		return new Endpoint(options);
 	},
 }));
-vi.mock("../src/modes/daemon/cotal/enrollment.js", () => ({
+vi.mock("../src/modes/daemon/cotal/enrollment.js", async (original) => ({
+	...(await original<typeof enrollment>()),
 	loadMeshConfiguration: () => ({ space: "prime", server: "nats://127.0.0.1:1" }),
 	readSigner: vi.fn(),
 	homeEnrollments: () => [],
-	claimEnrollment: () => ({ release: releaseClaim }),
+	claimEnrollment: vi.fn(() => ({ release: releaseClaim })),
 	ensureEnrollmentRecord: (_: string, id: string, path: string) => ({
 		sessionId: id,
 		sessionFile: path,
@@ -36,12 +37,13 @@ vi.mock("../src/modes/daemon/cotal/enrollment.js", () => ({
 	})),
 	credentialSource: () => async () => "test-only-credential",
 	enrollmentPath: (root: string, id: string) => join(root, `${id}.json`),
-	readDirectory: (_: string, id: string) => directories.get(id),
+	readDirectory: vi.fn((_: string, id: string) => directories.get(id)),
 }));
 
 class Endpoint extends EventEmitter {
 	static instances: Endpoint[] = [];
-	readonly start = vi.fn(async () => undefined);
+	static onStart?: (endpoint: Endpoint) => void;
+	readonly start = vi.fn(async () => Endpoint.onStart?.(this));
 	readonly stop = vi.fn(async (): Promise<void> => undefined);
 	readonly unicastAttributed = vi.fn(async () => ({ msg: { id: "published" }, ack: { seq: 42, duplicate: false } }));
 	constructor(readonly options: core.EndpointOptions) {
@@ -65,6 +67,7 @@ afterEach(async () => {
 	vi.useRealTimers();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	Endpoint.instances = [];
+	Endpoint.onStart = undefined;
 	directories.clear();
 	releaseClaim.mockClear();
 	vi.clearAllMocks();
@@ -114,6 +117,64 @@ async function settled(mesh: MeshEndpoints, id: string) {
 }
 
 describe("mesh endpoints", () => {
+	it("redacts endpoint diagnostics and publish causes without losing the actionable error", async () => {
+		const { mesh, source, target, log } = await fixture();
+		const identity = core.newIdentity();
+		const auth = core.stripSpaceAuth(await core.createSpaceAuth("prime"));
+		const creds = await core.mintCreds(auth, identity, "agent", { lifecycleUid: core.mintLifecycleUid() });
+		const jwt = creds.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/)![0];
+		const error = Object.assign(
+			new Error(`connection refused ${identity.seed} ${auth.account.signingSeed} ${creds}`),
+			{ code: "ECONNREFUSED" },
+		);
+		target.emit("error", error);
+		target.emit("warning", error);
+		expect(log).toHaveBeenCalledTimes(2);
+		for (const [diagnostic] of log.mock.calls) {
+			expect(diagnostic).toContain("ECONNREFUSED");
+			expect(diagnostic).toContain("connection refused");
+		}
+		source.unicastAttributed.mockRejectedValueOnce(error);
+		const failure = await mesh.send({ sessionId: "a" }, "b", "hello").catch((cause: unknown) => cause);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("ECONNREFUSED");
+		const diagnostics = `${JSON.stringify(log.mock.calls)} ${(failure as Error).message}`;
+		expect(diagnostics).toContain("ECONNREFUSED");
+		expect(diagnostics).toContain("connection refused");
+		for (const secret of [identity.seed, auth.account.signingSeed, creds, jwt, jwt.slice(0, 64)])
+			expect(diagnostics).not.toContain(secret);
+		expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds in-flight enrollment during stop and releases the late claim without opening an endpoint", async () => {
+		vi.useFakeTimers();
+		const { mesh, root } = await fixture();
+		let finish!: () => void;
+		vi.mocked(enrollment.provisionEnrollment).mockImplementationOnce(
+			() =>
+				new Promise<void>((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const work = mesh.enroll("late", join(root, "late.json"));
+		const refused = expect(work).rejects.toThrow("shutting down");
+		let stoppedDone = false;
+		const stopped = mesh.stop().then(() => {
+			stoppedDone = true;
+		});
+		try {
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(stoppedDone).toBe(true);
+			expect(releaseClaim).toHaveBeenCalledTimes(2);
+		} finally {
+			finish();
+			await refused;
+			await stopped;
+		}
+		expect(releaseClaim).toHaveBeenCalledTimes(3);
+		expect(Endpoint.instances).toHaveLength(2);
+	});
+
 	it("publishes exactly once through the sender to the directory principal and returns broker storage proof", async () => {
 		const { mesh, source } = await fixture();
 		expect(await mesh.send({ sessionId: "a" }, "b", "hello")).toMatchObject({
@@ -148,12 +209,19 @@ describe("mesh endpoints", () => {
 			expect(receipt).toMatchObject({ deliveryStatus: "stored", sequence: 42 });
 	});
 
-	it.each(["source", "target", "record"])("refuses a missing %s before any publish", async (missing) => {
+	it.each(["source", "target", "record", "directory"])("refuses pre-publish %s failures", async (missing) => {
 		const { mesh, source, root } = await fixture();
 		if (missing === "target") directories.delete("b");
 		if (missing === "record") rmSync(join(root, "b.json"));
+		if (missing === "directory")
+			vi.mocked(enrollment.readDirectory)
+				.mockReturnValueOnce(directories.get("a"))
+				.mockImplementationOnce(() => {
+					throw new Error("invalid directory principal");
+				});
+		const expected = missing === "directory" ? "not stored: Error: invalid directory principal" : "not stored";
 		await expect(mesh.send({ sessionId: missing === "source" ? "fileless" : "a" }, "b", "hello")).rejects.toThrow(
-			"not stored",
+			expected,
 		);
 		expect(source.unicastAttributed).not.toHaveBeenCalled();
 	});
@@ -173,7 +241,17 @@ describe("mesh endpoints", () => {
 
 	it("answers acceptance without ack, holds FIFO order and renews both messages until their own persistence frames", async () => {
 		vi.useFakeTimers();
-		const { mesh, target, handoff } = await fixture();
+		const early = delivery("early");
+		Endpoint.onStart = (endpoint) => {
+			if (endpoint.options.card?.id === "b") endpoint.emit("message", early.message, early.delivery, { kind: "dm" });
+		};
+		const { mesh, target, handoff, log } = await fixture();
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(early.ack).not.toHaveBeenCalled();
+		mesh.confirmPersisted("early", recipient);
+		await settled(mesh, "b");
+		expect(early.ack).toHaveBeenCalledTimes(1);
+		handoff.mockClear();
 		const first = delivery("first");
 		const second = delivery("second", 2);
 		target.emit("message", first.message, first.delivery, { kind: "dm" });
@@ -184,6 +262,14 @@ describe("mesh endpoints", () => {
 		await vi.advanceTimersByTimeAsync(1000);
 		expect(first.working).toHaveBeenCalledTimes(2);
 		expect(second.working).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(log.mock.calls).toEqual([
+			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
+			["Mesh session b, Cotal ID second, delivery count 2: persistence still pending; queued behind 0"],
+		]);
+		expect(first.working).toHaveBeenCalledTimes(7);
+		expect(second.ack).not.toHaveBeenCalled();
 		mesh.confirmPersisted("second", recipient);
 		mesh.confirmPersisted("first", {});
 		expect(first.ack).not.toHaveBeenCalled();
@@ -199,18 +285,32 @@ describe("mesh endpoints", () => {
 		expect(handoff.mock.calls[1]![2]).toBe(2);
 	});
 
-	it.each(["handoff", "disconnect"])("leaves a %s failure unacknowledged", async (failure) => {
-		const { mesh, target, log } = await fixture(async (_record, _message, _count, bind) => {
+	it.each(["handoff", "disconnect", "directory"])("leaves a %s failure unacknowledged", async (failure) => {
+		vi.useFakeTimers();
+		const { mesh, target, log, handoff } = await fixture(async (_record, _message, _count, bind) => {
 			bind(recipient);
 			if (failure === "handoff") throw new Error("restart old worker");
 		});
 		const item = delivery("failed");
+		const queued = delivery("queued");
+		if (failure === "directory") directories.delete("b");
 		target.emit("message", item.message, item.delivery, { kind: "dm" });
+		if (failure === "directory") target.emit("message", queued.message, queued.delivery, { kind: "dm" });
 		if (failure === "disconnect") mesh.disconnect(recipient);
 		await settled(mesh, "b");
 		mesh.confirmPersisted("failed", recipient);
 		expect(item.ack).not.toHaveBeenCalled();
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("left unacknowledged"));
+		if (failure === "directory") {
+			expect(target.stop).toHaveBeenCalledTimes(1);
+			expect(releaseClaim).toHaveBeenCalledTimes(1);
+			expect(handoff).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(6000);
+			expect(item.working).toHaveBeenCalledTimes(1);
+			expect(queued.working).toHaveBeenCalledTimes(1);
+			expect(queued.ack).not.toHaveBeenCalled();
+			expect(log).toHaveBeenCalledTimes(1);
+		}
 	});
 
 	it("stops every pull immediately, acknowledges nothing after shutdown, drains at most five seconds and releases claims after all stops", async () => {
