@@ -6088,12 +6088,19 @@ export class InteractiveMode {
 	}
 
 	private async handleConnectionExtensionUiRequest(request: AgentConnectionExtensionUiRequest): Promise<void> {
-		// A replacement dialog follows a worker's cancelled form when its client set changes.
+		// The worker may have cancelled the form already, but unrelated dialogs must cancel it too.
 		if (this.expectsConnectionExtensionUiResponse(request)) {
 			for (const [id, pending] of this.activeConnectionExtensionUiRequests) {
 				if (!pending.questionnaire) continue;
 				this.activeConnectionExtensionUiRequests.delete(id);
 				pending.cancelLocal();
+				try {
+					await this.agentConnection.respondToExtensionUiRequest(id, { cancelled: true });
+				} catch (error) {
+					if (!(error instanceof Error && error.message === `Unknown extension UI request: ${id}`)) {
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
+				}
 			}
 		}
 		let response: AgentConnectionExtensionUiResponse | undefined;

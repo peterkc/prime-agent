@@ -328,9 +328,10 @@ function waitForSupervisorReady(child: ChildProcess, socketPath: string): Promis
 }
 
 describe("daemon supervisor resident workers", () => {
-	it.each([true, false])(
-		"TM-14 TM-15 real supervisor relays a native form only when all UI clients are capable: %s",
-		async (allCapable) => {
+	it.each([true, false, "client joins pending"] as const)(
+		"TM-14 TM-15 TM-19 real supervisor relays a native form only when all UI clients are capable: %s",
+		async (scenario) => {
+			const allCapable = scenario === true;
 			const root = tempDir();
 			const agentDir = join(root, "agent");
 			const projectDir = join(root, "project");
@@ -357,10 +358,23 @@ export default function(pi) {
 			const watcher = new DaemonClient(socketPath);
 			const requests: Extract<DaemonOutbound, { type: "extension_ui_request" }>[] = [];
 			const responses: Promise<unknown>[] = [];
+			async function attachWatcher(activeSessionId: string): Promise<void> {
+				await watcher.connect();
+				await watcher.waitForHello();
+				const attached = await watcher.request({
+					type: "attach",
+					activeSessionId,
+					supportsExtensionUi: true,
+					capabilities: ["extension_ui"],
+				});
+				if (!attached.success) throw new Error(attached.error);
+			}
 			const unsubscribe = client.onMessage((message) => {
 				if (message.type !== "extension_ui_request") return;
 				requests.push(message);
-				if (message.method === "questionnaire" || message.method === "select")
+				if (message.method === "questionnaire" && scenario === "client joins pending")
+					responses.push(attachWatcher(message.activeSessionId));
+				else if (message.method === "questionnaire" || message.method === "select")
 					responses.push(
 						client.request({
 							type: "extension_ui_response",
@@ -405,17 +419,7 @@ export default function(pi) {
 					capabilities: ["extension_ui", "questionnaire_ui"],
 				});
 				if (!attached.success) throw new Error(attached.error);
-				if (!allCapable) {
-					await watcher.connect();
-					await watcher.waitForHello();
-					const attachedWatcher = await watcher.request({
-						type: "attach",
-						activeSessionId,
-						supportsExtensionUi: true,
-						capabilities: ["extension_ui"],
-					});
-					if (!attachedWatcher.success) throw new Error(attachedWatcher.error);
-				}
+				if (scenario === false) await attachWatcher(activeSessionId);
 				const completed = await client.request({
 					type: "prompt_and_wait",
 					activeSessionId,
@@ -423,7 +427,9 @@ export default function(pi) {
 				});
 				if (!completed.success) throw new Error(completed.error);
 				await Promise.all(responses);
-				expect(requests.filter((request) => request.method === "questionnaire")).toHaveLength(allCapable ? 1 : 0);
+				expect(requests.filter((request) => request.method === "questionnaire")).toHaveLength(
+					scenario === false ? 0 : 1,
+				);
 				expect(requests.filter((request) => request.method === "select")).toHaveLength(allCapable ? 0 : 3);
 				const notification = requests.find((request) => request.method === "notify");
 				if (!notification) throw new Error("Form result was not reported");

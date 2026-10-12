@@ -1215,6 +1215,51 @@ describe("daemon mode helpers", () => {
 		expect(messages.map((message) => message.type)).toEqual(["session_replaced", "session_resynced"]);
 	});
 
+	it.each([false, true])(
+		"R1 direct attach cancels a form only for a new client (already attached: %s)",
+		async (alreadyAttached) => {
+			const root = mkdtempSync(join(tmpdir(), "prime-direct-form-attach-"));
+			try {
+				const daemon = new AgentDaemon(join(root, "daemon.sock"), {
+					defaultSessionConfig: { agentDir: root, cwd: root },
+					createRuntime: vi.fn(),
+				});
+				const state = makeState("form");
+				const client = makeClient("client", state.activeSessionId, true);
+				client.attachedActiveSessionIds.clear();
+				if (alreadyAttached) state.clients.add(client);
+				const replies: unknown[] = [];
+				state.extensionUiRequests.set("form-request", {
+					method: "questionnaire",
+					resolve: (response) => {
+						replies.push(response);
+					},
+				});
+				const internals = daemon as unknown as {
+					sessions: Map<string, ActiveSessionState>;
+					createAttachResult: ReturnType<typeof vi.fn>;
+					handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				};
+				internals.sessions.set(state.activeSessionId, state);
+				internals.createAttachResult = vi.fn(async () => ({
+					activeSessionId: state.activeSessionId,
+					snapshot: { summary: {}, state: {}, messages: [] },
+					lastEventSequence: 0,
+				}));
+				await internals.handleCommand(client, {
+					type: "attach",
+					activeSessionId: state.activeSessionId,
+					supportsExtensionUi: true,
+				});
+				expect(replies).toEqual(alreadyAttached ? [] : [{ cancelled: true }]);
+				expect(state.extensionUiRequests.size).toBe(alreadyAttached ? 1 : 0);
+				expect(state.clients.has(client)).toBe(true);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("does not attach a non-chunked client until its snapshot is ready", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -3451,6 +3496,7 @@ function makeAgentFamilyState(
 function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {
 	return {
 		activeSessionId,
+		extensionUiRequests: new Map(),
 		clients: new Set(),
 		pendingAttaches: 0,
 		lastEventSequence: 0,

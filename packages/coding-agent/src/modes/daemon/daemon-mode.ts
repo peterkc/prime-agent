@@ -4330,7 +4330,7 @@ export class AgentDaemon {
 				} finally {
 					state.pendingAttaches--;
 				}
-				cancelPendingQuestionnaireRequests(state);
+				if (!state.clients.has(client)) cancelPendingQuestionnaireRequests(state);
 				state.clients.add(client);
 				client.attachedActiveSessionIds.add(state.activeSessionId);
 				// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.

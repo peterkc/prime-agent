@@ -17,7 +17,7 @@ import type { QuestionnaireResult } from "../src/core/tools/questionnaire.js";
 import type { ExtensionAPI, ExtensionFactory, RenderModeChangeEvent } from "../src/index.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState, reportRenderMode } from "../src/modes/daemon/daemon-extension-binding.js";
-import { cancelPendingQuestionnaireRequests, detachClientFromActiveSession } from "../src/modes/daemon/daemon-mode.js";
+import { detachClientFromActiveSession } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon extension binding", () => {
@@ -172,38 +172,32 @@ describe("daemon extension binding", () => {
 		expect(state.extensionUiRequests.size).toBe(0);
 	});
 
-	it.each(["client added", "client detached", "abort"])(
-		"TM-19 cancels a pending form on %s without submitting",
-		async (change) => {
-			const state = await questionnaireState();
-			const controller = new AbortController();
-			const methods: string[] = [];
-			await bindActiveSessionState(state, {
-				shutdown: () => {},
-				broadcast: (_state, message) => {
-					if (message.type !== "extension_ui_request") return;
-					methods.push(message.method);
-					if (message.method === "questionnaire") {
-						if (change === "abort") controller.abort();
-						else if (change === "client added") {
-							state.clients.add(uiClient("new"));
-							cancelPendingQuestionnaireRequests(state);
-						} else {
-							state.clients.add(uiClient("remaining"));
-							detachClientFromActiveSession([...state.clients][0], state);
-						}
-					} else if (message.method === "select")
-						state.extensionUiRequests.get(message.id)?.resolve({ cancelled: true });
-				},
-			});
-			const tool = state.runtime.session.agent.state.tools.find((tool) => tool.name === "questionnaire");
-			if (!tool) throw new Error("Questionnaire missing");
-			const result = await tool.execute("changed", form, controller.signal);
-			expect(result.details as QuestionnaireResult).toMatchObject({ cancelled: true, answers: [] });
-			expect(methods).toEqual(change === "abort" ? ["questionnaire"] : ["questionnaire", "select"]);
-			expect(state.extensionUiRequests.size).toBe(0);
-		},
-	);
+	it.each(["client detached", "abort"])("TM-19 cancels a pending form on %s without submitting", async (change) => {
+		const state = await questionnaireState();
+		const controller = new AbortController();
+		const methods: string[] = [];
+		await bindActiveSessionState(state, {
+			shutdown: () => {},
+			broadcast: (_state, message) => {
+				if (message.type !== "extension_ui_request") return;
+				methods.push(message.method);
+				if (message.method === "questionnaire") {
+					if (change === "abort") controller.abort();
+					else {
+						state.clients.add(uiClient("remaining"));
+						detachClientFromActiveSession([...state.clients][0], state);
+					}
+				} else if (message.method === "select")
+					state.extensionUiRequests.get(message.id)?.resolve({ cancelled: true });
+			},
+		});
+		const tool = state.runtime.session.agent.state.tools.find((tool) => tool.name === "questionnaire");
+		if (!tool) throw new Error("Questionnaire missing");
+		const result = await tool.execute("changed", form, controller.signal);
+		expect(result.details as QuestionnaireResult).toMatchObject({ cancelled: true, answers: [] });
+		expect(methods).toEqual(change === "abort" ? ["questionnaire"] : ["questionnaire", "select"]);
+		expect(state.extensionUiRequests.size).toBe(0);
+	});
 
 	it("reports window render-mode changes once with the previous mode", async () => {
 		const events: RenderModeChangeEvent[] = [];
