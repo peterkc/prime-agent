@@ -146,6 +146,25 @@ describe("mesh endpoints", () => {
 		expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
 	});
 
+	it("F13 cancels every early delivery renewal when registration fails after endpoint start", async () => {
+		vi.useFakeTimers();
+		const first = delivery("early-first");
+		const second = delivery("early-second");
+		Endpoint.onStart = (endpoint) => {
+			if (endpoint.options.card?.id !== "b") return;
+			for (const item of [first, second]) endpoint.emit("message", item.message, item.delivery, { kind: "dm" });
+			directories.delete("b");
+		};
+		await expect(fixture()).rejects.toThrow("directory entry disappeared");
+		expect(Endpoint.instances[1]!.stop).toHaveBeenCalledTimes(1);
+		expect(releaseClaim).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(6000);
+		for (const item of [first, second]) {
+			expect(item.working).toHaveBeenCalledTimes(1);
+			expect(item.ack).not.toHaveBeenCalled();
+		}
+	});
+
 	it("bounds in-flight enrollment during stop and releases the late claim without opening an endpoint", async () => {
 		vi.useFakeTimers();
 		const { mesh, root } = await fixture();
@@ -209,9 +228,16 @@ describe("mesh endpoints", () => {
 			expect(receipt).toMatchObject({ deliveryStatus: "stored", sequence: 42 });
 	});
 
-	it.each(["source", "target", "record", "directory"])("refuses pre-publish %s failures", async (missing) => {
+	it.each([
+		["source", "sender fileless is not enrolled"],
+		["source-record", "sender a has no enrollment record or directory entry"],
+		["target", "target b is not enrolled: no enrollment record or directory entry"],
+		["record", "target b is not enrolled: no enrollment record or directory entry"],
+		["directory", "Error: invalid directory principal"],
+	])("refuses pre-publish %s failures", async (missing, reason) => {
 		const { mesh, source, root } = await fixture();
 		if (missing === "target") directories.delete("b");
+		if (missing === "source-record") rmSync(join(root, "a.json"));
 		if (missing === "record") rmSync(join(root, "b.json"));
 		if (missing === "directory")
 			vi.mocked(enrollment.readDirectory)
@@ -219,9 +245,8 @@ describe("mesh endpoints", () => {
 				.mockImplementationOnce(() => {
 					throw new Error("invalid directory principal");
 				});
-		const expected = missing === "directory" ? "not stored: Error: invalid directory principal" : "not stored";
 		await expect(mesh.send({ sessionId: missing === "source" ? "fileless" : "a" }, "b", "hello")).rejects.toThrow(
-			expected,
+			`Message was not stored: ${reason}`,
 		);
 		expect(source.unicastAttributed).not.toHaveBeenCalled();
 	});
@@ -266,7 +291,6 @@ describe("mesh endpoints", () => {
 		expect(handoff).toHaveBeenCalledTimes(1);
 		expect(log.mock.calls).toEqual([
 			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
-			["Mesh session b, Cotal ID second, delivery count 2: persistence still pending; queued behind 0"],
 		]);
 		expect(first.working).toHaveBeenCalledTimes(7);
 		expect(second.ack).not.toHaveBeenCalled();
@@ -277,6 +301,11 @@ describe("mesh endpoints", () => {
 		await settled(mesh, "b");
 		expect(first.ack).toHaveBeenCalledTimes(1);
 		expect(handoff).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(log.mock.calls).toEqual([
+			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
+			["Mesh session b, Cotal ID second, delivery count 2: persistence still pending; queued behind 0"],
+		]);
 		mesh.confirmPersisted("second", recipient);
 		await settled(mesh, "b");
 		expect(second.ack).toHaveBeenCalledTimes(1);

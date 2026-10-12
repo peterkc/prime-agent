@@ -4786,8 +4786,11 @@ export class DaemonSupervisor {
 		worker?: ResidentWorker,
 		statusLabel?: AgentRosterEntry["statusLabel"],
 	): AgentRosterEntry {
-		const previousDirect = this.roster().get(entry.agentId)?.summary.directAttachedClients ?? 0;
+		const previous = this.roster().get(entry.agentId);
+		const previousDirect = previous?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
+		if (!previous && entry.summary.sessionId && entry.summary.sessionFile)
+			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile);
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {

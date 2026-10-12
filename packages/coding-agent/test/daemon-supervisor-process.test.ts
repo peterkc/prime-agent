@@ -26,6 +26,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { AgentRoster } from "../src/modes/daemon/agent-roster.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { DaemonCommand, DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -2012,7 +2013,7 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 });
 
 describe("mesh supervisor compatibility", () => {
-	it("enrolls only on explicit reopen, not roster updates, and preserves native session reuse on mesh failure", async () => {
+	it("F12 enrolls a new child once, retries only on explicit reopen, and preserves native reuse on mesh failure", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
@@ -2033,20 +2034,45 @@ describe("mesh supervisor compatibility", () => {
 			isWorkerReadyForCreate(): boolean;
 			reuseWorkerForCreate(worker: unknown, owner: undefined, path: string): Promise<unknown>;
 		};
-		const enroll = vi.fn().mockRejectedValueOnce(new Error("provisioning refused")).mockResolvedValue(undefined);
+		const enroll = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("child refused"))
+			.mockRejectedValueOnce(new Error("provisioning refused"))
+			.mockResolvedValue(undefined);
+		const roster = new AgentRoster((path) => path);
+		internals.roster = () => roster;
+		internals.writeRosterEntry({ agentId: "a", summary }, worker);
 		internals.mesh = { enroll };
 		internals.log = vi.fn();
-		internals.roster = () => ({ get: () => undefined, write: (entry: unknown) => entry });
 		internals.assertWorkerCreateOwner = () => undefined;
 		internals.canRetryFailedWorker = () => false;
 		internals.isWorkerReadyForCreate = () => true;
 		internals.workers.set("w", worker);
-		for (let n = 0; n < 3; n++) internals.writeRosterEntry({ agentId: "a", summary }, worker);
-		expect(enroll).not.toHaveBeenCalled();
+		const child = {
+			agentId: "child",
+			summary: {
+				...summary,
+				id: "child",
+				sessionId: "child-saved",
+				sessionFile: "child.jsonl",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "a",
+			},
+		};
+		for (let n = 0; n < 3; n++) {
+			internals.writeRosterEntry(child, worker);
+			internals.writeRosterEntry({ agentId: "a", summary }, worker);
+		}
+		expect(enroll).toHaveBeenCalledExactlyOnceWith("child-saved", "child.jsonl");
 		await expect(internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl")).resolves.toBe(worker);
+		expect(internals.log).toHaveBeenCalledWith(
+			expect.stringContaining("Mesh session child-saved: enrollment failed: Error: child refused"),
+		);
 		expect(internals.log).toHaveBeenCalledWith(expect.stringContaining("provisioning refused"));
-		await internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl");
+		internals.writeRosterEntry(child, worker);
 		expect(enroll).toHaveBeenCalledTimes(2);
+		await internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl");
+		expect(enroll).toHaveBeenCalledTimes(3);
 		expect(enroll).toHaveBeenLastCalledWith("saved", "saved.jsonl");
 	});
 

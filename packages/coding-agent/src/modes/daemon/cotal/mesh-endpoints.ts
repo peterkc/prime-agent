@@ -148,6 +148,7 @@ export class MeshEndpoints {
 			throw error;
 		}
 		let endpoint: CotalEndpoint | undefined;
+		let session: SessionEndpoint | undefined;
 		try {
 			readSigner(this.options.meshRoot, config.space);
 			const record = ensureEnrollmentRecord(this.options.meshRoot, sessionId, sessionFile);
@@ -167,7 +168,8 @@ export class MeshEndpoints {
 					this.options.credentialLifetimeSeconds,
 				),
 			});
-			const session: SessionEndpoint = { record, claim, endpoint, queue: [] };
+			session = { record, claim, endpoint, queue: [] };
+			const startedSession = session;
 			endpoint.on("error", (error: unknown) =>
 				this.options.log(`Mesh session ${sessionId}: endpoint error: ${redactMeshError(error)}`),
 			);
@@ -175,7 +177,7 @@ export class MeshEndpoints {
 				this.options.log(`Mesh session ${sessionId}: endpoint warning: ${redactMeshError(error)}`),
 			);
 			endpoint.on("message", (message: CotalMessage, delivery: Delivery, meta: MessageMeta) => {
-				if (meta.kind === "dm" && delivery.durable) this.enqueue(session, message, delivery);
+				if (meta.kind === "dm" && delivery.durable) this.enqueue(startedSession, message, delivery);
 			});
 			try {
 				await endpoint.start();
@@ -189,6 +191,13 @@ export class MeshEndpoints {
 			this.enrollmentFailures.delete(sessionId);
 			this.drain(session);
 		} catch (error) {
+			if (session) {
+				for (const item of session.queue) {
+					if (item.workingTimer) clearInterval(item.workingTimer);
+					if (item.stallTimer) clearTimeout(item.stallTimer);
+				}
+				session.queue.length = 0;
+			}
 			try {
 				await endpoint?.stop();
 			} catch (error) {
@@ -213,22 +222,28 @@ export class MeshEndpoints {
 			throw new Error(
 				`Message was not stored: sender ${senderSessionId} ${this.enrollmentFailures.get(senderSessionId) ?? "is not enrolled"}`,
 			);
-		let target: ReturnType<typeof readDirectory>;
+		let senderEnrolled: boolean;
 		try {
-			if (
-				!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
-				!readDirectory(this.options.meshRoot, senderSessionId)
-			) {
-				throw new Error(`sender ${senderSessionId} has no enrollment record or directory entry`);
-			}
-			target = readDirectory(this.options.meshRoot, targetSessionId);
-			if (!target || !existsSync(enrollmentPath(this.options.meshRoot, targetSessionId))) {
-				throw new Error(
-					`target ${targetSessionId} ${this.enrollmentFailures.get(targetSessionId) ?? "is not enrolled: no enrollment record or directory entry"}`,
-				);
-			}
+			senderEnrolled =
+				existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) &&
+				!!readDirectory(this.options.meshRoot, senderSessionId);
 		} catch (error) {
 			throw new Error(`Message was not stored: ${redactMeshError(error)}`);
+		}
+		if (!senderEnrolled)
+			throw new Error(
+				`Message was not stored: sender ${senderSessionId} has no enrollment record or directory entry`,
+			);
+		let target: ReturnType<typeof readDirectory>;
+		try {
+			target = readDirectory(this.options.meshRoot, targetSessionId);
+		} catch (error) {
+			throw new Error(`Message was not stored: ${redactMeshError(error)}`);
+		}
+		if (!target || !existsSync(enrollmentPath(this.options.meshRoot, targetSessionId))) {
+			throw new Error(
+				`Message was not stored: target ${targetSessionId} ${this.enrollmentFailures.get(targetSessionId) ?? "is not enrolled: no enrollment record or directory entry"}`,
+			);
 		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
@@ -277,19 +292,6 @@ export class MeshEndpoints {
 			: undefined;
 		workingTimer?.unref();
 		const item: QueuedDelivery = { message, delivery, deliveryCount, workingTimer };
-		if (redelivery) {
-			item.stallTimer = setTimeout(() => {
-				const queuedBehind =
-					session.queue.length - (session.current === item ? 0 : session.queue.indexOf(item) + 1);
-				this.logDelivery(
-					session,
-					message.id,
-					deliveryCount,
-					`persistence still pending; queued behind ${queuedBehind}`,
-				);
-			}, redelivery.ackWaitMs);
-			item.stallTimer.unref();
-		}
 		session.queue.push(item);
 		this.drain(session);
 	}
@@ -299,6 +301,18 @@ export class MeshEndpoints {
 		const item = session.queue.shift();
 		if (!item) return;
 		session.current = item;
+		const redelivery = item.delivery.redelivery;
+		if (redelivery) {
+			item.stallTimer = setTimeout(() => {
+				this.logDelivery(
+					session,
+					item.message.id,
+					item.deliveryCount,
+					`persistence still pending; queued behind ${session.queue.length}`,
+				);
+			}, redelivery.ackWaitMs);
+			item.stallTimer.unref();
+		}
 		const handoff = this.deliver(session, item);
 		session.handoff = handoff;
 		void handoff.finally(() => {
