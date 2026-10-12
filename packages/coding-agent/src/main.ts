@@ -1039,6 +1039,7 @@ async function createDaemonClientConnection(options: {
 	clientOwned?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
+	supportsQuestionnaireUi?: boolean;
 	tracksHeartbeats?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
@@ -1055,6 +1056,7 @@ async function createDaemonClientConnection(options: {
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
 				restartReopenConfig: options.clientOwned ? undefined : options.config,
 				supportsExtensionUi: options.supportsExtensionUi,
+				supportsQuestionnaireUi: options.supportsQuestionnaireUi,
 				tracksHeartbeats: options.tracksHeartbeats,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -1512,6 +1514,7 @@ export async function main(args: string[], options?: MainOptions) {
 				clientOwned: parsed.noSession,
 				noSession: parsed.noSession,
 				supportsExtensionUi: true,
+				supportsQuestionnaireUi: InteractiveMode.supportsQuestionnaireUi,
 			}));
 		} catch (error) {
 			if (error instanceof DaemonSessionCreateError) {

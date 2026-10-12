@@ -701,6 +701,73 @@ describe("InteractiveMode connection extension UI", () => {
 
 	const prototype = InteractiveMode.prototype as unknown as ConnectionExtensionUiHandlerHarness;
 
+	test.each([
+		["omitted", undefined, 1],
+		["malformed", null, 0],
+	] as const)("PR-19 connection form handles %s saved answers", async (_name, answers, shown) => {
+		const showQuestionnaire = vi.fn(async () => ({ status: "cancelled" as const, answers: {} }));
+		await prototype.resolveConnectionExtensionUiRequest.call(
+			{ showQuestionnaire },
+			{
+				id: "form",
+				method: "questionnaire",
+				payload: {
+					questions: [{ id: "scope", prompt: "Choose scope", options: [{ value: "small", label: "Small" }] }],
+					...(answers === undefined ? {} : { answers }),
+				},
+			},
+		);
+		expect(showQuestionnaire).toHaveBeenCalledTimes(shown);
+	});
+
+	test.each([
+		["pending form", undefined, []],
+		["already cancelled form", "Unknown extension UI request: form", []],
+		["transport failure", "Connection closed", [["Connection closed"]]],
+	] as const)(
+		"R2 a replacement dialog cancels %s without hiding other errors",
+		async (_name, error, expectedErrors) => {
+			const workerReply = createDeferred<AgentConnectionExtensionUiResponse>();
+			const fakeThis = Object.create(InteractiveMode.prototype) as ConnectionExtensionUiHandlerHarness;
+			fakeThis.activeConnectionExtensionUiRequests = new Map();
+			fakeThis.agentConnection = {
+				respondToExtensionUiRequest: vi.fn(async (id, response) => {
+					if (id !== "form") return;
+					if (error) throw new Error(error);
+					workerReply.resolve(response);
+				}),
+			};
+			const showError = vi.fn();
+			fakeThis.showError = showError;
+			fakeThis.resolveConnectionExtensionUiRequest = vi.fn(async (request) =>
+				request.method === "questionnaire"
+					? new Promise<AgentConnectionExtensionUiResponse>(() => {})
+					: { value: "chosen" },
+			);
+			const form = prototype.handleConnectionExtensionUiRequest.call(fakeThis, {
+				id: "form",
+				method: "questionnaire",
+				payload: {},
+			});
+			await prototype.handleConnectionExtensionUiRequest.call(fakeThis, {
+				id: "dialog",
+				method: "select",
+				payload: {},
+			});
+			await form;
+			expect(fakeThis.agentConnection.respondToExtensionUiRequest).toHaveBeenCalledTimes(2);
+			expect(fakeThis.agentConnection.respondToExtensionUiRequest).toHaveBeenNthCalledWith(1, "form", {
+				cancelled: true,
+			});
+			expect(fakeThis.agentConnection.respondToExtensionUiRequest).toHaveBeenNthCalledWith(2, "dialog", {
+				value: "chosen",
+			});
+			expect(fakeThis.activeConnectionExtensionUiRequests.size).toBe(0);
+			expect(showError.mock.calls).toEqual(expectedErrors);
+			if (error === undefined) await expect(workerReply.promise).resolves.toEqual({ cancelled: true });
+		},
+	);
+
 	test("reset cancellation responds to active connection UI requests", async () => {
 		const cancelLocal = vi.fn();
 		const fakeThis = Object.create(InteractiveMode.prototype) as ConnectionExtensionUiCancelHarness;
