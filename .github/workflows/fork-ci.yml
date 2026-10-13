@@ -111,7 +111,8 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: PrimeIntellect-ai/prime-agent-catalog
-          ref: main
+          # Pinned: catalog changes upstream must not break fork tests. Bump on purpose.
+          ref: a35d3fd0d8a75c6d417e4587147fb0579a695b92 # 2026-09-28
           path: prime-agent-catalog
           persist-credentials: false
 
