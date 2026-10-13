@@ -685,7 +685,7 @@ describe("AgentSession autonomous continuations vs subagents", () => {
 	});
 
 	it("fires one keep-alive continuation while a subagent stays active past the window", async () => {
-		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 2 });
+		const parent = await createGatedChildParent({ keepAliveMs: 25, maxContinuations: 1 });
 		parent.setResponses([
 			fauxAssistantMessage("delegated to the child; waiting"),
 			fauxAssistantMessage("checked on the still-running child"),
