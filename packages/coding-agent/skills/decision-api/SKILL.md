@@ -1,6 +1,6 @@
 ---
 name: decision-api
-description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is the model named by the decisionApi.systemOneModel setting, called directly through the host bridge to pick every action from observations; System 2 is you, updating the goal each later decision reads. You design, measure, and optimize the whole loop. Requires the decisionApi.systemOneModel setting.
+description: Experimental System 1 / System 2 loop. System 1 is the model named by the decisionApi.systemOneModel setting, called directly through the host bridge to pick an action from observations; System 2 is you, updating the goal each later decision reads. Use it for real-time, low-latency control tasks, where you design, measure and optimize the whole loop, and for one-off classification of eval runs on synthetic test fixtures into a fixed set of groups, such as sorting failed skill-eval runs by cause. Not for other choices or task text. Requires the decisionApi.systemOneModel setting.
 ---
 
 # Decision API (System 1 / System 2)
