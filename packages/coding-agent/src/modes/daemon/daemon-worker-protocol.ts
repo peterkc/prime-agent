@@ -1,5 +1,9 @@
 import { closeSync, readFileSync } from "node:fs";
-import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
+import type {
+	AgentFamilyRelationship,
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageSender,
+} from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
@@ -33,6 +37,13 @@ export const DAEMON_WORKER_ROSTER_CAPABILITY = "agent_roster";
 /** Advertised in the worker_auth response by workers that accept peer transport grants. */
 export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
 
+/** Advertised by workers that report persistence before mesh acknowledgement. */
+export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
+
+export type DaemonWorkerPersistenceOutbound =
+	| { type: "agent_message_persisted"; cotalId: string }
+	| { type: "agent_message_dropped"; cotalId: string; reason: "cleared" | "closed" | "other" };
+
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -45,7 +56,10 @@ export type DaemonWorkerFrameHeader =
 	| {
 			kind: "outbound";
 			requestId?: string;
-			outboundType: DaemonOutbound["type"] | DaemonWorkerRosterOutbound["type"];
+			outboundType:
+				| DaemonOutbound["type"]
+				| DaemonWorkerRosterOutbound["type"]
+				| DaemonWorkerPersistenceOutbound["type"];
 			activeSessionId?: string;
 			snapshotId?: string;
 			sessionEventType?: string;
@@ -107,6 +121,7 @@ export type DaemonWorkerCommand =
 			supervisorPid: number;
 			supervisorProcessStartId?: string;
 			supervisorSocketPath: string;
+			agentMessageTransport?: "native" | "cotal";
 	  }
 	| {
 			id?: string;
@@ -130,7 +145,9 @@ export type DaemonWorkerCommand =
 			targetActiveSessionId: string;
 			message: string;
 			sender: AgentSessionMessageSender;
+			fromRelationship?: AgentFamilyRelationship;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			cotal?: { id: string; deliveryCount: number };
 	  }
 	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }

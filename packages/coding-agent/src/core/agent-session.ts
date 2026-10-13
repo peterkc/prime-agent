@@ -46,6 +46,7 @@ import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
+	AgentMessageClearedError,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -4440,6 +4441,16 @@ export class AgentSession {
 		return outcome.delivery.promise;
 	}
 
+	waitForAgentMessagePromptCompletion(agentMessageId: string): Promise<void> {
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		outcome.completion ??= createAgentMessageDeferred();
+		return outcome.completion.promise;
+	}
+
+	rejectAgentMessagePrompt(agentMessageId: string, error: Error): void {
+		this._rejectAgentMessage(agentMessageId, error);
+	}
+
 	private _settleAgentMessage(
 		agentMessageId: string | undefined,
 		leg: "delivery" | "completion",
@@ -5226,7 +5237,7 @@ export class AgentSession {
 		}
 	}
 
-	registerDisposeCallback(callback: () => void | Promise<void>): void {
+	registerDisposeCallback(callback: () => void | Promise<void>): () => void {
 		if (this._disposed) {
 			try {
 				const result = callback();
@@ -5234,9 +5245,12 @@ export class AgentSession {
 			} catch {
 				// Late registration follows the same best-effort disposal contract.
 			}
-			return;
+			return () => {};
 		}
 		this._disposeCallbacks.add(callback);
+		return () => {
+			this._disposeCallbacks.delete(callback);
+		};
 	}
 
 	get state(): AgentState {
@@ -5729,7 +5743,7 @@ export class AgentSession {
 		const admissionCommitted = () => {
 			options?.admissionCommitted?.();
 			if (clearEpoch !== this._agentMessageClearEpoch) {
-				throw new Error("Agent message was cleared before admission");
+				throw new AgentMessageClearedError("Agent message was cleared before admission");
 			}
 		};
 		if (
@@ -7604,8 +7618,8 @@ export class AgentSession {
 		const followUp = clearable
 			.filter((action) => action.delivery === "when_run_idle")
 			.map((action) => action.payload.text);
-		const promptError = new Error("Queued prompt was cleared before delivery.");
-		const agentMessageError = new Error("Queued agent message was cleared before delivery.");
+		const promptError = new AgentMessageClearedError("Queued prompt was cleared before delivery.");
+		const agentMessageError = new AgentMessageClearedError("Queued agent message was cleared before delivery.");
 		for (const action of clearable) {
 			const error =
 				action.payload.kind === "turn" && action.lifecycle.state === "preparing" ? promptError : agentMessageError;
@@ -7669,8 +7683,8 @@ export class AgentSession {
 			].map((action) => action.payload.text);
 		const removedSteering = removedTexts("next_turn_boundary");
 		const removedFollowUp = removedTexts("when_run_idle");
-		const acceptedError = new Error("Accepted agent message was cleared before delivery.");
-		const queuedError = new Error("Queued agent message was cleared before delivery.");
+		const acceptedError = new AgentMessageClearedError("Accepted agent message was cleared before delivery.");
+		const queuedError = new AgentMessageClearedError("Queued agent message was cleared before delivery.");
 		for (const action of matching) {
 			const error =
 				action.payload.kind === "turn" && action.payload.acceptedAgentMessage ? acceptedError : queuedError;
@@ -7717,7 +7731,7 @@ export class AgentSession {
 		const item = projection[index];
 		if (!item || queuedAgentMessagePreview(item) !== expectedText) return "rejected";
 		if (mutation.type === "delete") {
-			const error = new Error("Queued prompt was deleted before delivery.");
+			const error = new AgentMessageClearedError("Queued prompt was deleted before delivery.");
 			this._rejectAgentMessage(item.agentMessageId, error);
 			this._cancelSessionActions((candidate) => candidate === item, error);
 			this._emitQueueUpdate();
@@ -8244,7 +8258,7 @@ export class AgentSession {
 			.clearableActions()
 			.filter((action) => action.payload.kind === "turn" && action.queueKey === queueKey);
 		if (matching.length === 0) return false;
-		const error = new Error("Queued agent message was cleared before delivery.");
+		const error = new AgentMessageClearedError("Queued agent message was cleared before delivery.");
 		for (const action of matching) this._rejectAgentMessage(action.agentMessageId, error);
 		const ids = new Set(matching.map((action) => action.id));
 		this._cancelSessionActions((action) => ids.has(action.id), error);

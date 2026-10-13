@@ -1,8 +1,15 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionEvent } from "../src/modes/agent-connection/types.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
-import type { DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
+import {
+	DaemonCapabilityUnavailableError,
+	DaemonClient,
+	type DaemonTransportClient,
+} from "../src/modes/daemon/daemon-client.js";
 import { shouldSendDaemonOutboundToClient } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
@@ -28,6 +35,7 @@ import {
 	success,
 	WORKER_DAEMON_COMMAND_TYPES,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
@@ -36,6 +44,68 @@ import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-co
 import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
+	it("accepts the revision-33 client command envelope on a revision-34 supervisor", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+		});
+		const internals = supervisor as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			write(client: DaemonSocketClient, outbound: DaemonOutbound): void;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		const write = vi.spyOn(internals, "write").mockImplementation(() => undefined);
+		const client = {
+			id: "legacy",
+			capabilities: new Set(),
+			attachedActiveSessionIds: new Set(),
+		} as DaemonSocketClient;
+		try {
+			await supervisor.start();
+			// Revision 33 uses protocol 7. Schema revision is in the server hello, not in client commands.
+			const envelope = {
+				type: "command",
+				id: "old-list",
+				clientId: "legacy",
+				protocol: { name: DAEMON_PROTOCOL_INFO.name, version: 7 },
+				command: { type: "list" },
+			};
+			await internals.handleLine(client, JSON.stringify(envelope));
+			expect(write).toHaveBeenCalledWith(
+				client,
+				expect.objectContaining({ id: "old-list", command: "list", success: true }),
+			);
+			expect(JSON.stringify(write.mock.calls)).not.toContain("mesh_send");
+		} finally {
+			await internals.cleanupSupervisorResources();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("checks a new client against schema revisions 33 and 34 before sending mesh_send", async () => {
+		const client = new DaemonClient("unused");
+		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
+		const state = client as unknown as {
+			socket: { destroyed: boolean };
+			helloMessage: { protocol: typeof DAEMON_PROTOCOL_INFO; schemaRevision: number; serverCapabilities: string[] };
+			requestWire: typeof wire;
+		};
+		state.socket = { destroyed: false };
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
+		state.requestWire = wire;
+		const command = { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" } as const;
+		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(wire).not.toHaveBeenCalled();
+		await expect(client.request({ type: "list" })).resolves.toMatchObject({ command: "list", success: true });
+		expect(wire.mock.calls[0]![0]).toEqual({ type: "list" });
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: [] };
+		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(wire).toHaveBeenCalledTimes(1);
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: ["mesh_send"] };
+		await expect(client.request(command)).resolves.toMatchObject({ command: "mesh_send", success: true });
+		expect(wire).toHaveBeenCalledTimes(2);
+	});
+
 	it.each([
 		["new TUI / old daemon", true, false, false],
 		["old client / new daemon", false, true, false],
@@ -168,8 +238,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(33);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-33-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(34);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-34-/);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -225,6 +295,7 @@ describe("daemon protocol helpers", () => {
 	// One table for the static command-compatibility gates: protocol floor, schema revision,
 	// capability name, and whether a default server advertises that capability.
 	it.each([
+		["mesh_send", { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
 		["replace_acp_mcp_servers", { minProtocol: 7, minSchemaRevision: 22, capability: "acp_mcp_servers" }, true],
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],
@@ -407,6 +478,7 @@ describe("daemon protocol helpers", () => {
 			"complete_owned_session",
 			"get_direct_worker_transport",
 			"list_agent_peers",
+			"mesh_send",
 			"promote_owned_session",
 			"reattach",
 			"roster_subscribe",

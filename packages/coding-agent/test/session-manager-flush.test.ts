@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+type AppendFileSync = typeof appendFileSync;
 type ChmodSync = typeof chmodSync;
 type ChownSync = typeof chownSync;
 type RenameSync = typeof renameSync;
@@ -28,6 +29,7 @@ type WriteSync = typeof writeSyncFs;
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
 	actualWriteSync: undefined as WriteSync | undefined,
+	appendFileSync: vi.fn<AppendFileSync>(),
 	chmodSync: vi.fn<ChmodSync>(),
 	chownSync: vi.fn<ChownSync>(),
 	renameSync: vi.fn<RenameSync>(),
@@ -38,6 +40,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
 	fsMocks.actualWriteSync = actual.writeSync;
+	fsMocks.appendFileSync.mockImplementation(actual.appendFileSync);
 	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
 	fsMocks.chownSync.mockImplementation(actual.chownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
@@ -45,6 +48,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	fsMocks.writeSync.mockImplementation(actual.writeSync);
 	return {
 		...actual,
+		appendFileSync: fsMocks.appendFileSync,
 		chmodSync: fsMocks.chmodSync,
 		chownSync: fsMocks.chownSync,
 		renameSync: fsMocks.renameSync,
@@ -359,6 +363,34 @@ const failAfterPartialTempWrite: WriteSync = (fd: number, data: NodeJS.ArrayBuff
 	fsMocks.actualWriteSync!(fd, bytes.subarray(0, 12));
 	throw new Error("repair failed");
 };
+
+describe("SessionManager.isEntryPersisted", () => {
+	it("does not vouch for a failed append on another entry's write, but records full rewrites and loads", () => {
+		const { mgr, file } = createPersistedSessionForRollbackTest();
+		const notices: boolean[] = [];
+		let failedId: string;
+		const unsubscribe = mgr.onPersist(() => notices.push(mgr.isEntryPersisted(failedId)));
+		fsMocks.appendFileSync.mockImplementationOnce(() => {
+			throw new Error("append failed");
+		});
+		expect(() => mgr.appendCustomEntry("mesh_failed")).toThrow("append failed");
+		failedId = mgr.getLeafId()!;
+		expect(mgr.isEntryPersisted(failedId)).toBe(false);
+		const savedId = mgr.appendCustomEntry("mesh_saved");
+		expect(mgr.isEntryPersisted(savedId)).toBe(true);
+		expect(mgr.isEntryPersisted(failedId)).toBe(false);
+		expect(notices).toEqual([false]);
+		(mgr as unknown as { _rewriteFile(): void })._rewriteFile();
+		expect(mgr.getEntries().every((entry) => mgr.isEntryPersisted(entry.id))).toBe(true);
+		expect(notices).toEqual([false, true]);
+		unsubscribe();
+		const reopened = SessionManager.open(file);
+		expect(reopened.isEntryPersisted(failedId)).toBe(true);
+		expect(reopened.isEntryPersisted(savedId)).toBe(true);
+		mgr.newSession();
+		expect(mgr.isEntryPersisted(savedId)).toBe(false);
+	});
+});
 
 describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 	it("flushes rollback-aware value entries immediately", () => {

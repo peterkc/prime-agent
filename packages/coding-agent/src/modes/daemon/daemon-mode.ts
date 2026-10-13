@@ -23,10 +23,13 @@ import {
 } from "../../config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	AGENT_MESSAGE_CUSTOM_TYPE,
+	AGENT_MESSAGE_ID_PREFIX,
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyMember,
 	type AgentFamilyRelationship,
+	AgentMessageClearedError,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -66,7 +69,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -147,6 +150,7 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonAutoReloadScheduler } from "./daemon-auto-reload.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import {
 	deserializeDaemonError,
@@ -211,6 +215,7 @@ import {
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -496,11 +501,13 @@ export class AgentDaemon {
 	 * passivation-only close reason by the durable identity needed by hydration/opening.
 	 */
 	private readonly passivatingSessions = new Map<string, Promise<void>>();
+	private readonly replacedSessions = new WeakSet<AgentSession>();
 	private readonly closingSessions = new Map<
 		string,
 		{
 			promise: Promise<void>;
 			reason: DaemonSessionClosedReason;
+			messageDropReason: "closed" | "other";
 			descendants: Set<ActiveSessionState>;
 			reasonUpgrade?: Promise<void>;
 		}
@@ -548,6 +555,8 @@ export class AgentDaemon {
 	private supervisorLaunchInProgress = false;
 	private supervisorAbsentSince?: number;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
+	// Keep the last authenticated mode while disconnected; never fall back from Cotal to native.
+	private agentMessageTransport: "native" | "cotal" = "native";
 	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
 	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
 	private peerAdmissionsFenced = false;
@@ -1721,6 +1730,14 @@ export class AgentDaemon {
 			lastEventSequence: 0,
 			clientEnv,
 		};
+		// Roster publication can run during binding; enrollment needs a readable header before visibility.
+		if (this.agentMessageTransport === "cotal") {
+			runtime.session.sessionManager.flushNow();
+			runtime.setBeforeSessionInvalidate((reason) => {
+				if (reason === "new" || reason === "resume" || reason === "fork")
+					this.replacedSessions.add(runtime.session);
+			});
+		}
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
 		let completeBinding!: () => void;
@@ -1737,6 +1754,9 @@ export class AgentDaemon {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
 				createConnectionState: (targetSessionState) => this.createConnectionState(targetSessionState),
 				sessionReplaced: (targetSessionState) => this.refreshReplacedSessionState(targetSessionState),
+				sessionApplied: (targetSessionState) => {
+					if (this.agentMessageTransport === "cotal") targetSessionState.runtime.session.sessionManager.flushNow();
+				},
 				shutdown: () => {
 					void this.shutdown(0);
 				},
@@ -3011,7 +3031,7 @@ export class AgentDaemon {
 		try {
 			await spawnAppend;
 		} catch (error) {
-			await this.closeSession(state, "killed", false).catch(() => undefined);
+			await this.closeSession(state, "killed", false, true, undefined, undefined, "other").catch(() => undefined);
 			// The child was never admitted: no ledger edge exists, so the
 			// display file written at the spawn write point must not remain
 			// claiming a running child.
@@ -3415,7 +3435,9 @@ export class AgentDaemon {
 			return state;
 		} catch (error) {
 			if (stateRef && this.sessions.get(stateRef.activeSessionId) === stateRef) {
-				await this.closeSession(stateRef, "completed").catch(() => undefined);
+				await this.closeSession(stateRef, "completed", true, true, undefined, undefined, "other").catch(
+					() => undefined,
+				);
 			} else {
 				await runtime?.dispose().catch(() => undefined);
 			}
@@ -3748,6 +3770,7 @@ export class AgentDaemon {
 				supervisorPid?: unknown;
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
+				agentMessageTransport?: unknown;
 				activeSessionId?: unknown;
 				admissionId?: unknown;
 				capabilities?: unknown;
@@ -3823,7 +3846,10 @@ export class AgentDaemon {
 					!Number.isInteger(parsed.supervisorPid) ||
 					(parsed.supervisorPid as number) <= 0 ||
 					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
-					typeof parsed.supervisorSocketPath !== "string"
+					typeof parsed.supervisorSocketPath !== "string" ||
+					(parsed.agentMessageTransport !== undefined &&
+						parsed.agentMessageTransport !== "native" &&
+						parsed.agentMessageTransport !== "cotal")
 				) {
 					clearParsedAdmission();
 					this.write(client, failure(commandId, "worker_auth", "Worker authentication failed"));
@@ -3837,6 +3863,7 @@ export class AgentDaemon {
 						? { supervisorProcessStartId: parsed.supervisorProcessStartId }
 						: {}),
 					supervisorSocketPath: parsed.supervisorSocketPath,
+					agentMessageTransport: parsed.agentMessageTransport === "cotal" ? "cotal" : "native",
 				};
 				let ownerFingerprint: string;
 				try {
@@ -3855,6 +3882,7 @@ export class AgentDaemon {
 				client.authenticated = true;
 				client.authenticationRole = "supervisor";
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
+				this.agentMessageTransport = claim.agentMessageTransport ?? "native";
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
 				this.write(client, {
@@ -3865,6 +3893,7 @@ export class AgentDaemon {
 					data: {
 						capabilities: [
 							DAEMON_WORKER_ROSTER_CAPABILITY,
+							DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 							...(this.options.worker.workerInstanceId !== undefined
 								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
 								: []),
@@ -4103,6 +4132,10 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_deliver_message": {
+					if (command.cotal) {
+						await this.receiveMeshMessage(client, command);
+						return;
+					}
 					const receipt = await this.sendAgentSessionMessage({
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
@@ -6285,6 +6318,10 @@ export class AgentDaemon {
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+		if (this.agentMessageTransport === "cotal") {
+			if (!options.fromState) throw new Error("Message was not stored: sender has no session endpoint");
+			return this.sendMeshMessage(options.fromState, targetSelector, message);
+		}
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
@@ -6356,6 +6393,184 @@ export class AgentDaemon {
 			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw error;
+		}
+	}
+
+	private async sendMeshMessage(
+		fromState: ActiveSessionState,
+		selector: string,
+		message: string,
+	): Promise<AgentSessionMessageReceipt> {
+		if (!fromState.runtime.session.sessionFile) throw new Error("Message was not stored: sender has no session file");
+		const family = await this.createAgentFamily(fromState);
+		const matches = family.filter(
+			({ entry }) =>
+				entry.id === selector ||
+				entry.name === selector ||
+				entry.activeSessionId === selector ||
+				entry.rlmChildId === selector,
+		);
+		if (matches.length !== 1)
+			throw new Error(
+				`Message was not stored: ${matches.length ? "ambiguous" : "unknown"} family target ${selector}`,
+			);
+		const target = matches[0]!.entry;
+		if (!target.sessionPath) throw new Error(`Message was not stored: target ${target.id} has no session file`);
+		const link = this.supervisorLink();
+		if (!link) throw new Error("Message was not stored: supervisor link is unavailable");
+		const rateLimitKey = `${fromState.activeSessionId}->${target.id}`;
+		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
+		if (!rateLimit.ok)
+			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
+		try {
+			await link.ensureConnected();
+		} catch {
+			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw new Error("Message was not stored: supervisor connection failed");
+		}
+		let response: DaemonResponse;
+		try {
+			// Leave room for the supervisor's 30-second publish deadline to return its error.
+			response = await link.request(
+				{ type: "mesh_send", fromActiveSessionId: fromState.activeSessionId, targetSessionId: target.id, message },
+				35_000,
+			);
+		} catch (error) {
+			if (error instanceof DaemonCapabilityUnavailableError) {
+				throw new Error("Message was not stored: supervisor does not support mesh_send; restart the daemon");
+			}
+			throw new Error(
+				"Message storage outcome is unknown: supervisor request failed; a resend can show the message twice",
+			);
+		}
+		if (!response.success) throw deserializeDaemonError(response);
+		if (!response.data || typeof response.data !== "object")
+			throw new Error("Supervisor returned an invalid mesh receipt; storage outcome is unknown");
+		return response.data as AgentSessionMessageReceipt;
+	}
+
+	private async receiveMeshMessage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+	): Promise<void> {
+		if (this.agentMessageTransport !== "cotal" || !command.cotal)
+			throw new Error("Mesh delivery requires the authenticated Cotal transport mode");
+		let target: ActiveSessionState;
+		try {
+			target = await this.getOrHydrateBoundSessionState(command.targetActiveSessionId);
+		} catch (error) {
+			const passive = await this.findPassiveRlmSubagent(command.targetActiveSessionId);
+			if (!passive) throw error;
+			target = await this.hydratePassiveRlmSubagent(passive);
+		}
+		const recipientSession = target.runtime.session;
+		const manager = recipientSession.sessionManager;
+		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
+		const payload: AgentSessionMessagePayload = {
+			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
+			source: AGENT_MESSAGE_SOURCE,
+			message: normalizeAgentSessionMessage(command.message),
+			from: command.sender,
+			fromRelationship: command.fromRelationship,
+			target: this.createAgentSessionMessageEndpoint(target),
+			possiblyRepeated: command.cotal.deliveryCount > 1,
+		};
+		const ownEntry = () =>
+			manager
+				.getEntries()
+				.find(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === AGENT_MESSAGE_CUSTOM_TYPE &&
+						entry.details !== null &&
+						typeof entry.details === "object" &&
+						"id" in entry.details &&
+						entry.details.id === payload.id,
+				);
+		let accepted = false;
+		let sent = false;
+		let active = true;
+		let deliveryFailure: unknown;
+		let unsubscribe: (() => void) | undefined;
+		let unregisterDispose: (() => void) | undefined;
+		const cleanup = () => {
+			active = false;
+			unsubscribe?.();
+			unregisterDispose?.();
+			client.socket.off("close", cleanup);
+		};
+		const check = () => {
+			if (!accepted || sent || !active) return;
+			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
+				cleanup();
+				return;
+			}
+			const entry = ownEntry();
+			if (!entry || !manager.isEntryPersisted(entry.id)) return;
+			sent = true;
+			cleanup();
+			client.socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "outbound", outboundType: "agent_message_persisted" },
+					Buffer.from(serializeJsonLine({ type: "agent_message_persisted", cotalId: command.cotal!.id })),
+				),
+			);
+		};
+		const dropped = (error: unknown) => {
+			deliveryFailure = error;
+			check();
+			const reason =
+				error instanceof AgentMessageClearedError
+					? "cleared"
+					: this.replacedSessions.has(recipientSession)
+						? "closed"
+						: (this.closingSessions.get(target.activeSessionId)?.messageDropReason ?? "other");
+			if ((!accepted && reason === "other") || sent || !active) return;
+			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
+				cleanup();
+				return;
+			}
+			sent = true;
+			cleanup();
+			client.socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "outbound", outboundType: "agent_message_dropped" },
+					Buffer.from(
+						serializeJsonLine({
+							type: "agent_message_dropped",
+							cotalId: command.cotal!.id,
+							reason,
+						}),
+					),
+				),
+			);
+		};
+		unsubscribe = manager.onPersist(check);
+		unregisterDispose = target.runtime.session.registerDisposeCallback(() =>
+			Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
+		);
+		client.socket.once("close", cleanup);
+		if (!ownEntry()) {
+			// Native delivery waiters must be registered before admission.
+			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
+			void target.runtime.session.waitForAgentMessagePromptCompletion(payload.id).then(() => {
+				if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
+			}, dropped);
+		}
+		try {
+			const status = ownEntry() ? "delivered" : (await this.acceptAgentSessionMessage(target, payload)).status;
+			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
+			accepted = true;
+			check();
+			if (deliveryFailure !== undefined) dropped(deliveryFailure);
+		} catch (error) {
+			target.runtime.session.rejectAgentMessagePrompt(
+				payload.id,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			dropped(error);
+			cleanup();
 			throw error;
 		}
 	}
@@ -6752,10 +6967,19 @@ export class AgentDaemon {
 		);
 		for (const state of closeStates) {
 			if (this.sessions.has(state.activeSessionId)) {
-				await this.closeSession(state, restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
+				await this.closeSession(
+					state,
+					restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed",
+					true,
+					true,
+					undefined,
+					undefined,
+					"other",
+				);
 			}
 		}
-		for (const state of [...this.sessions.values()]) await this.closeSession(state, "killed");
+		for (const state of [...this.sessions.values()])
+			await this.closeSession(state, "killed", true, true, undefined, undefined, "other");
 		return manifest;
 	}
 
@@ -6850,6 +7074,7 @@ export class AgentDaemon {
 		cascadeChildren = true,
 		descendantCollector?: Set<ActiveSessionState>,
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<void> {
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
@@ -6857,6 +7082,7 @@ export class AgentDaemon {
 		}
 		const existingClose = this.closingSessions.get(state.activeSessionId);
 		if (existingClose) {
+			if (messageDropReason === "closed") existingClose.messageDropReason = "closed";
 			const requestedReason = this.isStrongerCloseReason(reason, existingClose.reason)
 				? reason
 				: existingClose.reason;
@@ -6888,9 +7114,9 @@ export class AgentDaemon {
 		}
 		const descendants = new Set<ActiveSessionState>();
 		const closePromise = Promise.resolve().then(() =>
-			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal),
+			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal, messageDropReason),
 		);
-		const close = { promise: closePromise, reason, descendants };
+		const close = { promise: closePromise, reason, messageDropReason, descendants };
 		this.closingSessions.set(state.activeSessionId, close);
 		try {
 			await closePromise;
@@ -6962,6 +7188,7 @@ export class AgentDaemon {
 		cascadeChildren: boolean,
 		descendants: Set<ActiveSessionState>,
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<void> {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
@@ -6975,7 +7202,7 @@ export class AgentDaemon {
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
 		const cascadeError = cascadeChildren
-			? await this.closeChildSessions(state, reason, waitForAbort, descendants, disposal)
+			? await this.closeChildSessions(state, reason, waitForAbort, descendants, disposal, messageDropReason)
 			: undefined;
 		// Empty draft (no messages, config, or jobs): discard rather than persist an
 		// empty session file. Mirrors the detach-time discard so a config-bearing
@@ -7053,12 +7280,13 @@ export class AgentDaemon {
 		waitForAbort = true,
 		descendants = new Set<ActiveSessionState>(),
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<unknown> {
 		let cascadeError: unknown;
 		for (const childState of getChildActiveSessionStates(this.sessions, parentState)) {
 			descendants.add(childState);
 			try {
-				await this.closeSession(childState, reason, waitForAbort, true, descendants, disposal);
+				await this.closeSession(childState, reason, waitForAbort, true, descendants, disposal, messageDropReason);
 			} catch (error) {
 				cascadeError ??= error;
 			}

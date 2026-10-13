@@ -1,0 +1,1 @@
+- Added experimental, opt-in Cotal transport for durable agent messages. Native messaging remains the default.
