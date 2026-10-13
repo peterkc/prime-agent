@@ -513,6 +513,17 @@ describe("daemon session summarizer", () => {
 			expect(appended.at(-1)).toMatchObject({ taskState: "completed" });
 		});
 
+		test("a seeded error verdict is dropped after a normal turn even when the classifier fails", async () => {
+			const messages = [...erroredTranscript(providerError), userMessage("retry"), assistantMessage("Done")];
+			const { state, appended } = erroredState({ messages });
+			state.summaryState = { summary: "Model request failed", taskState: "error", basedOnMessageCount: 2 };
+			await runSummarize(state, async () => undefined);
+			await runSummarize(state, async () => undefined);
+			const cleared = { summary: "", taskState: "needs_input", basedOnMessageCount: 4 };
+			expect(state.summaryState).toEqual(cleared);
+			expect(appended).toEqual([cleared]); // a restart now seeds the cleared verdict
+		});
+
 		test("a working session is never error-settled, even with an errored trailing assistant message", async () => {
 			// While working (e.g. mid-retry) the model refresh keeps recapping;
 			// verdicts settle only when the session goes idle.

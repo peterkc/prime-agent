@@ -1,0 +1,1 @@
+- Fixed the daemon session recap keeping an old "Model request failed" error after a later turn ended normally, including when the summary model is unavailable and after a daemon restart.
