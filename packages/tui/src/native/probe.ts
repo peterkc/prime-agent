@@ -16,14 +16,15 @@ function packageVersion(): string {
 	return (JSON.parse(readFileSync(path, "utf8")) as { readonly version: string }).version;
 }
 
+/** XTVERSION: terminals that do not know it ignore it, so it never prints. */
+const XTVERSION = "\x1b[>0q";
+const VERSION_REPLY = "\x1bP>|";
 /**
- * Brackets the hello query. A terminal that cannot parse APC, such as JetBrains
- * JediTerm or Apple Terminal, drops `ESC _` and `ESC \` and prints the payload.
- * With autowrap off at the right margin, that text overwrites only the row's last
- * cell, concealed (SGR 8); DECRC returns the cursor. Nothing else is erased.
+ * Terminals named here parse APC strings. Others get no hello, because some,
+ * such as JetBrains JediTerm and Apple Terminal, print an APC payload as text.
+ * Tern answers XTVERSION as kitty.
  */
-const PROBE_GUARD_BEGIN = "\x1b7\x1b[?7l\x1b[999C\x1b[8m";
-const PROBE_GUARD_END = "\x1b[28m\x1b8\x1b[?7h";
+const APC_TERMINAL = /^(?:kitty|tern)(?![a-z])/i;
 
 export interface NativeCapabilities {
 	readonly apc: number;
@@ -56,6 +57,14 @@ function helloCapabilities(reply: HelloReply): NativeCapabilities | undefined {
 	return { apc, credits, cols };
 }
 
+/** The length of the longest end of `text` that starts `prefix`. */
+function partialPrefix(text: string, prefix: string): number {
+	for (let length = Math.min(prefix.length - 1, text.length); length > 0; length--) {
+		if (text.endsWith(prefix.slice(0, length))) return length;
+	}
+	return 0;
+}
+
 export class NativeProbe {
 	private readonly parser = new InputParser();
 	private readonly listeners = new Set<() => void>();
@@ -66,6 +75,14 @@ export class NativeProbe {
 	private flushTimer?: ReturnType<typeof setTimeout>;
 	private reading = false;
 	private awaitingSentinel = false;
+	private write?: (text: string) => void;
+	private hello = "";
+	/** The XTVERSION reply to the identify query, until our DA1 reply decides. */
+	private version?: string;
+	/** XTVERSION queries still unanswered; their replies are removed from input. */
+	private versions = 0;
+	/** The start of an XTVERSION reply that the next input completes. */
+	private held = "";
 
 	get state(): NativeState {
 		return this.outcome;
@@ -89,30 +106,30 @@ export class NativeProbe {
 			return;
 		}
 		this.outcome = { kind: "pending" };
+		this.write = write;
+		this.hello = Buffer.from(
+			encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } }),
+		).toString("utf8");
+		// Step 1: identify the terminal. Our DA1 reply ends this step (see route).
 		this.awaitingSentinel = true;
+		this.versions++;
 		this.probeTimer = setTimeout(() => this.end(), 1000);
-		write(PROBE_GUARD_BEGIN);
-		write(
-			Buffer.from(encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } })).toString("utf8"),
-		);
-		write("\x1b[c");
-		write(PROBE_GUARD_END);
+		write(`${XTVERSION}\x1b[c`);
 	}
 
 	feed(text: string): void {
 		this.clearFlushTimer();
-		if ((this.outcome.kind === "off" && !this.awaitingSentinel) || this.outcome.kind === "unprobed") {
-			this.keys?.(text);
-			return;
-		}
 		this.reading = true;
 		try {
-			this.route(this.parser.feed(Buffer.from(text, "utf8")));
+			for (const part of this.splitVersions(text)) {
+				if (typeof part === "string") this.input(part);
+				else this.versionReply(part.name);
+			}
 		} finally {
 			this.reading = false;
 		}
 		if (this.state.kind === "off") this.flush();
-		else if (this.parser.pending) this.flushTimer = setTimeout(() => this.flush(), 10);
+		else if (this.parser.pending || this.held) this.flushTimer = setTimeout(() => this.flush(), 10);
 	}
 
 	end(): void {
@@ -150,7 +167,56 @@ export class NativeProbe {
 
 	private flush(): void {
 		this.clearFlushTimer();
+		// A started XTVERSION reply waits for its end; a bare prefix of one is input.
+		if (this.held && !this.held.startsWith(VERSION_REPLY)) {
+			const text = this.held;
+			this.held = "";
+			this.input(text);
+		}
 		this.route(this.parser.flush());
+	}
+
+	/** Probe replies go through the TSP parser; once the probe settles, input passes unchanged. */
+	private input(text: string): void {
+		if (!text) return;
+		if ((this.outcome.kind === "off" && !this.awaitingSentinel) || this.outcome.kind === "unprobed") {
+			this.keys?.(text);
+		} else {
+			this.route(this.parser.feed(Buffer.from(text, "utf8")));
+		}
+	}
+
+	/** Splits input around the XTVERSION replies we wait for, keeping their order. */
+	private splitVersions(text: string): (string | { readonly name: string })[] {
+		const parts: (string | { readonly name: string })[] = [];
+		let rest = this.held + text;
+		this.held = "";
+		while (this.versions > 0) {
+			const at = rest.indexOf(VERSION_REPLY);
+			const end = at < 0 ? -1 : rest.indexOf("\x1b\\", at);
+			if (end < 0) {
+				let keep = at < 0 ? partialPrefix(rest, VERSION_REPLY) : rest.length - at;
+				// No real reply is this long; release it as input.
+				if (keep > 256) keep = 0;
+				parts.push(rest.slice(0, rest.length - keep));
+				this.held = rest.slice(rest.length - keep);
+				return parts;
+			}
+			parts.push(rest.slice(0, at), { name: rest.slice(at + VERSION_REPLY.length, end) });
+			this.versions--;
+			rest = rest.slice(end + 2);
+		}
+		parts.push(rest);
+		return parts;
+	}
+
+	private versionReply(name: string): void {
+		if (this.awaitingSentinel) {
+			this.version = name;
+		} else if (this.outcome.kind === "pending") {
+			// Step 2 sentinel: a terminal that speaks TSP answers hello before it.
+			this.end();
+		}
 	}
 
 	private route(items: readonly InputItem[]): void {
@@ -168,7 +234,19 @@ export class NativeProbe {
 				case "da1":
 					if (this.awaitingSentinel) {
 						this.awaitingSentinel = false;
-						if (this.outcome.kind === "pending") this.end();
+						// Replies come in order: an XTVERSION reply can no longer follow our DA1's.
+						this.versions = 0;
+						if (this.outcome.kind !== "pending") break;
+						if (!APC_TERMINAL.test(this.version ?? "")) {
+							this.end();
+							break;
+						}
+						// Step 2: hello. XTVERSION, not DA1, marks its end: other startup
+						// probes send DA1 too, and their replies would arrive first.
+						clearTimeout(this.probeTimer);
+						this.probeTimer = setTimeout(() => this.end(), 1000);
+						this.versions++;
+						this.write?.(`${this.hello}${XTVERSION}`);
 					} else {
 						// InputParser discards DA1 attributes; downstream probes only need the sentinel.
 						this.keys?.("\x1b[?c");

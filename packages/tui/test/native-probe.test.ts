@@ -152,3 +152,44 @@ for (const outcome of ["available", "invalid", "timeout"] as const) {
 		assert.equal(keys.join(""), `a\x1b[Ab\x1b]99;i=p:p=?;p=title\x1b\\${sentinel}`);
 	});
 }
+
+const kitty = "\x1bP>|kitty(0.48.2)\x1b\\";
+for (const [name, reply] of [
+	["tmux", "\x1bP>|tmux 3.5a\x1b\\"],
+	["a terminal without XTVERSION", ""],
+] as const) {
+	it(`never sends hello to ${name}`, (t) => {
+		const { native, writes, keys } = connection(t);
+		native.probe.feed(`${reply}${da1}`);
+		assert.equal(native.probe.state.kind, "off");
+		assert.deepEqual([writes, keys], [[], []]);
+	});
+}
+
+it("sends hello after a kitty reply and ends on its XTVERSION reply, not another DA1", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed(kitty.slice(0, 5));
+	native.probe.feed(`${kitty.slice(5)}${da1}`);
+	assert.equal(writes.length, 1);
+	assert.ok(writes[0].startsWith("\x1b_tsp;q;") && writes[0].endsWith("\x1b\\\x1b[>0q"));
+	native.probe.feed(da1);
+	assert.equal(native.probe.state.kind, "pending");
+	native.probe.feed(`\x1b_tsp;r;${JSON.stringify(hello)}\x1b\\${kitty}`);
+	assert.equal(native.probe.state.kind, "available");
+	assert.deepEqual(keys, ["\x1b[?c"]);
+});
+
+it("ends at once when a kitty terminal does not answer hello", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed(`${kitty}${da1}`);
+	native.probe.feed(kitty);
+	assert.equal(native.probe.state.kind, "off");
+	assert.deepEqual(keys, []);
+});
+
+it("passes an Escape typed during the probe after 10 ms", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1b");
+	t.mock.timers.tick(10);
+	assert.deepEqual(keys, ["\x1b"]);
+});

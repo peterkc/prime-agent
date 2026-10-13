@@ -506,7 +506,8 @@ const terminal = new ProcessTerminal(), tui = new TUI(terminal);
 const chat = { lines: [], render() { return this.lines; }, invalidate() {} };
 const dock = { render() { return ["dock"]; }, invalidate() {} };
 tui.addChild(chat); tui.addChild(dock); tui.start();
-terminal.native?.probe.feed('\x1b_tsp;r;{"r":"hello","v":1,"apc":65536,"credits":2,"cols":80}\x1b\\\x1b[?1;2c');
+terminal.native?.probe.feed('\x1bP>|kitty(0.48.2)\x1b\\\x1b[?62;c');
+terminal.native?.probe.feed('\x1b_tsp;r;{"r":"hello","v":1,"apc":65536,"credits":2,"cols":80}\x1b\\\x1bP>|kitty\x1b\\');
 if (process.env.PI_TUI_NATIVE === "1" && terminal.native?.probe.state.kind !== "available") throw new Error("probe failed");
 tui.enterFullscreen({ scroll: [chat], dock, ...(process.env.PI_TUI_NATIVE === "1" ? {} : { native: true }) });
 for (const line of ["first", "second"]) {
@@ -526,17 +527,9 @@ for (const gate of [undefined, "1"]) {
 		});
 		assert.equal(result.error, undefined);
 		assert.equal(result.status, 0, result.stderr);
-		const query = `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\\x1b[c`;
-		const probe = gate === "1" ? `\x1b7\x1b[?7l\x1b[999C\x1b[8m${query}\x1b[28m\x1b8\x1b[?7h` : "";
-		assert.equal(result.stdout, baseAnsiBytes.replace("\x1b[?u", `\x1b[?u${probe}`));
+		const hello = `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\\x1b[>0q`;
+		const native = (text: string) => (gate === "1" ? text : "");
+		const expected = baseAnsiBytes.replace("\x1b[?u", `\x1b[?u${native("\x1b[>0q\x1b[c")}`);
+		assert.equal(result.stdout, expected.replace("\x1b[?25l", `\x1b[?25l${native(hello)}`));
 	});
 }
-it("keeps the start row when the terminal prints the APC hello", async (t) => {
-	const vt = new VirtualTerminal(20, 2);
-	vt.write("keep tail\x1b[5D");
-	const native = new NativeConnection();
-	native.start({ write: (text) => vt.write(text.replaceAll("\x1b_", "")) }, () => {});
-	t.after(() => native.probe.stop());
-	const [row, next] = await vt.flushAndGetViewport();
-	assert.deepEqual([row.slice(0, 19).trimEnd(), next, vt.getCursorPosition()], ["keep tail", "", { x: 4, y: 0 }]);
-});
