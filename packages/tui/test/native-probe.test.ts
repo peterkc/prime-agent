@@ -236,3 +236,11 @@ it("keeps tracking a paste that starts in the same read as the kitty reply", (t)
 	native.probe.feed(`${da1}${kitty}\x1b[201~`);
 	assert.deepEqual([writes, keys.join("")], [[], `\x1b[200~${da1}${kitty}\x1b[201~`]);
 });
+
+it("keeps a split XTVERSION reply start across a pause", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed("\x1bP>");
+	t.mock.timers.tick(10);
+	native.probe.feed(`${kitty.slice(3)}${da1}`);
+	assert.deepEqual([writes.length, keys], [1, []]);
+});

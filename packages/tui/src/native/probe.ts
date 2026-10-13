@@ -174,9 +174,13 @@ export class NativeProbe {
 
 	private flush(): void {
 		this.clearFlushTimer();
-		// Once the probe is off, nothing is held. While probing, a started XTVERSION
-		// reply or a paste waits for its end; a bare prefix is input.
-		if (this.outcome.kind === "off" || (!this.pasting && !this.held.startsWith(VERSION_REPLY))) this.release();
+		// Once the probe is off, nothing is held. While probing, a paste or an awaited
+		// XTVERSION reply (from `ESC P` on) waits for its end; a lone Escape is input.
+		const reply =
+			this.pendingVersionReplies > 0 &&
+			this.held.length >= 2 &&
+			(this.held.startsWith(VERSION_REPLY) || VERSION_REPLY.startsWith(this.held));
+		if (this.outcome.kind === "off" || (!this.pasting && !reply)) this.release();
 		this.route(this.parser.flush());
 	}
 
