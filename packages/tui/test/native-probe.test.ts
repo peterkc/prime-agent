@@ -152,3 +152,95 @@ for (const outcome of ["available", "invalid", "timeout"] as const) {
 		assert.equal(keys.join(""), `a\x1b[Ab\x1b]99;i=p:p=?;p=title\x1b\\${sentinel}`);
 	});
 }
+
+const kitty = "\x1bP>|kitty(0.48.2)\x1b\\";
+for (const [name, reply] of [
+	["tmux", "\x1bP>|tmux 3.5a\x1b\\"],
+	["kitty-foo", "\x1bP>|kitty-foo(1)\x1b\\"],
+	["a terminal without XTVERSION", ""],
+] as const) {
+	it(`never sends hello to ${name}`, (t) => {
+		const { native, writes, keys } = connection(t);
+		native.probe.feed(`${reply}${da1}`);
+		assert.equal(native.probe.state.kind, "off");
+		assert.deepEqual([writes, keys], [[], []]);
+	});
+}
+
+it("sends hello after a kitty reply and ends on its XTVERSION reply, not another DA1", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed(kitty.slice(0, 5));
+	native.probe.feed(`${kitty.slice(5)}${da1}`);
+	assert.equal(writes.length, 1);
+	assert.ok(writes[0].startsWith("\x1b_tsp;q;") && writes[0].endsWith("\x1b\\\x1b[>0q"));
+	native.probe.feed(da1);
+	assert.equal(native.probe.state.kind, "pending");
+	native.probe.feed(`\x1b_tsp;r;${JSON.stringify(hello)}\x1b\\${kitty}`);
+	assert.equal(native.probe.state.kind, "available");
+	assert.deepEqual(keys, ["\x1b[?c"]);
+});
+
+it("ends at once when a kitty terminal does not answer hello", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed(`${kitty}${da1}`);
+	native.probe.feed(kitty);
+	assert.equal(native.probe.state.kind, "off");
+	assert.deepEqual(keys, []);
+});
+
+it("passes an Escape typed during the probe after 10 ms", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1b");
+	t.mock.timers.tick(10);
+	assert.deepEqual(keys, ["\x1b"]);
+});
+
+it("releases an unfinished XTVERSION reply once the probe gives up", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1bP>|kit");
+	t.mock.timers.tick(1000);
+	native.probe.feed("abc");
+	assert.equal(keys.join(""), "\x1bP>|kitabc");
+});
+
+it("leaves a pasted XTVERSION reply in the paste and sends no hello for it", (t) => {
+	const { native, writes, keys } = connection(t);
+	const paste = `\x1b[200~${kitty}\x1b[201~`;
+	native.probe.feed(paste.slice(0, 9));
+	native.probe.feed(`${paste.slice(9)}${da1}`);
+	assert.deepEqual([native.probe.state.kind, writes, keys.join("")], ["off", [], paste]);
+});
+
+it("forgets an unfinished paste when the probe stops", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1b[200~x");
+	native.probe.stop();
+	native.start({ write: () => {} }, (text) => keys.push(text));
+	keys.length = 0;
+	native.probe.feed("\x1b");
+	t.mock.timers.tick(10);
+	assert.deepEqual(keys, ["\x1b"]);
+});
+
+it("releases a partial paste end once the probe gives up", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed(`${kitty}${da1}`);
+	native.probe.feed("\x1b[200~x\x1b[20");
+	t.mock.timers.tick(1000);
+	assert.equal(keys.join(""), "\x1b[200~x\x1b[20");
+});
+
+it("keeps tracking a paste that starts in the same read as the kitty reply", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed(`${kitty}\x1b[200~`);
+	native.probe.feed(`${da1}${kitty}\x1b[201~`);
+	assert.deepEqual([writes, keys.join("")], [[], `\x1b[200~${da1}${kitty}\x1b[201~`]);
+});
+
+it("keeps a split XTVERSION reply start across a pause", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed("\x1bP>");
+	t.mock.timers.tick(10);
+	native.probe.feed(`${kitty.slice(3)}${da1}`);
+	assert.deepEqual([writes.length, keys], [1, []]);
+});

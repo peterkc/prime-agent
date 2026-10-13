@@ -16,6 +16,18 @@ function packageVersion(): string {
 	return (JSON.parse(readFileSync(path, "utf8")) as { readonly version: string }).version;
 }
 
+/** XTVERSION: terminals that do not know it ignore it, so it never prints. */
+const XTVERSION = "\x1b[>0q";
+const VERSION_REPLY = "\x1bP>|";
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+/**
+ * Terminals named here parse APC strings. Others get no hello, because some,
+ * such as JetBrains JediTerm and Apple Terminal, print an APC payload as text.
+ * Tern answers XTVERSION as kitty.
+ */
+const APC_TERMINAL = /^(?:kitty|tern)(?:[(\s]|$)/i;
+
 export interface NativeCapabilities {
 	readonly apc: number;
 	readonly credits: number;
@@ -47,6 +59,14 @@ function helloCapabilities(reply: HelloReply): NativeCapabilities | undefined {
 	return { apc, credits, cols };
 }
 
+/** The length of the longest end of `text` that starts `prefix`. */
+function partialPrefix(text: string, prefix: string): number {
+	for (let length = Math.min(prefix.length - 1, text.length); length > 0; length--) {
+		if (text.endsWith(prefix.slice(0, length))) return length;
+	}
+	return 0;
+}
+
 export class NativeProbe {
 	private readonly parser = new InputParser();
 	private readonly listeners = new Set<() => void>();
@@ -57,6 +77,16 @@ export class NativeProbe {
 	private flushTimer?: ReturnType<typeof setTimeout>;
 	private reading = false;
 	private awaitingSentinel = false;
+	private write?: (text: string) => void;
+	private hello = "";
+	/** The XTVERSION reply to the identify query, until our DA1 reply decides. */
+	private version?: string;
+	/** XTVERSION queries still unanswered; their replies are removed from input. */
+	private pendingVersionReplies = 0;
+	/** The start of an XTVERSION reply or paste marker that the next input completes. */
+	private held = "";
+	/** Inside a bracketed paste, where nothing is a reply. */
+	private pasting = false;
 
 	get state(): NativeState {
 		return this.outcome;
@@ -80,28 +110,30 @@ export class NativeProbe {
 			return;
 		}
 		this.outcome = { kind: "pending" };
+		this.write = write;
+		this.hello = Buffer.from(
+			encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } }),
+		).toString("utf8");
+		// Step 1: identify the terminal. Our DA1 reply ends this step (see route).
 		this.awaitingSentinel = true;
+		this.pendingVersionReplies++;
 		this.probeTimer = setTimeout(() => this.end(), 1000);
-		write(
-			Buffer.from(encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } })).toString("utf8"),
-		);
-		write("\x1b[c");
+		write(`${XTVERSION}\x1b[c`);
 	}
 
 	feed(text: string): void {
 		this.clearFlushTimer();
-		if ((this.outcome.kind === "off" && !this.awaitingSentinel) || this.outcome.kind === "unprobed") {
-			this.keys?.(text);
-			return;
-		}
 		this.reading = true;
 		try {
-			this.route(this.parser.feed(Buffer.from(text, "utf8")));
+			for (const part of this.splitVersions(text)) {
+				if (typeof part === "string") this.input(part);
+				else this.versionReply(part.name);
+			}
 		} finally {
 			this.reading = false;
 		}
 		if (this.state.kind === "off") this.flush();
-		else if (this.parser.pending) this.flushTimer = setTimeout(() => this.flush(), 10);
+		else if (this.parser.pending || this.held) this.flushTimer = setTimeout(() => this.flush(), 10);
 	}
 
 	end(): void {
@@ -120,6 +152,9 @@ export class NativeProbe {
 	stop(): void {
 		if (this.outcome.kind === "pending") this.end();
 		else this.flush();
+		this.release();
+		this.pendingVersionReplies = 0;
+		this.pasting = false;
 		this.awaitingSentinel = false;
 		this.keys = undefined;
 		this.event = undefined;
@@ -139,7 +174,74 @@ export class NativeProbe {
 
 	private flush(): void {
 		this.clearFlushTimer();
+		// Once the probe is off, nothing is held. While probing, a paste or an awaited
+		// XTVERSION reply (from `ESC P` on) waits for its end; a lone Escape is input.
+		const reply =
+			this.pendingVersionReplies > 0 &&
+			this.held.length >= 2 &&
+			(this.held.startsWith(VERSION_REPLY) || VERSION_REPLY.startsWith(this.held));
+		if (this.outcome.kind === "off" || (!this.pasting && !reply)) this.release();
 		this.route(this.parser.flush());
+	}
+
+	private release(): void {
+		const text = this.held;
+		this.held = "";
+		this.input(text);
+	}
+
+	/** Probe replies go through the TSP parser; once the probe settles, input passes unchanged. */
+	private input(text: string): void {
+		if (!text) return;
+		if ((this.outcome.kind === "off" && !this.awaitingSentinel) || this.outcome.kind === "unprobed") {
+			this.keys?.(text);
+		} else {
+			this.route(this.parser.feed(Buffer.from(text, "utf8")));
+		}
+	}
+
+	/** Splits input around the XTVERSION replies we wait for, keeping their order and pastes. */
+	private splitVersions(text: string): (string | { readonly name: string })[] {
+		const parts: (string | { readonly name: string })[] = [];
+		let rest = this.held + text;
+		this.held = "";
+		while (rest && (this.pendingVersionReplies > 0 || this.pasting)) {
+			const marker = this.pasting ? PASTE_END : PASTE_START;
+			const paste = rest.indexOf(marker);
+			const at = this.pasting ? -1 : rest.indexOf(VERSION_REPLY);
+			if (paste >= 0 && (at < 0 || paste < at)) {
+				parts.push(rest.slice(0, paste + marker.length));
+				rest = rest.slice(paste + marker.length);
+				this.pasting = !this.pasting;
+				continue;
+			}
+			const end = at < 0 ? -1 : rest.indexOf("\x1b\\", at);
+			if (end < 0) {
+				let keep = Math.max(
+					partialPrefix(rest, marker),
+					at < 0 ? partialPrefix(rest, VERSION_REPLY) : rest.length - at,
+				);
+				// No real reply is this long; release it as input.
+				if (keep > 256) keep = 0;
+				parts.push(rest.slice(0, rest.length - keep));
+				this.held = rest.slice(rest.length - keep);
+				return parts;
+			}
+			parts.push(rest.slice(0, at), { name: rest.slice(at + VERSION_REPLY.length, end) });
+			this.pendingVersionReplies--;
+			rest = rest.slice(end + 2);
+		}
+		parts.push(rest);
+		return parts;
+	}
+
+	private versionReply(name: string): void {
+		if (this.awaitingSentinel) {
+			this.version = name;
+		} else if (this.outcome.kind === "pending") {
+			// Step 2 sentinel: a terminal that speaks TSP answers hello before it.
+			this.end();
+		}
 	}
 
 	private route(items: readonly InputItem[]): void {
@@ -157,7 +259,19 @@ export class NativeProbe {
 				case "da1":
 					if (this.awaitingSentinel) {
 						this.awaitingSentinel = false;
-						if (this.outcome.kind === "pending") this.end();
+						// Replies come in order: an XTVERSION reply can no longer follow our DA1's.
+						this.pendingVersionReplies = 0;
+						if (this.outcome.kind !== "pending") break;
+						if (!APC_TERMINAL.test(this.version ?? "")) {
+							this.end();
+							break;
+						}
+						// Step 2: hello. XTVERSION, not DA1, marks its end: other startup
+						// probes send DA1 too, and their replies would arrive first.
+						clearTimeout(this.probeTimer);
+						this.probeTimer = setTimeout(() => this.end(), 1000);
+						this.pendingVersionReplies++;
+						this.write?.(`${this.hello}${XTVERSION}`);
 					} else {
 						// InputParser discards DA1 attributes; downstream probes only need the sentinel.
 						this.keys?.("\x1b[?c");
