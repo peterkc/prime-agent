@@ -54,3 +54,79 @@ jobs:
       # `npm run check` runs `biome check --write`, so fail on any file it changed.
       - name: No formatting changes
         run: git diff --exit-code
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ai
+            package: packages/ai
+            command: npm test
+          - name: agent
+            package: packages/agent
+            command: npm test
+          - name: tui
+            package: packages/tui
+            command: npm test
+          - name: coding-agent 1/3
+            package: packages/coding-agent
+            command: npm run test:ci -- --shard=1/3
+          - name: coding-agent 2/3
+            package: packages/coding-agent
+            command: npm run test:ci -- --shard=2/3
+          - name: coding-agent 3/3
+            package: packages/coding-agent
+            command: npm run test:ci -- --shard=3/3
+    # Upstream's process-stress, process smoke and kernel-heavy runs are left out: they are slow,
+    # and the default vitest config already skips their tags.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          # These dependencies come from Ubuntu, not the runner's third-party repositories.
+          test -f /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s $(which fdfind) /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Checkout catalog assets
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: PrimeIntellect-ai/prime-agent-catalog
+          ref: main
+          path: prime-agent-catalog
+          persist-credentials: false
+
+      - name: Generate catalog assets
+        run: npm run catalog:assets -- --catalog-dir prime-agent-catalog
+
+      - name: Build
+        run: npm run build
+
+      - name: Install uv
+        if: matrix.package == 'packages/coding-agent'
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        working-directory: ${{ matrix.package }}
+        run: ${{ matrix.command }}
