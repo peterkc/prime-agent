@@ -16,6 +16,15 @@ function packageVersion(): string {
 	return (JSON.parse(readFileSync(path, "utf8")) as { readonly version: string }).version;
 }
 
+/**
+ * Brackets the hello query. A terminal that cannot parse APC, such as JetBrains
+ * JediTerm or Apple Terminal, drops `ESC _` and `ESC \` and prints the payload.
+ * DECSC, autowrap off and SGR 8 (conceal) keep that text hidden on the cursor
+ * row; DECRC returns the cursor and EL erases the text from there.
+ */
+const PROBE_GUARD_BEGIN = "\x1b7\x1b[?7l\x1b[8m";
+const PROBE_GUARD_END = "\x1b[28m\x1b8\x1b[K\x1b[?7h";
+
 export interface NativeCapabilities {
 	readonly apc: number;
 	readonly credits: number;
@@ -82,10 +91,12 @@ export class NativeProbe {
 		this.outcome = { kind: "pending" };
 		this.awaitingSentinel = true;
 		this.probeTimer = setTimeout(() => this.end(), 1000);
+		write(PROBE_GUARD_BEGIN);
 		write(
 			Buffer.from(encodeJson({ verb: "q", body: { q: "hello", v: [1], app: "prime-agent", ver } })).toString("utf8"),
 		);
 		write("\x1b[c");
+		write(PROBE_GUARD_END);
 	}
 
 	feed(text: string): void {

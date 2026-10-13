@@ -526,8 +526,17 @@ for (const gate of [undefined, "1"]) {
 		});
 		assert.equal(result.error, undefined);
 		assert.equal(result.status, 0, result.stderr);
-		const probe =
-			gate === "1" ? `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\\x1b[c` : "";
+		const query = `\x1b_tsp;q;{"q":"hello","v":[1],"app":"prime-agent","ver":"${pkg.version}"}\x1b\\\x1b[c`;
+		const probe = gate === "1" ? `\x1b7\x1b[?7l\x1b[8m${query}\x1b[28m\x1b8\x1b[K\x1b[?7h` : "";
 		assert.equal(result.stdout, baseAnsiBytes.replace("\x1b[?u", `\x1b[?u${probe}`));
 	});
 }
+it("hides the hello query from a terminal that prints APC payloads", async (t) => {
+	const screen = new VirtualTerminal(20, 4);
+	screen.write("keep");
+	const native = new NativeConnection();
+	native.start({ write: (text) => screen.write(text.replaceAll("\x1b_", "").replaceAll("\x1b\\", "")) }, () => {});
+	t.after(() => native.probe.stop());
+	assert.deepEqual(await screen.flushAndGetViewport(), ["keep", "", "", ""]);
+	assert.deepEqual(screen.getCursorPosition(), { x: 4, y: 0 });
+});
