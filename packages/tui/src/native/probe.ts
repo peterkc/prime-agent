@@ -82,7 +82,7 @@ export class NativeProbe {
 	/** The XTVERSION reply to the identify query, until our DA1 reply decides. */
 	private version?: string;
 	/** XTVERSION queries still unanswered; their replies are removed from input. */
-	private versions = 0;
+	private pendingVersionReplies = 0;
 	/** The start of an XTVERSION reply or paste marker that the next input completes. */
 	private held = "";
 	/** Inside a bracketed paste, where nothing is a reply. */
@@ -116,7 +116,7 @@ export class NativeProbe {
 		).toString("utf8");
 		// Step 1: identify the terminal. Our DA1 reply ends this step (see route).
 		this.awaitingSentinel = true;
-		this.versions++;
+		this.pendingVersionReplies++;
 		this.probeTimer = setTimeout(() => this.end(), 1000);
 		write(`${XTVERSION}\x1b[c`);
 	}
@@ -153,7 +153,7 @@ export class NativeProbe {
 		if (this.outcome.kind === "pending") this.end();
 		else this.flush();
 		this.release();
-		this.versions = 0;
+		this.pendingVersionReplies = 0;
 		this.pasting = false;
 		this.awaitingSentinel = false;
 		this.keys = undefined;
@@ -200,7 +200,7 @@ export class NativeProbe {
 		const parts: (string | { readonly name: string })[] = [];
 		let rest = this.held + text;
 		this.held = "";
-		while (rest && (this.versions > 0 || this.pasting)) {
+		while (rest && (this.pendingVersionReplies > 0 || this.pasting)) {
 			const marker = this.pasting ? PASTE_END : PASTE_START;
 			const paste = rest.indexOf(marker);
 			const at = this.pasting ? -1 : rest.indexOf(VERSION_REPLY);
@@ -223,7 +223,7 @@ export class NativeProbe {
 				return parts;
 			}
 			parts.push(rest.slice(0, at), { name: rest.slice(at + VERSION_REPLY.length, end) });
-			this.versions--;
+			this.pendingVersionReplies--;
 			rest = rest.slice(end + 2);
 		}
 		parts.push(rest);
@@ -255,7 +255,7 @@ export class NativeProbe {
 					if (this.awaitingSentinel) {
 						this.awaitingSentinel = false;
 						// Replies come in order: an XTVERSION reply can no longer follow our DA1's.
-						this.versions = 0;
+						this.pendingVersionReplies = 0;
 						if (this.outcome.kind !== "pending") break;
 						if (!APC_TERMINAL.test(this.version ?? "")) {
 							this.end();
@@ -265,7 +265,7 @@ export class NativeProbe {
 						// probes send DA1 too, and their replies would arrive first.
 						clearTimeout(this.probeTimer);
 						this.probeTimer = setTimeout(() => this.end(), 1000);
-						this.versions++;
+						this.pendingVersionReplies++;
 						this.write?.(`${this.hello}${XTVERSION}`);
 					} else {
 						// InputParser discards DA1 attributes; downstream probes only need the sentinel.
