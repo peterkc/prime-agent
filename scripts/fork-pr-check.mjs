@@ -13,7 +13,7 @@ const root = resolve(import.meta.dirname, "..");
 const testFilePattern =
 	/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)vitest\.config\.[cm]?[jt]s$|^prime-agent-runtime\/test\/.*\.py$/;
 const codeFilePattern = /\.(?:[cm]?[jt]sx?|py)$/;
-const runnableTestPattern = /^(packages\/[^/]+)\/(.+\.test\.[cm]?[jt]sx?)$/;
+const runnableTestPattern = /^(packages\/[^/]+)\/(.+\.(?:test|spec)\.[cm]?[jt]sx?)$/;
 const seeds = [17, 43, 101];
 
 function git(args) {
