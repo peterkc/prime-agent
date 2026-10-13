@@ -19,6 +19,8 @@ function packageVersion(): string {
 /** XTVERSION: terminals that do not know it ignore it, so it never prints. */
 const XTVERSION = "\x1b[>0q";
 const VERSION_REPLY = "\x1bP>|";
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 /**
  * Terminals named here parse APC strings. Others get no hello, because some,
  * such as JetBrains JediTerm and Apple Terminal, print an APC payload as text.
@@ -81,8 +83,10 @@ export class NativeProbe {
 	private version?: string;
 	/** XTVERSION queries still unanswered; their replies are removed from input. */
 	private versions = 0;
-	/** The start of an XTVERSION reply that the next input completes. */
+	/** The start of an XTVERSION reply or paste marker that the next input completes. */
 	private held = "";
+	/** Inside a bracketed paste, where nothing is a reply. */
+	private pasting = false;
 
 	get state(): NativeState {
 		return this.outcome;
@@ -148,6 +152,8 @@ export class NativeProbe {
 	stop(): void {
 		if (this.outcome.kind === "pending") this.end();
 		else this.flush();
+		this.release();
+		this.versions = 0;
 		this.awaitingSentinel = false;
 		this.keys = undefined;
 		this.event = undefined;
@@ -167,13 +173,15 @@ export class NativeProbe {
 
 	private flush(): void {
 		this.clearFlushTimer();
-		// A started XTVERSION reply waits for its end; a bare prefix of one is input.
-		if (this.held && !this.held.startsWith(VERSION_REPLY)) {
-			const text = this.held;
-			this.held = "";
-			this.input(text);
-		}
+		// While probing, a started XTVERSION reply waits for its end; a bare prefix is input.
+		if (!this.pasting && (this.outcome.kind === "off" || !this.held.startsWith(VERSION_REPLY))) this.release();
 		this.route(this.parser.flush());
+	}
+
+	private release(): void {
+		const text = this.held;
+		this.held = "";
+		this.input(text);
 	}
 
 	/** Probe replies go through the TSP parser; once the probe settles, input passes unchanged. */
@@ -186,16 +194,27 @@ export class NativeProbe {
 		}
 	}
 
-	/** Splits input around the XTVERSION replies we wait for, keeping their order. */
+	/** Splits input around the XTVERSION replies we wait for, keeping their order and pastes. */
 	private splitVersions(text: string): (string | { readonly name: string })[] {
 		const parts: (string | { readonly name: string })[] = [];
 		let rest = this.held + text;
 		this.held = "";
-		while (this.versions > 0) {
-			const at = rest.indexOf(VERSION_REPLY);
+		while (rest && (this.versions > 0 || this.pasting)) {
+			const marker = this.pasting ? PASTE_END : PASTE_START;
+			const paste = rest.indexOf(marker);
+			const at = this.pasting ? -1 : rest.indexOf(VERSION_REPLY);
+			if (paste >= 0 && (at < 0 || paste < at)) {
+				parts.push(rest.slice(0, paste + marker.length));
+				rest = rest.slice(paste + marker.length);
+				this.pasting = !this.pasting;
+				continue;
+			}
 			const end = at < 0 ? -1 : rest.indexOf("\x1b\\", at);
 			if (end < 0) {
-				let keep = at < 0 ? partialPrefix(rest, VERSION_REPLY) : rest.length - at;
+				let keep = Math.max(
+					partialPrefix(rest, marker),
+					at < 0 ? partialPrefix(rest, VERSION_REPLY) : rest.length - at,
+				);
 				// No real reply is this long; release it as input.
 				if (keep > 256) keep = 0;
 				parts.push(rest.slice(0, rest.length - keep));

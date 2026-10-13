@@ -193,3 +193,19 @@ it("passes an Escape typed during the probe after 10 ms", (t) => {
 	t.mock.timers.tick(10);
 	assert.deepEqual(keys, ["\x1b"]);
 });
+
+it("releases an unfinished XTVERSION reply once the probe gives up", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1bP>|kit");
+	t.mock.timers.tick(1000);
+	native.probe.feed("abc");
+	assert.equal(keys.join(""), "\x1bP>|kitabc");
+});
+
+it("leaves a pasted XTVERSION reply in the paste and sends no hello for it", (t) => {
+	const { native, writes, keys } = connection(t);
+	const paste = `\x1b[200~${kitty}\x1b[201~`;
+	native.probe.feed(paste.slice(0, 9));
+	native.probe.feed(`${paste.slice(9)}${da1}`);
+	assert.deepEqual([native.probe.state.kind, writes, keys.join("")], ["off", [], paste]);
+});
