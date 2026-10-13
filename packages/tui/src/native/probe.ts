@@ -154,6 +154,7 @@ export class NativeProbe {
 		else this.flush();
 		this.release();
 		this.versions = 0;
+		this.pasting = false;
 		this.awaitingSentinel = false;
 		this.keys = undefined;
 		this.event = undefined;

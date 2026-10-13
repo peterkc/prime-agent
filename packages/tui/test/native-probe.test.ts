@@ -209,3 +209,14 @@ it("leaves a pasted XTVERSION reply in the paste and sends no hello for it", (t)
 	native.probe.feed(`${paste.slice(9)}${da1}`);
 	assert.deepEqual([native.probe.state.kind, writes, keys.join("")], ["off", [], paste]);
 });
+
+it("forgets an unfinished paste when the probe stops", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed("\x1b[200~x");
+	native.probe.stop();
+	native.start({ write: () => {} }, (text) => keys.push(text));
+	keys.length = 0;
+	native.probe.feed("\x1b");
+	t.mock.timers.tick(10);
+	assert.deepEqual(keys, ["\x1b"]);
+});
