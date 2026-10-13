@@ -373,14 +373,16 @@ describe("codemode", () => {
 	);
 
 	it.each([
-		{ enabled: undefined, tools: undefined, active: ["ipython", "codemode"] },
-		{ enabled: false, tools: undefined, active: ["ipython"] },
+		{ enabled: undefined, tools: undefined, active: ["ipython", "questionnaire", "codemode"] },
+		{ enabled: false, tools: undefined, active: ["ipython", "questionnaire"] },
 		{ enabled: true, tools: ["ipython"], active: ["ipython"] },
 		{ enabled: false, tools: ["codemode"], active: ["codemode"] },
 	])("TM-10 defaults and SDK lists $enabled $tools", async ({ enabled, tools, active }) => {
 		const settings = SettingsManager.inMemory(enabled === undefined ? {} : { codemode: enabled });
 		const setup = await makeSession(undefined, settings);
-		expect(setup.session.getActiveToolNames()).toEqual(enabled === false ? ["ipython"] : ["ipython", "codemode"]);
+		expect(setup.session.getActiveToolNames()).toEqual(
+			enabled === false ? ["ipython", "questionnaire"] : ["ipython", "questionnaire", "codemode"],
+		);
 		const { session } = await createAgentSession({
 			...setup,
 			cwd: dir,

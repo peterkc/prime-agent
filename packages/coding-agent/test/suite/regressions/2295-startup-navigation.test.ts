@@ -42,6 +42,7 @@ describe("back navigation during chat startup", () => {
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			applyHeartbeatCatalog: vi.fn(),
+			bindRenderMode: vi.fn(),
 			isShuttingDown: false,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -167,7 +168,7 @@ describe("back navigation during chat startup", () => {
 				getSessionStats: vi.fn(async () => harness.session.getSessionStats()),
 				dispose: vi.fn(async () => {}),
 			},
-			ui: { terminal: { drainInput: vi.fn(async () => {}) } },
+			ui: { terminal: { drainInput: vi.fn(async () => {}) }, releaseNative: vi.fn(async () => {}) },
 			options: { onShutdown: vi.fn(async () => {}) },
 			clearCtrlCExitHint: vi.fn(),
 			stop: vi.fn(),
