@@ -251,6 +251,8 @@ const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
+// A client that never closes its end would hold server.close(), the socket lock and the process forever.
+const SHUTDOWN_CLIENT_END_GRACE_MS = 2_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.
@@ -7767,7 +7769,12 @@ export class DaemonSupervisor {
 			client.detachInput();
 			client.socket.end();
 		}
+		const forceClose = setTimeout(() => {
+			this.log(`Force-closing ${this.clients.size} daemon client(s) still open after shutdown`);
+			for (const client of [...this.clients]) client.socket.destroy();
+		}, SHUTDOWN_CLIENT_END_GRACE_MS);
 		await new Promise<void>((resolveClose) => this.server?.close(() => resolveClose()) ?? resolveClose());
+		clearTimeout(forceClose);
 		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
 		await this.runCleanupStep("supervisor cache", () => {
 			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
