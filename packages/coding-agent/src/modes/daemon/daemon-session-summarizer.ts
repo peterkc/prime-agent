@@ -365,8 +365,13 @@ export class DaemonSessionSummarizer {
 		// it, so exempt terminal errors from the unchanged-content fast return.
 		const owesErrorVerdict = turnError !== undefined && previous?.taskState !== "error";
 		// A later turn ended normally: the old error recap no longer describes the
-		// session, so drop it even when the classifier call below fails.
-		const supersedesError = !isWorking && turnError === undefined && previous?.taskState === "error";
+		// session, so drop it even when the classifier call below fails. Only while
+		// the active branch still holds that error: branch navigation keeps the cache.
+		const supersedesError =
+			!isWorking &&
+			turnError === undefined &&
+			previous?.taskState === "error" &&
+			session.sessionManager.getLatestAgentStatus()?.taskState === "error";
 		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict && !supersedesError) {
 			return;
 		}

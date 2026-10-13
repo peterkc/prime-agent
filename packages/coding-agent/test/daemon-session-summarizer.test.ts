@@ -513,15 +513,17 @@ describe("daemon session summarizer", () => {
 			expect(appended.at(-1)).toMatchObject({ taskState: "completed" });
 		});
 
-		test("a seeded error verdict is dropped after a normal turn even when the classifier fails", async () => {
+		test.each([
+			["error", [{ summary: "", taskState: "needs_input", basedOnMessageCount: 4 }]],
+			["completed", []],
+		] as const)("a cached error verdict after a normal turn, active branch status %s", async (branch, expected) => {
 			const messages = [...erroredTranscript(providerError), userMessage("retry"), assistantMessage("Done")];
-			const { state, appended } = erroredState({ messages });
+			const persistedStatus = { summary: "x", taskState: branch, basedOnMessageCount: 2 };
+			const { state, appended } = erroredState({ messages, persistedStatus });
 			state.summaryState = { summary: "Model request failed", taskState: "error", basedOnMessageCount: 2 };
 			await runSummarize(state, async () => undefined);
 			await runSummarize(state, async () => undefined);
-			const cleared = { summary: "", taskState: "needs_input", basedOnMessageCount: 4 };
-			expect(state.summaryState).toEqual(cleared);
-			expect(appended).toEqual([cleared]); // a restart now seeds the cleared verdict
+			expect(appended).toEqual(expected); // a restart seeds the latest entry on this branch
 		});
 
 		test("a working session is never error-settled, even with an errored trailing assistant message", async () => {
