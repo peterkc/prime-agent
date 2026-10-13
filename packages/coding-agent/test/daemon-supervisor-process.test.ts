@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import {
 	chmodSync,
 	existsSync,
@@ -10,7 +11,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1067,6 +1068,23 @@ export default function(pi) {
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
 		await waitForSocketGone(socketPath);
+	});
+
+	it("exits and frees its socket when a client never ends its side", async () => {
+		const agentDir = join(tempDir(), "agent");
+		const socketPath = join(tmpdir(), `prime-supervisor-half-open-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		const supervisor = spawnSupervisor(agentDir, socketPath, tmpdir());
+		const client = await connectEventually(socketPath, supervisor);
+		const halfOpen = createConnection({ path: socketPath, allowHalfOpen: true });
+		try {
+			await once(halfOpen, "data");
+			expect((await client.request({ type: "shutdown" })).success).toBe(true);
+			await waitForExit(supervisor);
+			(await connectEventually(socketPath, spawnSupervisor(agentDir, socketPath, tmpdir()))).close();
+		} finally {
+			halfOpen.destroy();
+			client.close();
+		}
 	});
 
 	it("survives a worker process spawn error", { tags: ["process-stress"] }, async () => {
