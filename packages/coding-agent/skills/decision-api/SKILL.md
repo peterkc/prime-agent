@@ -7,6 +7,8 @@ description: Experimental System 1 / System 2 loop for real-time, low-latency ta
 
 Use this for real-time control tasks where every step is one choice from an
 action set (a game, a device, a UI) and a full agent turn per step is too slow.
+It also serves one-off classification: sorting the facts of one eval run into
+a fixed set of groups with a single `decide()` call (see the end of this file).
 
 - **System 1** is the decision model the user configured: the
   `decisionApi.systemOneModel` setting names it. This fork uses Jev
@@ -89,9 +91,17 @@ and makes every provider call. No key enters the kernel. If a call reports
 that the setting is unset or unresolvable, ask the user to fix the setting.
 Do not ask for keys yourself.
 
-Data rule: `state` holds the control task's observations only, never code,
-file contents, secrets or personal data. The host logs the full state and
+Data rule: `state` holds only the control task's observations, or the facts
+of one eval run on synthetic test fixtures: its case, arm, check results, tool
+calls and the agent's whole final reply. Never put code or file contents from a
+real repository, secrets, credentials or personal data in `state`. Each call
+sends `state` to the configured provider, and the host logs the full state and
 decision results locally.
+
+Pass each text field in `state` whole. Do not cut, truncate or summarize it in
+your own code: a reply cut at a fixed length makes System 1 decide from partial
+facts. If the provider rejects a state as too large, report that instead of
+shortening the text.
 
 ## Usage
 
