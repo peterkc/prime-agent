@@ -41,8 +41,8 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 		}
 	});
 
-	it("registers only ipython as a built-in tool and keeps legacy names parseable", () => {
-		expect(Object.keys(createAllToolDefinitions(process.cwd()))).toEqual(["ipython"]);
+	it("registers no legacy pi-mono built-in tool and keeps legacy names parseable", () => {
+		expect(Object.keys(createAllToolDefinitions(process.cwd()))).toEqual(["ipython", "codemode", "questionnaire"]);
 		expect(parseArgs(["--tools", "bash,edit,ipython"])).toMatchObject({
 			tools: ["bash", "edit", "ipython"],
 			diagnostics: [],
