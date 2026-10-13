@@ -103,7 +103,8 @@ decision results locally.
 Pass each text field in `state` whole. Do not cut, truncate or summarize it in
 your own code: a reply cut at a fixed length makes System 1 decide from partial
 facts. If a field holds anything the data rule forbids, do not call `decide()`
-for that run, and report why. If the provider rejects a state as too large,
+for that run, and report which part of the data rule it breaks, without
+quoting the content. If the provider rejects a state as too large,
 report that instead of shortening the text.
 
 ## Usage
