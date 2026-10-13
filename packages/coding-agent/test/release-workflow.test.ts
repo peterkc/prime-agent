@@ -207,9 +207,11 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 			const directory = mkdtempSync(join(tmpdir(), "prime-release-context-"));
 			try {
 				const output = join(directory, "output");
+				// The fork versions itself 0.9.8+fork.N, which this upstream production path rejects; use a plain version.
+				writeFileSync(join(directory, "package.json"), JSON.stringify({ version: "0.0.1" }));
 				const context = step(release.jobs["release-context"]!, "Resolve release context");
 				const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", context.run!], {
-					cwd: repository,
+					cwd: directory,
 					env: {
 						...process.env,
 						EVENT_NAME: "pull_request",
