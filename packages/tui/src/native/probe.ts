@@ -26,7 +26,7 @@ const PASTE_END = "\x1b[201~";
  * such as JetBrains JediTerm and Apple Terminal, print an APC payload as text.
  * Tern answers XTVERSION as kitty.
  */
-const APC_TERMINAL = /^(?:kitty|tern)(?![a-z])/i;
+const APC_TERMINAL = /^(?:kitty|tern)(?:[(\s]|$)/i;
 
 export interface NativeCapabilities {
 	readonly apc: number;
@@ -174,8 +174,9 @@ export class NativeProbe {
 
 	private flush(): void {
 		this.clearFlushTimer();
-		// While probing, a started XTVERSION reply waits for its end; a bare prefix is input.
-		if (!this.pasting && (this.outcome.kind === "off" || !this.held.startsWith(VERSION_REPLY))) this.release();
+		// Once the probe is off, nothing is held. While probing, a started XTVERSION
+		// reply or a paste waits for its end; a bare prefix is input.
+		if (this.outcome.kind === "off" || (!this.pasting && !this.held.startsWith(VERSION_REPLY))) this.release();
 		this.route(this.parser.flush());
 	}
 

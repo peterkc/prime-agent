@@ -156,6 +156,7 @@ for (const outcome of ["available", "invalid", "timeout"] as const) {
 const kitty = "\x1bP>|kitty(0.48.2)\x1b\\";
 for (const [name, reply] of [
 	["tmux", "\x1bP>|tmux 3.5a\x1b\\"],
+	["kitty-foo", "\x1bP>|kitty-foo(1)\x1b\\"],
 	["a terminal without XTVERSION", ""],
 ] as const) {
 	it(`never sends hello to ${name}`, (t) => {
@@ -219,4 +220,19 @@ it("forgets an unfinished paste when the probe stops", (t) => {
 	native.probe.feed("\x1b");
 	t.mock.timers.tick(10);
 	assert.deepEqual(keys, ["\x1b"]);
+});
+
+it("releases a partial paste end once the probe gives up", (t) => {
+	const { native, keys } = connection(t);
+	native.probe.feed(`${kitty}${da1}`);
+	native.probe.feed("\x1b[200~x\x1b[20");
+	t.mock.timers.tick(1000);
+	assert.equal(keys.join(""), "\x1b[200~x\x1b[20");
+});
+
+it("keeps tracking a paste that starts in the same read as the kitty reply", (t) => {
+	const { native, writes, keys } = connection(t);
+	native.probe.feed(`${kitty}\x1b[200~`);
+	native.probe.feed(`${da1}${kitty}\x1b[201~`);
+	assert.deepEqual([writes, keys.join("")], [[], `\x1b[200~${da1}${kitty}\x1b[201~`]);
 });
