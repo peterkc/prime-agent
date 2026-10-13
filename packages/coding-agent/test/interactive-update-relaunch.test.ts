@@ -197,6 +197,7 @@ describe("interactive self-update relaunch", () => {
 				ui: {
 					terminal: { drainInput: async () => events.push("drain-input") },
 					stop: () => events.push("ui-stop"),
+					releaseNative: async () => {},
 				},
 				agentConnection: {
 					dispose: async () => events.push("connection-dispose"),
