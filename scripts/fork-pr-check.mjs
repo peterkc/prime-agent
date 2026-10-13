@@ -85,6 +85,10 @@ function shuffledCommand(pkg, tests, seed) {
 	const script = JSON.parse(readFileSync(resolve(root, pkg, "package.json"), "utf8")).scripts?.test ?? "";
 	const [command, ...flags] = script.trim().split(/\s+/);
 	if (command === "node" && flags.includes("--test")) {
+		// Node 24.16.0 and 26.1.0 added the flag; Node 25 lacks it.
+		if (!process.allowedNodeEnvironmentFlags.has("--test-random-seed")) {
+			throw new Error(`Seeded node --test runs need Node 24.16.0 or 26.1.0 or later; this is ${process.versions.node}.`);
+		}
 		return ["node", [...flags.filter((flag) => !flag.includes("*")), `--test-random-seed=${seed}`, ...tests]];
 	}
 	return ["npx", ["vitest", "--run", "--sequence.shuffle", `--sequence.seed=${seed}`, ...tests]];
