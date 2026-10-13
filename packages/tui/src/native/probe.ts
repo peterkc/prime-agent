@@ -19,11 +19,11 @@ function packageVersion(): string {
 /**
  * Brackets the hello query. A terminal that cannot parse APC, such as JetBrains
  * JediTerm or Apple Terminal, drops `ESC _` and `ESC \` and prints the payload.
- * DECSC, autowrap off and SGR 8 (conceal) keep that text hidden on the cursor
- * row; DECRC returns the cursor and EL erases the text from there.
+ * With autowrap off at the right margin, that text overwrites only the row's last
+ * cell, concealed (SGR 8); DECRC returns the cursor. Nothing else is erased.
  */
-const PROBE_GUARD_BEGIN = "\x1b7\x1b[?7l\x1b[8m";
-const PROBE_GUARD_END = "\x1b[28m\x1b8\x1b[K\x1b[?7h";
+const PROBE_GUARD_BEGIN = "\x1b7\x1b[?7l\x1b[999C\x1b[8m";
+const PROBE_GUARD_END = "\x1b[28m\x1b8\x1b[?7h";
 
 export interface NativeCapabilities {
 	readonly apc: number;
