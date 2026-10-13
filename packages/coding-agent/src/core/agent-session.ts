@@ -4441,6 +4441,16 @@ export class AgentSession {
 		return outcome.delivery.promise;
 	}
 
+	waitForAgentMessagePromptCompletion(agentMessageId: string): Promise<void> {
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		outcome.completion ??= createAgentMessageDeferred();
+		return outcome.completion.promise;
+	}
+
+	rejectAgentMessagePrompt(agentMessageId: string, error: Error): void {
+		this._rejectAgentMessage(agentMessageId, error);
+	}
+
 	private _settleAgentMessage(
 		agentMessageId: string | undefined,
 		leg: "delivery" | "completion",
@@ -5227,7 +5237,7 @@ export class AgentSession {
 		}
 	}
 
-	registerDisposeCallback(callback: () => void | Promise<void>): void {
+	registerDisposeCallback(callback: () => void | Promise<void>): () => void {
 		if (this._disposed) {
 			try {
 				const result = callback();
@@ -5235,9 +5245,12 @@ export class AgentSession {
 			} catch {
 				// Late registration follows the same best-effort disposal contract.
 			}
-			return;
+			return () => {};
 		}
 		this._disposeCallbacks.add(callback);
+		return () => {
+			this._disposeCallbacks.delete(callback);
+		};
 	}
 
 	get state(): AgentState {

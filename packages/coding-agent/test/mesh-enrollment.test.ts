@@ -370,15 +370,17 @@ describe("mesh enrollment", () => {
 		if (mode === "project")
 			writeFileSync(join(cwd, ".prime", "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
 		expect(SettingsManager.create(cwd, root).getAgentMessageTransport()).toBe("native");
-		const script = `
+		const hook = `
 			import { registerHooks } from "node:module";
 			registerHooks({ resolve(specifier, context, next) {
 				if (specifier === "@cotal-ai/core" || specifier === "nats" || specifier.startsWith("@nats-io/"))
 					throw new Error("Mode off loaded " + specifier);
 				return next(specifier, context);
 			} });
-			const { DaemonSupervisor } = await import(${JSON.stringify(resolve("src/modes/daemon/daemon-supervisor.ts"))});
-			await import(${JSON.stringify(resolve("src/modes/daemon/daemon-mode.ts"))});
+		`;
+		const script = `
+			import { DaemonSupervisor } from ${JSON.stringify(resolve("src/modes/daemon/daemon-supervisor.ts"))};
+			import ${JSON.stringify(resolve("src/modes/daemon/daemon-mode.ts"))};
 			const supervisor = new DaemonSupervisor(${JSON.stringify(join(root, "probe.sock"))}, {
 				defaultSessionConfig: { cwd: ${JSON.stringify(cwd)}, agentDir: ${JSON.stringify(root)} }
 			});
@@ -387,7 +389,15 @@ describe("mesh enrollment", () => {
 		`;
 		const child = spawn(
 			process.execPath,
-			["--import", resolve("../../node_modules/tsx/dist/loader.mjs"), "--input-type=module", "-e", script],
+			[
+				"--import",
+				resolve("../../node_modules/tsx/dist/loader.mjs"),
+				"--import",
+				`data:text/javascript,${encodeURIComponent(hook)}`,
+				"--input-type=module",
+				"-e",
+				script,
+			],
 			{
 				cwd,
 				env: {

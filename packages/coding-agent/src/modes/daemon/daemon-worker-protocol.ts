@@ -42,7 +42,7 @@ export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
 
 export type DaemonWorkerPersistenceOutbound =
 	| { type: "agent_message_persisted"; cotalId: string }
-	| { type: "agent_message_dropped"; cotalId: string; cleared: boolean };
+	| { type: "agent_message_dropped"; cotalId: string; reason: "cleared" | "closed" | "other" };
 
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;

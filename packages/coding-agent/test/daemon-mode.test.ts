@@ -4525,85 +4525,445 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["clear", "abort-clear", "agent-clear", "dispose", "persist-race"])(
-		"reports a terminal queued delivery once without dropping a written entry (%s)",
+	it.each(["new_session", "fork"])(
+		"publishes and enrolls a readable replacement before binding (%s)",
+		async (command) => {
+			let built = 0;
+			let h: ReturnType<typeof harness>;
+			let readableAtPublication = false;
+			const replacing = createDeferred();
+			const release = createDeferred();
+			h = harness(async (options) => {
+				const replacement = ++built > 1;
+				const session = Object.assign(makeRuntimeSession(options.sessionManager), {
+					setCurrentRecap: () => undefined,
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					bindExtensions: async () => {
+						if (replacement) {
+							readableAtPublication = existsSync(options.sessionManager.getSessionFile()!);
+							(h.internals as unknown as { flushRoster(): void }).flushRoster();
+							replacing.resolve();
+							await release.promise;
+						}
+					},
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				} as never;
+			});
+			(h.internals as unknown as { clients: Set<DaemonSocketClient> }).clients.add(h.client);
+			await h.authenticate("cotal");
+			await h.internals.handleLine(h.client, JSON.stringify({ id: "initial", type: "create" }));
+			const state = [...h.internals.sessions.values()][0]!;
+			const oldId = state.runtime.session.sessionId;
+			const entryId = state.runtime.session.sessionManager.appendMessage({
+				role: "user",
+				content: "before assistant",
+				timestamp: 1,
+			});
+			h.written.length = 0;
+			const replacement = h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					id: "replacement",
+					type: command,
+					activeSessionId: state.activeSessionId,
+					...(command === "fork" ? { entryId } : {}),
+				}),
+			);
+			const supervisor = new DaemonSupervisor(join(h.root, "enrollment.sock"), {
+				defaultSessionConfig: { agentDir: h.root, cwd: h.root },
+			});
+			const enrolled = createDeferred();
+			let enrolledInfo: SessionInfo | null | undefined;
+			let enrolledId: string | undefined;
+			const sup = supervisor as unknown as {
+				mesh: unknown;
+				writeRosterEntry(entry: unknown): unknown;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			sup.mesh = {
+				enqueueEnrollment: async (id: string, file: string) => {
+					enrolledId = id;
+					enrolledInfo = await readSessionInfo(file);
+					enrolled.resolve();
+				},
+				stop: async () => undefined,
+			};
+			try {
+				await replacing.promise;
+				expect(readableAtPublication).toBe(true);
+				const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader).push(Buffer.concat(h.written));
+				const frame = frames.find(
+					(frame) => frame.header.kind === "outbound" && frame.header.outboundType === "roster_delta",
+				);
+				expect(frame).toBeDefined();
+				const delta = JSON.parse(frame!.payload.toString("utf8"));
+				const row = delta.entries.find(
+					(entry: { summary: SessionSummary }) => entry.summary.sessionId === state.runtime.session.sessionId,
+				);
+				expect(row.summary.sessionId).not.toBe(oldId);
+				expect(existsSync(row.summary.sessionFile)).toBe(true);
+				sup.writeRosterEntry(row);
+				await enrolled.promise;
+				expect(enrolledId).toBe(row.summary.sessionId);
+				expect(enrolledInfo).toMatchObject({ id: row.summary.sessionId, messageCount: 0 });
+			} finally {
+				release.resolve();
+				await replacement;
+				await sup.cleanupSupervisorResources();
+				await state.runtime.dispose();
+			}
+			expect(h.frames().at(-1)).toMatchObject({ command, success: true });
+		},
+	);
+
+	it.each([
+		"clear",
+		"abort-clear",
+		"agent-clear",
+		"dispose",
+		"killed",
+		"completed",
+		"shutdown",
+		"update",
+		"update-discard",
+		"persist-race",
+	])("reports a terminal queued delivery once without dropping a written entry (%s)", async (outcome) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		h.written.length = 0;
+		const gate = createDeferred();
+		const started = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "wait",
+					label: "Wait",
+					description: "Hold the running turn",
+					parameters: Type.Object({}),
+					execute: async () => {
+						started.resolve();
+						await gate.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		const running = live.session.prompt("start");
+		try {
+			await started.promise;
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			(live.session as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
+			await h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					id: "delivery",
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionName: "parent" },
+					fromRelationship: "parent",
+					cotal: { id: "terminal", deliveryCount: 1 },
+				}),
+			);
+			expect(h.frames()).toMatchObject([
+				{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
+			]);
+			expect(live.session.getSteeringMessages()).toHaveLength(1);
+			expect(live.session.getSteeringMessages()[0]).toContain("parent:parent");
+			expect(live.session.repliedToParentSinceTask).toBe(false);
+			if (outcome === "persist-race") {
+				live.sessionManager.appendCustomMessageEntry("agent_message", "already written", true, {
+					id: "agentmsg_terminal",
+				});
+			}
+			if (["killed", "completed", "shutdown", "update", "update-discard"].includes(outcome)) {
+				state.runtime.dispose = async () => live.session.disposeAsync({ kernelSnapshot: false });
+				await (
+					h.internals as unknown as {
+						closeSession(
+							state: ActiveSessionState,
+							reason: "killed" | "completed" | "shutdown" | "update",
+							wait?: boolean,
+							cascade?: boolean,
+							descendants?: Set<ActiveSessionState>,
+							disposal?: { kernelSnapshot?: boolean },
+							drop?: "other",
+						): Promise<void>;
+					}
+				).closeSession(
+					state,
+					(outcome === "update-discard" ? "killed" : outcome) as "killed" | "completed" | "shutdown" | "update",
+					true,
+					true,
+					undefined,
+					undefined,
+					outcome === "update-discard" ? "other" : undefined,
+				);
+			} else if (outcome === "dispose" || outcome === "persist-race") live.session.dispose();
+			else if (outcome === "agent-clear") live.session.clearQueuedAgentMessages();
+			else {
+				live.session.clearQueue();
+				if (outcome === "abort-clear") void live.session.abort();
+			}
+			await Promise.resolve();
+			expect(h.frames()[1]).toEqual(
+				outcome === "persist-race"
+					? { type: "agent_message_persisted", cotalId: "terminal" }
+					: {
+							type: "agent_message_dropped",
+							cotalId: "terminal",
+							reason:
+								outcome === "killed" || outcome === "completed"
+									? "closed"
+									: ["dispose", "shutdown", "update", "update-discard"].includes(outcome)
+										? "other"
+										: "cleared",
+						},
+			);
+			live.sessionManager.appendCustomEntry("later");
+			expect(h.frames()).toHaveLength(2);
+		} finally {
+			gate.resolve();
+			await running.catch(() => undefined);
+			live.cleanup();
+		}
+	});
+
+	it.each(["killed", "completed"] as const)(
+		"reports closed for an existing unwritten own entry (%s)",
+		async (reason) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
+			const id = live.sessionManager.appendCustomMessageEntry("agent_message", "buffered", true, {
+				id: "agentmsg_buffered",
+			});
+			expect(live.sessionManager.isEntryPersisted(id)).toBe(false);
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const archive = vi.spyOn(live.sessionManager, "appendSessionState").mockImplementation(() => {
+				throw new Error("Archive write failed");
+			});
+			try {
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "buffered",
+						type: "worker_deliver_message",
+						targetActiveSessionId: "target",
+						message: "hello",
+						sender: { sessionName: "sender" },
+						cotal: { id: "buffered", deliveryCount: 2 },
+					}),
+				);
+				expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
+				await (
+					h.internals as unknown as {
+						closeSession(state: ActiveSessionState, reason: "killed" | "completed"): Promise<void>;
+					}
+				)
+					.closeSession(state, reason)
+					.catch(() => undefined);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual([
+					{ type: "agent_message_dropped", cotalId: "buffered", reason: "closed" },
+				]);
+			} finally {
+				archive.mockRestore();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("unregisters native disposal callbacks after an operation finishes", async () => {
+		const live = await createHarness();
+		const called = vi.fn();
+		const unregister = live.session.registerDisposeCallback(called);
+		try {
+			unregister();
+			live.session.dispose();
+			expect(called).not.toHaveBeenCalled();
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["paused", "clear-race"])(
+		"settles native outcome waiters when mesh acceptance fails (%s)",
+		async (failure) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const completion = live.session.waitForAgentMessagePromptCompletion("agentmsg_failed");
+			const delivery = live.session.waitForAgentMessagePromptDelivery("agentmsg_failed");
+			let completionEnded = false;
+			let deliveryEnded = false;
+			void completion.catch(() => {
+				completionEnded = true;
+			});
+			void delivery.catch(() => {
+				deliveryEnded = true;
+			});
+			const original = live.session.acceptAgentMessagePrompt.bind(live.session);
+			const admission = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) =>
+				original(text, {
+					...options,
+					admissionCommitted: () => {
+						options?.admissionCommitted?.();
+						if (failure === "clear-race") live.session.clearQueuedAgentMessages();
+					},
+				}),
+			);
+			if (failure === "paused")
+				(h.internals as unknown as { agentMessagesPaused: boolean }).agentMessagesPaused = true;
+			try {
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "failed",
+						type: "worker_deliver_message",
+						targetActiveSessionId: "target",
+						message: "hello",
+						sender: { sessionName: "sender" },
+						cotal: { id: "failed", deliveryCount: 1 },
+					}),
+				);
+				await Promise.resolve();
+				expect(completionEnded).toBe(true);
+				expect(deliveryEnded).toBe(true);
+				expect(live.session.waitForAgentMessagePromptCompletion("agentmsg_failed")).not.toBe(completion);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
+					failure === "clear-race"
+						? [{ type: "agent_message_dropped", cotalId: "failed", reason: "cleared" }]
+						: [],
+				);
+				expect(h.frames().at(-1)).toMatchObject({ command: "worker_deliver_message", success: false });
+			} finally {
+				admission.mockRestore();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["abort", "dispose", "append-event-error"])(
+		"tracks the own entry when ending a native delivery after message_start (%s)",
 		async (outcome) => {
 			const h = harness();
 			await h.authenticate("cotal");
 			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
 			const gate = createDeferred();
 			const started = createDeferred();
-			const live = await createHarness({
-				persistSession: true,
-				tools: [
-					{
-						name: "wait",
-						label: "Wait",
-						description: "Hold the running turn",
-						parameters: Type.Object({}),
-						execute: async () => {
-							started.resolve();
-							await gate.promise;
-							return { content: [], details: {} };
-						},
-					},
-				],
+			const original = live.session.extensionRunner.emit.bind(live.session.extensionRunner);
+			const blocked = vi.spyOn(live.session.extensionRunner, "emit").mockImplementation(async (event) => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === "agent_message"
+				) {
+					started.resolve();
+					await gate.promise;
+				}
+				return original(event);
 			});
-			live.setResponses([
-				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
-				fauxAssistantMessage("done"),
-			]);
-			const running = live.session.prompt("start");
+			const originalEnd = live.session.extensionRunner.emitMessageEnd.bind(live.session.extensionRunner);
+			const appendEvent = vi
+				.spyOn(live.session.extensionRunner, "emitMessageEnd")
+				.mockImplementation(async (event) => {
+					if (
+						outcome === "append-event-error" &&
+						event.message.role === "custom" &&
+						event.message.customType === "agent_message"
+					)
+						throw new Error("Message-end processing failed before append");
+					return originalEnd(event);
+				});
+			let copiesAtCompletion = -1;
+			const countOwn = () =>
+				live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message").length;
+			const completion = live.session.waitForAgentMessagePromptCompletion("agentmsg_started");
+			void completion.then(
+				() => {
+					copiesAtCompletion = countOwn();
+				},
+				() => {
+					copiesAtCompletion = countOwn();
+				},
+			);
+			live.setResponses([fauxAssistantMessage("done")]);
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const receiving = h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					id: "started",
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionName: "sender" },
+					cotal: { id: "started", deliveryCount: 1 },
+				}),
+			);
 			try {
 				await started.promise;
-				const state = makeState("target");
-				state.runtime = {
-					...state.runtime,
-					metadata: { kind: "top-level", createdAt: 1 },
-					session: live.session,
-				} as ActiveSessionState["runtime"];
-				h.internals.sessions.set("target", state);
-				(live.session as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
-				await h.internals.handleLine(
-					h.client,
-					JSON.stringify({
-						id: "delivery",
-						type: "worker_deliver_message",
-						targetActiveSessionId: "target",
-						message: "hello",
-						sender: { sessionName: "parent" },
-						fromRelationship: "parent",
-						cotal: { id: "terminal", deliveryCount: 1 },
-					}),
+				if (outcome === "dispose") live.session.dispose();
+				const aborting = live.session.abort();
+				gate.resolve();
+				await aborting;
+				await receiving;
+				await completion.catch(() => undefined);
+				expect(countOwn()).toBe(outcome === "append-event-error" ? 0 : 1);
+				expect(copiesAtCompletion).toBe(outcome === "abort" ? 1 : 0);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
+					outcome !== "abort" ? [{ type: "agent_message_dropped", cotalId: "started", reason: "other" }] : [],
 				);
-				expect(h.frames()).toMatchObject([
-					{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
-				]);
-				expect(live.session.getSteeringMessages()).toHaveLength(1);
-				expect(live.session.getSteeringMessages()[0]).toContain("parent:parent");
-				expect(live.session.repliedToParentSinceTask).toBe(false);
-				if (outcome === "persist-race") {
-					live.sessionManager.appendCustomMessageEntry("agent_message", "already written", true, {
-						id: "agentmsg_terminal",
-					});
-				}
-				if (outcome === "dispose" || outcome === "persist-race") live.session.dispose();
-				else if (outcome === "agent-clear") live.session.clearQueuedAgentMessages();
-				else {
-					live.session.clearQueue();
-					if (outcome === "abort-clear") void live.session.abort();
-				}
-				await Promise.resolve();
-				expect(h.frames()[1]).toEqual(
-					outcome === "persist-race"
-						? { type: "agent_message_persisted", cotalId: "terminal" }
-						: { type: "agent_message_dropped", cotalId: "terminal", cleared: outcome !== "dispose" },
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual(
+					outcome === "abort" ? [{ type: "agent_message_persisted", cotalId: "started" }] : [],
 				);
-				live.sessionManager.appendCustomEntry("later");
-				expect(h.frames()).toHaveLength(2);
 			} finally {
 				gate.resolve();
-				await running.catch(() => undefined);
+				await receiving;
+				blocked.mockRestore();
+				appendEvent.mockRestore();
 				live.cleanup();
 			}
 		},
@@ -4627,6 +4987,9 @@ describe("mesh worker persistence", () => {
 			session: Object.assign(makeRuntimeSession(manager), {
 				acceptAgentMessagePrompt: accept,
 				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: () => undefined,
+				registerDisposeCallback: () => () => undefined,
 			}),
 		} as unknown as ActiveSessionState["runtime"];
 		h.internals.sessions.set("target", state);

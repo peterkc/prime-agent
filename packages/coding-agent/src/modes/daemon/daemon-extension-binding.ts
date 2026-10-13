@@ -24,6 +24,7 @@ export interface ActiveSessionBindingCallbacks {
 	createConnectionState?: (state: ActiveSessionState) => AgentConnectionState;
 	/** May be async (the daemon's rebind awaits cron-store locks); awaited before session_replaced. */
 	sessionReplaced?: (state: ActiveSessionState) => void | Promise<void>;
+	beforeSessionRebind?: (state: ActiveSessionState) => void;
 	shutdown: () => void;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 }
@@ -70,6 +71,7 @@ export async function bindActiveSessionState(
 	});
 
 	state.runtime.setRebindSession(async () => {
+		callbacks.beforeSessionRebind?.(state);
 		await bindActiveSessionState(state, callbacks);
 		// A floating promise here would let clients observe pre-rebind job state
 		// and turn a cron-store failure into an unhandled rejection.

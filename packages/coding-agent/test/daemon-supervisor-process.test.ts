@@ -2044,7 +2044,7 @@ describe("mesh supervisor compatibility", () => {
 			stop: async () => undefined,
 			sessionIdForPrincipal: () => "parent",
 		};
-		const requestWorker = vi.fn(async () => ({ success: true }));
+		const requestWorker = vi.fn(async (_command: unknown, _timeout: number) => ({ success: true }));
 		const recipient = { requestWorker };
 		const targetFile = join(root, "target.jsonl");
 		const parentFile = join(root, "parent.jsonl");
@@ -2121,6 +2121,18 @@ describe("mesh supervisor compatibility", () => {
 					error: expect.stringContaining("Agent reach is limited"),
 				});
 			expect(send).toHaveBeenCalledTimes(1);
+			for (const targetSessionId of ["missing", "ambiguous"]) {
+				const catalog = (supervisor as unknown as { catalog: { resolve: () => Promise<string> } }).catalog;
+				const resolveTarget = vi
+					.spyOn(catalog, "resolve")
+					.mockRejectedValueOnce(new Error(`${targetSessionId} target`));
+				expect(await client.request({ ...command, targetSessionId })).toMatchObject({
+					success: false,
+					error: expect.stringContaining("Message was not stored:"),
+				});
+				resolveTarget.mockRestore();
+			}
+			expect(send).toHaveBeenCalledTimes(1);
 			const bind = vi.fn();
 			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
 			expect(bind).toHaveBeenCalledExactlyOnceWith(recipient);
@@ -2136,6 +2148,30 @@ describe("mesh supervisor compatibility", () => {
 				86_400_000,
 			);
 			expect(enroll).toHaveBeenCalledExactlyOnceWith("parent", parentFile);
+			const catalog = (supervisor as unknown as { catalog: { list: () => Promise<unknown[]> } }).catalog;
+			const scan = vi.spyOn(catalog, "list").mockRejectedValue(new Error("catalog unavailable"));
+			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			expect(scan).not.toHaveBeenCalled();
+			const resolver = vi.spyOn(
+				internals.mesh as { sessionIdForPrincipal: () => string | undefined },
+				"sessionIdForPrincipal",
+			);
+			for (const lookup of ["unresolved", "error"]) {
+				if (lookup === "error")
+					resolver.mockImplementation(() => {
+						throw new Error("directory unavailable");
+					});
+				else resolver.mockReturnValue(undefined);
+				await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+				expect(requestWorker.mock.calls.at(-1)?.[0]).toMatchObject({
+					fromRelationship: undefined,
+					sender: { sessionId: undefined, sessionName: "parent" },
+				});
+			}
+			expect(requestWorker).toHaveBeenCalledTimes(4);
+			resolver.mockRestore();
+			scan.mockRestore();
+			expect(enroll).toHaveBeenCalledTimes(4);
 		} finally {
 			releaseEnrollment();
 			client.close();
@@ -2442,7 +2478,7 @@ describe("mesh supervisor compatibility", () => {
 		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient);
 		const drop = {
 			header: { kind: "outbound", outboundType: "agent_message_dropped" },
-			payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", cleared: true })),
+			payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "cleared" })),
 		};
 		worker.meshDeliveryCapable = false;
 		internals.handleWorkerFrame(worker, drop, recipient);
@@ -2456,13 +2492,23 @@ describe("mesh supervisor compatibility", () => {
 			{
 				...drop,
 				payload: Buffer.from(
-					JSON.stringify({ type: "agent_message_dropped", cotalId: "message", cleared: "true" }),
+					JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "invalid" }),
 				),
 			},
 			recipient,
 		);
 		expect(dropped).not.toHaveBeenCalled();
-		internals.handleWorkerFrame(worker, drop, recipient);
-		expect(dropped).toHaveBeenCalledExactlyOnceWith("message", recipient, true);
+		for (const reason of ["cleared", "closed", "other"]) {
+			internals.handleWorkerFrame(
+				worker,
+				{
+					...drop,
+					payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason })),
+				},
+				recipient,
+			);
+			expect(dropped).toHaveBeenLastCalledWith("message", recipient, reason);
+		}
+		expect(dropped).toHaveBeenCalledTimes(3);
 	});
 });

@@ -506,6 +506,7 @@ export class AgentDaemon {
 		{
 			promise: Promise<void>;
 			reason: DaemonSessionClosedReason;
+			messageDropReason: "closed" | "other";
 			descendants: Set<ActiveSessionState>;
 			reasonUpgrade?: Promise<void>;
 		}
@@ -1746,6 +1747,9 @@ export class AgentDaemon {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
 				createConnectionState: (targetSessionState) => this.createConnectionState(targetSessionState),
 				sessionReplaced: (targetSessionState) => this.refreshReplacedSessionState(targetSessionState),
+				beforeSessionRebind: (targetSessionState) => {
+					if (this.agentMessageTransport === "cotal") targetSessionState.runtime.session.sessionManager.flushNow();
+				},
 				shutdown: () => {
 					void this.shutdown(0);
 				},
@@ -3020,7 +3024,7 @@ export class AgentDaemon {
 		try {
 			await spawnAppend;
 		} catch (error) {
-			await this.closeSession(state, "killed", false).catch(() => undefined);
+			await this.closeSession(state, "killed", false, true, undefined, undefined, "other").catch(() => undefined);
 			// The child was never admitted: no ledger edge exists, so the
 			// display file written at the spawn write point must not remain
 			// claiming a running child.
@@ -3424,7 +3428,9 @@ export class AgentDaemon {
 			return state;
 		} catch (error) {
 			if (stateRef && this.sessions.get(stateRef.activeSessionId) === stateRef) {
-				await this.closeSession(stateRef, "completed").catch(() => undefined);
+				await this.closeSession(stateRef, "completed", true, true, undefined, undefined, "other").catch(
+					() => undefined,
+				);
 			} else {
 				await runtime?.dispose().catch(() => undefined);
 			}
@@ -6479,9 +6485,11 @@ export class AgentDaemon {
 		let active = true;
 		let deliveryFailure: unknown;
 		let unsubscribe: (() => void) | undefined;
+		let unregisterDispose: (() => void) | undefined;
 		const cleanup = () => {
 			active = false;
 			unsubscribe?.();
+			unregisterDispose?.();
 			client.socket.off("close", cleanup);
 		};
 		const check = () => {
@@ -6504,7 +6512,11 @@ export class AgentDaemon {
 		const dropped = (error: unknown) => {
 			deliveryFailure = error;
 			check();
-			if (!accepted || sent || !active) return;
+			const reason =
+				error instanceof AgentMessageClearedError
+					? "cleared"
+					: (this.closingSessions.get(target.activeSessionId)?.messageDropReason ?? "other");
+			if ((!accepted && reason === "other") || sent || !active) return;
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();
 				return;
@@ -6518,17 +6530,23 @@ export class AgentDaemon {
 						serializeJsonLine({
 							type: "agent_message_dropped",
 							cotalId: command.cotal!.id,
-							cleared: error instanceof AgentMessageClearedError,
+							reason,
 						}),
 					),
 				),
 			);
 		};
 		unsubscribe = manager.onPersist(check);
+		unregisterDispose = target.runtime.session.registerDisposeCallback(() =>
+			Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
+		);
 		client.socket.once("close", cleanup);
 		if (!ownEntry()) {
 			// Native delivery waiters must be registered before admission.
 			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
+			void target.runtime.session.waitForAgentMessagePromptCompletion(payload.id).then(() => {
+				if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
+			}, dropped);
 		}
 		try {
 			const status = ownEntry() ? "delivered" : (await this.acceptAgentSessionMessage(target, payload)).status;
@@ -6537,6 +6555,11 @@ export class AgentDaemon {
 			check();
 			if (deliveryFailure !== undefined) dropped(deliveryFailure);
 		} catch (error) {
+			target.runtime.session.rejectAgentMessagePrompt(
+				payload.id,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			dropped(error);
 			cleanup();
 			throw error;
 		}
@@ -6934,10 +6957,19 @@ export class AgentDaemon {
 		);
 		for (const state of closeStates) {
 			if (this.sessions.has(state.activeSessionId)) {
-				await this.closeSession(state, restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
+				await this.closeSession(
+					state,
+					restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed",
+					true,
+					true,
+					undefined,
+					undefined,
+					"other",
+				);
 			}
 		}
-		for (const state of [...this.sessions.values()]) await this.closeSession(state, "killed");
+		for (const state of [...this.sessions.values()])
+			await this.closeSession(state, "killed", true, true, undefined, undefined, "other");
 		return manifest;
 	}
 
@@ -7032,6 +7064,7 @@ export class AgentDaemon {
 		cascadeChildren = true,
 		descendantCollector?: Set<ActiveSessionState>,
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<void> {
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
@@ -7039,6 +7072,7 @@ export class AgentDaemon {
 		}
 		const existingClose = this.closingSessions.get(state.activeSessionId);
 		if (existingClose) {
+			if (messageDropReason === "closed") existingClose.messageDropReason = "closed";
 			const requestedReason = this.isStrongerCloseReason(reason, existingClose.reason)
 				? reason
 				: existingClose.reason;
@@ -7070,9 +7104,9 @@ export class AgentDaemon {
 		}
 		const descendants = new Set<ActiveSessionState>();
 		const closePromise = Promise.resolve().then(() =>
-			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal),
+			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, disposal, messageDropReason),
 		);
-		const close = { promise: closePromise, reason, descendants };
+		const close = { promise: closePromise, reason, messageDropReason, descendants };
 		this.closingSessions.set(state.activeSessionId, close);
 		try {
 			await closePromise;
@@ -7144,6 +7178,7 @@ export class AgentDaemon {
 		cascadeChildren: boolean,
 		descendants: Set<ActiveSessionState>,
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<void> {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
@@ -7157,7 +7192,7 @@ export class AgentDaemon {
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
 		const cascadeError = cascadeChildren
-			? await this.closeChildSessions(state, reason, waitForAbort, descendants, disposal)
+			? await this.closeChildSessions(state, reason, waitForAbort, descendants, disposal, messageDropReason)
 			: undefined;
 		// Empty draft (no messages, config, or jobs): discard rather than persist an
 		// empty session file. Mirrors the detach-time discard so a config-bearing
@@ -7235,12 +7270,13 @@ export class AgentDaemon {
 		waitForAbort = true,
 		descendants = new Set<ActiveSessionState>(),
 		disposal?: AgentSessionRuntimeDisposeOptions,
+		messageDropReason: "closed" | "other" = reason === "killed" || reason === "completed" ? "closed" : "other",
 	): Promise<unknown> {
 		let cascadeError: unknown;
 		for (const childState of getChildActiveSessionStates(this.sessions, parentState)) {
 			descendants.add(childState);
 			try {
-				await this.closeSession(childState, reason, waitForAbort, true, descendants, disposal);
+				await this.closeSession(childState, reason, waitForAbort, true, descendants, disposal, messageDropReason);
 			} catch (error) {
 				cascadeError ??= error;
 			}

@@ -252,6 +252,16 @@ describe("mesh endpoints", () => {
 		expect(source.unicastAttributed).toHaveBeenCalledExactlyOnceWith("local.b", "hello");
 		expect(mesh.sessionIdForPrincipal("local.a", ["b", "a"])).toBe("a");
 		expect(mesh.sessionIdForPrincipal("local.unknown", ["a", "b"])).toBeUndefined();
+		const get = directories.get.bind(directories);
+		const corrupt = vi.spyOn(directories, "get").mockImplementation((id) => {
+			if (id === "broken") throw new Error("Invalid mesh directory entry");
+			return get(id);
+		});
+		try {
+			expect(mesh.sessionIdForPrincipal("local.a", ["broken", "b", "a"])).toBe("a");
+		} finally {
+			corrupt.mockRestore();
+		}
 	});
 
 	it("broadcasts through the existing host expansion once per each of three family members", async () => {
@@ -363,40 +373,55 @@ describe("mesh endpoints", () => {
 		expect(handoff.mock.calls[1]![2]).toBe(2);
 	});
 
-	it.each([true, false])(
-		"settles a dropped delivery, stops its timers and hands off the next item (cleared=%s)",
-		async (cleared) => {
+	it.each(["cleared", "closed", "other"] as const)(
+		"settles a dropped delivery, stops its timers and hands off the next item (reason=%s)",
+		async (reason) => {
 			vi.useFakeTimers();
 			const { mesh, target, handoff, log } = await fixture();
 			const first = delivery("dropped");
 			const next = delivery("next");
 			target.emit("message", first.message, first.delivery, { kind: "dm" });
 			target.emit("message", next.message, next.delivery, { kind: "dm" });
-			mesh.confirmDropped("dropped", {}, cleared);
-			mesh.confirmDropped("next", recipient, cleared);
+			mesh.confirmDropped("dropped", {}, reason);
+			mesh.confirmDropped("next", recipient, reason);
 			expect(first.ack).not.toHaveBeenCalled();
 			expect(first.delivery.nak).not.toHaveBeenCalled();
 			expect(handoff).toHaveBeenCalledTimes(1);
 			const firstHandoff = settled(mesh, "b");
-			mesh.confirmDropped("dropped", recipient, cleared);
+			mesh.confirmDropped("dropped", recipient, reason);
 			await vi.advanceTimersByTimeAsync(0);
 			expect(handoff).toHaveBeenCalledTimes(2);
 			await firstHandoff;
-			expect(first.ack).toHaveBeenCalledTimes(cleared ? 1 : 0);
-			expect(first.delivery.nak).toHaveBeenCalledTimes(cleared ? 0 : 1);
+			expect(first.ack).toHaveBeenCalledTimes(reason !== "other" ? 1 : 0);
+			expect(first.delivery.nak).toHaveBeenCalledTimes(0);
 			expect(handoff).toHaveBeenCalledTimes(2);
 			mesh.confirmPersisted("next", recipient);
 			await settled(mesh, "b");
-			mesh.confirmDropped("dropped", recipient, !cleared);
-			mesh.confirmDropped("next", recipient, false);
+			mesh.confirmDropped("dropped", recipient, "other");
+			mesh.confirmDropped("next", recipient, "other");
 			await vi.advanceTimersByTimeAsync(6000);
 			expect(first.working).toHaveBeenCalledTimes(1);
 			expect(next.working).toHaveBeenCalledTimes(1);
 			expect(next.ack).toHaveBeenCalledTimes(1);
 			expect(next.delivery.nak).not.toHaveBeenCalled();
-			expect(log).not.toHaveBeenCalled();
+			expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(`dropped ${reason}`));
 		},
 	);
+
+	it("logs and settles a cleared drop before its failed handoff response", async () => {
+		const { mesh, target, handoff, log } = await fixture();
+		const first = delivery("race");
+		handoff.mockImplementationOnce(async (_record, _message, _count, bind) => {
+			bind(recipient);
+			mesh.confirmDropped("race", recipient, "cleared");
+			throw new Error("Acceptance was cleared");
+		});
+		target.emit("message", first.message, first.delivery, { kind: "dm" });
+		await settled(mesh, "b");
+		expect(first.ack).toHaveBeenCalledTimes(1);
+		expect(first.delivery.nak).not.toHaveBeenCalled();
+		expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("dropped cleared"));
+	});
 
 	it.each(["malformed", "unknown", "empty", "overlong", "nontext", "wrong-text"])(
 		"acknowledges and logs only permanent payload validation failures (%s)",

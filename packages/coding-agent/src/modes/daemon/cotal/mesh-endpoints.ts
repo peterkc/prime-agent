@@ -55,6 +55,7 @@ interface SessionEndpoint {
 }
 
 interface PendingPersistence {
+	readonly deliveryCount: number;
 	readonly sessionId: string;
 	readonly delivery: Delivery;
 	readonly resolve: () => void;
@@ -221,9 +222,13 @@ export class MeshEndpoints {
 	}
 
 	sessionIdForPrincipal(principal: string, knownSessionIds: readonly string[]): string | undefined {
-		return knownSessionIds.find(
-			(sessionId) => readDirectory(this.options.meshRoot, sessionId)?.principal === principal,
-		);
+		return knownSessionIds.find((sessionId) => {
+			try {
+				return readDirectory(this.options.meshRoot, sessionId)?.principal === principal;
+			} catch {
+				return false;
+			}
+		});
 	}
 
 	async send(
@@ -359,7 +364,7 @@ export class MeshEndpoints {
 			}
 			if (this.pending.has(message.id)) throw new Error("A copy is already in flight");
 			const persisted = new Promise<void>((resolve, reject) => {
-				pending = { sessionId: session.record.sessionId, delivery, resolve, reject };
+				pending = { sessionId: session.record.sessionId, deliveryCount, delivery, resolve, reject };
 				this.pending.set(message.id, pending);
 			});
 			// A disconnect may reject this while wake/acceptance is still pending.
@@ -369,6 +374,7 @@ export class MeshEndpoints {
 			});
 			await persisted;
 		} catch (error) {
+			if (pending && this.pending.get(message.id) !== pending) return;
 			if (error instanceof InvalidMeshPayloadError) {
 				let outcome = "invalid payload acknowledged";
 				try {
@@ -403,18 +409,22 @@ export class MeshEndpoints {
 		}
 	}
 
-	confirmDropped(cotalId: string, recipient: object, cleared: boolean): void {
+	confirmDropped(cotalId: string, recipient: object, reason: "cleared" | "closed" | "other"): void {
 		if (this.closing) return;
 		const pending = this.pending.get(cotalId);
 		if (!pending || pending.recipient !== recipient) return;
 		this.pending.delete(cotalId);
+		let outcome = reason === "other" ? "left unacknowledged" : "acknowledged";
 		try {
-			if (cleared) pending.delivery.ack();
-			else pending.delivery.nak();
+			if (reason !== "other") pending.delivery.ack();
 			pending.resolve();
 		} catch {
+			outcome = "acknowledgement failed; left unacknowledged";
 			pending.reject(new Error("Mesh terminal acknowledgement failed"));
 		}
+		this.options.log(
+			`Mesh session ${pending.sessionId}, Cotal ID ${cotalId}, delivery count ${pending.deliveryCount}: dropped ${reason}; ${outcome}`,
+		);
 	}
 
 	disconnect(recipient: object): void {

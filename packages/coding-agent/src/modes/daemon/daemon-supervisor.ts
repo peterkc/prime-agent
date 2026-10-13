@@ -2879,13 +2879,17 @@ export class DaemonSupervisor {
 			);
 			let target = targetRow ? sessionSummaryFromRosterEntry(targetRow) : undefined;
 			if (!target) {
-				const path = await this.catalog.resolve(
-					command.targetSessionId,
-					source.summary.cwd,
-					source.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
-				);
-				const info = await readSessionInfo(path);
-				if (info) target = summaryForInactiveSession(info);
+				try {
+					const path = await this.catalog.resolve(
+						command.targetSessionId,
+						source.summary.cwd,
+						source.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
+					);
+					const info = await readSessionInfo(path);
+					if (info) target = summaryForInactiveSession(info);
+				} catch (error) {
+					throw new Error(`Message was not stored: ${redactMeshError(error)}`);
+				}
 			}
 			if (!target) throw new Error("Message was not stored: target session is unavailable");
 			this.assertAgentMessageOrigin(source.summary, target, true);
@@ -3840,15 +3844,30 @@ export class DaemonSupervisor {
 			(root ? sessionSummaryFromRosterEntry(root) : undefined);
 		if (!summary || summary.sessionId !== record.sessionId)
 			throw new Error("Woken worker has no matching mesh session");
-		const family = await this.familyCatalogEntries();
-		const senderSessionId = this.mesh?.sessionIdForPrincipal(
-			message.from.id,
-			family.map((entry) => entry.id),
-		);
-		const senderEntry = family.find((entry) => entry.id === senderSessionId);
-		const fromRelationship = senderEntry
-			? agentFamilyRelationship(this.familyCatalogEntry(summary), senderEntry)
-			: undefined;
+		let senderSessionId: string | undefined;
+		let fromRelationship: ReturnType<typeof agentFamilyRelationship>;
+		try {
+			let family = [...this.roster().values()].map((entry) =>
+				this.familyCatalogEntry(sessionSummaryFromRosterEntry(entry)),
+			);
+			senderSessionId = this.mesh?.sessionIdForPrincipal(
+				message.from.id,
+				family.map((entry) => entry.id),
+			);
+			if (!senderSessionId) {
+				family = await this.familyCatalogEntries();
+				senderSessionId = this.mesh?.sessionIdForPrincipal(
+					message.from.id,
+					family.map((entry) => entry.id),
+				);
+			}
+			const senderEntry = family.find((entry) => entry.id === senderSessionId);
+			fromRelationship = senderEntry
+				? agentFamilyRelationship(this.familyCatalogEntry(summary), senderEntry)
+				: undefined;
+		} catch {
+			fromRelationship = undefined;
+		}
 		const recipient = this.requireAvailableWorkerClient(worker);
 		bindRecipient(recipient);
 		const response = await recipient.requestWorker(
@@ -6139,8 +6158,11 @@ export class DaemonSupervisor {
 					typeof persisted.cotalId === "string"
 				) {
 					if (persisted.type === "agent_message_persisted") this.mesh?.confirmPersisted(persisted.cotalId, source);
-					else if ("cleared" in persisted && typeof persisted.cleared === "boolean")
-						this.mesh?.confirmDropped(persisted.cotalId, source, persisted.cleared);
+					else if (
+						"reason" in persisted &&
+						(persisted.reason === "cleared" || persisted.reason === "closed" || persisted.reason === "other")
+					)
+						this.mesh?.confirmDropped(persisted.cotalId, source, persisted.reason);
 				}
 			} catch {
 				this.log("Mesh worker sent an invalid persistence frame");
