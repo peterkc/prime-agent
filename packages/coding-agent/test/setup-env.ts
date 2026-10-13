@@ -10,6 +10,7 @@ for (const name of Object.keys(process.env)) {
 	if (name.startsWith("PRIME_AGENT_INTERNAL_") || name.startsWith("RLM_")) delete process.env[name];
 }
 delete process.env.PRIME_AGENT_SESSION_DIR;
+delete process.env.PRIME_AGENT_CODING_AGENT_SESSION_DIR; // legacy name, still read by getSessionDir()
 delete process.env.PRIME_AGENT_KERNEL_OWNER_PID;
 const agentDir = mkdtempSync(join(tmpdir(), "prime-agent-test-home-"));
 process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
