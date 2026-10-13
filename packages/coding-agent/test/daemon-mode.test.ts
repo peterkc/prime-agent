@@ -4369,11 +4369,13 @@ describe("update restart checkpoint wait", () => {
 describe("mesh worker persistence", () => {
 	const roots: string[] = [];
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	});
 	function harness(createRuntime?: CreateAgentSessionRuntimeFactory) {
 		const root = mkdtempSync(join(tmpdir(), "prime-mesh-worker-"));
 		roots.push(root);
+		vi.stubEnv(ENV_AGENT_DIR, root); // Default session files follow this variable, not defaultSessionConfig.
 		const daemon = new AgentDaemon(join(root, "worker.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
 			createRuntime:

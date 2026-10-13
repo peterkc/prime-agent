@@ -13,7 +13,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
@@ -2013,6 +2013,8 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 });
 
 describe("mesh supervisor compatibility", () => {
+	beforeEach(() => vi.stubEnv(ENV_AGENT_DIR, tempDir())); // Supervisor logs follow this variable.
+	afterEach(() => vi.unstubAllEnvs());
 	it("publishes a stored mesh receipt, rejects unrelated/self origins and hands off a parent message without awaiting enrollment", async () => {
 		const root = tempDir();
 		const socketPath = join(root, "mesh.sock");

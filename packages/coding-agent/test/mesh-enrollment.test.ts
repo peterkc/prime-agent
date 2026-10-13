@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
@@ -64,11 +65,14 @@ afterEach(async () => {
 	FakeEndpoint.instances = [];
 	FakeEndpoint.failStart = false;
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+	vi.useRealTimers();
 });
 
 async function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "prime-mesh-enrollment-"));
 	roots.push(root);
+	vi.stubEnv(ENV_AGENT_DIR, root); // Supervisor logs follow this variable, not defaultSessionConfig.
 	const meshRoot = join(root, "mesh");
 	mkdirSync(meshRoot);
 	const auth = core.stripSpaceAuth(await core.createSpaceAuth("prime"));
@@ -349,6 +353,7 @@ describe("mesh enrollment", () => {
 	);
 
 	it("mints two one-hour credentials with the same identity, lifecycle and read set", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] }); // expiry and iat read the clock separately; a second boundary between them gave 3599
 		const { meshRoot, sessionId, sessionFile } = await fixture();
 		const record = { ...ensureEnrollmentRecord(meshRoot, sessionId, sessionFile), allowSubscribe: ["work"] };
 		const source = credentialSource(meshRoot, "prime", record);
@@ -364,6 +369,7 @@ describe("mesh enrollment", () => {
 	it.each(["native", "project", "invalid"])("selects native for %s and creates no mesh files", async (mode) => {
 		const root = mkdtempSync(join(tmpdir(), "prime-mesh-off-"));
 		roots.push(root);
+		vi.stubEnv(ENV_AGENT_DIR, root);
 		const cwd = join(root, "project");
 		mkdirSync(join(cwd, ".prime"), { recursive: true });
 		writeFileSync(join(root, "settings.json"), mode === "invalid" ? "{" : "{}");
@@ -402,7 +408,6 @@ describe("mesh enrollment", () => {
 				cwd,
 				env: {
 					...process.env,
-					PRIME_AGENT_CODING_AGENT_DIR: root,
 					TSX_TSCONFIG_PATH: resolve("../../tsconfig.json"),
 				},
 			},
