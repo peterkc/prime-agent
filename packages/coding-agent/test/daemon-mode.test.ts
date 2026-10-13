@@ -18,7 +18,8 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type Api, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
+import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
@@ -73,6 +74,8 @@ import {
 
 import { type PrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
+import { createHarness } from "./suite/harness.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 describe("daemon mode helpers", () => {
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -4364,14 +4367,16 @@ describe("mesh worker persistence", () => {
 	afterEach(() => {
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	});
-	function harness() {
+	function harness(createRuntime?: CreateAgentSessionRuntimeFactory) {
 		const root = mkdtempSync(join(tmpdir(), "prime-mesh-worker-"));
 		roots.push(root);
 		const daemon = new AgentDaemon(join(root, "worker.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
-			createRuntime: async () => {
-				throw new Error("unused");
-			},
+			createRuntime:
+				createRuntime ??
+				(async () => {
+					throw new Error("unused");
+				}),
 			worker: { authenticationToken: "token" },
 		});
 		const internals = daemon as unknown as {
@@ -4445,43 +4450,164 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it("returns not stored for an old supervisor without trying a native send", async () => {
+	it.each(["old", "stored"])("sends through the mesh controller without native fallback (%s)", async (mode) => {
 		const h = harness();
 		await h.authenticate("cotal");
 		const worker = h.internals as unknown as {
 			createAgentFamily(): Promise<unknown[]>;
 			supervisorLink(): unknown;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState: ActiveSessionState;
-				origin: "agent";
-			}): Promise<unknown>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
 		};
 		worker.createAgentFamily = async () => [
 			{ relationship: "sibling", entry: { id: "session-b", sessionPath: join(h.root, "b.jsonl") } },
 		];
+		const receipt = { deliveryStatus: "stored", cotalId: "stored", sequence: 42 };
 		const request = vi.fn(async () => {
-			throw new DaemonCapabilityUnavailableError("mesh_send", "mesh_send");
+			if (mode === "old") throw new DaemonCapabilityUnavailableError("mesh_send", "mesh_send");
+			return { success: true, data: receipt };
 		});
 		worker.supervisorLink = () => ({ ensureConnected: async () => undefined, request });
 		const source = makeState("a");
 		source.runtime = {
 			session: { sessionFile: join(h.root, "a.jsonl") },
 		} as unknown as ActiveSessionState["runtime"];
-		await expect(
-			worker.sendAgentSessionMessage({
-				targetSelector: "session-b",
-				message: "hello",
-				fromState: source,
-				origin: "agent",
-			}),
-		).rejects.toThrow("not stored");
+		const sending = worker
+			.createAgentMessageController(() => source)
+			.sendAgentMessage({ target: "session-b", message: "hello" });
+		if (mode === "old") await expect(sending).rejects.toThrow("not stored");
+		else await expect(sending).resolves.toEqual(receipt);
 		expect(request).toHaveBeenCalledExactlyOnceWith(
 			{ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "session-b", message: "hello" },
 			35_000,
 		);
 	});
+
+	it.each(["native", "cotal"])(
+		"makes a new Cotal session file readable before binding can publish its roster (%s)",
+		async (mode) => {
+			const gate = createDeferred();
+			const reached = createDeferred();
+			let manager!: SessionManager;
+			const h = harness(async (options) => {
+				manager = options.sessionManager;
+				const session = Object.assign(makeRuntimeSession(manager), {
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				});
+				session.bindExtensions = async () => {
+					reached.resolve();
+					await gate.promise;
+				};
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				} as never;
+			});
+			await h.authenticate(mode);
+			const creating = h.internals.handleLine(h.client, JSON.stringify({ id: "new", type: "create" }));
+			try {
+				await reached.promise;
+				expect(h.internals.sessions.size).toBe(1);
+				expect(existsSync(manager.getSessionFile()!)).toBe(mode === "cotal");
+				if (mode === "cotal")
+					expect(await readSessionInfo(manager.getSessionFile()!)).toMatchObject({
+						id: manager.getSessionId(),
+						messageCount: 0,
+					});
+			} finally {
+				gate.resolve();
+				await creating;
+			}
+			expect(h.frames().at(-1)).toMatchObject({ command: "create", success: true });
+		},
+	);
+
+	it.each(["clear", "abort-clear", "agent-clear", "dispose", "persist-race"])(
+		"reports a terminal queued delivery once without dropping a written entry (%s)",
+		async (outcome) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const gate = createDeferred();
+			const started = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				tools: [
+					{
+						name: "wait",
+						label: "Wait",
+						description: "Hold the running turn",
+						parameters: Type.Object({}),
+						execute: async () => {
+							started.resolve();
+							await gate.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			const running = live.session.prompt("start");
+			try {
+				await started.promise;
+				const state = makeState("target");
+				state.runtime = {
+					...state.runtime,
+					metadata: { kind: "top-level", createdAt: 1 },
+					session: live.session,
+				} as ActiveSessionState["runtime"];
+				h.internals.sessions.set("target", state);
+				(live.session as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "delivery",
+						type: "worker_deliver_message",
+						targetActiveSessionId: "target",
+						message: "hello",
+						sender: { sessionName: "parent" },
+						fromRelationship: "parent",
+						cotal: { id: "terminal", deliveryCount: 1 },
+					}),
+				);
+				expect(h.frames()).toMatchObject([
+					{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
+				]);
+				expect(live.session.getSteeringMessages()).toHaveLength(1);
+				expect(live.session.getSteeringMessages()[0]).toContain("parent:parent");
+				expect(live.session.repliedToParentSinceTask).toBe(false);
+				if (outcome === "persist-race") {
+					live.sessionManager.appendCustomMessageEntry("agent_message", "already written", true, {
+						id: "agentmsg_terminal",
+					});
+				}
+				if (outcome === "dispose" || outcome === "persist-race") live.session.dispose();
+				else if (outcome === "agent-clear") live.session.clearQueuedAgentMessages();
+				else {
+					live.session.clearQueue();
+					if (outcome === "abort-clear") void live.session.abort();
+				}
+				await Promise.resolve();
+				expect(h.frames()[1]).toEqual(
+					outcome === "persist-race"
+						? { type: "agent_message_persisted", cotalId: "terminal" }
+						: { type: "agent_message_dropped", cotalId: "terminal", cleared: outcome !== "dispose" },
+				);
+				live.sessionManager.appendCustomEntry("later");
+				expect(h.frames()).toHaveLength(2);
+			} finally {
+				gate.resolve();
+				await running.catch(() => undefined);
+				live.cleanup();
+			}
+		},
+	);
 
 	it("answers acceptance, rejects an unrelated write notice after its own failed append, then reports its own rewrite once and detects repeats", async () => {
 		const h = harness();
@@ -4498,7 +4624,10 @@ describe("mesh worker persistence", () => {
 		state.runtime = {
 			...state.runtime,
 			metadata: { kind: "top-level", createdAt: 1 },
-			session: Object.assign(makeRuntimeSession(manager), { acceptAgentMessagePrompt: accept }),
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+			}),
 		} as unknown as ActiveSessionState["runtime"];
 		h.internals.sessions.set("target", state);
 		h.internals.getOrHydrateBoundSessionState = async () => state;

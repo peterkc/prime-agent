@@ -2013,14 +2013,152 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 });
 
 describe("mesh supervisor compatibility", () => {
+	it("publishes a stored mesh receipt, rejects unrelated/self origins and hands off a parent message without awaiting enrollment", async () => {
+		const root = tempDir();
+		const socketPath = join(root, "mesh.sock");
+		const supervisor = new DaemonSupervisor(socketPath, { defaultSessionConfig: { agentDir: root, cwd: root } });
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			workers: Map<string, unknown>;
+			roster(): AgentRoster;
+			handoffMeshMessage(
+				record: { sessionFile: string; sessionId: string },
+				message: unknown,
+				count: number,
+				bind: (recipient: object) => void,
+			): Promise<void>;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		await supervisor.start();
+		const client = new DaemonClient(socketPath);
+		let releaseEnrollment!: () => void;
+		const enrolling = new Promise<void>((resolveEnroll) => {
+			releaseEnrollment = resolveEnroll;
+		});
+		const send = vi.fn(async () => ({ deliveryStatus: "stored", cotalId: "published", sequence: 42 }));
+		const enroll = vi.fn(() => enrolling);
+		internals.mesh = {
+			send,
+			enroll,
+			start: async () => undefined,
+			stop: async () => undefined,
+			sessionIdForPrincipal: () => "parent",
+		};
+		const requestWorker = vi.fn(async () => ({ success: true }));
+		const recipient = { requestWorker };
+		const targetFile = join(root, "target.jsonl");
+		const parentFile = join(root, "parent.jsonl");
+		const sourceSummary = {
+			id: "source",
+			activeSessionId: "source",
+			sessionId: "parent",
+			sessionFile: parentFile,
+			cwd: root,
+			rlmDepth: 0,
+		};
+		const targetSummary = {
+			id: "target",
+			activeSessionId: "target",
+			sessionId: "child",
+			sessionFile: targetFile,
+			cwd: root,
+			rlmDepth: 1,
+			parentSessionId: "parent",
+		};
+		const worker = {
+			descriptor: {
+				workerId: "w",
+				rootActiveSessionId: "source",
+				lifecycle: "ready",
+				createCommand: { type: "create" },
+			},
+			client: recipient,
+			meshDeliveryCapable: true,
+			summaries: new Map([
+				["source", sourceSummary],
+				["target", targetSummary],
+			]),
+		};
+		internals.workers.set("w", worker);
+		for (const summary of [
+			sourceSummary,
+			targetSummary,
+			{
+				...targetSummary,
+				id: "stranger",
+				activeSessionId: "stranger",
+				sessionId: "stranger",
+				sessionFile: join(root, "stranger.jsonl"),
+				parentSessionId: "another",
+			},
+		])
+			internals.roster().write({ agentId: summary.id, summary } as never, "w");
+		const message = {
+			id: "incoming",
+			from: { id: "local.parent", name: "parent" },
+			parts: [{ kind: "text", text: " hello " }],
+		};
+		try {
+			await client.connect();
+			const command = {
+				type: "mesh_send",
+				fromActiveSessionId: "source",
+				targetSessionId: "child",
+				message: " hello ",
+			} as const;
+			expect(await client.request(command)).toMatchObject({
+				success: true,
+				data: { deliveryStatus: "stored", cotalId: "published", sequence: 42 },
+			});
+			expect(send).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ sessionId: "parent" }),
+				"child",
+				"hello",
+			);
+			for (const targetSessionId of ["parent", "stranger"])
+				expect(await client.request({ ...command, targetSessionId })).toMatchObject({
+					success: false,
+					error: expect.stringContaining("Agent reach is limited"),
+				});
+			expect(send).toHaveBeenCalledTimes(1);
+			const bind = vi.fn();
+			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			expect(bind).toHaveBeenCalledExactlyOnceWith(recipient);
+			expect(requestWorker).toHaveBeenCalledExactlyOnceWith(
+				{
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionId: "parent", sessionName: "parent", clientId: "local.parent" },
+					fromRelationship: "parent",
+					cotal: { id: "incoming", deliveryCount: 2 },
+				},
+				86_400_000,
+			);
+			expect(enroll).toHaveBeenCalledExactlyOnceWith("parent", parentFile);
+		} finally {
+			releaseEnrollment();
+			client.close();
+			internals.workers.clear();
+			await internals.cleanupSupervisorResources();
+		}
+	});
+
 	it("F12 F14 enrolls queued-to-bound and adopted children, with direct reopen and one failure log on launch", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
 		});
-		const summary = { id: "a", sessionId: "saved", sessionFile: "saved.jsonl" };
+		const summary = { id: "a", activeSessionId: "a", sessionId: "saved", sessionFile: "saved.jsonl" };
 		const worker = {
-			descriptor: { workerId: "w", rootActiveSessionId: "a", lifecycle: "ready", sessionFile: "saved.jsonl" },
+			descriptor: {
+				workerId: "w",
+				rootActiveSessionId: "a",
+				rootSessionId: "saved",
+				lifecycle: "ready",
+				sessionFile: "saved.jsonl",
+				createCommand: { type: "create" },
+			},
 			summaries: new Map([["a", summary]]),
 			client: {},
 		};
@@ -2035,9 +2173,6 @@ describe("mesh supervisor compatibility", () => {
 			applyWorkerRosterSnapshot(worker: unknown, delta: unknown): Promise<void>;
 			rlmSpawnLedger(): unknown;
 			hydratedSeedEntry(entry: unknown): Promise<unknown>;
-			assertWorkerCreateOwner(): void;
-			canRetryFailedWorker(): boolean;
-			isWorkerReadyForCreate(): boolean;
 			reuseWorkerForCreate(worker: unknown, owner: undefined, path: string): Promise<unknown>;
 		};
 		const enroll = vi
@@ -2051,9 +2186,6 @@ describe("mesh supervisor compatibility", () => {
 		const enqueueEnrollment = vi.fn((id: string, file?: string) => enroll(id, file));
 		internals.mesh = { enroll, enqueueEnrollment };
 		internals.log = vi.fn();
-		internals.assertWorkerCreateOwner = () => undefined;
-		internals.canRetryFailedWorker = () => false;
-		internals.isWorkerReadyForCreate = () => true;
 		internals.workers.set("w", worker);
 		const child = {
 			agentId: "child",
@@ -2124,6 +2256,24 @@ describe("mesh supervisor compatibility", () => {
 		expect(enroll).toHaveBeenCalledTimes(2);
 		expect(internals.log).toHaveBeenCalledTimes(2);
 		for (const [message] of vi.mocked(internals.log).mock.calls) expect(message).toContain("launch refused");
+		let release!: () => void;
+		enroll.mockImplementationOnce(
+			() =>
+				new Promise<void>((resolveEnroll) => {
+					release = resolveEnroll;
+				}),
+		);
+		let reused = false;
+		const opening = internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl").then(() => {
+			reused = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(reused).toBe(true);
+		} finally {
+			release();
+			await opening;
+		}
 	});
 
 	it.each(["shutdown", "reject-shutdown", "cleanup"])("orders mesh stop and teardown (%s)", async (mode) => {
@@ -2217,6 +2367,7 @@ describe("mesh supervisor compatibility", () => {
 			defaultSessionConfig: { agentDir: root, cwd: root },
 		});
 		const confirm = vi.fn();
+		const dropped = vi.fn();
 		const publish = vi.fn();
 		const recipient = { requestWorker: vi.fn() };
 		const worker = { client: recipient, meshDeliveryCapable: false, descriptor: { workerId: "worker" } };
@@ -2235,7 +2386,7 @@ describe("mesh supervisor compatibility", () => {
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			handleWorkerFrame(worker: unknown, frame: unknown, source: unknown): void;
 		};
-		internals.mesh = { confirmPersisted: confirm, send: publish };
+		internals.mesh = { confirmPersisted: confirm, confirmDropped: dropped, send: publish };
 		internals.clearRosterStaleness = () => undefined;
 		internals.findWorkerForClient = async () => ({
 			worker,
@@ -2265,7 +2416,12 @@ describe("mesh supervisor compatibility", () => {
 		internals.createOrReuseWorker = async () => worker;
 		const bind = vi.fn();
 		await expect(
-			internals.handoffMeshMessage({ sessionFile: "a.jsonl", sessionId: "a" }, {}, 1, bind),
+			internals.handoffMeshMessage(
+				{ sessionFile: "a.jsonl", sessionId: "a" },
+				{ id: "legacy", from: { id: "local.sender", name: "sender" }, parts: [{ kind: "text", text: "hello" }] },
+				1,
+				bind,
+			),
 		).rejects.toThrow("Restart that session");
 		expect(bind).not.toHaveBeenCalled();
 		expect(recipient.requestWorker).not.toHaveBeenCalled();
@@ -2284,5 +2440,29 @@ describe("mesh supervisor compatibility", () => {
 		internals.shuttingDown = false;
 		internals.handleWorkerFrame(worker, frame, recipient);
 		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient);
+		const drop = {
+			header: { kind: "outbound", outboundType: "agent_message_dropped" },
+			payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", cleared: true })),
+		};
+		worker.meshDeliveryCapable = false;
+		internals.handleWorkerFrame(worker, drop, recipient);
+		worker.meshDeliveryCapable = true;
+		internals.handleWorkerFrame(worker, drop, {});
+		internals.shuttingDown = true;
+		internals.handleWorkerFrame(worker, drop, recipient);
+		internals.shuttingDown = false;
+		internals.handleWorkerFrame(
+			worker,
+			{
+				...drop,
+				payload: Buffer.from(
+					JSON.stringify({ type: "agent_message_dropped", cotalId: "message", cleared: "true" }),
+				),
+			},
+			recipient,
+		);
+		expect(dropped).not.toHaveBeenCalled();
+		internals.handleWorkerFrame(worker, drop, recipient);
+		expect(dropped).toHaveBeenCalledExactlyOnceWith("message", recipient, true);
 	});
 });

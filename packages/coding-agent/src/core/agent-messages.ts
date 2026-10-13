@@ -340,6 +340,9 @@ export function isAgentSessionMessageId(id: string | undefined): boolean {
 	return id !== undefined && id.startsWith(AGENT_MESSAGE_ID_PREFIX);
 }
 
+/** Terminal delivery caused by an explicit queue clear or deletion. */
+export class AgentMessageClearedError extends Error {}
+
 export function normalizeAgentSessionMessage(message: string, maxChars = DEFAULT_AGENT_MESSAGE_MAX_CHARS): string {
 	const trimmed = message.trim();
 	if (!trimmed) {

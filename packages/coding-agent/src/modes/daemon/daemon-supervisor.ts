@@ -18,6 +18,7 @@ import {
 import {
 	type AgentFamilyCatalogEntry,
 	type AgentSessionMessageAgentSummary,
+	agentFamilyRelationship,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	formatAgentSessionNameUnavailable,
@@ -77,8 +78,8 @@ import {
 } from "./agent-roster.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
-import { type EnrollmentRecord, redactMeshError } from "./cotal/enrollment.js";
-import { MeshEndpoints } from "./cotal/mesh-endpoints.js";
+import type { MeshEndpoints } from "./cotal/mesh-endpoints.js";
+import { type EnrollmentRecord, meshMessageText, redactMeshError } from "./cotal/mesh-shared.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import {
 	DaemonSessionRecoveringError,
@@ -859,6 +860,7 @@ export class DaemonSupervisor {
 			}
 			this.assertSocketLeaseHeld();
 			if (this.agentMessageTransport === "cotal") {
+				const { MeshEndpoints } = await import("./cotal/mesh-endpoints.js");
 				this.mesh = new MeshEndpoints({
 					meshRoot: join(agentDir, "mesh"),
 					homeSocket: this.socketPath,
@@ -2872,6 +2874,21 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
+			const targetRow = [...this.roster().values()].find(
+				(entry) => entry.summary.sessionId === command.targetSessionId,
+			);
+			let target = targetRow ? sessionSummaryFromRosterEntry(targetRow) : undefined;
+			if (!target) {
+				const path = await this.catalog.resolve(
+					command.targetSessionId,
+					source.summary.cwd,
+					source.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
+				);
+				const info = await readSessionInfo(path);
+				if (info) target = summaryForInactiveSession(info);
+			}
+			if (!target) throw new Error("Message was not stored: target session is unavailable");
+			this.assertAgentMessageOrigin(source.summary, target, true);
 			const receipt = await this.mesh.send(
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
@@ -2938,13 +2955,8 @@ export class DaemonSupervisor {
 				target = { worker, summary };
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
-			if (source && command.agentOrigin === true) {
-				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
-			}
 			if (source) {
-				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
-					throw new Error("Agent messaging cannot target the sending session");
-				}
+				this.assertAgentMessageOrigin(source.summary, target.summary, command.agentOrigin === true);
 				const targetClient = this.requireAvailableWorkerClient(target.worker);
 				const response = await targetClient.requestWorker(
 					{
@@ -3354,7 +3366,7 @@ export class DaemonSupervisor {
 			throw new Error(`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`);
 		}
 		const root = current.summaries.get(current.descriptor.rootActiveSessionId);
-		if (root?.sessionId) await this.enrollMeshSession(root.sessionId, root.sessionFile);
+		if (root?.sessionId) void this.enrollMeshSession(root.sessionId, root.sessionFile);
 		return current;
 	}
 
@@ -3668,7 +3680,7 @@ export class DaemonSupervisor {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
-			if (summary.sessionId) await this.enrollMeshSession(summary.sessionId, summary.sessionFile);
+			if (summary.sessionId) void this.enrollMeshSession(summary.sessionId, summary.sessionFile);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
@@ -3814,6 +3826,7 @@ export class DaemonSupervisor {
 		bindRecipient: (recipient: object) => void,
 	): Promise<void> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
+		const text = meshMessageText(message);
 		const worker = await this.createOrReuseWorker("mesh", {
 			type: "create",
 			sessionPath: record.sessionFile,
@@ -3827,18 +3840,24 @@ export class DaemonSupervisor {
 			(root ? sessionSummaryFromRosterEntry(root) : undefined);
 		if (!summary || summary.sessionId !== record.sessionId)
 			throw new Error("Woken worker has no matching mesh session");
+		const family = await this.familyCatalogEntries();
+		const senderSessionId = this.mesh?.sessionIdForPrincipal(
+			message.from.id,
+			family.map((entry) => entry.id),
+		);
+		const senderEntry = family.find((entry) => entry.id === senderSessionId);
+		const fromRelationship = senderEntry
+			? agentFamilyRelationship(this.familyCatalogEntry(summary), senderEntry)
+			: undefined;
 		const recipient = this.requireAvailableWorkerClient(worker);
 		bindRecipient(recipient);
 		const response = await recipient.requestWorker(
 			{
 				type: "worker_deliver_message",
 				targetActiveSessionId: summary.activeSessionId ?? summary.id,
-				message: message.parts
-					.flatMap((part) =>
-						part.kind === "text" && "text" in part && typeof part.text === "string" ? [part.text] : [],
-					)
-					.join("\n"),
-				sender: { sessionName: message.from.name, clientId: message.from.id },
+				message: text,
+				fromRelationship,
+				sender: { sessionId: senderSessionId, sessionName: message.from.name, clientId: message.from.id },
 				cotal: { id: message.id, deliveryCount },
 			},
 			WORKER_REQUEST_TIMEOUT_MS,
@@ -5306,6 +5325,12 @@ export class DaemonSupervisor {
 		};
 	}
 
+	private assertAgentMessageOrigin(source: SessionSummary, target: SessionSummary, agentOrigin: boolean): void {
+		if (agentOrigin) assertAgentFamilyReach(this.familyCatalogEntry(source), this.familyCatalogEntry(target));
+		if ((source.activeSessionId ?? source.id) === (target.activeSessionId ?? target.id))
+			throw new Error("Agent messaging cannot target the sending session");
+	}
+
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
 		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
 		return {
@@ -6101,7 +6126,7 @@ export class DaemonSupervisor {
 		if (outboundType === "roster_heartbeat") {
 			return;
 		}
-		if (outboundType === "agent_message_persisted") {
+		if (outboundType === "agent_message_persisted" || outboundType === "agent_message_dropped") {
 			if (this.shuttingDown || !source || source !== worker.client || !worker.meshDeliveryCapable) return;
 			try {
 				const persisted: unknown = JSON.parse(frame.payload.toString("utf8"));
@@ -6109,11 +6134,13 @@ export class DaemonSupervisor {
 					persisted &&
 					typeof persisted === "object" &&
 					"type" in persisted &&
-					persisted.type === "agent_message_persisted" &&
+					persisted.type === outboundType &&
 					"cotalId" in persisted &&
 					typeof persisted.cotalId === "string"
 				) {
-					this.mesh?.confirmPersisted(persisted.cotalId, source);
+					if (persisted.type === "agent_message_persisted") this.mesh?.confirmPersisted(persisted.cotalId, source);
+					else if ("cleared" in persisted && typeof persisted.cleared === "boolean")
+						this.mesh?.confirmDropped(persisted.cotalId, source, persisted.cleared);
 				}
 			} catch {
 				this.log("Mesh worker sent an invalid persistence frame");

@@ -20,8 +20,8 @@ import {
 	publishDirectory,
 	readDirectory,
 	readSigner,
-	redactMeshError,
 } from "./enrollment.js";
+import { InvalidMeshPayloadError, meshMessageText, redactMeshError } from "./mesh-shared.js";
 
 export interface MeshEndpointOptions {
 	readonly meshRoot: string;
@@ -220,6 +220,12 @@ export class MeshEndpoints {
 		}
 	}
 
+	sessionIdForPrincipal(principal: string, knownSessionIds: readonly string[]): string | undefined {
+		return knownSessionIds.find(
+			(sessionId) => readDirectory(this.options.meshRoot, sessionId)?.principal === principal,
+		);
+	}
+
 	async send(
 		sender: AgentSessionMessageSender & { sessionId: string },
 		targetSessionId: string,
@@ -339,6 +345,7 @@ export class MeshEndpoints {
 		const { message, delivery, deliveryCount } = item;
 		let pending: PendingPersistence | undefined;
 		try {
+			meshMessageText(message);
 			if (!readDirectory(this.options.meshRoot, session.record.sessionId)) {
 				await session.endpoint.stop();
 				session.claim.release();
@@ -362,14 +369,24 @@ export class MeshEndpoints {
 			});
 			await persisted;
 		} catch (error) {
-			this.logDelivery(
-				session,
-				message.id,
-				deliveryCount,
-				`handoff failed; left unacknowledged: ${redactMeshError(error)}`,
-			);
+			if (error instanceof InvalidMeshPayloadError) {
+				let outcome = "invalid payload acknowledged";
+				try {
+					delivery.ack();
+				} catch {
+					outcome = "invalid payload acknowledgement failed; left unacknowledged";
+				}
+				this.logDelivery(session, message?.id, deliveryCount, `${outcome}: ${redactMeshError(error)}`);
+			} else {
+				this.logDelivery(
+					session,
+					message.id,
+					deliveryCount,
+					`handoff failed; left unacknowledged: ${redactMeshError(error)}`,
+				);
+			}
 		} finally {
-			if (this.pending.get(message.id) === pending) this.pending.delete(message.id);
+			if (pending && this.pending.get(message.id) === pending) this.pending.delete(message.id);
 		}
 	}
 
@@ -383,6 +400,20 @@ export class MeshEndpoints {
 			pending.resolve();
 		} catch {
 			pending.reject(new Error("Mesh acknowledgement failed"));
+		}
+	}
+
+	confirmDropped(cotalId: string, recipient: object, cleared: boolean): void {
+		if (this.closing) return;
+		const pending = this.pending.get(cotalId);
+		if (!pending || pending.recipient !== recipient) return;
+		this.pending.delete(cotalId);
+		try {
+			if (cleared) pending.delivery.ack();
+			else pending.delivery.nak();
+			pending.resolve();
+		} catch {
+			pending.reject(new Error("Mesh terminal acknowledgement failed"));
 		}
 	}
 

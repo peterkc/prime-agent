@@ -374,6 +374,15 @@ An active-to-active action snapshot can drop a pending error notification. Quota
 
 Normally the package manager's global modules location is queried using `root -g`. As a special case, if the first element of `npmCommand` is `"bun"`, the modules location will instead be queried with `pm bin -g`.
 
+### Agent Messaging
+
+`agentMessageTransport` is a global-only, experimental setting. It defaults to
+`"native"`; set it to `"cotal"` to opt in to durable mesh agent messages.
+Project settings cannot enable it. Restart the daemon after changing it.
+Cotal mode requires `mesh/mesh.json` and the private `mesh/signer.json` in the
+agent home directory. Setup tooling will come later. Missing or invalid mesh
+files refuse mesh messages; they do not fall back to native delivery.
+
 ### Daemon
 
 | Setting | Type | Default | Description |

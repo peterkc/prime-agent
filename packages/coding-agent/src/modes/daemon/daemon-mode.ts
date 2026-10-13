@@ -29,6 +29,7 @@ import {
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyMember,
 	type AgentFamilyRelationship,
+	AgentMessageClearedError,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -1727,6 +1728,8 @@ export class AgentDaemon {
 			lastEventSequence: 0,
 			clientEnv,
 		};
+		// Roster publication can run during binding; enrollment needs a readable header before visibility.
+		if (this.agentMessageTransport === "cotal") runtime.session.sessionManager.flushNow();
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
 		let completeBinding!: () => void;
@@ -6455,6 +6458,7 @@ export class AgentDaemon {
 			source: AGENT_MESSAGE_SOURCE,
 			message: normalizeAgentSessionMessage(command.message),
 			from: command.sender,
+			fromRelationship: command.fromRelationship,
 			target: this.createAgentSessionMessageEndpoint(target),
 			possiblyRepeated: command.cotal.deliveryCount > 1,
 		};
@@ -6472,13 +6476,16 @@ export class AgentDaemon {
 				);
 		let accepted = false;
 		let sent = false;
+		let active = true;
+		let deliveryFailure: unknown;
 		let unsubscribe: (() => void) | undefined;
 		const cleanup = () => {
+			active = false;
 			unsubscribe?.();
 			client.socket.off("close", cleanup);
 		};
 		const check = () => {
-			if (!accepted || sent) return;
+			if (!accepted || sent || !active) return;
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();
 				return;
@@ -6494,13 +6501,41 @@ export class AgentDaemon {
 				),
 			);
 		};
+		const dropped = (error: unknown) => {
+			deliveryFailure = error;
+			check();
+			if (!accepted || sent || !active) return;
+			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
+				cleanup();
+				return;
+			}
+			sent = true;
+			cleanup();
+			client.socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "outbound", outboundType: "agent_message_dropped" },
+					Buffer.from(
+						serializeJsonLine({
+							type: "agent_message_dropped",
+							cotalId: command.cotal!.id,
+							cleared: error instanceof AgentMessageClearedError,
+						}),
+					),
+				),
+			);
+		};
 		unsubscribe = manager.onPersist(check);
 		client.socket.once("close", cleanup);
+		if (!ownEntry()) {
+			// Native delivery waiters must be registered before admission.
+			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
+		}
 		try {
 			const status = ownEntry() ? "delivered" : (await this.acceptAgentSessionMessage(target, payload)).status;
 			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
 			accepted = true;
 			check();
+			if (deliveryFailure !== undefined) dropped(deliveryFailure);
 		} catch (error) {
 			cleanup();
 			throw error;

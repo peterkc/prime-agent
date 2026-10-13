@@ -370,6 +370,45 @@ describe("mesh enrollment", () => {
 		if (mode === "project")
 			writeFileSync(join(cwd, ".prime", "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
 		expect(SettingsManager.create(cwd, root).getAgentMessageTransport()).toBe("native");
+		const script = `
+			import { registerHooks } from "node:module";
+			registerHooks({ resolve(specifier, context, next) {
+				if (specifier === "@cotal-ai/core" || specifier === "nats" || specifier.startsWith("@nats-io/"))
+					throw new Error("Mode off loaded " + specifier);
+				return next(specifier, context);
+			} });
+			const { DaemonSupervisor } = await import(${JSON.stringify(resolve("src/modes/daemon/daemon-supervisor.ts"))});
+			await import(${JSON.stringify(resolve("src/modes/daemon/daemon-mode.ts"))});
+			const supervisor = new DaemonSupervisor(${JSON.stringify(join(root, "probe.sock"))}, {
+				defaultSessionConfig: { cwd: ${JSON.stringify(cwd)}, agentDir: ${JSON.stringify(root)} }
+			});
+			try { await supervisor.start(); console.log("mode off imports clean"); }
+			finally { await supervisor.cleanupSupervisorResources(); }
+		`;
+		const child = spawn(
+			process.execPath,
+			["--import", resolve("../../node_modules/tsx/dist/loader.mjs"), "--input-type=module", "-e", script],
+			{
+				cwd,
+				env: {
+					...process.env,
+					PRIME_AGENT_CODING_AGENT_DIR: root,
+					TSX_TSCONFIG_PATH: resolve("../../tsconfig.json"),
+				},
+			},
+		);
+		let output = "";
+		child.stdout.on("data", (data: Buffer) => {
+			output += data.toString();
+		});
+		child.stderr.on("data", (data: Buffer) => {
+			output += data.toString();
+		});
+		const code = await new Promise<number | null>((resolveExit, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolveExit);
+		});
+		expect({ code, output }).toEqual({ code: 0, output: expect.stringContaining("mode off imports clean") });
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { cwd, agentDir: root },
 		});

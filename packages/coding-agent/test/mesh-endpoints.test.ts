@@ -250,6 +250,8 @@ describe("mesh endpoints", () => {
 			id: "agentmsg_published",
 		});
 		expect(source.unicastAttributed).toHaveBeenCalledExactlyOnceWith("local.b", "hello");
+		expect(mesh.sessionIdForPrincipal("local.a", ["b", "a"])).toBe("a");
+		expect(mesh.sessionIdForPrincipal("local.unknown", ["a", "b"])).toBeUndefined();
 	});
 
 	it("broadcasts through the existing host expansion once per each of three family members", async () => {
@@ -360,6 +362,76 @@ describe("mesh endpoints", () => {
 		expect(second.ack).toHaveBeenCalledTimes(1);
 		expect(handoff.mock.calls[1]![2]).toBe(2);
 	});
+
+	it.each([true, false])(
+		"settles a dropped delivery, stops its timers and hands off the next item (cleared=%s)",
+		async (cleared) => {
+			vi.useFakeTimers();
+			const { mesh, target, handoff, log } = await fixture();
+			const first = delivery("dropped");
+			const next = delivery("next");
+			target.emit("message", first.message, first.delivery, { kind: "dm" });
+			target.emit("message", next.message, next.delivery, { kind: "dm" });
+			mesh.confirmDropped("dropped", {}, cleared);
+			mesh.confirmDropped("next", recipient, cleared);
+			expect(first.ack).not.toHaveBeenCalled();
+			expect(first.delivery.nak).not.toHaveBeenCalled();
+			expect(handoff).toHaveBeenCalledTimes(1);
+			const firstHandoff = settled(mesh, "b");
+			mesh.confirmDropped("dropped", recipient, cleared);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(handoff).toHaveBeenCalledTimes(2);
+			await firstHandoff;
+			expect(first.ack).toHaveBeenCalledTimes(cleared ? 1 : 0);
+			expect(first.delivery.nak).toHaveBeenCalledTimes(cleared ? 0 : 1);
+			expect(handoff).toHaveBeenCalledTimes(2);
+			mesh.confirmPersisted("next", recipient);
+			await settled(mesh, "b");
+			mesh.confirmDropped("dropped", recipient, !cleared);
+			mesh.confirmDropped("next", recipient, false);
+			await vi.advanceTimersByTimeAsync(6000);
+			expect(first.working).toHaveBeenCalledTimes(1);
+			expect(next.working).toHaveBeenCalledTimes(1);
+			expect(next.ack).toHaveBeenCalledTimes(1);
+			expect(next.delivery.nak).not.toHaveBeenCalled();
+			expect(log).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(["malformed", "unknown", "empty", "overlong", "nontext", "wrong-text"])(
+		"acknowledges and logs only permanent payload validation failures (%s)",
+		async (failure) => {
+			vi.useFakeTimers();
+			const { mesh, target, handoff, log } = await fixture();
+			const item = delivery("invalid");
+			const payload =
+				failure === "malformed"
+					? null
+					: {
+							...item.message,
+							parts:
+								failure === "unknown"
+									? {}
+									: failure === "nontext"
+										? [{ kind: "blob", data: "unsupported" }]
+										: [
+												{
+													kind: "text",
+													text:
+														failure === "empty" ? " " : failure === "overlong" ? "x".repeat(16385) : 42,
+												},
+											],
+						};
+			target.emit("message", payload, item.delivery, { kind: "dm" });
+			await settled(mesh, "b");
+			await vi.advanceTimersByTimeAsync(6000);
+			expect(item.ack).toHaveBeenCalledTimes(1);
+			expect(item.delivery.nak).not.toHaveBeenCalled();
+			expect(item.working).toHaveBeenCalledTimes(1);
+			expect(handoff).not.toHaveBeenCalled();
+			expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("invalid payload acknowledged"));
+		},
+	);
 
 	it.each(["handoff", "disconnect", "directory"])("leaves a %s failure unacknowledged", async (failure) => {
 		vi.useFakeTimers();

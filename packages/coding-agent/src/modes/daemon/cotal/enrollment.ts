@@ -2,7 +2,6 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	CotalEndpoint,
-	type Identity,
 	isAccountNkey,
 	isUserNkey,
 	mintCreds,
@@ -23,18 +22,13 @@ import {
 } from "../../../core/session-lease.js";
 import { readSessionInfo } from "../../../core/session-manager.js";
 import { writeFileAtomicSync } from "../../../utils/atomic-file.js";
+import { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
+
+export { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
 
 export interface MeshConfiguration {
 	readonly space: string;
 	readonly server: string;
-}
-
-export interface EnrollmentRecord {
-	readonly sessionId: string;
-	readonly sessionFile: string;
-	readonly identity: Identity;
-	readonly lifecycleUid: string;
-	readonly allowSubscribe: string[];
 }
 
 export interface MeshDirectoryEntry {
@@ -48,22 +42,6 @@ function object(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
-}
-
-/** Preserve diagnostic fields, never a request-bearing cause or credential material. */
-export function redactMeshError(error: unknown, includeMessage = true): string {
-	const fields = object(error);
-	const redact = (value: string) =>
-		value
-			.replace(/-----BEGIN NATS USER JWT-----[\s\S]*?-----END USER NKEY SEED-----/g, "[redacted credentials]")
-			.replace(/S[A-Z2-7]{57}/g, "[redacted seed]")
-			.replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted JWT]")
-			.replace(/[\r\n]+/g, " ")
-			.slice(0, 512);
-	const name = redact(typeof fields?.name === "string" ? fields.name : "Error");
-	const code = typeof fields?.code === "string" ? ` (${redact(fields.code)})` : "";
-	const message = typeof error === "string" ? error : fields?.message;
-	return `${name}${code}${includeMessage && typeof message === "string" ? `: ${redact(message)}` : ""}`;
 }
 
 function readJson(path: string): unknown {

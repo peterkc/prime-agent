@@ -1,5 +1,9 @@
 import { closeSync, readFileSync } from "node:fs";
-import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
+import type {
+	AgentFamilyRelationship,
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageSender,
+} from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
@@ -36,10 +40,9 @@ export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
 /** Advertised by workers that report persistence before mesh acknowledgement. */
 export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
 
-export interface DaemonWorkerPersistenceOutbound {
-	type: "agent_message_persisted";
-	cotalId: string;
-}
+export type DaemonWorkerPersistenceOutbound =
+	| { type: "agent_message_persisted"; cotalId: string }
+	| { type: "agent_message_dropped"; cotalId: string; cleared: boolean };
 
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -142,6 +145,7 @@ export type DaemonWorkerCommand =
 			targetActiveSessionId: string;
 			message: string;
 			sender: AgentSessionMessageSender;
+			fromRelationship?: AgentFamilyRelationship;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 			cotal?: { id: string; deliveryCount: number };
 	  }
