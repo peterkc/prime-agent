@@ -13,6 +13,7 @@ export default defineConfig({
 		environment: "node",
 		testTimeout: 30000,
 		env: { DO_NOT_TRACK: "1" },
+		setupFiles: ["./test/setup-env.ts"],
 		tags: [
 			{
 				name: "process-stress",
