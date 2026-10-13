@@ -66,6 +66,7 @@ afterEach(async () => {
 	FakeEndpoint.failStart = false;
 	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
+	vi.useRealTimers();
 });
 
 async function fixture() {
@@ -352,6 +353,7 @@ describe("mesh enrollment", () => {
 	);
 
 	it("mints two one-hour credentials with the same identity, lifecycle and read set", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] }); // expiry and iat read the clock separately; a second boundary between them gave 3599
 		const { meshRoot, sessionId, sessionFile } = await fixture();
 		const record = { ...ensureEnrollmentRecord(meshRoot, sessionId, sessionFile), allowSubscribe: ["work"] };
 		const source = credentialSource(meshRoot, "prime", record);
