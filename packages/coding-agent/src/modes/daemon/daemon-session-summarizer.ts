@@ -387,7 +387,8 @@ export class DaemonSessionSummarizer {
 		}
 		// The leaf entry id is the branch-tip identity (appends, edits, and branch
 		// navigation all move it; counts and timestamps collide across siblings).
-		const contentKey = `${session.sessionManager.getLeafId() ?? "root"}:${messageCount}`;
+		const leafId = session.sessionManager.getLeafId();
+		const contentKey = `${leafId ?? "root"}:${messageCount}`;
 		const failed = this.failedIdleGenerations.get(id);
 		if (
 			!isWorking &&
@@ -436,13 +437,14 @@ export class DaemonSessionSummarizer {
 			if (!result) {
 				return;
 			}
-			// Discard if the session closed, was swapped, or moved to a new turn
-			// during the async call — never write a verdict for stale state.
+			// Discard if the session closed, was swapped, moved to a new turn or
+			// switched branch during the async call — never write a verdict for stale state.
 			if (
 				controller.signal.aborted ||
 				state.runtime.session !== session ||
 				session.isSessionActive !== isWorking ||
-				session.messages.length !== messageCount
+				session.messages.length !== messageCount ||
+				session.sessionManager.getLeafId() !== leafId
 			) {
 				return;
 			}
