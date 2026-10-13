@@ -80,6 +80,20 @@ function lineRule({ test, source }) {
 		: `adds ${test.added} test lines for ${source.added} source lines; needs a maintainer exception`;
 }
 
+// Use the package's own runner: a `node --test` script gets its flags, the seed and the changed files.
+function shuffledCommand(pkg, tests, seed) {
+	const script = JSON.parse(readFileSync(resolve(root, pkg, "package.json"), "utf8")).scripts?.test ?? "";
+	const [command, ...flags] = script.trim().split(/\s+/);
+	if (command === "node" && flags.includes("--test")) {
+		// Node 24.16.0 and 26.1.0 added the flag; Node 25 lacks it.
+		if (!process.allowedNodeEnvironmentFlags.has("--test-random-seed")) {
+			throw new Error(`Seeded node --test runs need Node 24.16.0 or 26.1.0 or later; this is ${process.versions.node}.`);
+		}
+		return ["node", [...flags.filter((flag) => !flag.includes("*")), `--test-random-seed=${seed}`, ...tests]];
+	}
+	return ["npx", ["vitest", "--run", "--sequence.shuffle", `--sequence.seed=${seed}`, ...tests]];
+}
+
 function runShuffled(files) {
 	const byPackage = new Map();
 	for (const path of files) {
@@ -89,8 +103,8 @@ function runShuffled(files) {
 	for (const [pkg, tests] of byPackage) {
 		for (const seed of seeds) {
 			console.log(`\n${pkg}, seed ${seed}: ${tests.join(" ")}`);
-			const args = ["vitest", "--run", "--sequence.shuffle", `--sequence.seed=${seed}`, ...tests];
-			const result = spawnSync("npx", args, { cwd: resolve(root, pkg), stdio: "inherit" });
+			const [command, args] = shuffledCommand(pkg, tests, seed);
+			const result = spawnSync(command, args, { cwd: resolve(root, pkg), stdio: "inherit" });
 			if (result.status !== 0) return false;
 		}
 	}
