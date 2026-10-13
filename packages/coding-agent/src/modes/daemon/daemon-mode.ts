@@ -69,7 +69,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -501,6 +501,7 @@ export class AgentDaemon {
 	 * passivation-only close reason by the durable identity needed by hydration/opening.
 	 */
 	private readonly passivatingSessions = new Map<string, Promise<void>>();
+	private readonly replacedSessions = new WeakSet<AgentSession>();
 	private readonly closingSessions = new Map<
 		string,
 		{
@@ -1730,7 +1731,13 @@ export class AgentDaemon {
 			clientEnv,
 		};
 		// Roster publication can run during binding; enrollment needs a readable header before visibility.
-		if (this.agentMessageTransport === "cotal") runtime.session.sessionManager.flushNow();
+		if (this.agentMessageTransport === "cotal") {
+			runtime.session.sessionManager.flushNow();
+			runtime.setBeforeSessionInvalidate((reason) => {
+				if (reason === "new" || reason === "resume" || reason === "fork")
+					this.replacedSessions.add(runtime.session);
+			});
+		}
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
 		let completeBinding!: () => void;
@@ -1747,7 +1754,7 @@ export class AgentDaemon {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
 				createConnectionState: (targetSessionState) => this.createConnectionState(targetSessionState),
 				sessionReplaced: (targetSessionState) => this.refreshReplacedSessionState(targetSessionState),
-				beforeSessionRebind: (targetSessionState) => {
+				sessionApplied: (targetSessionState) => {
 					if (this.agentMessageTransport === "cotal") targetSessionState.runtime.session.sessionManager.flushNow();
 				},
 				shutdown: () => {
@@ -6457,7 +6464,8 @@ export class AgentDaemon {
 			if (!passive) throw error;
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
-		const manager = target.runtime.session.sessionManager;
+		const recipientSession = target.runtime.session;
+		const manager = recipientSession.sessionManager;
 		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
 		const payload: AgentSessionMessagePayload = {
 			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
@@ -6515,7 +6523,9 @@ export class AgentDaemon {
 			const reason =
 				error instanceof AgentMessageClearedError
 					? "cleared"
-					: (this.closingSessions.get(target.activeSessionId)?.messageDropReason ?? "other");
+					: this.replacedSessions.has(recipientSession)
+						? "closed"
+						: (this.closingSessions.get(target.activeSessionId)?.messageDropReason ?? "other");
 			if ((!accepted && reason === "other") || sent || !active) return;
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();

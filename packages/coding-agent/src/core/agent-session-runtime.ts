@@ -107,7 +107,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
 	private readonly sessionReplacedListeners = new Set<(session: AgentSession) => void | Promise<void>>();
 	private runtimeEnvScope?: <T>(fn: () => Promise<T>) => Promise<T>;
-	private beforeSessionInvalidate?: () => void;
+	private beforeSessionInvalidate?: (reason: SessionShutdownEvent["reason"]) => void;
+	private sessionApplied?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
@@ -162,8 +163,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return this.sessionConfig ? { ...this.sessionConfig } : undefined;
 	}
 
-	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
+	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>, sessionApplied?: () => void): void {
 		this.rebindSession = rebindSession;
+		this.sessionApplied = sessionApplied;
 	}
 
 	onSessionReplaced(listener: (session: AgentSession) => void | Promise<void>): () => void {
@@ -197,7 +199,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * such as detaching extension-provided TUI components before the old extension
 	 * context becomes stale.
 	 */
-	setBeforeSessionInvalidate(beforeSessionInvalidate?: () => void): void {
+	setBeforeSessionInvalidate(beforeSessionInvalidate?: (reason: SessionShutdownEvent["reason"]) => void): void {
 		this.beforeSessionInvalidate = beforeSessionInvalidate;
 	}
 
@@ -241,7 +243,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			reason,
 			targetSessionFile,
 		});
-		this.beforeSessionInvalidate?.();
+		this.beforeSessionInvalidate?.(reason);
 		// Await the kernel's final snapshot flush before invalidating the session.
 		await this.session.disposeAsync();
 		await this.disposeHostedSubagentRuntimes();
@@ -299,6 +301,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		this.apply(result);
 		this.commitReplacementLease(lease);
+		// Hosts must make the replacement visible safely before setup can yield.
+		this.sessionApplied?.();
 	}
 
 	private async teardownForReplacement(
@@ -707,7 +711,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			disposeError ??= error;
 		}
 		try {
-			this.beforeSessionInvalidate?.();
+			this.beforeSessionInvalidate?.("quit");
 		} catch (error) {
 			disposeError ??= error;
 		}
