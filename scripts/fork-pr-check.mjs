@@ -24,6 +24,11 @@ function lines(output) {
 	return output.split("\n").filter(Boolean);
 }
 
+// Count lines as git --numstat does: blank lines count, and a last line without a newline counts too.
+function countLines(text) {
+	return text.split("\n").length - (text === "" || text.endsWith("\n") ? 1 : 0);
+}
+
 function resolveBase() {
 	const index = process.argv.indexOf("--base");
 	if (index !== -1) return git(["merge-base", "HEAD", process.argv[index + 1]]);
@@ -59,7 +64,7 @@ function changes(base) {
 	for (const path of lines(git(["ls-files", "--others", "--exclude-standard"]))) {
 		const kind = kindOf(path);
 		files.push(path);
-		if (kind) counts[kind].added += lines(readFileSync(resolve(root, path), "utf8")).length;
+		if (kind) counts[kind].added += countLines(readFileSync(resolve(root, path), "utf8"));
 	}
 	return { counts, files };
 }
