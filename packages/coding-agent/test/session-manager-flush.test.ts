@@ -83,6 +83,7 @@ describe("SessionManager.flushNow", () => {
 		// Append a custom entry (goal state) — normally suppressed by _persist
 		// because no assistant message exists yet.
 		mgr.appendCustomEntry("thread_goal_state", { active: true, status: "active" });
+		expect(mgr.rewritesOnNextPersist()).toBe(true);
 
 		const file = mgr.getSessionFile()!;
 		expect(existsSync(file)).toBe(false);
@@ -90,6 +91,7 @@ describe("SessionManager.flushNow", () => {
 		// flushNow forces a write despite the no-assistant guard
 		mgr.flushNow();
 		expect(existsSync(file)).toBe(true);
+		expect(mgr.rewritesOnNextPersist()).toBe(true);
 
 		const content = readFileSync(file, "utf8");
 		const lines = content.trim().split("\n");
@@ -240,6 +242,7 @@ describe("SessionManager.flushNow", () => {
 			timestamp: Date.now(),
 		});
 
+		expect(mgr.rewritesOnNextPersist()).toBe(true);
 		// Then append an ASSISTANT message — this triggers the full rewrite
 		// (not appendFileSync) because flushed is false.
 		mgr.appendMessage({
@@ -260,6 +263,7 @@ describe("SessionManager.flushNow", () => {
 			timestamp: Date.now(),
 		});
 
+		expect(mgr.rewritesOnNextPersist()).toBe(false);
 		const content = readFileSync(file, "utf8");
 		const lines = content.trim().split("\n");
 		expect(lines.length).toBe(4);

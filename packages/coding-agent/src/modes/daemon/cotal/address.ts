@@ -1,6 +1,6 @@
-import { existsSync, readdirSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { type MeshDirectoryEntry, readDirectory } from "./enrollment.js";
+import { type MeshDirectoryEntry, readDirectory, readDirectoryAsync } from "./enrollment.js";
 
 export interface MeshAddress {
 	readonly space: string;
@@ -35,12 +35,12 @@ export function resolveMeshAddress(
 	};
 }
 
-export function resolveDirectoryAddress(
+export async function resolveDirectoryAddress(
 	meshRoot: string,
 	localSpace: string,
 	selector: string,
 	onInvalidEntry: (file: string) => void,
-): MeshAddressResult {
+): Promise<MeshAddressResult> {
 	// Read an exact ID first, so an unrelated broken directory entry cannot block it.
 	if (/^[A-Za-z0-9_-]+$/.test(selector)) {
 		try {
@@ -52,15 +52,20 @@ export function resolveDirectoryAddress(
 	}
 	const directory = join(meshRoot, "directory");
 	const entries: MeshDirectoryEntry[] = [];
-	if (existsSync(directory)) {
-		for (const file of readdirSync(directory).sort()) {
-			if (!file.endsWith(".json")) continue;
-			try {
-				const entry = readDirectory(meshRoot, file.slice(0, -5));
-				if (entry) entries.push(entry);
-			} catch {
-				onInvalidEntry(file);
-			}
+	let files: string[];
+	try {
+		files = await readdir(directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		files = [];
+	}
+	for (const file of files.sort()) {
+		if (!file.endsWith(".json")) continue;
+		try {
+			const entry = await readDirectoryAsync(meshRoot, file.slice(0, -5));
+			if (entry) entries.push(entry);
+		} catch {
+			onInvalidEntry(file);
 		}
 	}
 	const local = resolveMeshAddress({ space: localSpace, target: selector }, localSpace, entries);

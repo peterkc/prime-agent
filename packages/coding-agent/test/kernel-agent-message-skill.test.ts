@@ -63,6 +63,10 @@ describe("agent-message skill over the kernel host bridge", () => {
 			relationship: relationship as AgentFamilyMember["relationship"],
 			entry: {
 				id: relationship,
+				name:
+					"receiver_role" in selectors && selectors.receiver_role === "child" && relationship === "sibling"
+						? "child"
+						: undefined,
 				depth: 0,
 				status: "idle",
 				sessionPath: join(tempDir, `${relationship}.jsonl`),

@@ -6333,6 +6333,8 @@ export class AgentDaemon {
 				options.receiverRole,
 			);
 		}
+		if (options.targetKind === "name")
+			throw new Error('Name-only agent messages require agentMessageTransport "cotal"');
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
@@ -6437,7 +6439,7 @@ export class AgentDaemon {
 		}
 		const link = this.supervisorLink();
 		if (!link) throw new Error("Message was not stored: supervisor link is unavailable");
-		const rateLimitKey = `${fromState.activeSessionId}->${targetSessionId}`;
+		const rateLimitKey = `${fromState.activeSessionId}->${targetKind === "name" ? targetSessionId.toLowerCase() : targetSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok)
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
@@ -6485,14 +6487,20 @@ export class AgentDaemon {
 		const recipientSession = target.runtime.session;
 		const manager = recipientSession.sessionManager;
 		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
-		const diskEntries = await loadEntriesFromFileAsync(manager.getSessionFile()!);
-		const latestName = diskEntries.reverse().find((entry) => entry.type === "session_info");
-		if (
-			latestName?.type === "session_info" &&
-			typeof latestName.name === "string" &&
-			!manager.getEntries().some((entry) => entry.id === latestName.id)
-		)
-			recipientSession.setSessionName(latestName.name);
+		if (manager.rewritesOnNextPersist()) {
+			try {
+				const diskEntries = await loadEntriesFromFileAsync(manager.getSessionFile()!);
+				const latestName = diskEntries.reverse().find((entry) => entry.type === "session_info");
+				if (
+					latestName?.type === "session_info" &&
+					typeof latestName.name === "string" &&
+					!manager.getEntries().some((entry) => entry.id === latestName.id)
+				)
+					recipientSession.setSessionName(latestName.name);
+			} catch {
+				this.log(`Mesh name adoption skipped for session ${manager.getSessionId()}`);
+			}
+		}
 		const payload: AgentSessionMessagePayload = {
 			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
 			source: AGENT_MESSAGE_SOURCE,

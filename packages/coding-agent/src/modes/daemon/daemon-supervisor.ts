@@ -2811,7 +2811,6 @@ export class DaemonSupervisor {
 					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
 					if (!command.activeSessionId) {
 						await this.catalog.rename(command.sessionPath, command.name);
-						await this.renameMeshSession(command.sessionPath, target.name);
 						// Third rename write point: an offline saved-session rename
 						// changes the name the ledger carries for that child.
 						await this.rlmSpawnLedger()
@@ -2828,6 +2827,7 @@ export class DaemonSupervisor {
 						// Heartbeat rows carry the owning session's display name;
 						// drop the snapshot so the next list shows the new one.
 						this.invalidatePassiveScheduledJobs();
+						await this.renameMeshSession(target.sessionId, command.sessionPath);
 						return success(command.id, command.type);
 					}
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
@@ -2835,7 +2835,7 @@ export class DaemonSupervisor {
 						...command,
 						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
 					});
-					if (response.success) await this.renameMeshSession(command.sessionPath, target.name);
+					if (response.success) await this.renameMeshSession(target.sessionId, command.sessionPath);
 					return response;
 				});
 			}
@@ -2879,7 +2879,7 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
-			const targetSessionId = this.mesh.resolveAddress(command.targetSessionId);
+			const targetSessionId = await this.mesh.resolveAddress(command.targetSessionId);
 			if (targetSessionId === source.summary.sessionId)
 				throw new Error("Message was not stored: agent messaging cannot target the sending session");
 			const receipt = await this.mesh.send(
@@ -3031,7 +3031,8 @@ export class DaemonSupervisor {
 					return await this.withSessionNameReservation(reservation, async () => {
 						await this.assertSupervisorSessionNameAvailable(match.summary, reservation.name);
 						const response = await forward();
-						if (response.success) await this.mesh?.rename(match.summary.sessionId, reservation.name);
+						if (response.success)
+							await this.renameMeshSession(match.summary.sessionId, match.summary.sessionFile);
 						return response;
 					});
 				}
@@ -4802,11 +4803,14 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
-	private async renameMeshSession(sessionFile: string, name: string): Promise<void> {
+	private async renameMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
 		if (!this.mesh) return;
-		const info = await readSessionInfo(sessionFile);
-		if (!info) throw new Error(`Session not found after rename: ${sessionFile}`);
-		await this.mesh.rename(info.id, name);
+		try {
+			if (!sessionFile) throw new Error("session has no session file");
+			await this.mesh.rename(sessionId, sessionFile);
+		} catch (error) {
+			this.log(`Mesh directory rename failed for session ${sessionId}: ${redactMeshError(error)}`);
+		}
 	}
 
 	private async enrollMeshSession(sessionId: string, sessionFile?: string, queued = false): Promise<void> {
@@ -5171,14 +5175,21 @@ export class DaemonSupervisor {
 	private async savedSessionNameReservationInput(
 		sessionPath: string,
 		name: string,
-	): Promise<{ name: string; depth: number; parentSessionId?: string; parentSessionPath?: string }> {
+	): Promise<{
+		sessionId: string;
+		name: string;
+		depth: number;
+		parentSessionId?: string;
+		parentSessionPath?: string;
+	}> {
 		const targetPath = canonicalSessionPath(sessionPath);
 		const active = this.workerOwnedRosterSummaryForPath(targetPath);
-		if (active) return this.summaryNameReservationInput(active, name);
+		if (active) return { ...this.summaryNameReservationInput(active, name), sessionId: active.sessionId };
 		const siblings = await this.rlmLedgerSiblings(sessionPath);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		return {
+			sessionId: saved.id,
 			name,
 			depth: saved.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0,
 			parentSessionPath: saved.parentSessionPath,

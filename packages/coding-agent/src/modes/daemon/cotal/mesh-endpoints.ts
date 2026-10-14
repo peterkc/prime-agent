@@ -224,19 +224,22 @@ export class MeshEndpoints {
 		}
 	}
 
-	resolveAddress(selector: string): string {
+	async resolveAddress(selector: string): Promise<string> {
 		if (!this.config || this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
-		const result = resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
+		const result = await resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
 			if (this.invalidDirectoryEntries.has(file)) return;
 			this.invalidDirectoryEntries.add(file);
 			this.options.log(`Mesh directory entry ${JSON.stringify(file)}: unreadable or invalid; ignored`);
 		});
-		if (!result.ok) throw new Error(`Message was not stored: ${result.error}`);
+		if (!result.ok) {
+			const reason = result.reason === "unknown" ? this.enrollmentFailures.get(selector) : undefined;
+			throw new Error(`Message was not stored: ${reason ?? result.error}`);
+		}
 		return result.entry.sessionId;
 	}
 
-	async rename(sessionId: string, name: string): Promise<void> {
-		await renameDirectory(this.options.meshRoot, sessionId, name);
+	async rename(sessionId: string, sessionFile: string): Promise<void> {
+		await renameDirectory(this.options.meshRoot, sessionId, sessionFile);
 	}
 
 	sessionIdForPrincipal(principal: string, knownSessionIds: readonly string[]): string | undefined {

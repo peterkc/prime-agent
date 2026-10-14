@@ -28,6 +28,7 @@ import {
 	readDirectory,
 	readSigner,
 	redactMeshError,
+	renameDirectory,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
@@ -268,6 +269,7 @@ describe("mesh enrollment", () => {
 	it("recovers after a stop at the record or at provisioning, and refuses fileless sessions", async () => {
 		const { mesh, meshRoot, sessionId, sessionFile } = await fixture();
 		await expect(mesh.enroll("memory")).rejects.toThrow("no session file");
+		await expect(mesh.resolveAddress("memory")).rejects.toThrow("no session file");
 		await expect(mesh.send({ sessionId: "never" }, sessionId, "hello")).rejects.toThrow("is not enrolled");
 		await expect(mesh.send({ sessionId: "memory" }, sessionId, "hello")).rejects.toThrow(
 			"enrollment failed: Error: Session memory has no session file",
@@ -312,8 +314,12 @@ describe("mesh enrollment", () => {
 		const { meshRoot, sessionId, sessionFile, session } = await fixture();
 		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
 		session.appendSessionInfo("latest-name");
-		expect((await publishDirectory(meshRoot, record, "home")).name).toBe("latest-name");
+		const entry = await publishDirectory(meshRoot, record, "home");
+		session.appendSessionInfo("newer-name");
+		await renameDirectory(meshRoot, sessionId, sessionFile);
+		expect(readDirectory(meshRoot, sessionId)).toEqual({ ...entry, name: "newer-name" });
 		rmSync(directoryPath(meshRoot, sessionId));
+		await renameDirectory(meshRoot, sessionId, sessionFile);
 		rmSync(enrollmentPath(meshRoot, sessionId));
 		await expect(publishDirectory(meshRoot, record, "home")).rejects.toThrow("missing");
 		expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);

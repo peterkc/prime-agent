@@ -527,7 +527,7 @@ export type DaemonCommand =
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
 	// targetSessionId carries an exact ID or a directory address. IDs win over names;
-	// schema 34 supervisors refuse names as not enrolled, before storage.
+	// Supervisors built before name addressing (same revision 34) refuse names before storage.
 	| { id?: string; type: "mesh_send"; fromActiveSessionId: string; targetSessionId: string; message: string }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }

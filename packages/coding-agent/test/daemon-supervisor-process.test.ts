@@ -2038,18 +2038,26 @@ function meshSignal(child: ChildProcess, type: string, id?: string): Promise<voi
 	return new Promise((resolveSignal, reject) => {
 		function finish(error?: Error): void {
 			child.stdout?.off("data", inspect);
+			child.stderr?.off("data", inspect);
 			child.off("exit", exited);
 			if (error) reject(error);
 			else resolveSignal();
 		}
 		function inspect(): void {
-			const matched = childDiagnostics
-				.get(child)
-				?.stdout.split("\n")
+			const diagnostics = childDiagnostics.get(child);
+			const matched = `${diagnostics?.stdout ?? ""}\n${diagnostics?.stderr ?? ""}`
+				.split("\n")
 				.filter(Boolean)
 				.some((line) => {
 					try {
 						const value = JSON.parse(line);
+						if (type === "log")
+							return (
+								value.component === "coding-agent.daemon-supervisor" &&
+								typeof value.msg === "string" &&
+								id !== undefined &&
+								value.msg.includes(id)
+							);
 						return value.type === type && (id === undefined || value.id === id);
 					} catch {
 						return false;
@@ -2061,6 +2069,7 @@ function meshSignal(child: ChildProcess, type: string, id?: string): Promise<voi
 			finish(new Error(`Fixture exited: ${childDiagnostics.get(child)?.stderr}`));
 		}
 		child.stdout?.on("data", inspect);
+		child.stderr?.on("data", inspect);
 		child.once("exit", exited);
 		inspect();
 	});
@@ -2139,7 +2148,7 @@ describe("mesh supervisor compatibility", () => {
 		}
 	});
 
-	it.each(["saved", "live", "other"] as const)(
+	it.each(["saved", "live", "other", "live-saved", "directory-error"] as const)(
 		"AC-25 changes directory addressing after a %s rename and holder restart",
 		async (path) => {
 			const f = await meshFixture();
@@ -2154,12 +2163,28 @@ describe("mesh supervisor compatibility", () => {
 				const before = JSON.parse(
 					readFileSync(join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`), "utf8"),
 				);
+				if (path === "directory-error")
+					writeFileSync(
+						join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`),
+						"private-json-fragment",
+					);
 				await f.request(
 					path === "other" ? other.client : holder.client,
 					path === "live"
 						? { type: "set_session_name", activeSessionId: target.activeSessionId!, name: "new-name" }
-						: { type: "rename_saved_session", sessionPath: target.sessionFile!, name: "new-name" },
+						: {
+								type: "rename_saved_session",
+								sessionPath: target.sessionFile!,
+								name: "new-name",
+								...(path === "live-saved" ? { activeSessionId: target.activeSessionId! } : {}),
+							},
 				);
+				if (path === "directory-error") {
+					expect((await readSessionInfo(target.sessionFile!))?.name).toBe("new-name");
+					await meshSignal(holder.child, "log", target.sessionId);
+					expect(childDiagnostics.get(holder.child)?.stderr).not.toContain("private-json-fragment");
+					return;
+				}
 				const entry = JSON.parse(
 					readFileSync(join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`), "utf8"),
 				);

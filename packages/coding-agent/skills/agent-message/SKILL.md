@@ -67,7 +67,8 @@ if child is not None:
   `await rlm.delete_subagent(child)`.
 - Role shortcuts and `"all"` remain limited to parent, siblings, and direct
   children. Name-only addressing reaches any local-space session on Cotal.
-  Native messaging still enforces family reach.
+  Name-only sends require `agentMessageTransport: "cotal"`. With native messaging,
+  send by family role.
 - Sender identity is daemon-derived and cannot be spoofed from Python.
 - The daemon enforces message size, rate, and pending-queue limits before
   accepting delivery.

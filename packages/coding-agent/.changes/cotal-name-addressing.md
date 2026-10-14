@@ -1,0 +1,2 @@
+- Added local-space name and session-ID addressing to `agent_message.send` when Cotal messaging is enabled.
+- Fixed queued Cotal redelivery duplicates and refreshed name addressing after session renames.

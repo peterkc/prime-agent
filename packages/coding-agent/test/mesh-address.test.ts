@@ -49,11 +49,20 @@ describe("mesh directory addressing", () => {
 		});
 		try {
 			for (let n = 0; n < 2; n++) {
-				if (expected.startsWith("id-")) expect(mesh.resolveAddress(selector)).toBe(expected);
-				else expect(() => mesh.resolveAddress(selector)).toThrow(expected);
+				const resolution = mesh.resolveAddress(selector);
+				if (selector === "aLpHa") {
+					let finished = false;
+					void resolution.then(() => {
+						finished = true;
+					});
+					await new Promise<void>((resolve) => queueMicrotask(resolve));
+					expect(finished).toBe(false);
+				}
+				if (expected.startsWith("id-")) await expect(resolution).resolves.toBe(expected);
+				else await expect(resolution).rejects.toThrow(expected);
 				if (selector === "same")
 					for (const candidate of ["id-c", "id-d", "same", "SAME"])
-						expect(() => mesh.resolveAddress(selector)).toThrow(candidate);
+						await expect(mesh.resolveAddress(selector)).rejects.toThrow(candidate);
 			}
 			expect(logs).toHaveLength(selector === "id-a" ? 0 : 1);
 			expect(logs.join()).not.toContain("invalid secret content");
