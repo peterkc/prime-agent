@@ -111,6 +111,7 @@ import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-fi
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
+	loadEntriesFromFileAsync,
 	readSessionInfo,
 	resolveSessionRlmDepth,
 	type SessionInfo,
@@ -3465,6 +3466,8 @@ export class AgentDaemon {
 				this.sendAgentSessionMessage({
 					targetSelector: input.target,
 					message: input.message,
+					targetKind: input.targetKind,
+					receiverRole: input.receiverRole,
 					fromState: requireCurrentState(),
 					origin: "agent",
 				}),
@@ -6307,6 +6310,8 @@ export class AgentDaemon {
 	private async sendAgentSessionMessage(options: {
 		targetSelector: string;
 		message: string;
+		targetKind?: "name";
+		receiverRole?: AgentFamilyRelationship;
 		fromState?: ActiveSessionState;
 		sender?: AgentSessionMessageSender;
 		clientId?: string;
@@ -6320,7 +6325,13 @@ export class AgentDaemon {
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		if (this.agentMessageTransport === "cotal") {
 			if (!options.fromState) throw new Error("Message was not stored: sender has no session endpoint");
-			return this.sendMeshMessage(options.fromState, targetSelector, message);
+			return this.sendMeshMessage(
+				options.fromState,
+				targetSelector,
+				message,
+				options.targetKind,
+				options.receiverRole,
+			);
 		}
 		let targetState: ActiveSessionState;
 		try {
@@ -6401,25 +6412,32 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		selector: string,
 		message: string,
+		targetKind?: "name",
+		receiverRole?: AgentFamilyRelationship,
 	): Promise<AgentSessionMessageReceipt> {
 		if (!fromState.runtime.session.sessionFile) throw new Error("Message was not stored: sender has no session file");
-		const family = await this.createAgentFamily(fromState);
-		const matches = family.filter(
-			({ entry }) =>
-				entry.id === selector ||
-				entry.name === selector ||
-				entry.activeSessionId === selector ||
-				entry.rlmChildId === selector,
-		);
-		if (matches.length !== 1)
-			throw new Error(
-				`Message was not stored: ${matches.length ? "ambiguous" : "unknown"} family target ${selector}`,
+		let targetSessionId = selector;
+		if (targetKind !== "name") {
+			const family = await this.createAgentFamily(fromState);
+			const matches = family.filter(
+				({ relationship, entry }) =>
+					(!receiverRole || relationship === receiverRole) &&
+					(entry.id === selector ||
+						entry.name === selector ||
+						entry.activeSessionId === selector ||
+						entry.rlmChildId === selector),
 			);
-		const target = matches[0]!.entry;
-		if (!target.sessionPath) throw new Error(`Message was not stored: target ${target.id} has no session file`);
+			if (matches.length !== 1)
+				throw new Error(
+					`Message was not stored: ${matches.length ? "ambiguous" : "unknown"} family target ${selector}`,
+				);
+			const target = matches[0]!.entry;
+			if (!target.sessionPath) throw new Error(`Message was not stored: target ${target.id} has no session file`);
+			targetSessionId = target.id;
+		}
 		const link = this.supervisorLink();
 		if (!link) throw new Error("Message was not stored: supervisor link is unavailable");
-		const rateLimitKey = `${fromState.activeSessionId}->${target.id}`;
+		const rateLimitKey = `${fromState.activeSessionId}->${targetSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok)
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
@@ -6433,7 +6451,7 @@ export class AgentDaemon {
 		try {
 			// Leave room for the supervisor's 30-second publish deadline to return its error.
 			response = await link.request(
-				{ type: "mesh_send", fromActiveSessionId: fromState.activeSessionId, targetSessionId: target.id, message },
+				{ type: "mesh_send", fromActiveSessionId: fromState.activeSessionId, targetSessionId, message },
 				35_000,
 			);
 		} catch (error) {
@@ -6467,6 +6485,14 @@ export class AgentDaemon {
 		const recipientSession = target.runtime.session;
 		const manager = recipientSession.sessionManager;
 		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
+		const diskEntries = await loadEntriesFromFileAsync(manager.getSessionFile()!);
+		const latestName = diskEntries.reverse().find((entry) => entry.type === "session_info");
+		if (
+			latestName?.type === "session_info" &&
+			typeof latestName.name === "string" &&
+			!manager.getEntries().some((entry) => entry.id === latestName.id)
+		)
+			recipientSession.setSessionName(latestName.name);
 		const payload: AgentSessionMessagePayload = {
 			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
 			source: AGENT_MESSAGE_SOURCE,
@@ -6551,6 +6577,7 @@ export class AgentDaemon {
 			Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
 		);
 		client.socket.once("close", cleanup);
+		const queued = recipientSession.hasQueuedAgentMessage(payload.id);
 		if (!ownEntry()) {
 			// Native delivery waiters must be registered before admission.
 			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
@@ -6559,7 +6586,11 @@ export class AgentDaemon {
 			}, dropped);
 		}
 		try {
-			const status = ownEntry() ? "delivered" : (await this.acceptAgentSessionMessage(target, payload)).status;
+			const status = ownEntry()
+				? "delivered"
+				: queued
+					? "queued"
+					: (await this.acceptAgentSessionMessage(target, payload)).status;
 			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
 			accepted = true;
 			check();

@@ -2811,6 +2811,7 @@ export class DaemonSupervisor {
 					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
 					if (!command.activeSessionId) {
 						await this.catalog.rename(command.sessionPath, command.name);
+						await this.renameMeshSession(command.sessionPath, target.name);
 						// Third rename write point: an offline saved-session rename
 						// changes the name the ledger carries for that child.
 						await this.rlmSpawnLedger()
@@ -2830,10 +2831,12 @@ export class DaemonSupervisor {
 						return success(command.id, command.type);
 					}
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return await this.forwardToWorker(match.worker, {
+					const response = await this.forwardToWorker(match.worker, {
 						...command,
 						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
 					});
+					if (response.success) await this.renameMeshSession(command.sessionPath, target.name);
+					return response;
 				});
 			}
 			case "delete_saved_session":
@@ -2876,25 +2879,9 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
-			const targetRow = [...this.roster().values()].find(
-				(entry) => entry.summary.sessionId === command.targetSessionId,
-			);
-			let target = targetRow ? sessionSummaryFromRosterEntry(targetRow) : undefined;
-			if (!target) {
-				try {
-					const path = await this.catalog.resolve(
-						command.targetSessionId,
-						source.summary.cwd,
-						source.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
-					);
-					const info = await readSessionInfo(path);
-					if (info) target = summaryForInactiveSession(info);
-				} catch (error) {
-					throw new Error(`Message was not stored: ${redactMeshError(error)}`);
-				}
-			}
-			if (!target) throw new Error("Message was not stored: target session is unavailable");
-			this.assertAgentMessageOrigin(source.summary, target, true);
+			const targetSessionId = this.mesh.resolveAddress(command.targetSessionId);
+			if (targetSessionId === source.summary.sessionId)
+				throw new Error("Message was not stored: agent messaging cannot target the sending session");
 			const receipt = await this.mesh.send(
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
@@ -2902,7 +2889,7 @@ export class DaemonSupervisor {
 					sessionName: source.summary.sessionName,
 					runtimeKind: source.summary.runtimeKind ?? "top-level",
 				},
-				command.targetSessionId,
+				targetSessionId,
 				normalizeAgentSessionMessage(command.message),
 			);
 			return success(command.id, command.type, receipt);
@@ -3043,7 +3030,9 @@ export class DaemonSupervisor {
 					const reservation = this.summaryNameReservationInput(match.summary, command.name.trim());
 					return await this.withSessionNameReservation(reservation, async () => {
 						await this.assertSupervisorSessionNameAvailable(match.summary, reservation.name);
-						return forward();
+						const response = await forward();
+						if (response.success) await this.mesh?.rename(match.summary.sessionId, reservation.name);
+						return response;
 					});
 				}
 				return await forward();
@@ -4811,6 +4800,13 @@ export class DaemonSupervisor {
 	private isRosterEntryVisibleToClients(entry: AgentRosterEntry): boolean {
 		const worker = entry.workerId !== undefined ? this.workers.get(entry.workerId) : undefined;
 		return worker === undefined || this.isVisibleWorker(worker);
+	}
+
+	private async renameMeshSession(sessionFile: string, name: string): Promise<void> {
+		if (!this.mesh) return;
+		const info = await readSessionInfo(sessionFile);
+		if (!info) throw new Error(`Session not found after rename: ${sessionFile}`);
+		await this.mesh.rename(info.id, name);
 	}
 
 	private async enrollMeshSession(sessionId: string, sessionFile?: string, queued = false): Promise<void> {

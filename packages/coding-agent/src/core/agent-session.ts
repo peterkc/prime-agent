@@ -4256,6 +4256,12 @@ export class AgentSession {
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					...(payload.targetKind === "name" ? { targetKind: "name" } : {}),
+					...(payload.receiverRole === "parent" ||
+					payload.receiverRole === "sibling" ||
+					payload.receiverRole === "child"
+						? { receiverRole: payload.receiverRole }
+						: {}),
 				});
 			}
 			default:
@@ -4439,6 +4445,10 @@ export class AgentSession {
 		const outcome = this._agentMessageOutcome(agentMessageId);
 		outcome.delivery ??= createAgentMessageDeferred();
 		return outcome.delivery.promise;
+	}
+
+	hasQueuedAgentMessage(agentMessageId: string): boolean {
+		return this._actionStore.unfinishedActions().some((action) => action.agentMessageId === agentMessageId);
 	}
 
 	waitForAgentMessagePromptCompletion(agentMessageId: string): Promise<void> {
@@ -11168,6 +11178,8 @@ export class AgentSession {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
 							message: input.message,
+							receiverRole: input.receiverRole,
+							targetKind: input.targetKind,
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";

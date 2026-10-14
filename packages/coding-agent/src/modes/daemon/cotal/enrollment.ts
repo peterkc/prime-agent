@@ -304,6 +304,16 @@ export async function publishDirectory(
 	});
 }
 
+export async function renameDirectory(meshRoot: string, sessionId: string, name: string): Promise<void> {
+	await withDirectoryLock(meshRoot, sessionId, async () => {
+		const entry = readDirectory(meshRoot, sessionId);
+		if (entry)
+			writeFileAtomicSync(directoryPath(meshRoot, sessionId), `${JSON.stringify({ ...entry, name })}\n`, {
+				mode: 0o600,
+			});
+	});
+}
+
 export function readDirectory(meshRoot: string, sessionId: string): MeshDirectoryEntry | undefined {
 	const path = directoryPath(meshRoot, sessionId);
 	if (!existsSync(path)) return undefined;

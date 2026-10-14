@@ -7,6 +7,7 @@ import {
 	type AgentSessionMessageSender,
 } from "../../../core/agent-messages.js";
 import { SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
+import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
 	credentialSource,
@@ -20,6 +21,7 @@ import {
 	publishDirectory,
 	readDirectory,
 	readSigner,
+	renameDirectory,
 } from "./enrollment.js";
 import { InvalidMeshPayloadError, meshMessageText, redactMeshError } from "./mesh-shared.js";
 
@@ -67,6 +69,7 @@ export class MeshEndpoints {
 	private readonly config?: MeshConfiguration;
 	private readonly refusal?: string;
 	private readonly enrollmentFailures = new Map<string, string>();
+	private readonly invalidDirectoryEntries = new Set<string>();
 	private readonly sessions = new Map<string, SessionEndpoint>();
 	private readonly enrolling = new Map<string, Promise<void>>();
 	private enrollmentQueue = Promise.resolve();
@@ -219,6 +222,21 @@ export class MeshEndpoints {
 			}
 			throw error;
 		}
+	}
+
+	resolveAddress(selector: string): string {
+		if (!this.config || this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
+		const result = resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
+			if (this.invalidDirectoryEntries.has(file)) return;
+			this.invalidDirectoryEntries.add(file);
+			this.options.log(`Mesh directory entry ${JSON.stringify(file)}: unreadable or invalid; ignored`);
+		});
+		if (!result.ok) throw new Error(`Message was not stored: ${result.error}`);
+		return result.entry.sessionId;
+	}
+
+	async rename(sessionId: string, name: string): Promise<void> {
+		await renameDirectory(this.options.meshRoot, sessionId, name);
 	}
 
 	sessionIdForPrincipal(principal: string, knownSessionIds: readonly string[]): string | undefined {

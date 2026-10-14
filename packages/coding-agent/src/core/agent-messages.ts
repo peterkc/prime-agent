@@ -167,6 +167,7 @@ export interface AgentSessionMessageSendInput {
 	target: string;
 	message: string;
 	receiverRole?: AgentFamilyRelationship;
+	targetKind?: "name";
 }
 
 export interface AgentSessionMessageController {
@@ -589,6 +590,15 @@ export function createAgentMessageHostHandlers(
 							},
 				);
 				return { receipts } as unknown as Record<string, unknown>;
+			} else if (payload.receiver_role === undefined || payload.receiver_role === null) {
+				if (typeof payload.receiver_name !== "string" || !payload.receiver_name.trim()) {
+					throw new Error("agent_message.send receiver_name is required when receiver_role is omitted");
+				}
+				return (await controller.sendAgentMessage({
+					target: payload.receiver_name.trim(),
+					message: payload.message,
+					targetKind: "name",
+				})) as unknown as Record<string, unknown>;
 			} else {
 				const role = payload.receiver_role;
 				if (role !== "parent" && role !== "sibling" && role !== "child") {
