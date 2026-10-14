@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { access, chmod, lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
-import { getAgentDir } from "../config.js";
+import chalk from "chalk";
+import { APP_NAME, getAgentDir } from "../config.js";
 
 type MeshCommand = "install" | "uninstall" | "start" | "stop" | "status" | "doctor";
 interface MeshOptions {
@@ -25,7 +26,7 @@ interface ToolResult {
 	readonly code: number;
 	readonly stdout: string;
 }
-const runtime: MeshRuntime = { platform: process.platform, now: Date.now, wait: setTimeout };
+const defaultRuntime: MeshRuntime = { platform: process.platform, now: Date.now, wait: setTimeout };
 
 function parseOptions(args: readonly string[]): MeshOptions {
 	const command = args[0];
@@ -37,7 +38,7 @@ function parseOptions(args: readonly string[]): MeshOptions {
 		command !== "status" &&
 		command !== "doctor"
 	)
-		throw new Error("Use mesh <install|uninstall|start|stop|status|doctor>");
+		throw new Error(`Use ${APP_NAME} mesh <install|uninstall|start|stop|status|doctor>`);
 	let label = "ai.prime.mesh";
 	let meshHome = join(getAgentDir(), "mesh");
 	let server = "nats://127.0.0.1:4222";
@@ -61,7 +62,7 @@ function parseOptions(args: readonly string[]): MeshOptions {
 				throw new Error("Unknown mesh option");
 		}
 	}
-	if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error("Invalid mesh launchd label");
+	if (!/^ai\.prime\.mesh(?:\.[A-Za-z0-9.-]+)?$/.test(label)) throw new Error("Invalid mesh launchd label");
 	let url: URL;
 	try {
 		url = new URL(server);
@@ -92,8 +93,12 @@ function parseOptions(args: readonly string[]): MeshOptions {
 	};
 }
 
+function absolutePathEntries(): string[] {
+	return (process.env.PATH ?? "").split(delimiter).filter(isAbsolute);
+}
+
 async function executable(name: string): Promise<string> {
-	for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+	for (const directory of absolutePathEntries()) {
 		const path = resolve(directory, name);
 		try {
 			await access(path, constants.X_OK);
@@ -113,7 +118,7 @@ function runTool(path: string, args: readonly string[], options: MeshOptions, ti
 			[...args],
 			{
 				cwd: options.meshHome,
-				env: { ...process.env, COTAL_HOME: join(options.meshHome, "home") },
+				env: { ...process.env, COTAL_HOME: join(options.meshHome, "home"), COTAL_SKIP_CONNECTOR_SEED: "1" },
 				timeout,
 				maxBuffer: 1024 * 1024,
 			},
@@ -143,10 +148,10 @@ function agentPlist(options: MeshOptions, cotal: string): string {
 	const args = [cotal, "up", "--space", "prime", "--server", options.server, "--no-manager"];
 	const env = {
 		COTAL_HOME: join(options.meshHome, "home"),
-		PATH: process.env.PATH ?? "",
+		PATH: absolutePathEntries().join(delimiter),
 		HOME: homedir(),
 		...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
-		...(process.env.COTAL_SKIP_CONNECTOR_SEED === "1" ? { COTAL_SKIP_CONNECTOR_SEED: "1" } : {}),
+		COTAL_SKIP_CONNECTOR_SEED: "1",
 	};
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -168,6 +173,19 @@ function agentPlist(options: MeshOptions, cotal: string): string {
 async function assertFreePort(port: number): Promise<void> {
 	const socket = createServer();
 	try {
+		const connection = createConnection({ host: "127.0.0.1", port });
+		try {
+			const connected = await new Promise<boolean>((ready, reject) => {
+				connection.once("connect", () => ready(true));
+				connection.once("error", (error: NodeJS.ErrnoException) =>
+					error.code === "ECONNREFUSED" ? ready(false) : reject(error),
+				);
+				connection.setTimeout(1000, () => reject(new Error("Port probe timed out")));
+			});
+			if (connected) throw new Error("Port accepts connections");
+		} finally {
+			connection.destroy();
+		}
 		await new Promise<void>((ready, reject) => {
 			socket.once("error", reject);
 			socket.listen(port, "127.0.0.1", ready);
@@ -184,44 +202,63 @@ function brokerServing(stdout: string): boolean {
 	return /^\s*broker\s+serving(?:\s|$)/m.test(stdout);
 }
 
-async function waitForBroker(cotal: string, options: MeshOptions, clock: MeshRuntime): Promise<void> {
-	const deadline = clock.now() + 30_000;
-	while (clock.now() < deadline) {
-		const status = await runTool(cotal, ["status", "--components"], options, Math.min(5000, deadline - clock.now()));
-		if (brokerServing(status.stdout)) return;
-		const remaining = deadline - clock.now();
-		if (remaining > 0) await clock.wait(Math.min(250, remaining));
+async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+	const deadline = runtime.now() + 30_000;
+	while (runtime.now() < deadline) {
+		try {
+			const status = await runTool(
+				cotal,
+				["status", "--components"],
+				options,
+				Math.min(5000, deadline - runtime.now()),
+			);
+			if (brokerServing(status.stdout)) return;
+		} catch {
+			// A failed probe is not readiness; keep checking within the same deadline.
+		}
+		const remaining = deadline - runtime.now();
+		if (remaining > 0) await runtime.wait(Math.min(250, remaining));
 	}
-	throw new Error("Mesh broker did not report serving within 30 seconds");
+	throw new Error(
+		`Mesh broker did not report serving within 30 seconds; see ${join(options.meshHome, "service.log")}`,
+	);
 }
 
 async function waitForBootout(
 	launchctl: string,
 	target: string,
 	options: MeshOptions,
-	clock: MeshRuntime,
+	runtime: MeshRuntime,
 ): Promise<void> {
-	const deadline = clock.now() + 10_000;
-	while (clock.now() < deadline) {
-		const job = await runTool(launchctl, ["print", target], options, Math.min(5000, deadline - clock.now()));
+	const deadline = runtime.now() + 30_000;
+	while (runtime.now() < deadline) {
+		const job = await runTool(launchctl, ["print", target], options, Math.min(5000, deadline - runtime.now()));
 		if (job.code === 113) return;
 		requireSuccess(job, "launchctl print after bootout");
-		const remaining = deadline - clock.now();
-		if (remaining > 0) await clock.wait(Math.min(250, remaining));
+		const remaining = deadline - runtime.now();
+		if (remaining > 0) await runtime.wait(Math.min(250, remaining));
 	}
 	throw new Error("Mesh launchd service is still loaded after bootout");
 }
 
-async function install(options: MeshOptions, launchctl: string, target: string, clock: MeshRuntime): Promise<void> {
+async function install(options: MeshOptions, launchctl: string, target: string, runtime: MeshRuntime): Promise<void> {
 	// print must work before the mesh home exists; launchctl does not use Cotal's working directory.
 	const probeOptions = { ...options, meshHome: homedir() };
 	const loaded = await runTool(launchctl, ["print", target], probeOptions);
 	if (loaded.code === 0) throw new Error("Mesh launchd label is already loaded");
+	if (existsSync(options.plist)) throw new Error("Mesh launchd plist already exists; uninstall it first");
 	if (loaded.code !== 113) requireSuccess(loaded, "launchctl print");
 	await assertFreePort(options.port);
 	const cotal = await executable("cotal");
-	await mkdir(options.meshHome, { recursive: true, mode: 0o700 });
-	await chmod(options.meshHome, 0o700);
+	const created = await mkdir(options.meshHome, { recursive: true, mode: 0o700 });
+	if (created) await chmod(options.meshHome, 0o700);
+	else {
+		const home = await lstat(options.meshHome);
+		if (!home.isDirectory() || (home.mode & 0o777) !== 0o700 || home.uid !== process.getuid?.()) {
+			throw new Error("Existing mesh home must be a directory owned by the current user with mode 0700");
+		}
+	}
+	await mkdir(join(options.meshHome, ".cotal"), { recursive: true, mode: 0o700 });
 	await writeFile(
 		join(options.meshHome, "mesh.json"),
 		`${JSON.stringify({ space: "prime", server: options.server })}\n`,
@@ -234,7 +271,7 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 			await runTool(launchctl, ["bootstrap", target.slice(0, target.lastIndexOf("/")), options.plist], options),
 			"launchctl bootstrap",
 		);
-		await waitForBroker(cotal, options, clock);
+		await waitForBroker(cotal, options, runtime);
 		if (!existsSync(join(options.meshHome, "signer.json"))) {
 			requireSuccess(
 				await runTool(cotal, ["mint", "--signer", "--out", "signer.json"], options),
@@ -247,9 +284,12 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 		try {
 			// bootout can return nonzero for an absent job; confirm removal with print.
 			await runTool(launchctl, ["bootout", target], options);
-			await waitForBootout(launchctl, target, options, clock);
-		} finally {
-			await rm(options.plist);
+			await waitForBootout(launchctl, target, options, runtime);
+			await rm(options.plist, { force: true });
+		} catch (rollbackError) {
+			const original = error instanceof Error ? error.message : "Mesh install failed";
+			const reason = rollbackError instanceof Error ? rollbackError.message : "cleanup failed";
+			throw new Error(`${original}; rollback incomplete: ${reason}`);
 		}
 		throw error;
 	}
@@ -279,10 +319,10 @@ function pendingCount(stdout: string): number {
 		typeof value !== "object" ||
 		!("pending" in value) ||
 		!("ackPending" in value) ||
-		!Number.isSafeInteger(value.pending) ||
-		!Number.isSafeInteger(value.ackPending) ||
 		typeof value.pending !== "number" ||
 		typeof value.ackPending !== "number" ||
+		!Number.isSafeInteger(value.pending) ||
+		!Number.isSafeInteger(value.ackPending) ||
 		value.pending < 0 ||
 		value.ackPending < 0 ||
 		!Number.isSafeInteger(value.pending + value.ackPending)
@@ -300,6 +340,8 @@ async function readJson(path: string): Promise<unknown> {
 }
 
 async function status(options: MeshOptions, launchctl: string | undefined, target: string): Promise<void> {
+	if (!existsSync(join(options.meshHome, ".cotal")))
+		throw new Error("Mesh home has no .cotal directory; install it first");
 	const cotal = await executable("cotal");
 	const config = await readJson(join(options.meshHome, "mesh.json"));
 	if (
@@ -322,10 +364,16 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 				? "absent"
 				: "unavailable on this platform";
 	console.log(`Launchd: ${state}`);
+	const lastExitCode = job?.code === 0 ? /^\s*last exit code = (-?\d+)\s*$/m.exec(job.stdout)?.[1] : undefined;
+	if (lastExitCode !== undefined) console.log(`Launchd last exit code: ${lastExitCode}`);
 	const broker = await runTool(cotal, ["status", "--components"], options);
 	const serving = brokerServing(broker.stdout);
 	console.log(`Broker: ${serving ? "serving" : "not serving"}`);
 	console.log(`Store: ${await storeBytes(join(options.meshHome, ".cotal", "nats", "jetstream"))} bytes`);
+	const log = join(options.meshHome, "service.log");
+	console.log(`Service log: ${existsSync(log) ? (await lstat(log)).size : 0} bytes`);
+	if (!serving) throw new Error("Mesh broker is not serving");
+	let countUnavailable = false;
 	const enrollments = join(options.meshHome, "enrollments");
 	for (const file of existsSync(enrollments) ? await readdir(enrollments) : []) {
 		if (!file.endsWith(".json")) continue;
@@ -352,26 +400,26 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 		// Cotal 0.79.0 dmDurable("local", id, uid).
 		const durable = `dm_local-${record.identity.id}-${record.lifecycleUid}`;
 		const pending = await runTool(cotal, ["deliver", "pending", sessionId, "--durable", durable, "--json"], options);
-		requireSuccess(pending, "cotal deliver pending");
+		if (pending.code !== 0) {
+			console.log(`Session ${sessionId}: count unavailable`);
+			countUnavailable = true;
+			continue;
+		}
 		console.log(`Session ${sessionId}: ${pendingCount(pending.stdout)} unacknowledged`);
 	}
 	if (job && job.code !== 0) throw new Error("Mesh launchd service is absent or inaccessible");
-	if (!serving) throw new Error("Mesh broker is not serving");
+	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
 }
 
-export async function runMeshCommand(args: readonly string[], clock: MeshRuntime = runtime): Promise<void> {
+export async function runMeshCommand(args: readonly string[], runtime: MeshRuntime = defaultRuntime): Promise<void> {
 	try {
 		const options = parseOptions(args);
 		const { command } = options;
-		if (clock.platform !== "darwin" && command !== "status" && command !== "doctor") {
-			throw new Error(`mesh ${command} is not supported on ${clock.platform}`);
+		if (runtime.platform !== "darwin" && command !== "status" && command !== "doctor") {
+			throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);
 		}
-		const launchctl = clock.platform === "darwin" ? await executable("launchctl") : undefined;
+		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = `gui/${process.getuid?.()}/${options.label}`;
-		if (command === "install") {
-			await install(options, launchctl!, target, clock);
-			return;
-		}
 		if (command === "status" || command === "doctor") {
 			await status(options, launchctl, target);
 			if (command === "doctor") {
@@ -381,19 +429,27 @@ export async function runMeshCommand(args: readonly string[], clock: MeshRuntime
 			}
 			return;
 		}
+		if (!launchctl) throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);
+		if (command === "install") {
+			await install(options, launchctl, target, runtime);
+			return;
+		}
 		const toolOptions = { ...options, meshHome: homedir() };
-		requireSuccess(await runTool(launchctl!, ["print", target], toolOptions), "Mesh launchd service lookup");
+		const job = await runTool(launchctl, ["print", target], toolOptions);
+		if (!(command === "uninstall" && job.code === 113 && existsSync(options.plist))) {
+			requireSuccess(job, "Mesh launchd service lookup");
+		}
 		switch (command) {
 			case "uninstall":
-				requireSuccess(await runTool(launchctl!, ["bootout", target], toolOptions), "launchctl bootout");
-				await rm(options.plist);
-				await waitForBootout(launchctl!, target, toolOptions, clock);
+				await runTool(launchctl, ["bootout", target], toolOptions);
+				await waitForBootout(launchctl, target, toolOptions, runtime);
+				await rm(options.plist, { force: true });
 				break;
 			case "start":
-				requireSuccess(await runTool(launchctl!, ["kickstart", target], toolOptions), "launchctl kickstart");
+				requireSuccess(await runTool(launchctl, ["kickstart", target], toolOptions), "launchctl kickstart");
 				break;
 			case "stop":
-				requireSuccess(await runTool(launchctl!, ["kill", "SIGTERM", target], toolOptions), "launchctl kill");
+				requireSuccess(await runTool(launchctl, ["kill", "SIGTERM", target], toolOptions), "launchctl kill");
 				break;
 			default: {
 				const unhandled: never = command;
@@ -403,8 +459,9 @@ export async function runMeshCommand(args: readonly string[], clock: MeshRuntime
 		console.log(`Mesh ${command}: ${options.label}`);
 	} catch (error) {
 		console.error(
-			`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`,
+			chalk.red(`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`),
 		);
+		console.error(chalk.dim(`Run "${APP_NAME} help mesh" for usage.`));
 		process.exitCode = 1;
 	}
 }
