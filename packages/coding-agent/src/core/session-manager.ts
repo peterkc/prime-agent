@@ -1935,6 +1935,10 @@ export class SessionManager {
 		return this.persist;
 	}
 
+	rewritesOnNextPersist(): boolean {
+		return !this.flushed || !this.hasAssistantEntry;
+	}
+
 	/** A successful append, rewrite or file load covered this entry, not merely another entry. */
 	isEntryPersisted(entryId: string): boolean {
 		return this.persistedEntryIds.has(entryId);

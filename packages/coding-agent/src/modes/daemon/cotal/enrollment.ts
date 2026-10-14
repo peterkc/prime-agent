@@ -1,4 +1,5 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CotalEndpoint,
@@ -304,10 +305,41 @@ export async function publishDirectory(
 	});
 }
 
+export async function renameDirectory(meshRoot: string, sessionId: string, sessionFile: string): Promise<void> {
+	await withDirectoryLock(meshRoot, sessionId, async () => {
+		const entry = readDirectory(meshRoot, sessionId);
+		if (!entry) return;
+		const info = await readSessionInfo(sessionFile);
+		if (!info || info.id !== sessionId) throw new Error(`Session ${sessionId}: invalid session file after rename`);
+		writeFileAtomicSync(
+			directoryPath(meshRoot, sessionId),
+			`${JSON.stringify({ ...entry, name: info.name ?? sessionId })}\n`,
+			{
+				mode: 0o600,
+			},
+		);
+	});
+}
+
 export function readDirectory(meshRoot: string, sessionId: string): MeshDirectoryEntry | undefined {
 	const path = directoryPath(meshRoot, sessionId);
 	if (!existsSync(path)) return undefined;
-	const value = object(readJson(path));
+	return parseDirectoryEntry(path, sessionId, readJson(path));
+}
+
+export async function readDirectoryAsync(meshRoot: string, sessionId: string): Promise<MeshDirectoryEntry> {
+	const path = directoryPath(meshRoot, sessionId);
+	let value: unknown;
+	try {
+		value = JSON.parse(await readFile(path, "utf8"));
+	} catch {
+		throw new Error(`Mesh directory ${path}: cannot read valid JSON`);
+	}
+	return parseDirectoryEntry(path, sessionId, value);
+}
+
+function parseDirectoryEntry(path: string, sessionId: string, input: unknown): MeshDirectoryEntry {
+	const value = object(input);
 	if (
 		value?.sessionId !== sessionId ||
 		typeof value.name !== "string" ||

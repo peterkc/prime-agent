@@ -26,6 +26,7 @@ import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessage,
 	type AgentSessionMessageController,
+	createAgentMessageHostHandlers,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import {
@@ -80,6 +81,7 @@ import { type PrivateFrame, PrivateFrameDecoder } from "../src/modes/session-wor
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 import { createHarness } from "./suite/harness.js";
 import { createDeferred } from "./suite/scheduling.js";
+import { userMsg } from "./utilities.js";
 
 describe("daemon mode helpers", () => {
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -934,12 +936,12 @@ describe("daemon mode helpers", () => {
 		await expect(observe.recentMessages({ target: "helper" })).resolves.toMatchObject({
 			agent: { activeSessionId: familyHelper.state.activeSessionId },
 		});
+		const controller = internals.createAgentMessageController(() => observer.state);
+		const handlers = createAgentMessageHostHandlers({ ...controller, family: async () => controller.family!() });
 		await expect(
-			internals
-				.createAgentMessageController(() => observer.state)
-				.sendAgentMessage({ target: "helper", message: "report progress" }),
-		).resolves.toMatchObject({ target: { activeSessionId: familyHelper.state.activeSessionId } });
-		expect(familyHelper.acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+			handlers["agent_message.send"]!({ receiver_name: "helper", message: "report progress" }),
+		).rejects.toThrow('agentMessageTransport "cotal"');
+		expect(familyHelper.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 		expect(unrelatedHelper.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
@@ -4456,7 +4458,7 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["old", "stored"])("sends through the mesh controller without native fallback (%s)", async (mode) => {
+	it.each(["old", "stored", "names"])("mesh send: refusal, receipt and rate limit (%s)", async (mode) => {
 		const h = harness();
 		await h.authenticate("cotal");
 		const worker = h.internals as unknown as {
@@ -4477,15 +4479,26 @@ describe("mesh worker persistence", () => {
 		source.runtime = {
 			session: { sessionFile: join(h.root, "a.jsonl") },
 		} as unknown as ActiveSessionState["runtime"];
-		const sending = worker
-			.createAgentMessageController(() => source)
-			.sendAgentMessage({ target: "session-b", message: "hello" });
-		if (mode === "old") await expect(sending).rejects.toThrow("not stored");
-		else await expect(sending).resolves.toEqual(receipt);
-		expect(request).toHaveBeenCalledExactlyOnceWith(
-			{ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "session-b", message: "hello" },
-			35_000,
-		);
+		const controller = worker.createAgentMessageController(() => source);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			const sending = controller.sendAgentMessage({ target: "session-b", message: "hello" });
+			if (mode === "old") await expect(sending).rejects.toThrow("not stored");
+			else await expect(sending).resolves.toEqual(receipt);
+			if (mode === "names") {
+				for (const target of ["SESSION-B", "session-b"])
+					await controller.sendAgentMessage({ target, targetKind: "name", message: "hello" });
+				await expect(
+					controller.sendAgentMessage({ target: "Session-B", targetKind: "name", message: "hello" }),
+				).rejects.toThrow("rate limit exceeded");
+			} else
+				expect(request).toHaveBeenCalledExactlyOnceWith(
+					{ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "session-b", message: "hello" },
+					35_000,
+				);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it.each(["native", "cotal"])(
@@ -4640,8 +4653,8 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["new_session", "fork", "switch_session", "import_jsonl"])(
-		"closes the old session's queued mesh delivery on user replacement (%s)",
+	it.each(["new_session", "fork", "switch_session", "import_jsonl", "repeat"])(
+		"closes or deduplicates the old session's queued mesh delivery (%s)",
 		async (command) => {
 			const gate = createDeferred();
 			const started = createDeferred();
@@ -4714,6 +4727,31 @@ describe("mesh worker persistence", () => {
 				expect(h.frames().filter((frame) => frame.command === "worker_deliver_message")).toMatchObject([
 					{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
 				]);
+				if (command === "repeat") {
+					h.socket.emit("close");
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({
+							id: "redelivery",
+							type: "worker_deliver_message",
+							targetActiveSessionId: state.activeSessionId,
+							message: "hello",
+							sender: { sessionName: "sender" },
+							cotal: { id: "replaced", deliveryCount: 2 },
+						}),
+					);
+					expect(live.session.getSessionActionSnapshot().queuedCount).toBe(1);
+					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(0);
+					gate.resolve();
+					await running;
+					expect(
+						live.sessionManager
+							.getEntries()
+							.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+					).toHaveLength(1);
+					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(1);
+					return;
+				}
 				await h.internals.handleLine(
 					h.client,
 					JSON.stringify({
@@ -5116,12 +5154,19 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it("answers acceptance, rejects an unrelated write notice after its own failed append, then reports its own rewrite once and detects repeats", async () => {
+	it.each(["pending", "flushed", "unreadable"])("accepts, writes and deduplicates (%s)", async (mode) => {
 		const h = harness();
 		await h.authenticate("cotal");
 		h.written.length = 0;
 		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
-		manager.appendMessage(fauxAssistantMessage("ready"));
+		manager.appendSessionInfo("disk-known");
+		manager.appendMessage(mode === "flushed" ? fauxAssistantMessage("ready") : userMsg("pending"));
+		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
+			throw new Error("name append failed");
+		});
+		expect(() => manager.appendSessionInfo("holder-newer")).toThrow("name append failed");
+		if (mode !== "pending") writeFileSync(manager.getSessionFile()!, "null\nprivate-json-fragment");
+		const log = vi.spyOn(h.internals as unknown as { log(message: string): void }, "log");
 		let accepted!: AgentSessionMessage;
 		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
 			expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
@@ -5136,6 +5181,7 @@ describe("mesh worker persistence", () => {
 				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
 				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
 				rejectAgentMessagePrompt: () => undefined,
+				hasQueuedAgentMessage: () => false,
 				registerDisposeCallback: () => () => undefined,
 			}),
 		} as unknown as ActiveSessionState["runtime"];
@@ -5152,6 +5198,10 @@ describe("mesh worker persistence", () => {
 		await h.internals.receiveMeshMessage(h.client, command);
 		expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
 		expect(accepted.details.id).toBe("agentmsg_stable");
+		expect(manager.getSessionName()).toBe("holder-newer");
+		if (mode === "unreadable") expect(log).toHaveBeenCalledWith(expect.stringContaining(manager.getSessionId()));
+		else expect(log).not.toHaveBeenCalled();
+		expect(log.mock.calls.flat().join()).not.toContain("private-json-fragment");
 		expect(accepted.content).toContain("Possibly repeated");
 		expect(accepted.content).toContain("sender");
 		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
@@ -5160,6 +5210,16 @@ describe("mesh worker persistence", () => {
 		expect(() =>
 			manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details),
 		).toThrow("append failed");
+		h.socket.emit("close"); // The supervisor connection ended while the failed append was only in memory.
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(
+			h
+				.frames()
+				.slice(1)
+				.some((frame) => frame.type === "agent_message_persisted"),
+		).toBe(false);
+		h.written.splice(1);
 		manager.appendCustomEntry("unrelated");
 		expect(h.frames()).toHaveLength(1);
 		(manager as unknown as { _rewriteFile(): void })._rewriteFile();

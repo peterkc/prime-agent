@@ -1,14 +1,15 @@
 ---
 name: agent-message
-description: Message an agent's parent, siblings, or direct children through the daemon. Discover reachable agents with agent_observe.list_agents, then send direct text without spoofing sender identity.
+description: Message family members by role, or any local-space agent by session name or ID when Cotal messaging is enabled. Sender identity comes from the daemon.
 ---
 
 # Agent Message
 
 Send direct messages within the current agent's nuclear family through the
-local daemon: parent, siblings, and direct children only. Roots are siblings.
-The daemon derives your sender identity from the current session; do not try
-to include a `from` field.
+local daemon: parent, siblings, and direct children. Roots are siblings.
+With Cotal messaging enabled, omit `receiver_role` to address any session in the
+local space by name or session ID. The daemon derives your sender identity from
+the current session; do not try to include a `from` field.
 
 Call directly from the kernel:
 
@@ -46,6 +47,17 @@ if child is not None:
   context; `"queued"` means a steering message was accepted and will deliver when
   the target's current work allows (`send` does not block waiting for that).
   Delivered receipts carry `deliveredAt`, queued receipts carry `queuedAt`.
+- `await agent_message.send(message, receiver_name="name-or-session-id")` —
+  with Cotal enabled, sends to any enrolled session in the local space. An exact
+  session ID wins; otherwise one case-insensitive name match is required.
+  Ambiguous names list the candidates. Unknown names and unsupported spaces fail
+  before storage. The whole selector is tried as a local ID or name first,
+  including names containing `/`. If no local match exists,
+  `"space/name-or-session-id"` qualifies the space; only the local space works.
+- On Cotal, every successful send returns `deliveryStatus: "stored"`, `sequence`
+  and `cotalId`. This proves broker storage, not delivery to the target. It carries
+  neither `deliveredAt` nor `queuedAt`. A storage-outcome-unknown error must not be
+  retried automatically: a resend can show the message twice.
 
 ## Safety
 
@@ -53,8 +65,10 @@ if child is not None:
   be running and queued receipts have not run yet. Wait until observation shows
   the child is idle and its context is no longer needed before calling
   `await rlm.delete_subagent(child)`.
-- Reach is limited to parent, siblings, and direct children; relay through an
-  intermediate child instead of messaging grandchildren or cousins directly.
+- Role shortcuts and `"all"` remain limited to parent, siblings, and direct
+  children. Name-only addressing reaches any local-space session on Cotal.
+  Name-only sends require `agentMessageTransport: "cotal"`. With native messaging,
+  send by family role.
 - Sender identity is daemon-derived and cannot be spoofed from Python.
 - The daemon enforces message size, rate, and pending-queue limits before
   accepting delivery.

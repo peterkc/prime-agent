@@ -2827,13 +2827,16 @@ export class DaemonSupervisor {
 						// Heartbeat rows carry the owning session's display name;
 						// drop the snapshot so the next list shows the new one.
 						this.invalidatePassiveScheduledJobs();
+						await this.renameMeshSession(target.sessionId, command.sessionPath);
 						return success(command.id, command.type);
 					}
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return await this.forwardToWorker(match.worker, {
+					const response = await this.forwardToWorker(match.worker, {
 						...command,
 						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
 					});
+					if (response.success) await this.renameMeshSession(target.sessionId, command.sessionPath);
+					return response;
 				});
 			}
 			case "delete_saved_session":
@@ -2876,25 +2879,9 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
-			const targetRow = [...this.roster().values()].find(
-				(entry) => entry.summary.sessionId === command.targetSessionId,
-			);
-			let target = targetRow ? sessionSummaryFromRosterEntry(targetRow) : undefined;
-			if (!target) {
-				try {
-					const path = await this.catalog.resolve(
-						command.targetSessionId,
-						source.summary.cwd,
-						source.worker.descriptor.sessionDir ?? this.defaultSessionConfig.sessionDir,
-					);
-					const info = await readSessionInfo(path);
-					if (info) target = summaryForInactiveSession(info);
-				} catch (error) {
-					throw new Error(`Message was not stored: ${redactMeshError(error)}`);
-				}
-			}
-			if (!target) throw new Error("Message was not stored: target session is unavailable");
-			this.assertAgentMessageOrigin(source.summary, target, true);
+			const targetSessionId = await this.mesh.resolveAddress(command.targetSessionId);
+			if (targetSessionId === source.summary.sessionId)
+				throw new Error("Message was not stored: agent messaging cannot target the sending session");
 			const receipt = await this.mesh.send(
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
@@ -2902,7 +2889,7 @@ export class DaemonSupervisor {
 					sessionName: source.summary.sessionName,
 					runtimeKind: source.summary.runtimeKind ?? "top-level",
 				},
-				command.targetSessionId,
+				targetSessionId,
 				normalizeAgentSessionMessage(command.message),
 			);
 			return success(command.id, command.type, receipt);
@@ -3043,7 +3030,10 @@ export class DaemonSupervisor {
 					const reservation = this.summaryNameReservationInput(match.summary, command.name.trim());
 					return await this.withSessionNameReservation(reservation, async () => {
 						await this.assertSupervisorSessionNameAvailable(match.summary, reservation.name);
-						return forward();
+						const response = await forward();
+						if (response.success)
+							await this.renameMeshSession(match.summary.sessionId, match.summary.sessionFile);
+						return response;
 					});
 				}
 				return await forward();
@@ -4813,6 +4803,16 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
+	private async renameMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
+		if (!this.mesh) return;
+		try {
+			if (!sessionFile) throw new Error("session has no session file");
+			await this.mesh.rename(sessionId, sessionFile);
+		} catch (error) {
+			this.log(`Mesh directory rename failed for session ${sessionId}: ${redactMeshError(error)}`);
+		}
+	}
+
 	private async enrollMeshSession(sessionId: string, sessionFile?: string, queued = false): Promise<void> {
 		try {
 			if (queued) await this.mesh?.enqueueEnrollment(sessionId, sessionFile);
@@ -5175,14 +5175,21 @@ export class DaemonSupervisor {
 	private async savedSessionNameReservationInput(
 		sessionPath: string,
 		name: string,
-	): Promise<{ name: string; depth: number; parentSessionId?: string; parentSessionPath?: string }> {
+	): Promise<{
+		sessionId: string;
+		name: string;
+		depth: number;
+		parentSessionId?: string;
+		parentSessionPath?: string;
+	}> {
 		const targetPath = canonicalSessionPath(sessionPath);
 		const active = this.workerOwnedRosterSummaryForPath(targetPath);
-		if (active) return this.summaryNameReservationInput(active, name);
+		if (active) return { ...this.summaryNameReservationInput(active, name), sessionId: active.sessionId };
 		const siblings = await this.rlmLedgerSiblings(sessionPath);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		return {
+			sessionId: saved.id,
 			name,
 			depth: saved.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0,
 			parentSessionPath: saved.parentSessionPath,
