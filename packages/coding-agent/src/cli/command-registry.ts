@@ -93,6 +93,30 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		options: ["--fix   Remove stale sockets and stop idle orphaned services", "--json  Print JSON"],
 	},
 	{
+		path: ["mesh"],
+		usage: "mesh <install|uninstall|start|stop|status|doctor>",
+		summary: "Manage the local Cotal broker service",
+		options: [
+			"--label <label>  Launchd label (default: ai.prime.mesh)",
+			"--mesh-home <path>  Mesh directory (default: <agent dir>/mesh)",
+			"--server <url>  Loopback NATS URL (default: nats://127.0.0.1:4222)",
+		],
+	},
+	{ path: ["mesh", "install"], usage: "mesh install [options]", summary: "Install and start the broker" },
+	{
+		path: ["mesh", "uninstall"],
+		usage: "mesh uninstall [options]",
+		summary: "Remove the service and keep mesh enrollments",
+	},
+	{ path: ["mesh", "start"], usage: "mesh start [options]", summary: "Start the installed service" },
+	{ path: ["mesh", "stop"], usage: "mesh stop [options]", summary: "Stop the installed service" },
+	{
+		path: ["mesh", "status"],
+		usage: "mesh status [options]",
+		summary: "Show service state, store size and pending counts",
+	},
+	{ path: ["mesh", "doctor"], usage: "mesh doctor [options]", summary: "Check service state and Cotal auth" },
+	{
 		path: ["incident"],
 		usage: "incident [--since <time>] [--until <time>] [--session <id>]",
 		summary: "Reconstruct a daemon incident from its logs",
