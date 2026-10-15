@@ -86,6 +86,85 @@ Every persisted session is protected by a process-safe lease keyed by canonical 
 
 This prevents daemon workers and one-shot clients from writing the same transcript concurrently.
 
+## Mesh Agent Messaging
+
+Set `"agentMessageTransport": "cotal"` in global settings for durable agent messages
+across daemons on this computer. Project settings cannot enable it. Restart the daemon
+after changing it. The default, `"native"`, keeps existing family messaging unchanged.
+
+On macOS, `prime-agent mesh install` creates `<agent dir>/mesh`, starts a launchd agent,
+waits for the broker, and creates the private signer. It requires `cotal` on `PATH`.
+The service runs `cotal up --space prime --server <URL> --no-manager` in the mesh home,
+with `COTAL_HOME=<mesh home>/home`. Options are `--mesh-home`, `--server nats://127.0.0.1:<port>`
+and `--label ai.prime.mesh.<name>`. Install refuses an occupied label or port.
+If startup or signer creation fails, it removes the service and plist but keeps the home.
+
+- `prime-agent mesh start` and `stop` start or stop the installed service.
+- `prime-agent mesh status` reports service state, store bytes, service-log bytes,
+  enrolled-session count, and each session's stored, unacknowledged message count.
+- `prime-agent mesh doctor` also checks Cotal auth.
+- `prime-agent mesh uninstall` removes the service and plist, not the mesh home,
+  signer, enrollment records or stored messages. Existing sessions need that auth.
+- Install, uninstall, start and stop refuse platforms other than macOS without changes.
+
+A session with a session file enrolls on create or open. The supervisor takes its claim,
+reuses or creates a private enrollment record, provisions the inbox, writes a directory
+entry, and starts an endpoint. The identity stays the same across restarts. Children
+enroll only after they have a session file. Fileless sessions cannot send or receive.
+All daemons must use the same agent directory.
+
+A claim permits one supervisor to pull a session's inbox. A live claim held elsewhere
+prevents a second endpoint. The holder delivers to idle or saved sessions and wakes a
+worker when needed. Opening elsewhere does not transfer a live claim. Workers from
+before mesh support must be restarted; restarting only the supervisor can leave them
+running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
+clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.
+
+`<mesh home>/directory/` carries IDs, names, principals and home sockets, never secrets.
+An exact ID wins; otherwise a case-insensitive name must match exactly one entry.
+Unknown targets, ambiguous names and another space have distinct errors. Renames update
+the entry under a per-session lock. Deletion removes the entry before the enrollment
+record under that lock, so stale publication cannot restore the entry.
+
+Deleting a session closes its endpoint before removing its lifecycle's inbox while
+holding its claim. If another live supervisor holds the claim, deletion leaves the inbox
+and logs the session ID. The holder removes it when it next finds the entry gone at
+endpoint start or before a handoff. A partial removal is logged and not retried; consumers
+left still count toward the limit. Failed endpoint stops keep the claim and prevent a
+second endpoint. Queued deliveries and late persistence frames settle nothing after close.
+
+There is no per-daemon endpoint cap. NATS's default is 1000 consumers per stream, so the
+space supports about 1000 enrolled inboxes. Each uses one consumer in `DM_prime` and one
+in `DLV_prime`. Presence and channel watches are off. Status prints
+`DM_prime: <count> consumers / 1000` and the equivalent `DLV_prime` line. Counts can differ
+after partial removal. Orphan consumers count even without an enrollment record.
+These lines count durable consumer directories on disk. Cotal's pending-count inspection
+can leave temporary memory-only DM consumers. They also use the limit but are not in
+these disk counts. The client sets a five-minute inactivity threshold and attempts
+immediate cleanup.
+The broker store has no retention limit. `<mesh home>/service.log` is not rotated.
+Monitor the reported sizes; a full disk can make sends fail. Status queries pending counts
+once per enrollment and gets slower as the number of sessions grows.
+
+A successful send returns `deliveryStatus: "stored"`, a stream sequence and a Cotal ID.
+This means the broker stored the message, not that the target wrote it. A delivery is
+acknowledged only after its own entry is written, or after an explicit cleared/closed drop.
+Crashes and other drops leave it unacknowledged for redelivery. A delivery above the first
+marks its text as possibly repeated. Already-held IDs are not added again.
+
+- `Message was not stored: ...` names a failure before publish: mesh unavailable,
+  missing enrollment or directory, unknown/ambiguous target, or a reconnect deadline.
+  Reconnect waits share the send's total 30-second budget. There is no native fallback.
+- `Message storage outcome is unknown: ...; a resend can show the message twice`
+  means publish failed or its acknowledgement did not arrive within that budget.
+  The broker might have stored it. Prime does not retry; check the target before resending.
+- Enrollment, wake and inbox-removal errors log the session ID and a redacted reason.
+  Missing or invalid signers refuse enrollment and sends without printing their contents.
+
+To roll back after activation, set `"agentMessageTransport": "native"` and restart the
+daemon. Stored, undelivered messages stay on the broker until mesh mode is enabled again.
+They are neither lost nor sent natively. `prime-agent mesh status` reports how many remain.
+
 ## Scheduling
 
 Each worker runs one scheduler for its root and descendants. Jobs are persisted per session in `session-artifacts/<session-id>/scheduled-jobs.json`; workers do not share a global cron file.

@@ -1935,6 +1935,7 @@ export class SessionManager {
 		return this.persist;
 	}
 
+	/** Whether the next persisted entry rewrites the file, also persisting earlier buffered entries. */
 	rewritesOnNextPersist(): boolean {
 		return !this.flushed || !this.hasAssistantEntry;
 	}

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { CotalEndpoint, type CotalMessage, type Delivery, type MessageMeta } from "@cotal-ai/core";
+import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, type MessageMeta } from "@cotal-ai/core";
 import {
 	AGENT_MESSAGE_ID_PREFIX,
 	AGENT_MESSAGE_SOURCE,
@@ -11,6 +11,7 @@ import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
 	credentialSource,
+	deprovisionEnrollment,
 	type EnrollmentRecord,
 	enrollmentPath,
 	ensureEnrollmentRecord,
@@ -21,7 +22,9 @@ import {
 	publishDirectory,
 	readDirectory,
 	readSigner,
+	removeEnrollment,
 	renameDirectory,
+	withDirectoryLock,
 } from "./enrollment.js";
 import { InvalidMeshPayloadError, meshMessageText, redactMeshError } from "./mesh-shared.js";
 
@@ -35,6 +38,7 @@ export interface MeshEndpointOptions {
 		message: CotalMessage,
 		deliveryCount: number,
 		bindRecipient: (recipient: object) => void,
+		isOpen: () => boolean,
 	) => Promise<void>;
 }
 
@@ -53,7 +57,11 @@ interface SessionEndpoint {
 	readonly queue: QueuedDelivery[];
 	handoff?: Promise<void>;
 	current?: QueuedDelivery;
-	failed?: boolean;
+	state: "starting" | "connected" | "transport-disconnected" | "reconnecting" | "closed";
+	readonly abort: AbortController;
+	credentialExpiresAt?: number;
+	close?: Promise<void>;
+	retirement?: Promise<void>;
 }
 
 interface PendingPersistence {
@@ -133,9 +141,13 @@ export class MeshEndpoints {
 			this.recordEnrollmentFailure(sessionId, error);
 			return Promise.reject(error);
 		}
-		if (this.sessions.has(sessionId)) return Promise.resolve();
 		const existing = this.enrolling.get(sessionId);
 		if (existing) return existing;
+		const session = this.sessions.get(sessionId);
+		if (session)
+			return session.state === "closed"
+				? Promise.reject(new Error(`Session ${sessionId}: mesh endpoint is closed`))
+				: Promise.resolve();
 		const work = this.startSession(sessionId, sessionFile).catch((error: unknown) => {
 			throw new Error(this.recordEnrollmentFailure(sessionId, error));
 		});
@@ -161,29 +173,60 @@ export class MeshEndpoints {
 			}
 			throw error;
 		}
-		let endpoint: CotalEndpoint | undefined;
 		let session: SessionEndpoint | undefined;
+		let record: EnrollmentRecord | undefined;
 		try {
 			readSigner(this.options.meshRoot, config.space);
-			const record = ensureEnrollmentRecord(this.options.meshRoot, sessionId, sessionFile);
+			record = await withDirectoryLock(this.options.meshRoot, sessionId, async () => {
+				if (!existsSync(sessionFile)) throw new Error(`Session ${sessionId}: session file is missing`);
+				return ensureEnrollmentRecord(this.options.meshRoot, sessionId, sessionFile);
+			});
 			await provisionEnrollment(this.options.meshRoot, config, record);
 			if (this.closing) throw new Error(`Session ${sessionId}: mesh is shutting down`);
 			const directory = await publishDirectory(this.options.meshRoot, record, this.options.homeSocket);
-			endpoint = new CotalEndpoint({
+			const source = credentialSource(
+				this.options.meshRoot,
+				config.space,
+				record,
+				this.options.credentialLifetimeSeconds,
+			);
+			let nextCredentialExpiresAt: number | undefined;
+			const endpoint = new CotalEndpoint({
 				space: config.space,
 				servers: config.server,
 				card: { name: directory.name, kind: "agent", id: record.identity.id },
 				lifecycleUid: record.lifecycleUid,
 				channels: [],
-				creds: credentialSource(
-					this.options.meshRoot,
-					config.space,
-					record,
-					this.options.credentialLifetimeSeconds,
-				),
+				watchPresence: false,
+				watchChannels: false,
+				creds: async () => {
+					const creds = await source();
+					// Initial/passive binds accept this generation at their ready edge. Timer candidates need adoption.
+					if (!session || session.state === "starting" || session.state === "reconnecting") {
+						const exp = credsClaims(creds).exp;
+						nextCredentialExpiresAt = exp === undefined ? undefined : exp * 1000;
+					}
+					return creds;
+				},
 			});
-			session = { record, claim, endpoint, queue: [] };
+			session = { record, claim, endpoint, queue: [], state: "starting", abort: new AbortController() };
+			this.sessions.set(sessionId, session);
 			const startedSession = session;
+			endpoint.on("connection", ({ connected }: { connected: boolean }) => {
+				if (startedSession.state === "closed") return;
+				startedSession.state = connected ? "connected" : "reconnecting";
+				if (connected) startedSession.credentialExpiresAt = nextCredentialExpiresAt;
+			});
+			endpoint.on("transport", ({ connected }: { connected: boolean }) => {
+				if (!connected && startedSession.state === "connected") startedSession.state = "transport-disconnected";
+				else if (connected && startedSession.state === "transport-disconnected") {
+					startedSession.state = "connected";
+					startedSession.credentialExpiresAt = nextCredentialExpiresAt;
+				}
+			});
+			endpoint.on("creds-adopted", ({ exp }: { exp?: number }) => {
+				nextCredentialExpiresAt = exp === undefined ? undefined : exp * 1000;
+			});
 			endpoint.on("error", (error: unknown) =>
 				this.options.log(`Mesh session ${sessionId}: endpoint error: ${redactMeshError(error)}`),
 			);
@@ -201,36 +244,107 @@ export class MeshEndpoints {
 			if (this.closing || !readDirectory(this.options.meshRoot, sessionId)) {
 				throw new Error(`Session ${sessionId}: mesh closed or directory entry disappeared`);
 			}
-			this.sessions.set(sessionId, session);
+			if (session.state === "closed") throw new Error(`Session ${sessionId}: mesh endpoint is closed`);
+			session.state = "connected";
 			this.enrollmentFailures.delete(sessionId);
 			this.drain(session);
 		} catch (error) {
 			if (session) {
-				session.failed = true;
-				for (const item of session.queue) {
-					if (item.workingTimer) clearInterval(item.workingTimer);
-					if (item.stallTimer) clearTimeout(item.stallTimer);
+				if (session.retirement || !readDirectory(this.options.meshRoot, sessionId)) {
+					await this.retireSession(session);
+				} else {
+					await this.closeSession(sessionId);
+					this.sessions.delete(sessionId);
+					claim.release();
 				}
-				session.queue.length = 0;
-			}
-			try {
-				await endpoint?.stop();
-			} catch (error) {
-				this.options.log(`Mesh session ${sessionId}: endpoint cleanup stop rejected: ${redactMeshError(error)}`);
-			} finally {
+			} else {
+				// An unpublished first enrollment is not a delete. Only missing persisted state authorizes removal.
+				if (record && !existsSync(enrollmentPath(this.options.meshRoot, sessionId))) {
+					await this.removeInbox(record);
+				}
 				claim.release();
 			}
 			throw error;
 		}
 	}
 
+	closeSession(sessionId: string): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		if (!session) return Promise.resolve();
+		if (session.close) return session.close;
+		session.state = "closed";
+		session.abort.abort();
+		for (const item of [...session.queue, ...(session.current ? [session.current] : [])]) {
+			if (item.workingTimer) clearInterval(item.workingTimer);
+			if (item.stallTimer) clearTimeout(item.stallTimer);
+		}
+		session.queue.length = 0;
+		for (const [id, pending] of this.pending) {
+			if (pending.sessionId !== sessionId) continue;
+			this.pending.delete(id);
+			pending.reject(new Error("Mesh endpoint closed before persistence"));
+		}
+		session.close = session.endpoint.stop().catch((error: unknown) => {
+			this.options.log(`Mesh session ${sessionId}: endpoint stop failed; claim retained: ${redactMeshError(error)}`);
+			throw error;
+		});
+		return session.close;
+	}
+
+	async unenroll(sessionId: string, sessionFile: string): Promise<void> {
+		const record = await removeEnrollment(this.options.meshRoot, sessionId);
+		const session = this.sessions.get(sessionId);
+		if (session) {
+			await this.retireSession(session);
+			return;
+		}
+		if (!record) return;
+		let claim: SessionLease;
+		try {
+			claim = claimEnrollment(this.options.meshRoot, sessionId, sessionFile);
+		} catch (error) {
+			if (!(error instanceof SessionAlreadyActiveError)) throw error;
+			this.options.log(`Mesh session ${sessionId}: inbox removal skipped; claimed by another daemon`);
+			return;
+		}
+		try {
+			await this.removeInbox(record);
+		} finally {
+			claim.release();
+		}
+	}
+
+	private retireSession(session: SessionEndpoint): Promise<void> {
+		if (session.retirement) return session.retirement;
+		session.retirement = this.closeSession(session.record.sessionId).then(async () => {
+			await this.removeInbox(session.record);
+			session.claim.release();
+			this.sessions.delete(session.record.sessionId);
+		});
+		return session.retirement;
+	}
+
+	private async removeInbox(record: EnrollmentRecord): Promise<void> {
+		if (!this.config) throw new Error("Mesh configuration is unavailable");
+		try {
+			await deprovisionEnrollment(this.options.meshRoot, this.config, record);
+		} catch (error) {
+			this.options.log(`Mesh session ${record.sessionId}: inbox removal failed: ${redactMeshError(error)}`);
+		}
+	}
+
 	async resolveAddress(selector: string): Promise<string> {
 		if (!this.config || this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
-		const result = await resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
-			if (this.invalidDirectoryEntries.has(file)) return;
-			this.invalidDirectoryEntries.add(file);
-			this.options.log(`Mesh directory entry ${JSON.stringify(file)}: unreadable or invalid; ignored`);
-		});
+		let result: Awaited<ReturnType<typeof resolveDirectoryAddress>>;
+		try {
+			result = await resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
+				if (this.invalidDirectoryEntries.has(file)) return;
+				this.invalidDirectoryEntries.add(file);
+				this.options.log(`Mesh directory entry ${JSON.stringify(file)}: unreadable or invalid; ignored`);
+			});
+		} catch (error) {
+			throw new Error(`Message was not stored: directory lookup failed: ${redactMeshError(error)}`);
+		}
 		if (!result.ok) {
 			const reason = result.reason === "unknown" ? this.enrollmentFailures.get(selector) : undefined;
 			throw new Error(`Message was not stored: ${reason ?? result.error}`);
@@ -257,6 +371,7 @@ export class MeshEndpoints {
 		targetSessionId: string,
 		message: string,
 	): Promise<AgentSessionMessageReceipt> {
+		const deadline = Date.now() + 30_000;
 		const senderSessionId = sender.sessionId;
 		if (this.closing) throw new Error("Message was not stored: mesh is shutting down");
 		if (this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
@@ -288,6 +403,21 @@ export class MeshEndpoints {
 				`Message was not stored: target ${targetSessionId} ${this.enrollmentFailures.get(targetSessionId) ?? "is not enrolled: no enrollment record or directory entry"}`,
 			);
 		}
+		try {
+			await this.waitForConnection(source, deadline);
+			if (this.closing || source.state === "closed") throw new Error("mesh endpoint closed");
+			if (Date.now() >= deadline) throw new Error("mesh send deadline elapsed before publish");
+			if (
+				!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
+				!readDirectory(this.options.meshRoot, senderSessionId)
+			)
+				throw new Error("sender enrollment disappeared while reconnecting");
+			target = readDirectory(this.options.meshRoot, targetSessionId);
+			if (!target || !existsSync(enrollmentPath(this.options.meshRoot, targetSessionId)))
+				throw new Error("target enrollment disappeared while reconnecting");
+		} catch (error) {
+			throw new Error(`Message was not stored: sender ${senderSessionId}: ${redactMeshError(error)}`);
+		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			// From this call onward any error is ambiguous. Never retry a publish or use native delivery.
@@ -295,7 +425,10 @@ export class MeshEndpoints {
 			const { msg, ack } = await Promise.race([
 				publish,
 				new Promise<never>((_, reject) => {
-					timer = setTimeout(() => reject(new Error("Mesh publish deadline elapsed")), 30_000);
+					timer = setTimeout(
+						() => reject(new Error("Mesh publish deadline elapsed")),
+						Math.max(0, deadline - Date.now()),
+					);
 				}),
 			]);
 			return {
@@ -317,12 +450,51 @@ export class MeshEndpoints {
 		}
 	}
 
+	private waitForConnection(session: SessionEndpoint, deadline: number): Promise<void> {
+		if (
+			session.state === "connected" &&
+			session.credentialExpiresAt !== undefined &&
+			Date.now() >= session.credentialExpiresAt
+		) {
+			session.state = "reconnecting";
+			void session.endpoint.reconnect().catch((error: unknown) => {
+				this.options.log(`Mesh session ${session.record.sessionId}: reconnect failed: ${redactMeshError(error)}`);
+			});
+		}
+		if (session.state === "connected") return Promise.resolve();
+		return new Promise<void>((resolve, reject) => {
+			function finish(error?: Error): void {
+				clearTimeout(timer);
+				session.endpoint.off("connection", connected);
+				session.endpoint.off("transport", connected);
+				session.abort.signal.removeEventListener("abort", closed);
+				if (error) reject(error);
+				else resolve();
+			}
+			function connected(): void {
+				if (session.state === "connected") finish();
+			}
+			function closed(): void {
+				finish(new Error("mesh endpoint closed"));
+			}
+			const timer = setTimeout(
+				() => finish(new Error("endpoint did not reconnect within 30 seconds")),
+				Math.max(0, deadline - Date.now()),
+			);
+			session.endpoint.on("connection", connected);
+			session.endpoint.on("transport", connected);
+			session.abort.signal.addEventListener("abort", closed, { once: true });
+			if (session.state === "closed") closed();
+			else connected();
+		});
+	}
+
 	private enqueue(session: SessionEndpoint, message: CotalMessage, delivery: Delivery): void {
-		if (this.closing || session.failed) return;
+		if (this.closing || session.state === "closed") return;
 		const redelivery = delivery.redelivery;
 		const deliveryCount = redelivery?.deliveryCount ?? 1;
 		const working = () => {
-			if (this.closing) return;
+			if (this.closing || session.state === "closed") return;
 			try {
 				redelivery?.working();
 			} catch {
@@ -340,7 +512,14 @@ export class MeshEndpoints {
 	}
 
 	private drain(session: SessionEndpoint): void {
-		if (this.closing || session.handoff || this.sessions.get(session.record.sessionId) !== session) return;
+		if (
+			this.closing ||
+			session.state === "closed" ||
+			session.state === "starting" ||
+			session.handoff ||
+			this.sessions.get(session.record.sessionId) !== session
+		)
+			return;
 		const item = session.queue.shift();
 		if (!item) return;
 		session.current = item;
@@ -373,15 +552,9 @@ export class MeshEndpoints {
 		try {
 			meshMessageText(message);
 			if (!readDirectory(this.options.meshRoot, session.record.sessionId)) {
-				await session.endpoint.stop();
-				session.claim.release();
-				this.sessions.delete(session.record.sessionId);
-				for (const queued of session.queue) {
-					if (queued.workingTimer) clearInterval(queued.workingTimer);
-					if (queued.stallTimer) clearTimeout(queued.stallTimer);
-				}
-				session.queue.length = 0;
-				throw new Error("Mesh directory entry disappeared");
+				this.logDelivery(session, message.id, deliveryCount, "directory entry disappeared; left unacknowledged");
+				await this.retireSession(session);
+				return;
 			}
 			if (this.pending.has(message.id)) throw new Error("A copy is already in flight");
 			const persisted = new Promise<void>((resolve, reject) => {
@@ -390,12 +563,23 @@ export class MeshEndpoints {
 			});
 			// A disconnect may reject this while wake/acceptance is still pending.
 			void persisted.catch(() => undefined);
-			await this.options.handoff(session.record, message, deliveryCount, (recipient) => {
-				if (pending) pending.recipient = recipient;
-			});
+			await this.options.handoff(
+				session.record,
+				message,
+				deliveryCount,
+				(recipient) => {
+					if (pending) pending.recipient = recipient;
+				},
+				() => {
+					if (this.closing || session.state === "closed") return false;
+					if (readDirectory(this.options.meshRoot, session.record.sessionId)) return true;
+					void this.retireSession(session).catch(() => undefined); // close logs a failed stop and keeps custody.
+					return false;
+				},
+			);
 			await persisted;
 		} catch (error) {
-			if (pending && this.pending.get(message.id) !== pending) return;
+			if (session.state === "closed" || (pending && this.pending.get(message.id) !== pending)) return;
 			if (error instanceof InvalidMeshPayloadError) {
 				let outcome = "invalid payload acknowledged";
 				try {

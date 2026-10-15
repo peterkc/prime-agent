@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
-import type { CotalEndpoint, CotalMessage, Delivery } from "@cotal-ai/core";
+import {
+	type CotalEndpoint,
+	type CotalMessage,
+	credsClaims,
+	type Delivery,
+	mintCreds,
+	newIdentity,
+} from "@cotal-ai/core";
 import { fauxAssistantMessage, getApiProvider, registerFauxProvider } from "../../../ai/src/index.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import type { SessionLease } from "../../src/core/session-lease.js";
@@ -12,6 +19,7 @@ import {
 	ensureEnrollmentRecord,
 	publishDirectory,
 	readDirectory,
+	readSigner,
 } from "../../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../../src/modes/daemon/cotal/mesh-endpoints.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
@@ -26,6 +34,14 @@ const socketPath = process.argv.includes("--daemon-socket")
 // The test owns the replacement supervisor, so an orphan worker must not launch a competing fixture.
 (AgentDaemon.prototype as unknown as { launchReplacementSupervisor(): Promise<void> }).launchReplacementSupervisor =
 	async () => undefined;
+const supervisorPrototype = DaemonSupervisor.prototype as unknown as {
+	persistWorker(worker: { descriptor: { pid: number } }): void;
+};
+const persistWorker = supervisorPrototype.persistWorker;
+supervisorPrototype.persistWorker = function (worker) {
+	appendFileSync(join(agentDir, "worker-pids.jsonl"), `${JSON.stringify({ pid: worker.descriptor.pid })}\n`);
+	persistWorker.call(this, worker);
+};
 const mailbox = join(agentDir, "mailbox");
 let releaseDelivery!: () => void;
 const deliveryReady = new Promise<void>((resolveReady) => {
@@ -57,22 +73,67 @@ interface StubSession {
 	claim: SessionLease;
 	endpoint: Pick<CotalEndpoint, "stop" | "unicastAttributed">;
 	queue: unknown[];
+	state: "connected";
+	abort: AbortController;
 }
 interface StubMesh {
 	sessions: Map<string, StubSession>;
 	enqueue(session: StubSession, message: CotalMessage, delivery: Delivery): void;
 	startSession(id: string, file: string): Promise<void>;
+	removeInbox(record: EnrollmentRecord): Promise<void>;
 }
+
+(MeshEndpoints.prototype as unknown as StubMesh).removeInbox = async (record) => {
+	const credential = await mintCreds(readSigner(join(agentDir, "mesh"), "prime"), newIdentity(), "deprovisioner", {
+		deprovisionTarget: { principal: record.identity.id, lifecycleUid: record.lifecycleUid },
+	});
+	const permissions = JSON.stringify(credsClaims(credential).nats);
+	if (!permissions.includes(record.identity.id) || !permissions.includes(record.lifecycleUid))
+		throw new Error("Wrong lifecycle credential");
+	appendFileSync(
+		join(agentDir, "cleanup-order.jsonl"),
+		`${JSON.stringify({ type: "remove", id: record.sessionId })}\n`,
+	);
+	const events = join(agentDir, "removals.jsonl");
+	appendFileSync(
+		events,
+		`${JSON.stringify({ sessionId: record.sessionId, identity: record.identity.id, uid: record.lifecycleUid })}\n`,
+	);
+	for (const stream of ["dm", "dlv"]) {
+		if (stream === "dlv" && existsSync(join(agentDir, "partial-removal"))) {
+			process.stderr.write(
+				`Mesh session ${record.sessionId}: inbox removal failed: DeprovisionError: partial removal\n`,
+			);
+			break;
+		}
+		unlinkSync(join(agentDir, `${stream}-${record.sessionId}`));
+	}
+	signal("removed", record.sessionId);
+};
+
 // Only the broker boundary is fake. The production handoff, frame routing, queue and ack logic run.
 (MeshEndpoints.prototype as unknown as StubMesh).startSession = async function (id, file) {
 	const meshRoot = join(agentDir, "mesh");
 	const claim = claimEnrollment(meshRoot, id, file);
 	try {
 		const record = ensureEnrollmentRecord(meshRoot, id, file);
+		if (existsSync(join(agentDir, `pause-publication-${id}`))) {
+			signal("publication-paused", id);
+			await new Promise<void>((resolve) => {
+				const resumed = watch(agentDir, () => {
+					if (!existsSync(join(agentDir, `pause-publication-${id}`))) {
+						resumed.close();
+						resolve();
+					}
+				});
+			});
+		}
 		const directory = await publishDirectory(meshRoot, record, socketPath);
+		for (const stream of ["dm", "dlv"]) writeFileAtomicSync(join(agentDir, `${stream}-${id}`), "inbox");
 		mkdirSync(mailbox, { recursive: true });
 		const seen = new Set<string>();
 		const pull = () => {
+			if (existsSync(join(agentDir, `hold-pulls-${id}`))) return;
 			for (const name of readdirSync(mailbox)) {
 				if (!name.endsWith(".json") || seen.has(name)) continue;
 				const stored = JSON.parse(readFileSync(join(mailbox, name), "utf8")) as {
@@ -105,9 +166,13 @@ interface StubMesh {
 			record,
 			claim,
 			queue: [],
+			state: "connected",
+			abort: new AbortController(),
 			endpoint: {
 				stop: async () => {
 					watcher.close();
+					appendFileSync(join(agentDir, "cleanup-order.jsonl"), `${JSON.stringify({ type: "stop", id })}\n`);
+					signal("endpoint-stopped", id);
 				},
 				unicastAttributed: async (principal, text) => {
 					const target = readdirSync(join(meshRoot, "directory"))

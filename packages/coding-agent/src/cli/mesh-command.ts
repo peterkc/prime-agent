@@ -339,6 +339,27 @@ async function readJson(path: string): Promise<unknown> {
 	}
 }
 
+async function inboxConsumerCounts(meshHome: string, space: string): Promise<readonly number[]> {
+	const store = join(meshHome, ".cotal", "nats", "jetstream");
+	if (!existsSync(store)) return [0, 0];
+	for (const account of await readdir(store, { withFileTypes: true })) {
+		if (!account.isDirectory()) continue;
+		const streams = join(store, account.name, "streams");
+		if (!existsSync(join(streams, `DM_${space}`))) continue;
+		const counts: number[] = [];
+		for (const stream of [`DM_${space}`, `DLV_${space}`]) {
+			const consumers = join(streams, stream, "obs");
+			counts.push(
+				existsSync(consumers)
+					? (await readdir(consumers, { withFileTypes: true })).filter((entry) => entry.isDirectory()).length
+					: 0,
+			);
+		}
+		return counts;
+	}
+	return [0, 0];
+}
+
 async function status(options: MeshOptions, launchctl: string | undefined, target: string): Promise<void> {
 	if (!existsSync(join(options.meshHome, ".cotal")))
 		throw new Error("Mesh home has no .cotal directory; install it first");
@@ -364,9 +385,15 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 				? "absent"
 				: "unavailable on this platform";
 	console.log(`Launchd: ${state}`);
-	const lastExitCode = job?.code === 0 ? /^\s*last exit code = (-?\d+)\s*$/m.exec(job.stdout)?.[1] : undefined;
+	const lastExitCode =
+		job?.code === 0 ? /^\s*last exit code = (-?\d+)(?:: [^\r\n]+)?\s*$/m.exec(job.stdout)?.[1] : undefined;
 	if (lastExitCode !== undefined) console.log(`Launchd last exit code: ${lastExitCode}`);
-	const broker = await runTool(cotal, ["status", "--components"], options);
+	const broker = await runTool(
+		cotal,
+		["status", "--components", "--space", config.space, "--server", config.server],
+		options,
+		30_000,
+	);
 	const serving = brokerServing(broker.stdout);
 	console.log(`Broker: ${serving ? "serving" : "not serving"}`);
 	console.log(`Store: ${await storeBytes(join(options.meshHome, ".cotal", "nats", "jetstream"))} bytes`);
@@ -375,8 +402,12 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	if (!serving) throw new Error("Mesh broker is not serving");
 	let countUnavailable = false;
 	const enrollments = join(options.meshHome, "enrollments");
-	for (const file of existsSync(enrollments) ? await readdir(enrollments) : []) {
-		if (!file.endsWith(".json")) continue;
+	const records = (existsSync(enrollments) ? await readdir(enrollments) : []).filter((file) => file.endsWith(".json"));
+	console.log(`Enrolled sessions: ${records.length}`);
+	const consumers = await inboxConsumerCounts(options.meshHome, config.space);
+	for (const [index, stream] of [`DM_${config.space}`, `DLV_${config.space}`].entries())
+		console.log(`${stream}: ${consumers[index]} consumers / 1000`);
+	for (const file of records) {
 		const sessionId = file.slice(0, -5);
 		const record = await readJson(join(enrollments, file));
 		if (
@@ -399,7 +430,24 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 		}
 		// Cotal 0.79.0 dmDurable("local", id, uid).
 		const durable = `dm_local-${record.identity.id}-${record.lifecycleUid}`;
-		const pending = await runTool(cotal, ["deliver", "pending", sessionId, "--durable", durable, "--json"], options);
+		const pending = await runTool(
+			cotal,
+			[
+				"deliver",
+				"pending",
+				sessionId,
+				"--space",
+				config.space,
+				"--server",
+				config.server,
+				"--root",
+				options.meshHome,
+				"--durable",
+				durable,
+				"--json",
+			],
+			options,
+		);
 		if (pending.code !== 0) {
 			console.log(`Session ${sessionId}: count unavailable`);
 			countUnavailable = true;
@@ -412,8 +460,15 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 }
 
 export async function runMeshCommand(args: readonly string[], runtime: MeshRuntime = defaultRuntime): Promise<void> {
+	let options: MeshOptions;
 	try {
-		const options = parseOptions(args);
+		options = parseOptions(args);
+	} catch (error) {
+		reportMeshCommandError(error);
+		console.error(chalk.dim(`Run "${APP_NAME} help mesh" for usage.`));
+		return;
+	}
+	try {
 		const { command } = options;
 		if (runtime.platform !== "darwin" && command !== "status" && command !== "doctor") {
 			throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);
@@ -458,10 +513,13 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		}
 		console.log(`Mesh ${command}: ${options.label}`);
 	} catch (error) {
-		console.error(
-			chalk.red(`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`),
-		);
-		console.error(chalk.dim(`Run "${APP_NAME} help mesh" for usage.`));
-		process.exitCode = 1;
+		reportMeshCommandError(error);
 	}
+}
+
+function reportMeshCommandError(error: unknown): void {
+	console.error(
+		chalk.red(`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`),
+	);
+	process.exitCode = 1;
 }

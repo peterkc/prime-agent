@@ -1,3 +1,4 @@
+import * as subprocessTools from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
@@ -20,6 +21,11 @@ import { runMeshCommand } from "../src/cli/mesh-command.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
 
+vi.mock("node:child_process", async (original) => {
+	const tools = await original<typeof subprocessTools>();
+	return { ...tools, execFile: vi.fn(tools.execFile) };
+});
+
 const seed = `S${"A".repeat(57)}`;
 const fakeTool = String.raw`#!${process.execPath}
 const { appendFileSync, existsSync, readFileSync, writeFileSync, unlinkSync } = require("node:fs");
@@ -34,7 +40,7 @@ while (!existsSync(join(cotalRoot, ".cotal")) && dirname(cotalRoot) !== cotalRoo
 appendFileSync(join(root, "events.jsonl"), JSON.stringify({ tool, args, cotalRoot, cwd: process.cwd(), home: process.env.COTAL_HOME, skipSeed: process.env.COTAL_SKIP_CONNECTOR_SEED }) + "\n");
 const loaded = join(root, "loaded");
 if (tool === "launchctl") {
-  if (args[0] === "print") { console.log("state = running\nlast exit code = 78"); if (existsSync(loaded) && (control.stalledBootout || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
+  if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (control.stalledBootout || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
   if (args[0] === "bootstrap") {
     const plist = readFileSync(args[2], "utf8");
@@ -311,11 +317,20 @@ describe("mesh command", () => {
 	});
 
 	it("reports store bytes and only unacknowledged counts, and diagnoses auth", async () => {
+		vi.mocked(subprocessTools.execFile).mockClear();
 		await command("install");
 		const store = join(mesh, ".cotal", "nats", "jetstream", "nested");
 		mkdirSync(store, { recursive: true });
 		writeFileSync(join(store, "a"), "a".repeat(37));
 		writeFileSync(join(store, "b"), "b".repeat(5));
+		for (const [stream, count] of [
+			["DM_prime", 2],
+			["DLV_prime", 3],
+		] as const) {
+			for (let i = 0; i < count; i++)
+				mkdirSync(join(store, "streams", stream, "obs", `consumer-${i}`), { recursive: true });
+			writeFileSync(join(store, "streams", stream, "obs", "not-a-consumer"), "");
+		}
 		writeFileSync(join(mesh, "service.log"), "l".repeat(17));
 		mkdirSync(join(mesh, "enrollments"));
 		writeFileSync(
@@ -329,7 +344,16 @@ describe("mesh command", () => {
 		await command("status");
 		await command("doctor");
 		expect(process.exitCode).toBeUndefined();
+		expect(subprocessTools.execFile).toHaveBeenCalledWith(
+			expect.stringContaining("cotal"),
+			["status", "--components", "--space", "prime", "--server", server],
+			expect.objectContaining({ timeout: 30_000 }),
+			expect.any(Function),
+		);
 		expect(output()).toContain("Store: 42 bytes");
+		expect(output()).toContain("Enrolled sessions: 1");
+		expect(output()).toContain("DM_prime: 2 consumers / 1000");
+		expect(output()).toContain("DLV_prime: 3 consumers / 1000");
 		expect(output()).toContain("Service log: 17 bytes");
 		expect(output()).toContain("Launchd last exit code: 78");
 		expect(output()).toContain("Session session-a: 5 unacknowledged");
@@ -341,6 +365,12 @@ describe("mesh command", () => {
 				"deliver",
 				"pending",
 				"session-a",
+				"--space",
+				"prime",
+				"--server",
+				server,
+				"--root",
+				mesh,
 				"--durable",
 				dmDurable("local", "UABC", "0123456789abcdefghijklmnop"),
 				"--json",
@@ -348,6 +378,13 @@ describe("mesh command", () => {
 		);
 		expect(output()).not.toMatch(/message-id|sender|message-content|UABC|0123456789abcdefghijklmnop/);
 		expect(output()).not.toContain(seed);
+	});
+
+	it("reports the symbolic launchctl last-exit-code form", async () => {
+		configure({ symbolicExit: true });
+		await command("install");
+		await command("status");
+		expect(output()).toContain("Launchd last exit code: 78");
 	});
 
 	it.each(["record", "counts", "broker", "auth", "pending"])(
@@ -398,6 +435,7 @@ describe("mesh command", () => {
 		await command("install");
 		expect(process.exitCode).toBe(1);
 		expect(output()).toContain(`${tool} is missing`);
+		expect(output()).not.toContain("help mesh");
 		expect(existsSync(mesh)).toBe(false);
 	});
 

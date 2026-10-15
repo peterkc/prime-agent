@@ -1,0 +1,2 @@
+- Added mesh inbox removal on session deletion, reconnect waits, and enrollment and consumer counts in mesh status.
+- Disabled unused mesh presence and channel watches and documented mesh setup, limits, and rollback.

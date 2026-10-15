@@ -11,6 +11,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as core from "@cotal-ai/core";
@@ -21,17 +22,22 @@ import { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	claimEnrollment,
 	credentialSource,
+	deprovisionEnrollment,
 	directoryPath,
 	enrollmentPath,
 	ensureEnrollmentRecord,
 	publishDirectory,
 	readDirectory,
+	readDirectoryAsync,
 	readSigner,
 	redactMeshError,
+	removeEnrollment,
 	renameDirectory,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+
+vi.mock("node:fs/promises", async (original) => ({ ...(await original<typeof fsPromises>()) }));
 
 vi.mock("@cotal-ai/core", async (original) => ({
 	...(await original<typeof core>()),
@@ -89,6 +95,38 @@ async function fixture() {
 }
 
 describe("mesh enrollment", () => {
+	it("AC-18 removes the directory before the record and mints only a lifecycle-exact deprovisioner", async () => {
+		const { meshRoot, sessionId, sessionFile } = await fixture();
+		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+		await publishDirectory(meshRoot, record, "home");
+		const removeFile = fsPromises.rm;
+		vi.spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+			if (path === enrollmentPath(meshRoot, sessionId))
+				expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);
+			await removeFile(path, options);
+		});
+		expect(await removeEnrollment(meshRoot, sessionId)).toEqual(record);
+		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+		expect(await readDirectoryAsync(meshRoot, sessionId)).toBeUndefined();
+		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await deprovisionEnrollment(meshRoot, { space: "prime", server: "nats://127.0.0.1:1" }, record);
+		const call = remove.mock.calls[0]![0];
+		expect(call).toMatchObject({
+			targetId: record.identity.id,
+			lifecycleUid: record.lifecycleUid,
+			space: "prime",
+			servers: "nats://127.0.0.1:1",
+		});
+		const claims = core.credsClaims(call.creds!);
+		const permissions = JSON.stringify(claims.nats);
+		for (const stream of ["DM_prime", "DLV_prime"])
+			expect(permissions).toContain(`$JS.API.CONSUMER.DELETE.${stream}.`);
+		expect(permissions).toContain(record.lifecycleUid);
+		expect(permissions).toContain(record.identity.id);
+		expect(remove).toHaveBeenCalledTimes(1);
+	});
+
 	it.each(["mesh.json", "signer.json", "invalid mesh.json", "signer mode"])(
 		"keeps the supervisor ready with refusing Cotal mode for %s",
 		async (missing) => {
