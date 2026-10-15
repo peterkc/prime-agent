@@ -11,6 +11,7 @@ import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
+import type { SecretValue } from "../tool-output-redaction.js";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -250,6 +251,8 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private secretValueSink?: (entries: readonly SecretValue[]) => void;
+	private maskToolResultMessagesFn = (messages: AgentMessage[]): AgentMessage[] => messages;
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -288,6 +291,8 @@ export class ExtensionRunner {
 		providerActions?: {
 			registerProvider?: (name: string, config: ProviderConfig) => void;
 			unregisterProvider?: (name: string) => void;
+			registerSecretValues?: (entries: readonly SecretValue[]) => void;
+			maskToolResultMessages?: (messages: AgentMessage[]) => AgentMessage[];
 		},
 	): void {
 		this.runtime.sendMessage = actions.sendMessage;
@@ -304,6 +309,14 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+
+		this.unbindSecretValues();
+		this.secretValueSink = providerActions?.registerSecretValues;
+		if (this.secretValueSink) {
+			this.runtime.secretValueSinks.add(this.secretValueSink);
+			this.secretValueSink(this.runtime.registeredSecretValues);
+		}
+		this.maskToolResultMessagesFn = providerActions?.maskToolResultMessages ?? ((messages) => messages);
 
 		this.getModel = contextActions.getModel;
 		this.isIdleFn = contextActions.isIdle;
@@ -492,6 +505,7 @@ export class ExtensionRunner {
 
 	/** Take over the previous runner's timer host: adopted timers report through, and are gated by, this runner. */
 	adoptHostTimers(previous: ExtensionRunner): void {
+		previous.unbindSecretValues();
 		this.timerHost = previous.timerHost;
 		this.timerHost.current = this;
 	}
@@ -502,11 +516,17 @@ export class ExtensionRunner {
 	): void {
 		if (this.staleMessage) return;
 		this.staleMessage = message;
+		this.unbindSecretValues();
 		for (const ref of this.timerHost.timers) {
 			const handle = ref.deref();
 			if (handle) clearTimeout(handle);
 		}
 		this.timerHost.timers.clear();
+	}
+
+	private unbindSecretValues(): void {
+		if (this.secretValueSink) this.runtime.secretValueSinks.delete(this.secretValueSink);
+		this.secretValueSink = undefined;
 	}
 
 	private assertActive(): void {
@@ -960,6 +980,10 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
+		return this.maskToolResultMessagesFn(messages);
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {

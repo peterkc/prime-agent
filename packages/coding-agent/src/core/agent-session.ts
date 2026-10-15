@@ -356,6 +356,7 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import { createSecretMatcher, redactText, redactToolOutput, type SecretValue } from "./tool-output-redaction.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { codemodeCallableTools } from "./tools/codemode.js";
@@ -1679,6 +1680,8 @@ export class AgentSession {
 	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
 
+	private readonly _secretValues = new Map<string, string>();
+	private _secretMatcher = createSecretMatcher([]);
 	private _extensionRunner!: ExtensionRunner;
 	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
 	private _turnIndex = 0;
@@ -2081,14 +2084,15 @@ export class AgentSession {
 				return undefined;
 			}
 
+			const masked = this._maskToolOutput(result);
 			const hookResult = await runner.emitToolResult({
 				type: "tool_result",
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
+				content: masked.content,
+				details: masked.details,
+				isError: masked.isError ?? isError,
 			});
 
 			if (!hookResult) {
@@ -4571,6 +4575,8 @@ export class AgentSession {
 				}
 			}
 		}
+		// Agent-core stores event.message itself, so this also protects synchronous state snapshots.
+		this._maskAgentEventOutput(event);
 		this._agentEventQueue = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
 			() => this._processAgentEvent(event),
@@ -4628,7 +4634,63 @@ export class AgentSession {
 		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
 	}
 
+	private _registerSecretValues(entries: readonly SecretValue[]): void {
+		for (const { label, value } of entries) {
+			if (!this._secretValues.has(value)) this._secretValues.set(value, label);
+		}
+		this._secretMatcher = createSecretMatcher(Array.from(this._secretValues, ([value, label]) => ({ label, value })));
+	}
+
+	private _maskToolOutput(output: AgentToolResult<unknown>): AgentToolResult<unknown> {
+		if (this._secretValues.size === 0) return output;
+		try {
+			return redactToolOutput(output, this._secretMatcher);
+		} catch {
+			return {
+				content: [{ type: "text", text: "Tool output was withheld because secret masking failed." }],
+				details: undefined,
+				isError: true,
+			};
+		}
+	}
+
+	private _maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
+		return messages.map((message) =>
+			message.role === "toolResult"
+				? {
+						...message,
+						...this._maskToolOutput({
+							content: message.content,
+							details: message.details,
+							isError: message.isError,
+						}),
+					}
+				: message,
+		);
+	}
+
+	private _maskToolResultMessagesInPlace(messages: AgentMessage[]): void {
+		const masked = this._maskToolResultMessages(messages);
+		for (let index = 0; index < messages.length; index++) {
+			this._replaceMessageInPlace(messages[index], masked[index]);
+		}
+	}
+
+	private _maskAgentEventOutput(event: AgentEvent): void {
+		if (event.type === "tool_execution_end") {
+			event.result = this._maskToolOutput(event.result);
+			if (event.result.isError) event.isError = true;
+		} else if (event.type === "message_start" || event.type === "message_end") {
+			this._maskToolResultMessagesInPlace([event.message]);
+		} else if (event.type === "turn_end") {
+			this._maskToolResultMessagesInPlace(event.toolResults);
+		} else if (event.type === "agent_end") {
+			this._maskToolResultMessagesInPlace(event.messages);
+		}
+	}
+
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		if (event.type === "tool_execution_update" && this._secretValues.size > 0) return;
 		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
@@ -4670,6 +4732,7 @@ export class AgentSession {
 			this._overflowRecovery = "idle";
 		}
 
+		this._maskAgentEventOutput(event);
 		await this._emitExtensionEvent(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			const cleared = this._capturingCancelledAction(event.message);
@@ -4681,6 +4744,8 @@ export class AgentSession {
 		}
 
 		this._addLoginGuidanceToAuthError(event);
+		// Mask again: message_end handlers may have rewritten the result.
+		this._maskAgentEventOutput(event);
 
 		this._emit(event);
 
@@ -5310,7 +5375,7 @@ export class AgentSession {
 				isError: true,
 			};
 		}
-		return runToolCall(
+		const outcome = await runToolCall(
 			{ type: "toolCall", id: callId, name, arguments: args },
 			{
 				tools: codemodeCallableTools(
@@ -5324,6 +5389,8 @@ export class AgentSession {
 				signal,
 			},
 		);
+		const result = this._maskToolOutput(outcome.result);
+		return { result, isError: outcome.isError || result.isError === true };
 	}
 
 	getAllTools(): ToolInfo[] {
@@ -8984,6 +9051,8 @@ export class AgentSession {
 			if (extensionCompaction) {
 				({ summary, firstKeptEntryId, tokensBefore, details, usage } = extensionCompaction);
 			} else {
+				preparation.messagesToSummarize = this._maskToolResultMessages(preparation.messagesToSummarize);
+				preparation.turnPrefixMessages = this._maskToolResultMessages(preparation.turnPrefixMessages);
 				// Compaction fires at context peak, and the summarizer runs with its own
 				// prompt prefix (a different system prompt, no tools), so it cannot hit
 				// the session's cached prefix: on the session model the summary re-reads
@@ -9621,7 +9690,7 @@ export class AgentSession {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
 		return reviewAutoRefine(
-			this.agent.state.messages,
+			this._maskToolResultMessages(this.agent.state.messages),
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
 			refinementModel.model,
@@ -10022,7 +10091,9 @@ export class AgentSession {
 					scope: requestedScope,
 					planningState,
 					history,
-					conversationText: serializeConversation(convertToLlm(this.agent.state.messages)).slice(-80_000),
+					conversationText: serializeConversation(
+						convertToLlm(this._maskToolResultMessages(this.agent.state.messages)),
+					).slice(-80_000),
 				},
 				signal,
 			})) as SessionBeforeRefineResult | undefined;
@@ -10041,7 +10112,7 @@ export class AgentSession {
 			}
 		}
 		const plan = await planRefinement(
-			this.agent.state.messages,
+			this._maskToolResultMessages(this.agent.state.messages),
 			planningState,
 			history,
 			refinementModel.model,
@@ -10655,7 +10726,27 @@ export class AgentSession {
 
 		this._extensionErrorUnsubscriber?.();
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
-			? runner.onError(this._extensionErrorListener)
+			? runner.onError((error) => {
+					if (this._secretValues.size === 0) {
+						this._extensionErrorListener?.(error);
+						return;
+					}
+					let masked = error;
+					try {
+						masked = {
+							...error,
+							error: redactText(error.error, this._secretMatcher),
+							stack: error.stack === undefined ? undefined : redactText(error.stack, this._secretMatcher),
+						};
+					} catch {
+						masked = {
+							...error,
+							error: "Extension error was withheld because secret masking failed.",
+							stack: undefined,
+						};
+					}
+					this._extensionErrorListener?.(masked);
+				})
 			: undefined;
 	}
 
@@ -10789,6 +10880,8 @@ export class AgentSession {
 					this._modelRegistry.registerProvider(name, config);
 					this._refreshCurrentModelFromRegistry();
 				},
+				registerSecretValues: (entries) => this._registerSecretValues(entries),
+				maskToolResultMessages: (messages) => this._maskToolResultMessages(messages),
 				unregisterProvider: (name) => {
 					this._modelRegistry.unregisterProvider(name);
 					this._refreshCurrentModelFromRegistry();

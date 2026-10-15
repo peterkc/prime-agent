@@ -228,6 +228,21 @@ describe("codemode", () => {
 		expect(session.sessionManager.getEntries().filter((entry) => entry.type === "message")).toEqual([]);
 	});
 
+	it("TM-24 masks nested returns before a codemode script can inspect them", async () => {
+		const secret = "dummy-secret-value-0123456789abcdef";
+		const { session } = await makeSession((pi) => {
+			pi.registerSecretValues([{ label: "fake", value: secret }]);
+			pi.registerTool(stub("echo", async () => reply(secret)));
+		});
+		session.setActiveToolsByName(["codemode", "echo"]);
+		const result = await sessionTool(session).execute("parent", {
+			code: 'const value = await tools.echo({value:"ok"}); text(value === "[fake]"); text(value);',
+		});
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain("true\n[fake]");
+		expect(text(result)).not.toContain(secret);
+	});
+
 	it("TM-08 folds only the current branch and persists completed writes including exit and deletion", async () => {
 		const { session } = await makeSession();
 		const manager = session.sessionManager;

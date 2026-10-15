@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
 import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getApiProvider, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
+import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.js";
+import { createAgentSession } from "../../src/core/sdk.js";
+import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { conversationMessages, createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
 const MODELS = [
@@ -51,9 +56,424 @@ describe("AgentSession model and extension characterization", () => {
 
 	afterEach(() => {
 		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
+			const h = harnesses.pop()!;
+			h.session.dispose();
+			h.cleanup();
 		}
 	});
+
+	const secret = "dummy-secret-value-0123456789abcdef";
+	async function secretHarness(
+		factory: ExtensionFactory,
+		execute: AgentTool["execute"] = async () => ({
+			content: [{ type: "text", text: secret }],
+			details: { value: secret },
+		}),
+		abortResultGraceMs?: number,
+	) {
+		const echo = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo",
+			parameters: Type.Object({ required: Type.String() }),
+			execute,
+			abortResultGraceMs,
+		};
+		const h = await createHarness({
+			tools: [],
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool(echo);
+					return factory(pi);
+				},
+			],
+		});
+		harnesses.push(h);
+		return h;
+	}
+	async function secretSdkSession(h: Harness) {
+		const { session } = await createAgentSession({
+			cwd: h.tempDir,
+			agentDir: h.tempDir,
+			model: h.getModel(),
+			modelRegistry: h.session.modelRegistry,
+			authStorage: h.authStorage,
+			settingsManager: h.settingsManager,
+			sessionManager: h.sessionManager,
+			resourceLoader: h.session.resourceLoader,
+			tools: ["echo"],
+			includeGoals: false,
+		});
+		return session;
+	}
+	function secretConnection(h: Harness) {
+		return new InProcessAgentConnection({
+			session: h.session,
+			setRebindSession: () => {},
+		} as unknown as AgentSessionRuntime);
+	}
+	async function secretTurn(
+		h: Harness,
+		name = "echo",
+		args: Record<string, unknown> = { required: "ok" },
+		resume = false,
+	) {
+		let request: unknown;
+		h.setResponses([
+			fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
+			(ctx) => {
+				request = structuredClone(ctx.messages.filter((m) => m.role === "toolResult"));
+				return fauxAssistantMessage("done");
+			},
+		]);
+		await h.session.prompt("run");
+		if (resume) await h.session.prompt("resume");
+		const ends = h.eventsOfType("tool_execution_end").map((e) => e.result);
+		const messages = h
+			.eventsOfType("message_end")
+			.flatMap((e) =>
+				e.message.role === "toolResult" ? [{ content: e.message.content, details: e.message.details }] : [],
+			);
+		const saved = readFileSync(h.session.sessionFile!, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line))
+			.filter((e) => e.type === "message" && e.message.role === "toolResult")
+			.map((e) => ({ content: e.message.content, details: e.message.details }));
+		expect(ends.length).toBeGreaterThan(0);
+		expect(messages.length).toBe(ends.length);
+		expect(saved.length).toBe(ends.length);
+		expect(request).toBeDefined();
+		return { ends, messages, saved, request };
+	}
+	it("TM-20 shares the union across sessions, rebuilds and reload, rejects atomically and releases sinks", async () => {
+		let pi!: ExtensionAPI;
+		const retired = "retired-fake-1234",
+			rotated = "rotated-fake-5678",
+			rejected = "rejected-fake-9012";
+		const h = await secretHarness(
+			(api) => {
+				pi = api;
+				api.registerSecretValues([{ label: "old", value: retired }]);
+			},
+			async () => ({ content: [{ type: "text", text: `${retired} ${rotated} ${rejected}` }], details: {} }),
+		);
+		const original = h.session,
+			second = await secretSdkSession(h);
+		second.subscribe((event) => h.events.push(event));
+		const runtime = original.resourceLoader.getExtensions().runtime;
+		try {
+			expect(() =>
+				pi.registerSecretValues([
+					{ label: "bad", value: rejected },
+					{ label: "", value: secret },
+				]),
+			).toThrow("entry 1");
+			const unused = async () => {
+				throw new Error("unused");
+			};
+			h.session.setRlmHeartbeatController({
+				listRlmHeartbeats: () => [],
+				createRlmHeartbeat: unused,
+				updateRlmHeartbeat: unused,
+				deleteRlmHeartbeat: unused,
+			});
+			const streamSimple = getApiProvider(h.faux.api)!.streamSimple;
+			await h.session.reload();
+			pi.registerProvider(h.getModel().provider, { api: h.faux.api, streamSimple });
+			pi.registerSecretValues([{ label: "new", value: rotated }]);
+			pi.registerSecretValues([{ label: "new", value: rotated }]);
+			for (const session of [original, second]) {
+				h.session = session;
+				const output = await secretTurn(h);
+				for (const sink of Object.values(output))
+					expect(JSON.stringify(sink)).toContain("[old] [new] rejected-fake-9012");
+			}
+			expect(runtime.secretValueSinks.size).toBe(2);
+			original.dispose();
+			expect(runtime.secretValueSinks.size).toBe(1);
+		} finally {
+			second.dispose();
+			h.session = original;
+		}
+		expect(runtime.secretValueSinks.size).toBe(0);
+	});
+	it("TM-21 TM-23 TM-25 masks final output and message_end rewrites while withholding split updates", async () => {
+		const seen: string[] = [];
+		const h = await secretHarness(
+			(pi) => {
+				pi.registerSecretValues([{ label: "fake", value: secret }]);
+				pi.on("tool_execution_end", (event) => void seen.push(JSON.stringify(event)));
+				pi.on("message_start", (event) => void seen.push(JSON.stringify(event)));
+				pi.on("turn_end", (event) => void seen.push(JSON.stringify(event)));
+				pi.on("agent_end", (event) => void seen.push(JSON.stringify(event)));
+				pi.on("message_end", (event) => {
+					seen.push(JSON.stringify(event));
+					return event.message.role === "toolResult"
+						? {
+								message: {
+									...event.message,
+									content: [{ type: "text", text: `rewrite ${secret}` }],
+									details: { rewrite: secret },
+								},
+							}
+						: undefined;
+				});
+			},
+			async (_id, _args, _signal, update) => {
+				update?.({ content: [{ type: "text", text: secret.slice(0, 6) }], details: {} });
+				update?.({ content: [{ type: "text", text: secret.slice(6) }], details: {} });
+				return { content: [{ type: "text", text: secret }], details: { value: secret } };
+			},
+		);
+		const output = await secretTurn(h);
+		expect(output.ends[0]).toMatchObject({ content: [{ text: "[fake]" }], details: { value: "[fake]" } });
+		for (const sink of [output.messages, output.saved])
+			expect(sink).toMatchObject([{ content: [{ text: "rewrite [fake]" }], details: { rewrite: "[fake]" } }]);
+		expect(JSON.stringify(output)).not.toContain(secret);
+		expect(JSON.stringify(output.request)).toContain("[fake]");
+		expect(seen.join()).toContain("[fake]");
+		expect(seen.join()).not.toContain(secret);
+		expect(h.eventsOfType("tool_execution_start")).toHaveLength(1);
+		expect(h.eventsOfType("tool_execution_update")).toEqual([]);
+		let later: unknown;
+		h.setResponses([
+			(ctx) => {
+				later = ctx.messages;
+				return fauxAssistantMessage("later");
+			},
+		]);
+		await h.session.prompt("later");
+		expect(JSON.stringify(later)).toContain("rewrite [fake]");
+		expect(JSON.stringify(later)).not.toContain(secret);
+	});
+	it.each(["unknown", "bad args", "block", "abort"])("TM-22 masks immediate %s results", async (kind) => {
+		const h = await secretHarness(
+			(pi) => {
+				pi.registerSecretValues([
+					{ label: "fake", value: secret },
+					{ label: "abort", value: "Request was aborted" },
+				]);
+				if (kind === "block") pi.on("tool_call", () => ({ block: true, reason: secret }));
+			},
+			async () => ({ content: [{ type: "text", text: "unused" }], details: {} }),
+		);
+		if (kind === "abort")
+			h.session.agent.beforeToolCall = async () => {
+				h.session.requestAbort();
+				return undefined;
+			};
+		const output =
+			kind === "abort"
+				? await secretTurn(h, "echo", { required: "ok" }, true)
+				: await secretTurn(
+						h,
+						kind === "unknown" ? secret : "echo",
+						kind === "bad args" ? { required: { fake: secret } } : { required: "ok" },
+					);
+		for (const sink of [output.ends, output.messages, output.saved]) {
+			expect(JSON.stringify(sink)).toContain(kind === "abort" ? "[abort]" : "[fake]");
+			expect(JSON.stringify(sink)).not.toContain(secret);
+		}
+	});
+	it("TM-22 masks the executed result retained after a tool_result abort deadline", async () => {
+		const started = createDeferred(),
+			release = createDeferred();
+		let h: Harness;
+		h = await secretHarness(
+			(pi) => {
+				pi.registerSecretValues([{ label: "fake", value: secret }]);
+				pi.on("tool_result", async () => {
+					h.session.requestAbort();
+					started.resolve();
+					await release.promise;
+				});
+			},
+			undefined,
+			1,
+		);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const running = secretTurn(h, "echo", { required: "ok" }, true);
+		try {
+			await started.promise;
+			await vi.advanceTimersByTimeAsync(1);
+			const output = await running;
+			for (const sink of Object.values(output)) {
+				expect(JSON.stringify(sink)).toContain("[fake]");
+				expect(JSON.stringify(sink)).not.toContain(secret);
+			}
+		} finally {
+			release.resolve();
+			vi.useRealTimers();
+			await running;
+		}
+	});
+
+	it.each(["message_end", "tool_execution_end"] as const)(
+		"TM-29 masks context requests and client snapshots while %s waits",
+		async (kind) => {
+			const started = createDeferred(),
+				release = createDeferred(),
+				requested = createDeferred();
+			let completed = false,
+				captured: unknown;
+			const h = await secretHarness((pi) => {
+				pi.registerSecretValues([{ label: "fake", value: secret }]);
+				const hold = async () => {
+					started.resolve();
+					await release.promise;
+					completed = true;
+				};
+				if (kind === "message_end")
+					pi.on(kind, (event) => (event.message.role === "toolResult" ? hold() : undefined));
+				else pi.on(kind, hold);
+				pi.on("context", (event) => ({
+					messages: event.messages.map((m) =>
+						m.role === "toolResult"
+							? { ...m, content: [{ type: "text", text: `context ${secret}` }], details: { value: secret } }
+							: m,
+					),
+				}));
+			});
+			const original = h.session;
+			const session = await secretSdkSession(h);
+			h.session = session;
+			await session.bindExtensions({});
+			h.setResponses([
+				fauxAssistantMessage(fauxToolCall("echo", { required: "ok" }), { stopReason: "toolUse" }),
+				(ctx) => {
+					captured = structuredClone(ctx.messages.filter((m) => m.role === "toolResult"));
+					requested.resolve();
+					return fauxAssistantMessage("done");
+				},
+			]);
+			const connection = secretConnection(h);
+			const running = h.session.prompt(secret);
+			try {
+				await started.promise;
+				await requested.promise;
+				expect(completed).toBe(false);
+				expect(captured).toMatchObject([{ content: [{ text: "context [fake]" }], details: { value: "[fake]" } }]);
+				const messages = await connection.getMessages();
+				expect(messages.filter((m) => m.role === "toolResult")).toMatchObject([
+					{ content: [{ text: "[fake]" }], details: { value: "[fake]" } },
+				]);
+				expect(getMessageText(messages.find((m) => m.role === "user"))).toBe(secret);
+			} finally {
+				release.resolve();
+				await running;
+				original.dispose();
+			}
+		},
+	);
+
+	it("TM-21 masks joined text runs while preserving images and unchanged part boundaries", async () => {
+		const image = { type: "image" as const, mimeType: "image/png", data: "ZHVtbXk=" };
+		const h = await secretHarness(
+			(pi) => pi.registerSecretValues([{ label: "fake", value: secret }]),
+			async () => ({
+				content: [
+					...[0, 9, 18, 27].map((offset) => ({ type: "text" as const, text: secret.slice(offset, offset + 9) })),
+					image,
+					{ type: "text", text: secret },
+					{ type: "text", text: "plain" },
+				],
+				details: {},
+			}),
+		);
+		const output = await secretTurn(h);
+		for (const sink of Object.values(output))
+			expect(sink).toMatchObject([
+				{
+					content: [
+						{ type: "text", text: "[fake]" },
+						image,
+						{ type: "text", text: "[fake]" },
+						{ type: "text", text: "plain" },
+					],
+				},
+			]);
+	});
+	it.each(["tool_result", "tool_execution_end"] as const)(
+		"TM-21 TM-23 masks %s handlers and forwarded error message and stack",
+		async (kind) => {
+			const seen: unknown[] = [],
+				errors: unknown[] = [];
+			const h = await secretHarness((pi) => {
+				pi.registerSecretValues([{ label: "fake", value: secret }]);
+				const fail = (value: unknown) => {
+					seen.push(value);
+					throw new Error(`${secret}: ${JSON.stringify(value)}`);
+				};
+				if (kind === "tool_result") pi.on(kind, (event) => fail(event.content));
+				else pi.on(kind, (event) => fail(event.result.content));
+			});
+			await h.session.bindExtensions({ onError: (error) => errors.push(error) });
+			await secretTurn(h);
+			expect(JSON.stringify(seen)).toContain("[fake]");
+			expect(JSON.stringify(seen)).not.toContain(secret);
+			expect
+				.soft(errors)
+				.toMatchObject([
+					{ error: expect.stringContaining("[fake]"), stack: expect.stringContaining("Error: [fake]") },
+				]);
+			expect.soft(JSON.stringify(errors)).not.toContain(secret);
+			const client: unknown[] = [],
+				connection = secretConnection(h);
+			connection.subscribe((event) => {
+				if (event.type === "extension_error") client.push(event);
+			});
+			await connection.bindHeadlessExtensions();
+			await secretTurn(h);
+			expect(client).toMatchObject([
+				{ type: "extension_error", event: kind, error: expect.stringContaining("[fake]") },
+			]);
+			expect(JSON.stringify(client)).not.toContain(secret);
+		},
+	);
+	it.each(["compaction", "refinement", "auto-review"])(
+		"TM-30 late registration masks %s requests without changing history",
+		async (kind) => {
+			let api!: ExtensionAPI;
+			const h = await secretHarness((pi) => {
+				api = pi;
+				pi.on("session_before_compact", () => pi.registerSecretValues([{ label: "late", value: secret }]));
+			});
+			h.settingsManager.applyOverrides({
+				autoRefine: { enabled: false },
+				compaction: { enabled: false, keepRecentTokens: 1 },
+			});
+			await secretTurn(h);
+			await secretTurn(h);
+			if (kind !== "compaction") api.registerSecretValues([{ label: "late", value: secret }]);
+			const history = h.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "message" && e.message.role === "toolResult");
+			const before = JSON.stringify(history);
+			const captured: unknown[] = [];
+			h.setResponses(
+				[1, 2].map(() => (ctx) => {
+					captured.push(structuredClone(ctx.messages));
+					return fauxAssistantMessage(
+						'{"summary":"none","rationale":"probe","expectedOutcome":"none","edits":[],"shouldRefine":false}',
+					);
+				}),
+			);
+			if (kind === "compaction") await h.session.compact();
+			else if (kind === "refinement") await h.session.refine({});
+			else {
+				h.settingsManager.applyOverrides({ autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } });
+				await h.session.disposeAsync({ kernelSnapshot: false });
+			}
+			expect(captured).toHaveLength(kind === "compaction" ? 2 : 1);
+			expect(JSON.stringify(captured)).toContain("[late]");
+			expect(JSON.stringify(captured)).not.toContain(secret);
+			expect(JSON.stringify(history)).toBe(before);
+			expect(before).toContain(secret);
+		},
+	);
 
 	/** Harness whose model_select handler blocks until the returned deferred is resolved. */
 	async function createSlowModelSelectHarness(options?: { nextTurnMessage?: string }): Promise<{
