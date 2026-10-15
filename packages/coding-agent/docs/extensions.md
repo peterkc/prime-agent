@@ -1634,8 +1634,8 @@ Core masks text content and nested string values in tool result `details`:
   client message snapshots or the session file see them. Core masks again after handlers
   run, including `message_end` rewrites. Immediate errors and abort-deadline results are covered.
 - All text parts of one result are matched as joined text, even across images. If a match
-  crosses part boundaries, core combines the text parts into one masked text part at the
-  position of the first one. Non-text parts stay in place.
+  crosses part boundaries, the label goes in the part where the match starts, and a later
+  text part that the match fully covers is removed. All other parts keep their order.
 - Tool result messages in each model request, after `context` handlers run.
   Compaction, refinement and auto-refine review requests use the current masking set,
   including values registered after the original output. A new registration also masks

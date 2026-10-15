@@ -370,7 +370,7 @@ describe("AgentSession model and extension characterization", () => {
 	);
 
 	it.each([
-		["split around an image", [secret.slice(0, 17), "image", secret.slice(17), "plain"], ["[fake]plain", "image"]],
+		["split by an image", [secret.slice(0, 17), "image", secret.slice(17), "plain"], ["[fake]", "image", "plain"]],
 		["whole parts", [secret, "image", "plain"], ["[fake]", "image", "plain"]],
 	])("TM-21 matches text parts as one text: %s", async (_name, parts, expected) => {
 		const image = { type: "image" as const, mimeType: "image/png", data: "ZHVtbXk=" };
