@@ -458,18 +458,33 @@ describe("AgentSession model and extension characterization", () => {
 		},
 	);
 
-	it("TM-30 late registration masks tool results that tree navigation restores", async () => {
+	it("TM-30 late registration masks tool results and send receipts that tree navigation restores", async () => {
 		let api!: ExtensionAPI;
 		const h = await secretHarness((pi) => {
 			api = pi;
 		});
 		await secretTurn(h);
+		const late = {
+			id: "agentmsg_1",
+			message: secret,
+			deliveryStatus: "delivered",
+			target: { activeSessionId: "a", sessionId: "s" },
+		};
+		h.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "ipython_1",
+			toolName: "ipython",
+			content: [],
+			isError: false,
+			timestamp: 0,
+		});
+		h.sessionManager.appendCustomEntry("ipython_sent_agent_message", { toolCallId: "ipython_1", message: late });
 		const leaf = h.sessionManager.getLeafId()!;
 		const user = h.sessionManager.getEntries().find((e) => e.type === "message" && e.message.role === "user")!;
 		await h.session.navigateTree(user.id, { summarize: false });
 		api.registerSecretValues([{ label: "late", value: secret }]);
 		await h.session.navigateTree(leaf, { summarize: false });
-		expect(JSON.stringify(h.session.messages)).toContain("[late]");
+		expect(JSON.stringify(h.session.messages)).toContain('"id":"agentmsg_1","message":"[late]"');
 		expect(JSON.stringify(h.session.messages)).not.toContain(secret);
 	});
 

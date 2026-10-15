@@ -2157,6 +2157,8 @@ export class AgentSession {
 		}
 		for (let index = this.agent.state.messages.length - 1; index >= 0; index -= 1) {
 			if (appendSentAgentMessageToToolResult(this.agent.state.messages[index], toolCallId, message)) {
+				// The appended text comes from session entries, which may predate a registration.
+				this._maskToolResultMessagesInPlace([this.agent.state.messages[index]]);
 				break;
 			}
 		}
