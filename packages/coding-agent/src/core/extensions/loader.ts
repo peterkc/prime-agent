@@ -14,6 +14,7 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
+import { parseSecretValues } from "../tool-output-redaction.js";
 import { collectExtensionEntries, resolveExtensionEntries } from "./discovery.js";
 import type {
 	Extension,
@@ -119,6 +120,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
 		flagValues: new Map(),
+		pendingSecretValues: [],
+		registerSecretValues: (entries) => runtime.pendingSecretValues.push(...entries),
 		pendingProviderRegistrations: [],
 		assertActive,
 		invalidate: (message) => {
@@ -281,6 +284,11 @@ function createExtensionAPI(
 		setThinkingLevel(level) {
 			runtime.assertActive();
 			runtime.setThinkingLevel(level);
+		},
+
+		registerSecretValues(entries) {
+			runtime.assertActive();
+			runtime.registerSecretValues(parseSecretValues(entries));
 		},
 
 		registerProvider(name: string, config: ProviderConfig) {

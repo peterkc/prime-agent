@@ -355,6 +355,7 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import { createSecretMatcher, redactToolOutput, type SecretValue } from "./tool-output-redaction.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { codemodeCallableTools } from "./tools/codemode.js";
@@ -1678,6 +1679,8 @@ export class AgentSession {
 	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
 
+	private readonly _secretValues = new Map<string, string>();
+	private _secretMatcher = createSecretMatcher([]);
 	private _extensionRunner!: ExtensionRunner;
 	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
 	private _turnIndex = 0;
@@ -4607,7 +4610,43 @@ export class AgentSession {
 		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
 	}
 
+	private _registerSecretValues(entries: readonly SecretValue[]): void {
+		for (const { label, value } of entries) {
+			if (!this._secretValues.has(value)) this._secretValues.set(value, label);
+		}
+		this._secretMatcher = createSecretMatcher(Array.from(this._secretValues, ([value, label]) => ({ label, value })));
+	}
+
+	private _maskToolOutput(output: AgentToolResult<unknown>): AgentToolResult<unknown> {
+		if (this._secretValues.size === 0) return output;
+		try {
+			return redactToolOutput(output, this._secretMatcher);
+		} catch {
+			return {
+				content: [{ type: "text", text: "Tool output was withheld because secret masking failed." }],
+				details: undefined,
+				isError: true,
+			};
+		}
+	}
+
+	private _maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
+		for (const message of messages) {
+			if (message.role !== "toolResult") continue;
+			const masked = this._maskToolOutput({
+				content: message.content,
+				details: message.details,
+				isError: message.isError,
+			});
+			message.content = masked.content;
+			message.details = masked.details;
+			if (masked.isError) message.isError = true;
+		}
+		return messages;
+	}
+
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		if (event.type === "tool_execution_update" && this._secretValues.size > 0) return;
 		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
@@ -4660,6 +4699,16 @@ export class AgentSession {
 		}
 
 		this._addLoginGuidanceToAuthError(event);
+		if (event.type === "tool_execution_end") {
+			event.result = this._maskToolOutput(event.result);
+			if (event.result.isError) event.isError = true;
+		} else if (event.type === "message_start" || event.type === "message_end") {
+			this._maskToolResultMessages([event.message]);
+		} else if (event.type === "turn_end") {
+			this._maskToolResultMessages(event.toolResults);
+		} else if (event.type === "agent_end") {
+			this._maskToolResultMessages(event.messages);
+		}
 
 		this._emit(event);
 
@@ -5286,7 +5335,7 @@ export class AgentSession {
 				isError: true,
 			};
 		}
-		return runToolCall(
+		const outcome = await runToolCall(
 			{ type: "toolCall", id: callId, name, arguments: args },
 			{
 				tools: codemodeCallableTools(
@@ -5300,6 +5349,8 @@ export class AgentSession {
 				signal,
 			},
 		);
+		const result = this._maskToolOutput(outcome.result);
+		return { result, isError: outcome.isError || result.isError === true };
 	}
 
 	getAllTools(): ToolInfo[] {
@@ -10765,6 +10816,8 @@ export class AgentSession {
 					this._modelRegistry.registerProvider(name, config);
 					this._refreshCurrentModelFromRegistry();
 				},
+				registerSecretValues: (entries) => this._registerSecretValues(entries),
+				maskToolResultMessages: (messages) => this._maskToolResultMessages(messages),
 				unregisterProvider: (name) => {
 					this._modelRegistry.unregisterProvider(name);
 					this._refreshCurrentModelFromRegistry();

@@ -228,6 +228,21 @@ describe("codemode", () => {
 		expect(session.sessionManager.getEntries().filter((entry) => entry.type === "message")).toEqual([]);
 	});
 
+	it("TM-24 masks nested returns before a codemode script can inspect them", async () => {
+		const secret = "dummy-secret-value-0123456789abcdef";
+		const { session } = await makeSession((pi) => {
+			pi.registerSecretValues([{ label: "fake", value: secret }]);
+			pi.registerTool(stub("echo", async () => reply(secret)));
+		});
+		session.setActiveToolsByName(["codemode", "echo"]);
+		const result = await sessionTool(session).execute("parent", {
+			code: 'const value = await tools.echo({value:"ok"}); text(value === "[fake]"); text(value);',
+		});
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain("true\n[fake]");
+		expect(text(result)).not.toContain(secret);
+	});
+
 	it("TM-08 folds only the current branch and persists completed writes including exit and deletion", async () => {
 		const { session } = await makeSession();
 		const manager = session.sessionManager;
@@ -373,14 +388,16 @@ describe("codemode", () => {
 	);
 
 	it.each([
-		{ enabled: undefined, tools: undefined, active: ["ipython", "codemode"] },
-		{ enabled: false, tools: undefined, active: ["ipython"] },
+		{ enabled: undefined, tools: undefined, active: ["ipython", "questionnaire", "codemode"] },
+		{ enabled: false, tools: undefined, active: ["ipython", "questionnaire"] },
 		{ enabled: true, tools: ["ipython"], active: ["ipython"] },
 		{ enabled: false, tools: ["codemode"], active: ["codemode"] },
 	])("TM-10 defaults and SDK lists $enabled $tools", async ({ enabled, tools, active }) => {
 		const settings = SettingsManager.inMemory(enabled === undefined ? {} : { codemode: enabled });
 		const setup = await makeSession(undefined, settings);
-		expect(setup.session.getActiveToolNames()).toEqual(enabled === false ? ["ipython"] : ["ipython", "codemode"]);
+		expect(setup.session.getActiveToolNames()).toEqual(
+			enabled === false ? ["ipython", "questionnaire"] : ["ipython", "questionnaire", "codemode"],
+		);
 		const { session } = await createAgentSession({
 			...setup,
 			cwd: dir,

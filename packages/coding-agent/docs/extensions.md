@@ -1607,6 +1607,43 @@ pi.events.on("my:event", (data) => { ... });
 pi.events.emit("my:event", { ... });
 ```
 
+### pi.registerSecretValues(entries)
+
+Add known secret values to this session's in-memory masking set. Call this during
+extension loading or later, after loading values from your secret manager:
+
+```typescript
+pi.registerSecretValues([
+  { label: "doppler:NAME", value: "dummy-secret-value-0123456789abcdef" },
+]);
+```
+
+- Each entry has a non-empty string `label` and a string `value` of at least 8 characters.
+- Invalid calls throw `Invalid secret registration at entry <index>` and add nothing.
+  The error never includes a value. A non-array argument names entry 0.
+- Calls only add values. Runtime rebuilds and `/reload` keep all registered values,
+  including rotated or removed values. Reloaded extensions can register them again.
+  The first label registered for the same value stays in use. Values are not saved to disk.
+- Values match exactly. For values of at least 16 characters, every 12-character piece
+  also matches. Overlapping or adjacent matches merge into `[<label>]`.
+
+Core masks text content and nested string values in tool result `details`:
+
+- Tool end events and tool result messages, before clients or the session file see them.
+  This includes immediate errors, abort-deadline results and `message_end` rewrites.
+- Tool result messages in each model request, after `context` handlers run.
+- Nested tool returns, before a codemode script receives them.
+
+While any value is registered, core withholds all `tool_execution_update` events
+for the session. Start events, end events and masked final results still go out.
+This prevents a secret split across streamed chunks from leaking. If masking fails,
+core replaces the output with `Tool output was withheld because secret masking failed.`
+
+This does not mask spill files, images, tool arguments, user or assistant messages,
+`!` command output or Python kernel state. Extensions still have full permissions;
+this is output masking, not isolation from an untrusted extension. If values cannot
+be loaded, the extension must report that failure. Core does not block tools.
+
 ### pi.registerProvider(name, config)
 
 Register or override a model provider dynamically. Useful for proxies, custom endpoints, or team-wide model configurations.

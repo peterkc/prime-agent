@@ -60,6 +60,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands.js";
 import type { SourceInfo } from "../source-info.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
+import type { SecretValue } from "../tool-output-redaction.js";
 import type { BashOperations } from "../tools/bash.js";
 import type { EditToolDetails } from "../tools/edit.js";
 import type {
@@ -1020,6 +1021,8 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** Add values masked in tool output until this session ends, including across reloads. */
+	registerSecretValues(entries: readonly { label: string; value: string }[]): void;
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(
@@ -1344,6 +1347,8 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	pendingSecretValues: SecretValue[];
+	registerSecretValues: (entries: readonly SecretValue[]) => void;
 	/**
 	 * Extra env vars merged over process.env for pi.exec() subprocesses (an
 	 * undefined value unsets the key in the child). Read at call time (not load

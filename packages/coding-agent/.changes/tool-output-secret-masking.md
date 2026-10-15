@@ -1,0 +1,1 @@
+- Added extension registration for secret values masked in tool results, session events and model requests, with live tool output withheld while values are registered.

@@ -344,7 +344,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transformContext: instrumentTransformContext(requestTimingEnabled, async (messages) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner) return messages;
-			return runner.emitContext(messages);
+			return runner.maskToolResultMessages(await runner.emitContext(messages));
 		}),
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),

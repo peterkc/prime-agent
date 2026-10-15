@@ -11,6 +11,7 @@ import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
+import type { SecretValue } from "../tool-output-redaction.js";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -250,6 +251,7 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private maskToolResultMessagesFn = (messages: AgentMessage[]): AgentMessage[] => messages;
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -288,6 +290,8 @@ export class ExtensionRunner {
 		providerActions?: {
 			registerProvider?: (name: string, config: ProviderConfig) => void;
 			unregisterProvider?: (name: string) => void;
+			registerSecretValues?: (entries: readonly SecretValue[]) => void;
+			maskToolResultMessages?: (messages: AgentMessage[]) => AgentMessage[];
 		},
 	): void {
 		this.runtime.sendMessage = actions.sendMessage;
@@ -304,6 +308,16 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+
+		this.runtime.registerSecretValues = (entries) => {
+			if (!providerActions?.registerSecretValues) throw new Error("Secret registration requires an agent session");
+			providerActions.registerSecretValues(entries);
+		};
+		if (this.runtime.pendingSecretValues.length > 0) {
+			this.runtime.registerSecretValues(this.runtime.pendingSecretValues);
+			this.runtime.pendingSecretValues = [];
+		}
+		this.maskToolResultMessagesFn = providerActions?.maskToolResultMessages ?? ((messages) => messages);
 
 		this.getModel = contextActions.getModel;
 		this.isIdleFn = contextActions.isIdle;
@@ -960,6 +974,10 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
+		return this.maskToolResultMessagesFn(messages);
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
