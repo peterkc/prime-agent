@@ -1,0 +1,1 @@
+- Added compaction settings for summary reasoning effort and default instructions.

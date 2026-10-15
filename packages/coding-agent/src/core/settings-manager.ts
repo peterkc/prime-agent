@@ -1,4 +1,4 @@
-import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -15,6 +15,8 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	thinkingLevel?: ModelThinkingLevel; // unset: no reasoning for summaries
+	summaryInstructions?: string; // default instructions for history and update summaries
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
 }
 
@@ -445,6 +447,7 @@ export class SettingsManager {
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
+	private warnedCompactionSettings = new Set<keyof CompactionSettings>();
 
 	private constructor(
 		storage: SettingsStorage,
@@ -1029,6 +1032,38 @@ export class SettingsManager {
 
 	getCompactionKeepRecentTokens(): number {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
+	}
+
+	getCompactionThinkingLevel(): ModelThinkingLevel | undefined {
+		const value: unknown = this.settings.compaction?.thinkingLevel;
+		switch (value) {
+			case undefined:
+				return undefined;
+			case "off":
+			case "minimal":
+			case "low":
+			case "medium":
+			case "high":
+			case "xhigh":
+			case "max":
+				return value;
+			default:
+				this.warnInvalidCompactionSetting("thinkingLevel");
+				return undefined;
+		}
+	}
+
+	getCompactionSummaryInstructions(): string | undefined {
+		const value: unknown = this.settings.compaction?.summaryInstructions;
+		if (value === undefined || typeof value === "string") return value;
+		this.warnInvalidCompactionSetting("summaryInstructions");
+		return undefined;
+	}
+
+	private warnInvalidCompactionSetting(key: keyof CompactionSettings): void {
+		if (this.warnedCompactionSettings.has(key)) return;
+		this.warnedCompactionSettings.add(key);
+		console.warn(`Warning: compaction.${key} is invalid; ignoring it.`);
 	}
 
 	getCompactionAgentCallable(): boolean {

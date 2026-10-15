@@ -9064,13 +9064,18 @@ export class AgentSession {
 				// its whole input at peak price, and on OpenAI-style providers it rides
 				// the session's prompt_cache_key with a divergent prefix, depressing
 				// hit rates. Route summaries to the auxiliary model when one is configured.
+				const defaultInstructions = this.settingsManager.getCompactionSummaryInstructions();
+				let effectiveInstructions = defaultInstructions ?? customInstructions;
+				if (defaultInstructions !== undefined && customInstructions) {
+					effectiveInstructions = `${defaultInstructions}\n\nAdditional instructions for this compaction:\n${customInstructions}`;
+				}
 				const summarization = (await this._resolveAuxiliaryModel(
 					"compaction summary",
 					{ model, apiKey, headers },
 					// The summary request serializes the whole conversation, so a
 					// smaller auxiliary window must fall back to the session model
 					// instead of failing over-limit and stranding the context.
-					estimateSummaryRequestTokens(preparation, customInstructions),
+					estimateSummaryRequestTokens(preparation, effectiveInstructions),
 				)) ?? {
 					model,
 					apiKey,
@@ -9103,17 +9108,15 @@ export class AgentSession {
 						throw error;
 					}
 				};
+				const thinkingLevel = this.settingsManager.getCompactionThinkingLevel();
 				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
 					preparation,
 					summarization.model,
 					summarization.apiKey,
 					summarization.headers,
-					customInstructions,
+					effectiveInstructions,
 					signal,
-					// Summarizing is transcription, not reasoning: no thinking level is
-					// requested, so the summary call stays cheap and cannot trip an invalid
-					// reasoning effort for the summary model.
-					undefined,
+					thinkingLevel === undefined ? undefined : clampThinkingLevel(summarization.model, thinkingLevel),
 					summaryCall,
 					providerRetryPolicy(this.settingsManager),
 					this.sessionId,

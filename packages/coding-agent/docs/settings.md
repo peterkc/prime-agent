@@ -202,6 +202,8 @@ prime-agent --offline
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.thinkingLevel` | string | unset | Summary reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; fitted to the summary model's supported levels |
+| `compaction.summaryInstructions` | string | unset | Default instructions for history and update summaries; caller instructions follow under a separate label |
 
 ```json
 {

@@ -36,6 +36,28 @@ By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/set
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary — for example `/compact focus on the auth refactor, remember the exact migration command`. The instructions are passed to the summarization prompt with high priority, persisted on the `CompactionEntry`, and shown on the `[compaction]` message in the TUI.
 
+### Summary Effort and Default Instructions
+
+Set `compaction.thinkingLevel` to `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
+Prime Agent fits the level to the summary model after auxiliary routing, using the same rule as session model switching.
+This can choose a higher supported level. With the key unset, or a non-reasoning model, summary requests use no reasoning.
+
+Set `compaction.summaryInstructions` to give history and update summaries default instructions.
+If `/compact` also supplies instructions, the summary receives this text:
+
+```text
+<summaryInstructions>
+
+Additional instructions for this compaction:
+<caller instructions>
+```
+
+Only the caller's instructions are saved on the compaction entry.
+The default instructions also count toward the summary request-size estimate and auxiliary-model fallback.
+They do not apply to split-turn prefix summaries or extension-provided summaries.
+When a key has an invalid value, Prime Agent warns once for that key and ignores it.
+Both keys use the normal global and project settings merge. With both unset, behavior stays unchanged.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`) is reached
