@@ -120,8 +120,12 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
 		flagValues: new Map(),
-		pendingSecretValues: [],
-		registerSecretValues: (entries) => runtime.pendingSecretValues.push(...entries),
+		registeredSecretValues: [],
+		secretValueSinks: new Set(),
+		registerSecretValues: (entries) => {
+			runtime.registeredSecretValues.push(...entries);
+			for (const sink of runtime.secretValueSinks) sink(entries);
+		},
 		pendingProviderRegistrations: [],
 		assertActive,
 		invalidate: (message) => {

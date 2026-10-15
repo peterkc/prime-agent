@@ -1347,7 +1347,8 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
-	pendingSecretValues: SecretValue[];
+	registeredSecretValues: SecretValue[];
+	secretValueSinks: Set<(entries: readonly SecretValue[]) => void>;
 	registerSecretValues: (entries: readonly SecretValue[]) => void;
 	/**
 	 * Extra env vars merged over process.env for pi.exec() subprocesses (an

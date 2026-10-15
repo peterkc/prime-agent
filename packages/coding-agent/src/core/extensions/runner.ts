@@ -251,6 +251,7 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private secretValueSink?: (entries: readonly SecretValue[]) => void;
 	private maskToolResultMessagesFn = (messages: AgentMessage[]): AgentMessage[] => messages;
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
@@ -309,13 +310,11 @@ export class ExtensionRunner {
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 
-		this.runtime.registerSecretValues = (entries) => {
-			if (!providerActions?.registerSecretValues) throw new Error("Secret registration requires an agent session");
-			providerActions.registerSecretValues(entries);
-		};
-		if (this.runtime.pendingSecretValues.length > 0) {
-			this.runtime.registerSecretValues(this.runtime.pendingSecretValues);
-			this.runtime.pendingSecretValues = [];
+		this.unbindSecretValues();
+		this.secretValueSink = providerActions?.registerSecretValues;
+		if (this.secretValueSink) {
+			this.runtime.secretValueSinks.add(this.secretValueSink);
+			this.secretValueSink(this.runtime.registeredSecretValues);
 		}
 		this.maskToolResultMessagesFn = providerActions?.maskToolResultMessages ?? ((messages) => messages);
 
@@ -506,6 +505,7 @@ export class ExtensionRunner {
 
 	/** Take over the previous runner's timer host: adopted timers report through, and are gated by, this runner. */
 	adoptHostTimers(previous: ExtensionRunner): void {
+		previous.unbindSecretValues();
 		this.timerHost = previous.timerHost;
 		this.timerHost.current = this;
 	}
@@ -516,11 +516,17 @@ export class ExtensionRunner {
 	): void {
 		if (this.staleMessage) return;
 		this.staleMessage = message;
+		this.unbindSecretValues();
 		for (const ref of this.timerHost.timers) {
 			const handle = ref.deref();
 			if (handle) clearTimeout(handle);
 		}
 		this.timerHost.timers.clear();
+	}
+
+	private unbindSecretValues(): void {
+		if (this.secretValueSink) this.runtime.secretValueSinks.delete(this.secretValueSink);
+		this.secretValueSink = undefined;
 	}
 
 	private assertActive(): void {

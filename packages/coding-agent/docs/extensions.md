@@ -1624,20 +1624,28 @@ pi.registerSecretValues([
 - Calls only add values. Runtime rebuilds and `/reload` keep all registered values,
   including rotated or removed values. Reloaded extensions can register them again.
   The first label registered for the same value stays in use. Values are not saved to disk.
+  Sessions bound to the same active extension runtime receive load-time and later registrations.
 - Values match exactly. For values of at least 16 characters, every 12-character piece
   also matches. Overlapping or adjacent matches merge into `[<label>]`.
 
 Core masks text content and nested string values in tool result `details`:
 
-- Tool end events and tool result messages, before clients or the session file see them.
-  This includes immediate errors, abort-deadline results and `message_end` rewrites.
+- Tool end events and tool result messages, before extension handlers, client events,
+  client message snapshots or the session file see them. Core masks again after handlers
+  run, including `message_end` rewrites. Immediate errors and abort-deadline results are covered.
+- Each contiguous run of text parts is matched as joined text. If a match crosses part
+  boundaries, core combines that run into one masked text part. Non-text parts stay in place.
 - Tool result messages in each model request, after `context` handlers run.
+  Compaction, refinement and auto-refine review requests use the current masking set,
+  including values registered after the original output. Stored history is not rewritten.
 - Nested tool returns, before a codemode script receives them.
+- Extension error messages and stacks, before core forwards them to clients.
 
 While any value is registered, core withholds all `tool_execution_update` events
 for the session. Start events, end events and masked final results still go out.
 This prevents a secret split across streamed chunks from leaking. If masking fails,
-core replaces the output with `Tool output was withheld because secret masking failed.`
+core replaces a tool result with `Tool output was withheld because secret masking failed.`
+For extension errors, core withholds the error text and stack instead of forwarding raw text.
 
 This does not mask spill files, images, tool arguments, user or assistant messages,
 `!` command output or Python kernel state. Extensions still have full permissions;

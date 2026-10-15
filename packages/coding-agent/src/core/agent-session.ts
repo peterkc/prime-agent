@@ -356,7 +356,7 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
-import { createSecretMatcher, redactToolOutput, type SecretValue } from "./tool-output-redaction.js";
+import { createSecretMatcher, redactText, redactToolOutput, type SecretValue } from "./tool-output-redaction.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { codemodeCallableTools } from "./tools/codemode.js";
@@ -2084,14 +2084,15 @@ export class AgentSession {
 				return undefined;
 			}
 
+			const masked = this._maskToolOutput(result);
 			const hookResult = await runner.emitToolResult({
 				type: "tool_result",
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
+				content: masked.content,
+				details: masked.details,
+				isError: masked.isError ?? isError,
 			});
 
 			if (!hookResult) {
@@ -4574,6 +4575,8 @@ export class AgentSession {
 				}
 			}
 		}
+		// Agent-core stores event.message itself, so this also protects synchronous state snapshots.
+		this._maskAgentEventOutput(event);
 		this._agentEventQueue = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
 			() => this._processAgentEvent(event),
@@ -4652,18 +4655,38 @@ export class AgentSession {
 	}
 
 	private _maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
-		for (const message of messages) {
-			if (message.role !== "toolResult") continue;
-			const masked = this._maskToolOutput({
-				content: message.content,
-				details: message.details,
-				isError: message.isError,
-			});
-			message.content = masked.content;
-			message.details = masked.details;
-			if (masked.isError) message.isError = true;
+		return messages.map((message) =>
+			message.role === "toolResult"
+				? {
+						...message,
+						...this._maskToolOutput({
+							content: message.content,
+							details: message.details,
+							isError: message.isError,
+						}),
+					}
+				: message,
+		);
+	}
+
+	private _maskToolResultMessagesInPlace(messages: AgentMessage[]): void {
+		const masked = this._maskToolResultMessages(messages);
+		for (let index = 0; index < messages.length; index++) {
+			this._replaceMessageInPlace(messages[index], masked[index]);
 		}
-		return messages;
+	}
+
+	private _maskAgentEventOutput(event: AgentEvent): void {
+		if (event.type === "tool_execution_end") {
+			event.result = this._maskToolOutput(event.result);
+			if (event.result.isError) event.isError = true;
+		} else if (event.type === "message_start" || event.type === "message_end") {
+			this._maskToolResultMessagesInPlace([event.message]);
+		} else if (event.type === "turn_end") {
+			this._maskToolResultMessagesInPlace(event.toolResults);
+		} else if (event.type === "agent_end") {
+			this._maskToolResultMessagesInPlace(event.messages);
+		}
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
@@ -4709,6 +4732,7 @@ export class AgentSession {
 			this._overflowRecovery = "idle";
 		}
 
+		this._maskAgentEventOutput(event);
 		await this._emitExtensionEvent(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			const cleared = this._capturingCancelledAction(event.message);
@@ -4720,16 +4744,8 @@ export class AgentSession {
 		}
 
 		this._addLoginGuidanceToAuthError(event);
-		if (event.type === "tool_execution_end") {
-			event.result = this._maskToolOutput(event.result);
-			if (event.result.isError) event.isError = true;
-		} else if (event.type === "message_start" || event.type === "message_end") {
-			this._maskToolResultMessages([event.message]);
-		} else if (event.type === "turn_end") {
-			this._maskToolResultMessages(event.toolResults);
-		} else if (event.type === "agent_end") {
-			this._maskToolResultMessages(event.messages);
-		}
+		// Mask again: message_end handlers may have rewritten the result.
+		this._maskAgentEventOutput(event);
 
 		this._emit(event);
 
@@ -9035,6 +9051,8 @@ export class AgentSession {
 			if (extensionCompaction) {
 				({ summary, firstKeptEntryId, tokensBefore, details, usage } = extensionCompaction);
 			} else {
+				preparation.messagesToSummarize = this._maskToolResultMessages(preparation.messagesToSummarize);
+				preparation.turnPrefixMessages = this._maskToolResultMessages(preparation.turnPrefixMessages);
 				// Compaction fires at context peak, and the summarizer runs with its own
 				// prompt prefix (a different system prompt, no tools), so it cannot hit
 				// the session's cached prefix: on the session model the summary re-reads
@@ -9672,7 +9690,7 @@ export class AgentSession {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
 		return reviewAutoRefine(
-			this.agent.state.messages,
+			this._maskToolResultMessages(this.agent.state.messages),
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
 			refinementModel.model,
@@ -10073,7 +10091,9 @@ export class AgentSession {
 					scope: requestedScope,
 					planningState,
 					history,
-					conversationText: serializeConversation(convertToLlm(this.agent.state.messages)).slice(-80_000),
+					conversationText: serializeConversation(
+						convertToLlm(this._maskToolResultMessages(this.agent.state.messages)),
+					).slice(-80_000),
 				},
 				signal,
 			})) as SessionBeforeRefineResult | undefined;
@@ -10092,7 +10112,7 @@ export class AgentSession {
 			}
 		}
 		const plan = await planRefinement(
-			this.agent.state.messages,
+			this._maskToolResultMessages(this.agent.state.messages),
 			planningState,
 			history,
 			refinementModel.model,
@@ -10706,7 +10726,27 @@ export class AgentSession {
 
 		this._extensionErrorUnsubscriber?.();
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
-			? runner.onError(this._extensionErrorListener)
+			? runner.onError((error) => {
+					if (this._secretValues.size === 0) {
+						this._extensionErrorListener?.(error);
+						return;
+					}
+					let masked = error;
+					try {
+						masked = {
+							...error,
+							error: redactText(error.error, this._secretMatcher),
+							stack: error.stack === undefined ? undefined : redactText(error.stack, this._secretMatcher),
+						};
+					} catch {
+						masked = {
+							...error,
+							error: "Extension error was withheld because secret masking failed.",
+							stack: undefined,
+						};
+					}
+					this._extensionErrorListener?.(masked);
+				})
 			: undefined;
 	}
 

@@ -48,7 +48,7 @@ export function createSecretMatcher(entries: readonly SecretValue[]): SecretMatc
 	return { exact: entries, windows };
 }
 
-function redactText(text: string, matcher: SecretMatcher): string {
+export function redactText(text: string, matcher: SecretMatcher): string {
 	const ranges: MatchRange[] = [];
 	for (const { label, value } of matcher.exact) {
 		let start = text.indexOf(value);
@@ -57,7 +57,7 @@ function redactText(text: string, matcher: SecretMatcher): string {
 			start = text.indexOf(value, start + 1);
 		}
 	}
-	for (let start = 0; start <= text.length - 12; start++) {
+	for (let start = 0; matcher.windows.size > 0 && start <= text.length - 12; start++) {
 		const label = matcher.windows.get(text.slice(start, start + 12));
 		if (label !== undefined) ranges.push({ start, end: start + 12, label });
 	}
@@ -96,9 +96,27 @@ function redactDetails(value: unknown, matcher: SecretMatcher, copies: WeakMap<o
 }
 
 export function redactToolOutput(output: AgentToolResult<unknown>, matcher: SecretMatcher): AgentToolResult<unknown> {
-	const content = output.content.map((part) =>
-		part.type === "text" ? { ...part, text: redactText(part.text, matcher) } : part,
-	);
+	const content: AgentToolResult<unknown>["content"] = [];
+	for (let index = 0; index < output.content.length; ) {
+		const part = output.content[index];
+		if (part.type !== "text") {
+			content.push(part);
+			index++;
+			continue;
+		}
+		const run = [];
+		while (index < output.content.length) {
+			const next = output.content[index];
+			if (next.type !== "text") break;
+			run.push(next);
+			index++;
+		}
+		const masked = run.map((text) => ({ ...text, text: redactText(text.text, matcher) }));
+		const joined = redactText(run.map((text) => text.text).join(""), matcher);
+		content.push(
+			...(joined === masked.map((text) => text.text).join("") ? masked : [{ type: "text" as const, text: joined }]),
+		);
+	}
 	return {
 		content,
 		details: redactDetails(output.details, matcher, new WeakMap()),

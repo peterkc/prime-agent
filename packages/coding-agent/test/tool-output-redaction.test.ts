@@ -68,7 +68,7 @@ describe("tool output redaction", () => {
 			pi.registerSecretValues([{ label: "old", value: secret }]);
 			const input = Array.isArray(bad) ? [{ label: "new", value: "dummy-rejected-value" }, ...bad] : bad;
 			expect(() => pi.registerSecretValues(input as Parameters<ExtensionAPI["registerSecretValues"]>[0])).toThrow(
-				`Invalid secret registration at entry ${Array.isArray(bad) ? 1 : 0}`,
+				new RegExp(`^Invalid secret registration at entry ${Array.isArray(bad) ? 1 : 0}$`),
 			);
 		});
 		expect(JSON.stringify(output)).not.toContain(secret);
