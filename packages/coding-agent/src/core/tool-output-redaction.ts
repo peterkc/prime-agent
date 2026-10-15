@@ -96,26 +96,22 @@ function redactDetails(value: unknown, matcher: SecretMatcher, copies: WeakMap<o
 }
 
 export function redactToolOutput(output: AgentToolResult<unknown>, matcher: SecretMatcher): AgentToolResult<unknown> {
-	const content: AgentToolResult<unknown>["content"] = [];
-	for (let index = 0; index < output.content.length; ) {
-		const part = output.content[index];
-		if (part.type !== "text") {
-			content.push(part);
-			index++;
-			continue;
-		}
-		const run = [];
-		while (index < output.content.length) {
-			const next = output.content[index];
-			if (next.type !== "text") break;
-			run.push(next);
-			index++;
-		}
-		const masked = run.map((text) => ({ ...text, text: redactText(text.text, matcher) }));
-		const joined = redactText(run.map((text) => text.text).join(""), matcher);
-		content.push(
-			...(joined === masked.map((text) => text.text).join("") ? masked : [{ type: "text" as const, text: joined }]),
+	// Serializers join all text parts and drop images, so match across every text part.
+	const texts = (parts: typeof output.content) => parts.flatMap((part) => (part.type === "text" ? [part.text] : []));
+	const original = texts(output.content).join("");
+	const joined = redactText(original, matcher);
+	let content = output.content;
+	if (joined !== original) {
+		const masked = output.content.map((part) =>
+			part.type === "text" ? { ...part, text: redactText(part.text, matcher) } : part,
 		);
+		const first = output.content.findIndex((part) => part.type === "text");
+		content =
+			joined === texts(masked).join("")
+				? masked
+				: masked.flatMap<(typeof masked)[number]>((part, index) =>
+						part.type !== "text" ? [part] : index === first ? [{ type: "text" as const, text: joined }] : [],
+					);
 	}
 	return {
 		content,

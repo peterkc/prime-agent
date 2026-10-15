@@ -123,7 +123,12 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		registeredSecretValues: [],
 		secretValueSinks: new Set(),
 		registerSecretValues: (entries) => {
-			runtime.registeredSecretValues.push(...entries);
+			const known = new Set(runtime.registeredSecretValues.map((entry) => entry.value));
+			for (const entry of entries) {
+				if (known.has(entry.value)) continue;
+				known.add(entry.value);
+				runtime.registeredSecretValues.push(entry);
+			}
 			for (const sink of runtime.secretValueSinks) sink(entries);
 		},
 		pendingProviderRegistrations: [],
