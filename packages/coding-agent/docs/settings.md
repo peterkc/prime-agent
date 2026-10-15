@@ -380,8 +380,9 @@ Normally the package manager's global modules location is queried using `root -g
 `"native"`; set it to `"cotal"` to opt in to durable mesh agent messages.
 Project settings cannot enable it. Restart the daemon after changing it.
 Cotal mode requires `mesh/mesh.json` and the private `mesh/signer.json` in the
-agent home directory. Setup tooling will come later. Missing or invalid mesh
-files refuse mesh messages; they do not fall back to native delivery.
+agent home directory. Use `prime-agent mesh install` to set them up on macOS.
+Missing or invalid mesh files refuse mesh messages; they do not fall back to native delivery.
+See [Mesh agent messaging](daemon.md#mesh-agent-messaging) for limits and rollback.
 
 ### Daemon
 
@@ -389,6 +390,7 @@ files refuse mesh messages; they do not fall back to native delivery.
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
 | `autoReload` | `"off"` or `"idle"` | `"off"` | Reload changed runtime files when daemon sessions are idle. |
+| `agentMessageTransport` | `"native"` or `"cotal"` | `"native"` | Global-only agent message transport. Restart the daemon after changing it. |
 
 `autoReload` reads only global settings; project settings and SDK overrides cannot enable it.
 The daemon reads the file every 15 seconds, so changing this setting needs no `/reload`.

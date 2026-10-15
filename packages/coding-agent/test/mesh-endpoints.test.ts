@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { type AgentFamilyMember, createAgentMessageHostHandlers } from "../src/core/agent-messages.js";
 import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
@@ -36,6 +37,8 @@ vi.mock("../src/modes/daemon/cotal/enrollment.js", async (original) => ({
 		homeSocket,
 	})),
 	credentialSource: () => async () => "test-only-credential",
+	deprovisionEnrollment: vi.fn(async () => undefined),
+	removeEnrollment: vi.fn(),
 	enrollmentPath: (root: string, id: string) => join(root, `${id}.json`),
 	readDirectory: vi.fn((_: string, id: string) => directories.get(id)),
 }));
@@ -45,6 +48,7 @@ class Endpoint extends EventEmitter {
 	static onStart?: (endpoint: Endpoint) => void;
 	readonly start = vi.fn(async () => Endpoint.onStart?.(this));
 	readonly stop = vi.fn(async (): Promise<void> => undefined);
+	readonly reconnect = vi.fn(async (): Promise<void> => undefined);
 	readonly unicastAttributed = vi.fn(async () => ({ msg: { id: "published" }, ack: { seq: 42, duplicate: false } }));
 	constructor(readonly options: core.EndpointOptions) {
 		super();
@@ -71,7 +75,9 @@ afterEach(async () => {
 	directories.clear();
 	releaseClaim.mockClear();
 	vi.mocked(enrollment.provisionEnrollment).mockReset().mockResolvedValue(undefined);
+	vi.restoreAllMocks();
 	vi.clearAllMocks();
+	vi.unstubAllEnvs();
 });
 
 async function fixture(
@@ -81,6 +87,7 @@ async function fixture(
 ) {
 	const root = mkdtempSync(join(tmpdir(), "prime-mesh-endpoints-"));
 	roots.push(root);
+	vi.stubEnv(ENV_AGENT_DIR, root);
 	for (const id of ["a", "b"]) {
 		writeFileSync(join(root, `${id}.json`), "{}");
 		directories.set(id, { sessionId: id, name: id, principal: `local.${id}`, homeSocket: "home" });
@@ -118,6 +125,241 @@ async function settled(mesh: MeshEndpoints, id: string) {
 }
 
 describe("mesh endpoints", () => {
+	it("AC-18 missing session file never provisions or creates an endpoint", async () => {
+		const { mesh, root } = await fixture();
+		vi.mocked(enrollment.provisionEnrollment).mockClear();
+		await expect(mesh.enroll("missing", join(root, "missing.json"))).rejects.toThrow("session file is missing");
+		expect(enrollment.provisionEnrollment).not.toHaveBeenCalled();
+		expect(Endpoint.instances).toHaveLength(2);
+		expect(enrollment.deprovisionEnrollment).not.toHaveBeenCalled();
+	});
+
+	it.each(["provision", "start", "read", "deleted"])("AC-18 failed %s removes only after delete", async (stage) => {
+		if (stage === "provision")
+			vi.mocked(enrollment.provisionEnrollment).mockImplementationOnce(async () => {
+				directories.delete("a"); // No first directory publication has happened.
+				throw new Error("first failed");
+			});
+		else if (stage === "deleted")
+			vi.mocked(enrollment.publishDirectory).mockImplementationOnce(async (root, record) => {
+				rmSync(enrollment.enrollmentPath(root, record.sessionId));
+				throw new Error("first failed");
+			});
+		else {
+			Endpoint.onStart = () => {
+				throw new Error("first failed");
+			};
+			if (stage === "read")
+				vi.mocked(enrollment.readDirectory).mockImplementationOnce(() => {
+					throw new Error("directory unreadable");
+				});
+		}
+		await expect(fixture()).rejects.toThrow("first failed");
+		expect(enrollment.deprovisionEnrollment).toHaveBeenCalledTimes(stage === "deleted" ? 1 : 0);
+		expect(releaseClaim).toHaveBeenCalledTimes(1);
+		if (stage === "read") expect(Endpoint.instances[0]!.stop).toHaveBeenCalledTimes(1);
+	});
+
+	it("AC-18 deletion during endpoint start removes and releases once", async () => {
+		let finishStart!: () => void;
+		let starting!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			starting = resolve;
+		});
+		Endpoint.onStart = (endpoint) => {
+			if (endpoint.options.card?.id !== "b") return;
+			starting();
+			return new Promise<void>((resolve) => {
+				finishStart = resolve;
+			});
+		};
+		const started = fixture();
+		const refused = expect(started).rejects.toThrow("directory entry disappeared");
+		await ready;
+		const mesh = meshes[0]!;
+		const root = roots[0]!;
+		directories.delete("b");
+		vi.mocked(enrollment.removeEnrollment).mockResolvedValueOnce(
+			enrollment.ensureEnrollmentRecord(root, "b", join(root, "b.json")),
+		);
+		try {
+			await mesh.unenroll("b", join(root, "b.json"));
+		} finally {
+			finishStart();
+			await refused;
+		}
+		expect(Endpoint.instances[1]!.stop).toHaveBeenCalledTimes(1);
+		expect(enrollment.deprovisionEnrollment).toHaveBeenCalledTimes(1);
+		expect(releaseClaim).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["partial", "stop-failed"])(
+		"AC-18 %s removal retains the right custody and never retries",
+		async (failure) => {
+			const { mesh, target, root, log } = await fixture();
+			const record = enrollment.ensureEnrollmentRecord(root, "b", join(root, "b.json"));
+			vi.mocked(enrollment.removeEnrollment).mockResolvedValueOnce(record);
+			if (failure === "partial")
+				vi.mocked(enrollment.deprovisionEnrollment).mockRejectedValueOnce(
+					new core.DeprovisionError("DLV consumer left", {
+						examined: 3,
+						deleted: 2,
+						absent: 0,
+						refused: 1,
+						acknowledged: 1,
+						disappeared: 0,
+						consumers: { examined: 2, deleted: 1, absent: 0, refused: 1, acknowledged: 1, disappeared: 0 },
+						acls: { examined: 1, deleted: 1, absent: 0, refused: 0, disappeared: 0 },
+						members: { examined: 0, deleted: 0, absent: 0, refused: 0, disappeared: 0 },
+					}),
+				);
+			else target.stop.mockRejectedValueOnce(new Error("stop failed"));
+			const removed = mesh.unenroll("b", join(root, "b.json"));
+			if (failure === "partial") await removed;
+			else await expect(removed).rejects.toThrow("stop failed");
+			expect(target.stop).toHaveBeenCalledTimes(1);
+			expect(enrollment.deprovisionEnrollment).toHaveBeenCalledTimes(failure === "partial" ? 1 : 0);
+			expect(releaseClaim).toHaveBeenCalledTimes(failure === "partial" ? 1 : 0);
+			expect(log).toHaveBeenCalledExactlyOnceWith(
+				expect.stringContaining(failure === "partial" ? "inbox removal failed" : "claim retained"),
+			);
+			if (failure === "stop-failed") await expect(mesh.enroll("b", join(root, "b.json"))).rejects.toThrow("closed");
+		},
+	);
+
+	it("AC-32 starts session endpoints without presence or channel watches", async () => {
+		const { source, target } = await fixture();
+		for (const endpoint of [source, target])
+			expect(endpoint.options).toMatchObject({ watchPresence: false, watchChannels: false });
+	});
+
+	it.each(["persisted", "cleared", "closed"] as const)(
+		"AC-18 close blocks late %s frames and queued wakes until stop completes",
+		async (frame) => {
+			vi.useFakeTimers();
+			let finishWake!: () => void;
+			let isOpen!: () => boolean;
+			const sent = vi.fn();
+			const { mesh, target } = await fixture(async (_record, _message, _count, bind, open) => {
+				bind(recipient);
+				isOpen = open;
+				await new Promise<void>((resolve) => {
+					finishWake = resolve;
+				});
+				if (open()) sent();
+			});
+			const first = delivery("held");
+			const second = delivery("queued");
+			target.emit("message", first.message, first.delivery, { kind: "dm" });
+			target.emit("message", second.message, second.delivery, { kind: "dm" });
+			let finishStop!: () => void;
+			target.stop.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						finishStop = resolve;
+					}),
+			);
+			const stopped = mesh.closeSession("b");
+			expect(isOpen()).toBe(false);
+			expect(releaseClaim).not.toHaveBeenCalled();
+			if (frame === "persisted") mesh.confirmPersisted("held", recipient);
+			else mesh.confirmDropped("held", recipient, frame);
+			finishWake();
+			await settled(mesh, "b");
+			await vi.advanceTimersByTimeAsync(6000);
+			expect(sent).not.toHaveBeenCalled();
+			for (const item of [first, second]) {
+				expect(item.ack).not.toHaveBeenCalled();
+				expect(item.delivery.nak).not.toHaveBeenCalled();
+				expect(item.working).toHaveBeenCalledTimes(1);
+			}
+			finishStop();
+			await stopped;
+			expect(mesh.closeSession("b")).toBe(stopped);
+			await expect(mesh.enroll("b", "b.json")).rejects.toThrow("closed");
+		},
+	);
+
+	it.each(["valid", "expired", "timeout"])("AC-27 %s wire credentials before a close event", async (state) => {
+		vi.useFakeTimers();
+		vi.spyOn(core, "credsClaims").mockImplementation(
+			() => ({ exp: Math.floor(Date.now() / 1000) + 120 }) as ReturnType<typeof core.credsClaims>,
+		);
+		Endpoint.onStart = async (endpoint) => {
+			if (typeof endpoint.options.creds !== "function") throw new Error("Expected credential source");
+			await endpoint.options.creds();
+			endpoint.emit("connection", { connected: true });
+		};
+		const { mesh, source } = await fixture();
+		if (state !== "valid") await vi.advanceTimersByTimeAsync(121_000);
+		const send = mesh.send({ sessionId: "a" }, "b", "after expiry");
+		const outcome =
+			state === "timeout"
+				? expect(send).rejects.toThrow("Message was not stored")
+				: expect(send).resolves.toMatchObject({ deliveryStatus: "stored" });
+		if (state === "valid") expect(source.reconnect).not.toHaveBeenCalled();
+		else {
+			expect(source.reconnect).toHaveBeenCalledTimes(1);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
+			if (state === "expired") {
+				source.emit("connection", { connected: false });
+				if (typeof source.options.creds !== "function") throw new Error("Expected credential source");
+				await source.options.creds();
+				source.emit("connection", { connected: true });
+			} else await vi.advanceTimersByTimeAsync(30_000);
+		}
+		await outcome;
+		expect(source.reconnect).toHaveBeenCalledTimes(state === "valid" ? 0 : 1);
+		expect(source.unicastAttributed).toHaveBeenCalledTimes(state === "timeout" ? 0 : 1);
+	});
+
+	it.each(["connection", "transport", "timeout"])(
+		"AC-27 waits for %s before publishing, within one deadline",
+		async (event) => {
+			vi.useFakeTimers();
+			const { mesh, source } = await fixture();
+			source.emit(event === "transport" ? "transport" : "connection", { connected: false });
+			const send = mesh.send({ sessionId: "a" }, "b", "hello");
+			const result =
+				event === "timeout"
+					? expect(send).rejects.toThrow("Message was not stored")
+					: expect(send).resolves.toMatchObject({ deliveryStatus: "stored" });
+			await vi.advanceTimersByTimeAsync(event === "timeout" ? 30_000 : 8000);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
+			if (event !== "timeout") source.emit(event, { connected: true });
+			await result;
+			expect(source.unicastAttributed).toHaveBeenCalledTimes(event === "timeout" ? 0 : 1);
+		},
+	);
+
+	it("AC-27 reconnect and held publish share the send's 30-second deadline", async () => {
+		vi.useFakeTimers();
+		const { mesh, source } = await fixture();
+		let finishPublish!: () => void;
+		const heldPublish = new Promise<Awaited<ReturnType<typeof source.unicastAttributed>>>((resolve) => {
+			finishPublish = () => resolve({ msg: { id: "published" }, ack: { seq: 42, duplicate: false } });
+		});
+		source.unicastAttributed.mockReturnValueOnce(heldPublish);
+		source.emit("connection", { connected: false });
+		const rejected = vi.fn();
+		const completed = mesh.send({ sessionId: "a" }, "b", "hello").catch(rejected);
+		try {
+			await vi.advanceTimersByTimeAsync(8000);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
+			source.emit("connection", { connected: true });
+			await vi.advanceTimersByTimeAsync(21_999);
+			expect(rejected).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(rejected).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ message: expect.stringContaining("Message storage outcome is unknown") }),
+			);
+			expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
+		} finally {
+			finishPublish();
+			await completed;
+		}
+	});
+
 	it("redacts endpoint diagnostics and publish causes without losing the actionable error", async () => {
 		const { mesh, source, target, log } = await fixture();
 		const identity = core.newIdentity();
@@ -174,19 +416,26 @@ describe("mesh endpoints", () => {
 
 	it("F15 defers and serializes adopted, home and bound enrollment, continuing after a failure", async () => {
 		const { mesh, root, log } = await fixture();
-		for (const id of ["home", "bound"])
+		for (const id of ["adopted", "home", "bound"]) {
+			writeFileSync(join(root, `${id}.json`), "{}");
 			directories.set(id, { sessionId: id, name: id, principal: `local.${id}`, homeSocket: "home" });
+		}
 		vi.mocked(enrollment.homeEnrollments).mockReturnValueOnce([
 			enrollment.ensureEnrollmentRecord(root, "home", join(root, "home.json")),
 		]);
 		vi.mocked(enrollment.claimEnrollment).mockClear();
 		let rejectFirst!: (error: Error) => void;
+		let beginFirst!: () => void;
+		const firstProvisioned = new Promise<void>((resolve) => {
+			beginFirst = resolve;
+		});
 		vi.mocked(enrollment.provisionEnrollment)
 			.mockClear()
 			.mockImplementation(async (_root, _config, record) => {
 				if (record.sessionId === "adopted")
 					await new Promise<void>((_resolve, reject) => {
 						rejectFirst = reject;
+						beginFirst();
 					});
 			});
 		const adopted = mesh.enqueueEnrollment("adopted", join(root, "adopted.json"));
@@ -195,7 +444,7 @@ describe("mesh endpoints", () => {
 		const home = mesh.start();
 		const bound = mesh.enqueueEnrollment("bound", join(root, "bound.json"));
 		try {
-			await Promise.resolve();
+			await firstProvisioned;
 			expect(inlineClaims).toBe(0);
 			expect(enrollment.claimEnrollment).toHaveBeenCalledTimes(1);
 			expect(enrollment.provisionEnrollment).toHaveBeenCalledTimes(1);
@@ -222,6 +471,7 @@ describe("mesh endpoints", () => {
 					finish = resolve;
 				}),
 		);
+		writeFileSync(join(root, "late.json"), "{}");
 		const work = mesh.enroll("late", join(root, "late.json"));
 		const refused = expect(work).rejects.toThrow("shutting down");
 		let stoppedDone = false;
@@ -480,7 +730,7 @@ describe("mesh endpoints", () => {
 			expect(handoff).not.toHaveBeenCalled();
 			await vi.advanceTimersByTimeAsync(6000);
 			expect(item.working).toHaveBeenCalledTimes(1);
-			expect(queued.working).toHaveBeenCalledTimes(1);
+			expect(queued.working).not.toHaveBeenCalled();
 			expect(queued.ack).not.toHaveBeenCalled();
 			expect(log).toHaveBeenCalledTimes(1);
 		}

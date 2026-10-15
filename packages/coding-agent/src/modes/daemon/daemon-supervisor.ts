@@ -868,7 +868,8 @@ export class DaemonSupervisor {
 					homeSocket: this.socketPath,
 					credentialLifetimeSeconds: this.meshCredentialLifetimeSeconds,
 					log: (message) => this.log(message),
-					handoff: (record, message, count, bind) => this.handoffMeshMessage(record, message, count, bind),
+					handoff: (record, message, count, bind, isOpen) =>
+						this.handoffMeshMessage(record, message, count, bind, isOpen),
 				});
 			}
 			await this.seedRosterLedger();
@@ -2839,8 +2840,9 @@ export class DaemonSupervisor {
 					return response;
 				});
 			}
-			case "delete_saved_session":
+			case "delete_saved_session": {
 				if (!command.activeSessionId) {
+					const deletedSession = this.mesh ? await readSessionInfo(command.sessionPath) : undefined;
 					const deletedPath = canonicalSessionPath(command.sessionPath);
 					const entry = this.roster().bySessionFile(deletedPath);
 					if (entry?.summary.activeSessionId !== undefined) {
@@ -2851,7 +2853,10 @@ export class DaemonSupervisor {
 						// A client-owned worker's files are invisible to other clients: a foreign delete is an unknown target.
 						this.assertWorkerAccessibleToClient(client, owner, command.sessionPath);
 						if (owner.client && !this.isWorkerStopping(owner)) {
-							return this.forwardToWorker(owner, command);
+							const response = await this.forwardToWorker(owner, command);
+							if (this.mesh && response.success && (response.data as { ok?: boolean } | undefined)?.ok)
+								await this.unenrollMeshSession(deletedSession, deletedPath);
+							return response;
 						}
 						if (!(await this.reclaimStaleWorkerRegistration(owner))) {
 							throw new Error(
@@ -2866,10 +2871,14 @@ export class DaemonSupervisor {
 					}
 					// The deleted session's armed heartbeats must leave the catalog
 					// snapshot too; their rows would otherwise linger until the TTL.
-					if (result.ok) this.invalidatePassiveScheduledJobs();
+					if (result.ok) {
+						this.invalidatePassiveScheduledJobs();
+						if (this.mesh) await this.unenrollMeshSession(deletedSession, deletedPath);
+					}
 					return success(command.id, command.type, result);
 				}
 				break;
+			}
 		}
 
 		if (command.type === "mesh_send") {
@@ -3014,7 +3023,22 @@ export class DaemonSupervisor {
 						this.reloadRequesters.set(activeSessionId, requesters);
 					}
 					try {
+						const deletedSession =
+							command.type === "delete_saved_session" && this.mesh
+								? await readSessionInfo(command.sessionPath)
+								: undefined;
+						const deletedPath =
+							command.type === "delete_saved_session" && this.mesh
+								? canonicalSessionPath(command.sessionPath)
+								: undefined;
 						const response = await this.forwardToWorker(match.worker, resolvedCommand);
+						if (
+							deletedPath !== undefined &&
+							this.mesh &&
+							response.success &&
+							(response.data as { ok?: boolean } | undefined)?.ok
+						)
+							await this.unenrollMeshSession(deletedSession, deletedPath);
 						if (admission && response.success) admission.status = "owned";
 						return response;
 					} finally {
@@ -3820,6 +3844,7 @@ export class DaemonSupervisor {
 		message: CotalMessage,
 		deliveryCount: number,
 		bindRecipient: (recipient: object) => void,
+		isOpen: () => boolean,
 	): Promise<void> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		const text = meshMessageText(message);
@@ -3861,6 +3886,7 @@ export class DaemonSupervisor {
 			fromRelationship = undefined;
 		}
 		const recipient = this.requireAvailableWorkerClient(worker);
+		if (!isOpen()) throw new Error("Mesh endpoint closed before handoff");
 		bindRecipient(recipient);
 		const response = await recipient.requestWorker(
 			{
@@ -4803,10 +4829,18 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
-	private async renameMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
-		if (!this.mesh) return;
+	private async unenrollMeshSession(session: SessionInfo | null | undefined, deletedPath: string): Promise<void> {
+		if (!this.mesh || !session) return;
 		try {
-			if (!sessionFile) throw new Error("session has no session file");
+			await this.mesh.unenroll(session.id, deletedPath);
+		} catch (error) {
+			this.log(`Mesh session ${session.id}: unenrollment failed: ${redactMeshError(error)}`);
+		}
+	}
+
+	private async renameMeshSession(sessionId: string, sessionFile?: string): Promise<void> {
+		if (!this.mesh || !sessionFile) return;
+		try {
 			await this.mesh.rename(sessionId, sessionFile);
 		} catch (error) {
 			this.log(`Mesh directory rename failed for session ${sessionId}: ${redactMeshError(error)}`);

@@ -1,8 +1,9 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CotalEndpoint,
+	deprovisionAgent,
 	isAccountNkey,
 	isUserNkey,
 	mintCreds,
@@ -17,6 +18,7 @@ import {
 import { lockSync } from "proper-lockfile";
 import {
 	acquireSessionLease,
+	canonicalSessionPath,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	type SessionLease,
@@ -236,6 +238,49 @@ export async function provisionEnrollment(
 	if (failure) throw failure;
 }
 
+export async function removeEnrollment(
+	meshRoot: string,
+	sessionId: string,
+	deletedPath: string,
+): Promise<"absent" | "mismatch" | EnrollmentRecord> {
+	return withDirectoryLock(meshRoot, sessionId, async () => {
+		const path = enrollmentPath(meshRoot, sessionId);
+		const record = existsSync(path) ? readEnrollment(meshRoot, sessionId) : undefined;
+		if (!record) return "absent";
+		if (
+			canonicalSessionPath(record.sessionFile) !== deletedPath ||
+			lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined
+		)
+			return "mismatch";
+		await rm(directoryPath(meshRoot, sessionId), { force: true });
+		await rm(path, { force: true });
+		return record;
+	});
+}
+
+export async function deprovisionEnrollment(
+	meshRoot: string,
+	config: MeshConfiguration,
+	record: EnrollmentRecord,
+): Promise<void> {
+	const signer = readSigner(meshRoot, config.space);
+	let creds: string;
+	try {
+		creds = await mintCreds(signer, newIdentity(), "deprovisioner", {
+			deprovisionTarget: { principal: record.identity.id, lifecycleUid: record.lifecycleUid },
+		});
+	} catch (error) {
+		throw new Error(`Deprovisioner mint failed: ${redactMeshError(error, false)}`);
+	}
+	await deprovisionAgent({
+		servers: config.server,
+		space: config.space,
+		targetId: record.identity.id,
+		lifecycleUid: record.lifecycleUid,
+		creds,
+	});
+}
+
 /** Same lock shape as the session-lease guard, but retry waits yield the event loop. */
 export async function withDirectoryLock<T>(meshRoot: string, sessionId: string, action: () => Promise<T>): Promise<T> {
 	mkSecretDir(join(meshRoot, "directory"));
@@ -327,12 +372,13 @@ export function readDirectory(meshRoot: string, sessionId: string): MeshDirector
 	return parseDirectoryEntry(path, sessionId, readJson(path));
 }
 
-export async function readDirectoryAsync(meshRoot: string, sessionId: string): Promise<MeshDirectoryEntry> {
+export async function readDirectoryAsync(meshRoot: string, sessionId: string): Promise<MeshDirectoryEntry | undefined> {
 	const path = directoryPath(meshRoot, sessionId);
 	let value: unknown;
 	try {
 		value = JSON.parse(await readFile(path, "utf8"));
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw new Error(`Mesh directory ${path}: cannot read valid JSON`);
 	}
 	return parseDirectoryEntry(path, sessionId, value);

@@ -9,6 +9,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -29,6 +30,7 @@ import { readSessionInfo, SessionManager } from "../src/core/session-manager.js"
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { AgentRoster } from "../src/modes/daemon/agent-roster.js";
+import { claimEnrollment } from "../src/modes/daemon/cotal/enrollment.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { DaemonCommand, DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -69,8 +71,14 @@ afterEach(async () => {
 		}
 	}
 	// Await owned exits before rmSync: a dying worker's log writer otherwise races it into ENOTEMPTY.
-	await Promise.all([...children].map((child) => waitForExit(child).catch(() => undefined)));
+	const childExits = await Promise.allSettled([...children].map((child) => waitForExit(child)));
 	children.clear();
+	for (const root of tempDirs) {
+		const path = join(root, "agent", "worker-pids.jsonl");
+		if (!existsSync(path)) continue;
+		for (const line of readFileSync(path, "utf8").trim().split("\n").filter(Boolean))
+			workerPids.add((JSON.parse(line) as { pid: number }).pid);
+	}
 	for (const pid of workerPids) {
 		try {
 			process.kill(pid, "SIGCONT");
@@ -87,8 +95,14 @@ afterEach(async () => {
 			}
 		}
 	}
-	await Promise.all([...workerPids].map((pid) => waitForProcessGone(pid).catch(() => undefined)));
+	const workerExits = await Promise.allSettled([...workerPids].map((pid) => waitForProcessGone(pid)));
 	workerPids.clear();
+	const failures = [...childExits, ...workerExits].filter((result) => result.status === "rejected");
+	if (failures.length)
+		throw new AggregateError(
+			failures.map((result) => result.reason),
+			"Fixture cleanup failed",
+		);
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 	}
@@ -226,7 +240,11 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}\n` +
+			`stdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
+	);
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -2109,6 +2127,161 @@ async function meshFixture() {
 }
 
 describe("mesh supervisor compatibility", () => {
+	it("AC-18 fileless rename calls no directory write and logs no failure", async () => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "fileless.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const rename = vi.fn(async () => {
+			throw new Error("Fileless write must not run");
+		});
+		const log = vi.fn();
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			log: typeof log;
+			renameMeshSession(id: string, file?: string): Promise<void>;
+		};
+		internals.mesh = { rename };
+		internals.log = log;
+		await internals.renameMeshSession("fileless");
+		expect(rename).not.toHaveBeenCalled();
+		expect(log).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		"holder",
+		"other",
+		"stopped",
+		"partial",
+		"publication-race",
+		"symlink-standalone",
+		"symlink-forwarded",
+	] as const)(
+		"AC-18 deletes through %s without settling the queued message",
+		async (mode) => {
+			const f = await meshFixture();
+			const socket = join(f.root, "holder.sock");
+			let holder = await f.start(socket);
+			const other = await f.start(join(f.root, "other.sock"));
+			try {
+				const target = await f.create(holder, "delete-target");
+				const sender = await f.create(other, "sender");
+				await f.request(holder.client, { type: "kill", activeSessionId: target.activeSessionId! });
+				const meshRoot = join(f.agentDir, "mesh");
+				const record = JSON.parse(readFileSync(join(meshRoot, "enrollments", `${target.sessionId}.json`), "utf8"));
+				writeFileSync(join(f.agentDir, `hold-pulls-${target.sessionId}`), "held");
+				const stored = (await f.request(other.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: "delete-target",
+					message: "must stay unacknowledged",
+				})) as { cotalId: string };
+				if (mode === "partial") writeFileSync(join(f.agentDir, "partial-removal"), "armed");
+				if (mode === "stopped" || mode === "publication-race") {
+					holder.child.kill("SIGKILL");
+					await waitForExit(holder.child);
+					holder.client.close();
+					if (mode === "publication-race") {
+						writeFileSync(join(f.agentDir, `pause-publication-${target.sessionId}`), "armed");
+						holder = await f.start(socket);
+						await meshSignal(holder.child, "publication-paused", target.sessionId);
+					}
+				}
+				const deleting = mode === "holder" || mode === "partial" ? holder : other;
+				const isSymlink = mode === "symlink-standalone" || mode === "symlink-forwarded";
+				const deletedFile = isSymlink ? join(dirname(target.sessionFile!), "alias.jsonl") : target.sessionFile!;
+				if (isSymlink) symlinkSync(target.sessionFile!, deletedFile);
+				expect(
+					await f.request(deleting.client, {
+						type: "delete_saved_session",
+						sessionPath: deletedFile,
+						...(mode === "other" || mode === "symlink-forwarded"
+							? { activeSessionId: sender.activeSessionId! }
+							: {}),
+					}),
+				).toMatchObject({ ok: true });
+				if (isSymlink) {
+					expect(existsSync(deletedFile)).toBe(false);
+					expect(existsSync(target.sessionFile!)).toBe(true);
+					for (const dir of ["directory", "enrollments"])
+						expect(existsSync(join(meshRoot, dir, `${target.sessionId}.json`))).toBe(true);
+					for (const stream of ["dm", "dlv"])
+						expect(existsSync(join(f.agentDir, `${stream}-${target.sessionId}`))).toBe(true);
+					expect(existsSync(join(f.agentDir, "mailbox", `${stored.cotalId}.json`))).toBe(true);
+					expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+					return;
+				}
+				for (const dir of ["directory", "enrollments"])
+					expect(existsSync(join(meshRoot, dir, `${target.sessionId}.json`))).toBe(false);
+				expect(
+					await other.client.request({
+						type: "mesh_send",
+						fromActiveSessionId: sender.activeSessionId!,
+						targetSessionId: "delete-target",
+						message: "unknown",
+					}),
+				).toMatchObject({ success: false, error: expect.stringContaining("Unknown mesh target") });
+				if (mode === "other") {
+					expect(
+						(childDiagnostics.get(other.child)?.stderr ?? "").split(
+							JSON.stringify(
+								`Mesh session ${target.sessionId}: inbox removal skipped; claimed by another daemon`,
+							),
+						).length - 1,
+					).toBe(1);
+					expect(existsSync(join(f.agentDir, `dm-${target.sessionId}`))).toBe(true);
+					rmSync(join(f.agentDir, `hold-pulls-${target.sessionId}`));
+					writeFileSync(join(f.agentDir, "mailbox", "trigger"), "event");
+					await meshSignal(holder.child, "removed", target.sessionId);
+				}
+				if (mode === "stopped") {
+					holder = await f.start(socket);
+					for (const dir of ["directory", "enrollments"])
+						expect(existsSync(join(meshRoot, dir, `${target.sessionId}.json`))).toBe(false);
+				}
+				if (mode === "publication-race") {
+					rmSync(join(f.agentDir, `pause-publication-${target.sessionId}`));
+					await meshSignal(holder.child, "log", `Mesh session ${target.sessionId}:`);
+					expect(existsSync(join(meshRoot, "directory", `${target.sessionId}.json`))).toBe(false);
+				} else {
+					const removals = readFileSync(join(f.agentDir, "removals.jsonl"), "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line));
+					const order = readFileSync(join(f.agentDir, "cleanup-order.jsonl"), "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line))
+						.filter((event) => event.id === target.sessionId)
+						.map((event) => event.type);
+					expect(order).toEqual(mode === "stopped" ? ["remove"] : ["stop", "remove"]);
+					if (mode === "partial")
+						expect(
+							(childDiagnostics.get(holder.child)?.stderr ?? "").split(
+								`Mesh session ${target.sessionId}: inbox removal failed`,
+							).length - 1,
+						).toBe(1);
+					expect(removals).toEqual([
+						{ sessionId: target.sessionId, identity: record.identity.id, uid: record.lifecycleUid },
+					]);
+					expect(existsSync(join(f.agentDir, `dm-${target.sessionId}`))).toBe(false);
+					expect(existsSync(join(f.agentDir, `dlv-${target.sessionId}`))).toBe(mode === "partial");
+					if (mode === "holder" || mode === "other" || mode === "partial")
+						await meshSignal(holder.child, "endpoint-stopped", target.sessionId);
+				}
+				expect(existsSync(join(f.agentDir, "mailbox", `${stored.cotalId}.json`))).toBe(true);
+				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+				const claim = claimEnrollment(meshRoot, target.sessionId, target.sessionFile!);
+				claim.release();
+			} finally {
+				holder.client.close();
+				other.client.close();
+			}
+		},
+		// test-policy: allow explicit-test-timeout -- AC-18 starts two supervisors and two workers per row (15.5 s alone); fork-pr-check runs five files in parallel, so the 30 s default expired under load. The timer only bounds failure; every wait awaits a concrete event.
+		60_000,
+	);
+
 	it("AC-22 keeps one transcript entry when the supervisor dies after persistence before ack", async () => {
 		const f = await meshFixture();
 		const socket = join(f.root, "holder.sock");
@@ -2240,6 +2413,7 @@ describe("mesh supervisor compatibility", () => {
 				message: unknown,
 				count: number,
 				bind: (recipient: object) => void,
+				open: () => boolean,
 			): Promise<void>;
 			cleanupSupervisorResources(): Promise<void>;
 		};
@@ -2347,7 +2521,13 @@ describe("mesh supervisor compatibility", () => {
 				});
 			expect(send).toHaveBeenCalledTimes(2);
 			const bind = vi.fn();
-			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			await internals.handoffMeshMessage(
+				{ sessionFile: targetFile, sessionId: "child" },
+				message,
+				2,
+				bind,
+				() => true,
+			);
 			expect(bind).toHaveBeenCalledExactlyOnceWith(recipient);
 			expect(requestWorker).toHaveBeenCalledExactlyOnceWith(
 				{
@@ -2363,7 +2543,13 @@ describe("mesh supervisor compatibility", () => {
 			expect(enroll).toHaveBeenCalledExactlyOnceWith("parent", parentFile);
 			const catalog = (supervisor as unknown as { catalog: { list: () => Promise<unknown[]> } }).catalog;
 			const scan = vi.spyOn(catalog, "list").mockRejectedValue(new Error("catalog unavailable"));
-			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			await internals.handoffMeshMessage(
+				{ sessionFile: targetFile, sessionId: "child" },
+				message,
+				2,
+				bind,
+				() => true,
+			);
 			expect(scan).not.toHaveBeenCalled();
 			const resolver = vi.spyOn(
 				internals.mesh as { sessionIdForPrincipal: () => string | undefined },
@@ -2375,16 +2561,32 @@ describe("mesh supervisor compatibility", () => {
 						throw new Error("directory unavailable");
 					});
 				else resolver.mockReturnValue(undefined);
-				await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+				await internals.handoffMeshMessage(
+					{ sessionFile: targetFile, sessionId: "child" },
+					message,
+					2,
+					bind,
+					() => true,
+				);
 				expect(requestWorker.mock.calls.at(-1)?.[0]).toMatchObject({
 					fromRelationship: undefined,
 					sender: { sessionId: undefined, sessionName: "parent" },
 				});
 			}
 			expect(requestWorker).toHaveBeenCalledTimes(4);
+			await expect(
+				internals.handoffMeshMessage(
+					{ sessionFile: targetFile, sessionId: "child" },
+					message,
+					2,
+					bind,
+					() => false,
+				),
+			).rejects.toThrow("closed before handoff");
+			expect(requestWorker).toHaveBeenCalledTimes(4);
 			resolver.mockRestore();
 			scan.mockRestore();
-			expect(enroll).toHaveBeenCalledTimes(4);
+			expect(enroll).toHaveBeenCalledTimes(5);
 		} finally {
 			releaseEnrollment();
 			client.close();
@@ -2630,6 +2832,7 @@ describe("mesh supervisor compatibility", () => {
 				message: unknown,
 				count: number,
 				bind: (recipient: object) => void,
+				open: () => boolean,
 			): Promise<void>;
 			findWorkerForClient(): Promise<unknown>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
@@ -2670,6 +2873,7 @@ describe("mesh supervisor compatibility", () => {
 				{ id: "legacy", from: { id: "local.sender", name: "sender" }, parts: [{ kind: "text", text: "hello" }] },
 				1,
 				bind,
+				() => true,
 			),
 		).rejects.toThrow("Restart that session");
 		expect(bind).not.toHaveBeenCalled();

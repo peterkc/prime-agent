@@ -47,7 +47,7 @@ export async function resolveDirectoryAddress(
 			const entry = readDirectory(meshRoot, selector);
 			if (entry) return { ok: true, entry };
 		} catch {
-			onInvalidEntry(`${selector}.json`);
+			// The scan below checks the actual filename, including on a case-insensitive filesystem.
 		}
 	}
 	const directory = join(meshRoot, "directory");

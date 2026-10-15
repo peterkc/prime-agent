@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -11,27 +12,35 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	claimEnrollment,
 	credentialSource,
+	deprovisionEnrollment,
 	directoryPath,
 	enrollmentPath,
 	ensureEnrollmentRecord,
 	publishDirectory,
 	readDirectory,
+	readDirectoryAsync,
+	readEnrollment,
 	readSigner,
 	redactMeshError,
+	removeEnrollment,
 	renameDirectory,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+
+vi.mock("node:fs/promises", async (original) => ({ ...(await original<typeof fsPromises>()) }));
 
 vi.mock("@cotal-ai/core", async (original) => ({
 	...(await original<typeof core>()),
@@ -83,12 +92,68 @@ async function fixture() {
 	session.appendSessionInfo("root-a");
 	const sessionId = session.getSessionId();
 	const sessionFile = session.getSessionFile()!;
-	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log: vi.fn(), handoff: vi.fn() });
+	const log = vi.fn();
+	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log, handoff: vi.fn() });
 	meshes.push(mesh);
-	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh };
+	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh, log };
 }
 
 describe("mesh enrollment", () => {
+	it("AC-18 deleting a copy with the same ID preserves the enrolled session and inbox", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const record = readEnrollment(meshRoot, sessionId);
+		const entry = readDirectory(meshRoot, sessionId);
+		const endpoint = FakeEndpoint.instances.at(-1)!;
+		const copy = join(root, "copied.jsonl");
+		copyFileSync(sessionFile, copy);
+		const deletedPath = canonicalSessionPath(copy);
+		rmSync(copy);
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await mesh.unenroll(sessionId, deletedPath);
+		expect(readDirectory(meshRoot, sessionId)).toEqual(entry);
+		expect(readEnrollment(meshRoot, sessionId)).toEqual(record);
+		expect(endpoint.stop).not.toHaveBeenCalled();
+		expect(remove).not.toHaveBeenCalled();
+		expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("deleted file is not the enrolled file"));
+	});
+
+	it("AC-18 removes the directory before the record and mints only a lifecycle-exact deprovisioner", async () => {
+		const { meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+		await publishDirectory(meshRoot, record, "home");
+		const removeFile = fsPromises.rm;
+		vi.spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+			if (path === enrollmentPath(meshRoot, sessionId))
+				expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);
+			await removeFile(path, options);
+		});
+		const deletedPath = canonicalSessionPath(sessionFile);
+		rmSync(sessionFile);
+		expect(await removeEnrollment(meshRoot, sessionId, deletedPath)).toEqual(record);
+		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+		expect(await readDirectoryAsync(meshRoot, sessionId)).toBeUndefined();
+		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		await mesh.unenroll(sessionId, canonicalSessionPath(sessionFile));
+		expect(log).not.toHaveBeenCalled();
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await deprovisionEnrollment(meshRoot, { space: "prime", server: "nats://127.0.0.1:1" }, record);
+		const call = remove.mock.calls[0]![0];
+		expect(call).toMatchObject({
+			targetId: record.identity.id,
+			lifecycleUid: record.lifecycleUid,
+			space: "prime",
+			servers: "nats://127.0.0.1:1",
+		});
+		const claims = core.credsClaims(call.creds!);
+		const permissions = JSON.stringify(claims.nats);
+		for (const stream of ["DM_prime", "DLV_prime"])
+			expect(permissions).toContain(`$JS.API.CONSUMER.DELETE.${stream}.`);
+		expect(permissions).toContain(record.lifecycleUid);
+		expect(permissions).toContain(record.identity.id);
+		expect(remove).toHaveBeenCalledTimes(1);
+	});
+
 	it.each(["mesh.json", "signer.json", "invalid mesh.json", "signer mode"])(
 		"keeps the supervisor ready with refusing Cotal mode for %s",
 		async (missing) => {
