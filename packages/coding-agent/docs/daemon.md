@@ -107,6 +107,9 @@ If startup or signer creation fails, it removes the service and plist but keeps 
   signer, enrollment records or stored messages. Existing sessions need that auth.
 - Install, uninstall, start and stop refuse platforms other than macOS without changes.
 
+`cotal status --components` also probes other entries in the mesh home's private Cotal
+registry, which install creates with only Prime's broker.
+
 A session with a session file enrolls on create or open. The supervisor takes its claim,
 reuses or creates a private enrollment record, provisions the inbox, writes a directory
 entry, and starts an endpoint. The identity stays the same across restarts. Children
@@ -132,9 +135,10 @@ and logs the session ID.
 
 The holder removes the inbox when it next finds the entry gone, before a handoff or at an
 endpoint start. An idle holder keeps the inbox until one of those checks runs. A partial
-removal is logged and not retried; consumers left still count toward the limit. Failed
-endpoint stops keep the claim and prevent a second endpoint. Queued deliveries and late
-persistence frames settle nothing after close.
+removal is logged and not retried; consumers left still count toward the limit.
+A failed per-session close keeps the claim and prevents a second endpoint.
+Whole-mesh shutdown releases claims before exit. Queued deliveries and late persistence
+frames settle nothing after close.
 
 When the mesh is on, deleting a session discards stored, unacknowledged messages, and
 restoring it from Trash does not restore them. Deleting while the transport is native

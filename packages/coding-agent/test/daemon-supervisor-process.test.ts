@@ -9,6 +9,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -2147,8 +2148,16 @@ describe("mesh supervisor compatibility", () => {
 		expect(log).not.toHaveBeenCalled();
 	});
 
-	it.each(["holder", "other", "stopped", "partial", "publication-race"] as const)(
-		"AC-18 deletes a held inbox through %s without settling its queued message",
+	it.each([
+		"holder",
+		"other",
+		"stopped",
+		"partial",
+		"publication-race",
+		"symlink-standalone",
+		"symlink-forwarded",
+	] as const)(
+		"AC-18 deletes through %s without settling the queued message",
 		async (mode) => {
 			const f = await meshFixture();
 			const socket = join(f.root, "holder.sock");
@@ -2179,13 +2188,29 @@ describe("mesh supervisor compatibility", () => {
 					}
 				}
 				const deleting = mode === "holder" || mode === "partial" ? holder : other;
+				const isSymlink = mode === "symlink-standalone" || mode === "symlink-forwarded";
+				const deletedFile = isSymlink ? join(dirname(target.sessionFile!), "alias.jsonl") : target.sessionFile!;
+				if (isSymlink) symlinkSync(target.sessionFile!, deletedFile);
 				expect(
 					await f.request(deleting.client, {
 						type: "delete_saved_session",
-						sessionPath: target.sessionFile!,
-						...(mode === "other" ? { activeSessionId: sender.activeSessionId! } : {}),
+						sessionPath: deletedFile,
+						...(mode === "other" || mode === "symlink-forwarded"
+							? { activeSessionId: sender.activeSessionId! }
+							: {}),
 					}),
 				).toMatchObject({ ok: true });
+				if (isSymlink) {
+					expect(existsSync(deletedFile)).toBe(false);
+					expect(existsSync(target.sessionFile!)).toBe(true);
+					for (const dir of ["directory", "enrollments"])
+						expect(existsSync(join(meshRoot, dir, `${target.sessionId}.json`))).toBe(true);
+					for (const stream of ["dm", "dlv"])
+						expect(existsSync(join(f.agentDir, `${stream}-${target.sessionId}`))).toBe(true);
+					expect(existsSync(join(f.agentDir, "mailbox", `${stored.cotalId}.json`))).toBe(true);
+					expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+					return;
+				}
 				for (const dir of ["directory", "enrollments"])
 					expect(existsSync(join(meshRoot, dir, `${target.sessionId}.json`))).toBe(false);
 				expect(

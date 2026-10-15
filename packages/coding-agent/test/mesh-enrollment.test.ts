@@ -128,7 +128,9 @@ describe("mesh enrollment", () => {
 				expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);
 			await removeFile(path, options);
 		});
-		expect(await removeEnrollment(meshRoot, sessionId, canonicalSessionPath(sessionFile))).toEqual(record);
+		const deletedPath = canonicalSessionPath(sessionFile);
+		rmSync(sessionFile);
+		expect(await removeEnrollment(meshRoot, sessionId, deletedPath)).toEqual(record);
 		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
 		expect(await readDirectoryAsync(meshRoot, sessionId)).toBeUndefined();
 		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);

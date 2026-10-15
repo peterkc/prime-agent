@@ -332,6 +332,34 @@ describe("mesh endpoints", () => {
 		},
 	);
 
+	it("AC-27 reconnect and held publish share the send's 30-second deadline", async () => {
+		vi.useFakeTimers();
+		const { mesh, source } = await fixture();
+		let finishPublish!: () => void;
+		const heldPublish = new Promise<Awaited<ReturnType<typeof source.unicastAttributed>>>((resolve) => {
+			finishPublish = () => resolve({ msg: { id: "published" }, ack: { seq: 42, duplicate: false } });
+		});
+		source.unicastAttributed.mockReturnValueOnce(heldPublish);
+		source.emit("connection", { connected: false });
+		const rejected = vi.fn();
+		const completed = mesh.send({ sessionId: "a" }, "b", "hello").catch(rejected);
+		try {
+			await vi.advanceTimersByTimeAsync(8000);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
+			source.emit("connection", { connected: true });
+			await vi.advanceTimersByTimeAsync(21_999);
+			expect(rejected).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(rejected).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ message: expect.stringContaining("Message storage outcome is unknown") }),
+			);
+			expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
+		} finally {
+			finishPublish();
+			await completed;
+		}
+	});
+
 	it("redacts endpoint diagnostics and publish causes without losing the actionable error", async () => {
 		const { mesh, source, target, log } = await fixture();
 		const identity = core.newIdentity();
