@@ -133,6 +133,10 @@ endpoint start or before a handoff. A partial removal is logged and not retried;
 left still count toward the limit. Failed endpoint stops keep the claim and prevent a
 second endpoint. Queued deliveries and late persistence frames settle nothing after close.
 
+When the mesh is on, deleting a session discards stored, unacknowledged messages, and
+restoring it from Trash does not restore them. Deleting while the transport is native
+leaves that session's directory entry, enrollment record and inbox unchanged.
+
 There is no per-daemon endpoint cap. NATS's default is 1000 consumers per stream, so the
 space supports about 1000 enrolled inboxes. Each uses one consumer in `DM_prime` and one
 in `DLV_prime`. Presence and channel watches are off. Status prints

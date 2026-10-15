@@ -4,11 +4,13 @@ import { join } from "node:path";
 import { createSpaceAuth, newIdentity, stripSpaceAuth } from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
 });
 
@@ -52,6 +54,13 @@ describe("mesh directory addressing", () => {
 			log: (line) => logs.push(line),
 			handoff: async () => undefined,
 		});
+		if (selector === "ID-A") {
+			const readDirectory = enrollment.readDirectory;
+			vi.spyOn(enrollment, "readDirectory").mockImplementation((meshRoot, sessionId) => {
+				if (sessionId === "ID-A") throw new Error("exact-ID read failed");
+				return readDirectory(meshRoot, sessionId);
+			});
+		}
 		if (selector === "scan-error") {
 			rmSync(directory, { recursive: true });
 			writeFileSync(directory, "not a directory");

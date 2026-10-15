@@ -134,19 +134,30 @@ describe("mesh endpoints", () => {
 		expect(enrollment.deprovisionEnrollment).not.toHaveBeenCalled();
 	});
 
-	it.each(["provision", "start"])("AC-18 failed first %s never removes an inbox", async (stage) => {
+	it.each(["provision", "start", "read", "deleted"])("AC-18 failed %s removes only after delete", async (stage) => {
 		if (stage === "provision")
 			vi.mocked(enrollment.provisionEnrollment).mockImplementationOnce(async () => {
 				directories.delete("a"); // No first directory publication has happened.
 				throw new Error("first failed");
 			});
-		else
+		else if (stage === "deleted")
+			vi.mocked(enrollment.publishDirectory).mockImplementationOnce(async (root, record) => {
+				rmSync(enrollment.enrollmentPath(root, record.sessionId));
+				throw new Error("first failed");
+			});
+		else {
 			Endpoint.onStart = () => {
 				throw new Error("first failed");
 			};
+			if (stage === "read")
+				vi.mocked(enrollment.readDirectory).mockImplementationOnce(() => {
+					throw new Error("directory unreadable");
+				});
+		}
 		await expect(fixture()).rejects.toThrow("first failed");
-		expect(enrollment.deprovisionEnrollment).not.toHaveBeenCalled();
+		expect(enrollment.deprovisionEnrollment).toHaveBeenCalledTimes(stage === "deleted" ? 1 : 0);
 		expect(releaseClaim).toHaveBeenCalledTimes(1);
+		if (stage === "read") expect(Endpoint.instances[0]!.stop).toHaveBeenCalledTimes(1);
 	});
 
 	it("AC-18 deletion during endpoint start removes and releases once", async () => {
@@ -313,8 +324,8 @@ describe("mesh endpoints", () => {
 				event === "timeout"
 					? expect(send).rejects.toThrow("Message was not stored")
 					: expect(send).resolves.toMatchObject({ deliveryStatus: "stored" });
-			expect(source.unicastAttributed).not.toHaveBeenCalled();
 			await vi.advanceTimersByTimeAsync(event === "timeout" ? 30_000 : 8000);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
 			if (event !== "timeout") source.emit(event, { connected: true });
 			await result;
 			expect(source.unicastAttributed).toHaveBeenCalledTimes(event === "timeout" ? 0 : 1);

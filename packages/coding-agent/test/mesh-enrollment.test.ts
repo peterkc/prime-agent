@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -17,6 +18,7 @@ import { join, resolve } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
@@ -29,6 +31,7 @@ import {
 	publishDirectory,
 	readDirectory,
 	readDirectoryAsync,
+	readEnrollment,
 	readSigner,
 	redactMeshError,
 	removeEnrollment,
@@ -89,12 +92,32 @@ async function fixture() {
 	session.appendSessionInfo("root-a");
 	const sessionId = session.getSessionId();
 	const sessionFile = session.getSessionFile()!;
-	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log: vi.fn(), handoff: vi.fn() });
+	const log = vi.fn();
+	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log, handoff: vi.fn() });
 	meshes.push(mesh);
-	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh };
+	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh, log };
 }
 
 describe("mesh enrollment", () => {
+	it("AC-18 deleting a copy with the same ID preserves the enrolled session and inbox", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const record = readEnrollment(meshRoot, sessionId);
+		const entry = readDirectory(meshRoot, sessionId);
+		const endpoint = FakeEndpoint.instances.at(-1)!;
+		const copy = join(root, "copied.jsonl");
+		copyFileSync(sessionFile, copy);
+		const deletedPath = canonicalSessionPath(copy);
+		rmSync(copy);
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await mesh.unenroll(sessionId, deletedPath);
+		expect(readDirectory(meshRoot, sessionId)).toEqual(entry);
+		expect(readEnrollment(meshRoot, sessionId)).toEqual(record);
+		expect(endpoint.stop).not.toHaveBeenCalled();
+		expect(remove).not.toHaveBeenCalled();
+		expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("deleted file is not the enrolled file"));
+	});
+
 	it("AC-18 removes the directory before the record and mints only a lifecycle-exact deprovisioner", async () => {
 		const { meshRoot, sessionId, sessionFile } = await fixture();
 		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
@@ -105,7 +128,7 @@ describe("mesh enrollment", () => {
 				expect(existsSync(directoryPath(meshRoot, sessionId))).toBe(false);
 			await removeFile(path, options);
 		});
-		expect(await removeEnrollment(meshRoot, sessionId)).toEqual(record);
+		expect(await removeEnrollment(meshRoot, sessionId, canonicalSessionPath(sessionFile))).toEqual(record);
 		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
 		expect(await readDirectoryAsync(meshRoot, sessionId)).toBeUndefined();
 		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);

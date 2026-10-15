@@ -18,6 +18,7 @@ import {
 import { lockSync } from "proper-lockfile";
 import {
 	acquireSessionLease,
+	canonicalSessionPath,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	type SessionLease,
@@ -237,10 +238,15 @@ export async function provisionEnrollment(
 	if (failure) throw failure;
 }
 
-export async function removeEnrollment(meshRoot: string, sessionId: string): Promise<EnrollmentRecord | undefined> {
+export async function removeEnrollment(
+	meshRoot: string,
+	sessionId: string,
+	deletedPath: string,
+): Promise<EnrollmentRecord | undefined> {
 	return withDirectoryLock(meshRoot, sessionId, async () => {
 		const path = enrollmentPath(meshRoot, sessionId);
 		const record = existsSync(path) ? readEnrollment(meshRoot, sessionId) : undefined;
+		if (!record || canonicalSessionPath(record.sessionFile) !== deletedPath) return undefined;
 		await rm(directoryPath(meshRoot, sessionId), { force: true });
 		await rm(path, { force: true });
 		return record;

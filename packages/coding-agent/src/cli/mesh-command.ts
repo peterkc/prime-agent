@@ -460,15 +460,9 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 }
 
 export async function runMeshCommand(args: readonly string[], runtime: MeshRuntime = defaultRuntime): Promise<void> {
-	let options: MeshOptions;
+	let options: MeshOptions | undefined;
 	try {
 		options = parseOptions(args);
-	} catch (error) {
-		reportMeshCommandError(error);
-		console.error(chalk.dim(`Run "${APP_NAME} help mesh" for usage.`));
-		return;
-	}
-	try {
 		const { command } = options;
 		if (runtime.platform !== "darwin" && command !== "status" && command !== "doctor") {
 			throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);
@@ -513,13 +507,10 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		}
 		console.log(`Mesh ${command}: ${options.label}`);
 	} catch (error) {
-		reportMeshCommandError(error);
+		console.error(
+			chalk.red(`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`),
+		);
+		if (options === undefined) console.error(chalk.dim(`Run "${APP_NAME} help mesh" for usage.`));
+		process.exitCode = 1;
 	}
-}
-
-function reportMeshCommandError(error: unknown): void {
-	console.error(
-		chalk.red(`Error: ${error instanceof Error ? error.message.replace(/[\r\n]+/g, " ") : "Mesh command failed"}`),
-	);
-	process.exitCode = 1;
 }

@@ -6,7 +6,7 @@ import {
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
 } from "../../../core/agent-messages.js";
-import { SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
+import { canonicalSessionPath, SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
 import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
@@ -250,7 +250,15 @@ export class MeshEndpoints {
 			this.drain(session);
 		} catch (error) {
 			if (session) {
-				if (session.retirement || !readDirectory(this.options.meshRoot, sessionId)) {
+				let directoryMissing = false;
+				try {
+					directoryMissing = !session.retirement && !readDirectory(this.options.meshRoot, sessionId);
+				} catch (cleanupError) {
+					this.options.log(
+						`Mesh session ${sessionId}: directory read failed; inbox retained: ${redactMeshError(cleanupError)}`,
+					);
+				}
+				if (session.retirement || directoryMissing) {
 					await this.retireSession(session);
 				} else {
 					await this.closeSession(sessionId);
@@ -292,13 +300,16 @@ export class MeshEndpoints {
 	}
 
 	async unenroll(sessionId: string, sessionFile: string): Promise<void> {
-		const record = await removeEnrollment(this.options.meshRoot, sessionId);
+		const record = await removeEnrollment(this.options.meshRoot, sessionId, canonicalSessionPath(sessionFile));
+		if (!record) {
+			this.options.log(`Mesh session ${sessionId}: deleted file is not the enrolled file; inbox unchanged`);
+			return;
+		}
 		const session = this.sessions.get(sessionId);
 		if (session) {
 			await this.retireSession(session);
 			return;
 		}
-		if (!record) return;
 		let claim: SessionLease;
 		try {
 			claim = claimEnrollment(this.options.meshRoot, sessionId, sessionFile);

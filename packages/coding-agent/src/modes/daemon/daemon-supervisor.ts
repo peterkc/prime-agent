@@ -2854,8 +2854,8 @@ export class DaemonSupervisor {
 						this.assertWorkerAccessibleToClient(client, owner, command.sessionPath);
 						if (owner.client && !this.isWorkerStopping(owner)) {
 							const response = await this.forwardToWorker(owner, command);
-							if (response.success && (response.data as { ok?: boolean } | undefined)?.ok)
-								await this.unenrollMeshSession(deletedSession);
+							if (this.mesh && response.success && (response.data as { ok?: boolean } | undefined)?.ok)
+								await this.unenrollMeshSession(deletedSession, deletedPath);
 							return response;
 						}
 						if (!(await this.reclaimStaleWorkerRegistration(owner))) {
@@ -2873,7 +2873,7 @@ export class DaemonSupervisor {
 					// snapshot too; their rows would otherwise linger until the TTL.
 					if (result.ok) {
 						this.invalidatePassiveScheduledJobs();
-						await this.unenrollMeshSession(deletedSession);
+						if (this.mesh) await this.unenrollMeshSession(deletedSession, deletedPath);
 					}
 					return success(command.id, command.type, result);
 				}
@@ -3027,14 +3027,18 @@ export class DaemonSupervisor {
 							command.type === "delete_saved_session" && this.mesh
 								? await readSessionInfo(command.sessionPath)
 								: undefined;
+						const deletedPath =
+							command.type === "delete_saved_session" && this.mesh
+								? canonicalSessionPath(command.sessionPath)
+								: undefined;
 						const response = await this.forwardToWorker(match.worker, resolvedCommand);
 						if (
-							command.type === "delete_saved_session" &&
+							deletedPath !== undefined &&
 							this.mesh &&
 							response.success &&
 							(response.data as { ok?: boolean } | undefined)?.ok
 						)
-							await this.unenrollMeshSession(deletedSession);
+							await this.unenrollMeshSession(deletedSession, deletedPath);
 						if (admission && response.success) admission.status = "owned";
 						return response;
 					} finally {
@@ -4825,10 +4829,10 @@ export class DaemonSupervisor {
 		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
-	private async unenrollMeshSession(session: SessionInfo | null | undefined): Promise<void> {
+	private async unenrollMeshSession(session: SessionInfo | null | undefined, deletedPath: string): Promise<void> {
 		if (!this.mesh || !session) return;
 		try {
-			await this.mesh.unenroll(session.id, session.path);
+			await this.mesh.unenroll(session.id, deletedPath);
 		} catch (error) {
 			this.log(`Mesh session ${session.id}: unenrollment failed: ${redactMeshError(error)}`);
 		}
