@@ -2157,6 +2157,8 @@ export class AgentSession {
 		}
 		for (let index = this.agent.state.messages.length - 1; index >= 0; index -= 1) {
 			if (appendSentAgentMessageToToolResult(this.agent.state.messages[index], toolCallId, message)) {
+				// The appended text comes from session entries, which may predate a registration.
+				this._maskToolResultMessagesInPlace([this.agent.state.messages[index]]);
 				break;
 			}
 		}
@@ -4639,6 +4641,8 @@ export class AgentSession {
 			if (!this._secretValues.has(value)) this._secretValues.set(value, label);
 		}
 		this._secretMatcher = createSecretMatcher(Array.from(this._secretValues, ([value, label]) => ({ label, value })));
+		// Results already in memory may hold a value registered late; clients read this state directly.
+		this._maskToolResultMessagesInPlace(this.agent.state.messages);
 	}
 
 	private _maskToolOutput(output: AgentToolResult<unknown>): AgentToolResult<unknown> {
@@ -4655,6 +4659,7 @@ export class AgentSession {
 	}
 
 	private _maskToolResultMessages(messages: AgentMessage[]): AgentMessage[] {
+		if (this._secretValues.size === 0) return messages;
 		return messages.map((message) =>
 			message.role === "toolResult"
 				? {
@@ -15031,6 +15036,8 @@ export class AgentSession {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
+			// Entries off the previous path may predate a registration.
+			this._maskToolResultMessagesInPlace(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			// Context rebuild = cold boundary: refresh the digest like resume.
 			// Summary navigation continues the same timeline (compaction), so the

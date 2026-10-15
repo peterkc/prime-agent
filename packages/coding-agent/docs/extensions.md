@@ -1633,11 +1633,15 @@ Core masks text content and nested string values in tool result `details`:
 - Tool end events and tool result messages, before extension handlers, client events,
   client message snapshots or the session file see them. Core masks again after handlers
   run, including `message_end` rewrites. Immediate errors and abort-deadline results are covered.
-- Each contiguous run of text parts is matched as joined text. If a match crosses part
-  boundaries, core combines that run into one masked text part. Non-text parts stay in place.
+- All text parts of one result are matched as joined text, even across images. If a match
+  crosses part boundaries, the label goes in the part where the match starts, and a later
+  text part that the match fully covers is removed. All other parts keep their order.
 - Tool result messages in each model request, after `context` handlers run.
   Compaction, refinement and auto-refine review requests use the current masking set,
-  including values registered after the original output. Stored history is not rewritten.
+  including values registered after the original output. A new registration also masks
+  tool results already in the session's memory, and tree navigation masks the results it
+  restores, so later client reads see masked text.
+  The session file is not rewritten.
 - Nested tool returns, before a codemode script receives them.
 - Extension error messages and stacks, before core forwards them to clients.
 

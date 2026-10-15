@@ -369,32 +369,19 @@ describe("AgentSession model and extension characterization", () => {
 		},
 	);
 
-	it("TM-21 masks joined text runs while preserving images and unchanged part boundaries", async () => {
+	it.each([
+		["split by an image", [secret.slice(0, 17), "image", secret.slice(17), "plain"], ["[fake]", "image", "plain"]],
+		["whole parts", [secret, "image", "plain"], ["[fake]", "image", "plain"]],
+	])("TM-21 matches text parts as one text: %s", async (_name, parts, expected) => {
 		const image = { type: "image" as const, mimeType: "image/png", data: "ZHVtbXk=" };
+		const content = (texts: string[]) =>
+			texts.map((text) => (text === "image" ? image : { type: "text" as const, text }));
 		const h = await secretHarness(
 			(pi) => pi.registerSecretValues([{ label: "fake", value: secret }]),
-			async () => ({
-				content: [
-					...[0, 9, 18, 27].map((offset) => ({ type: "text" as const, text: secret.slice(offset, offset + 9) })),
-					image,
-					{ type: "text", text: secret },
-					{ type: "text", text: "plain" },
-				],
-				details: {},
-			}),
+			async () => ({ content: content(parts), details: {} }),
 		);
 		const output = await secretTurn(h);
-		for (const sink of Object.values(output))
-			expect(sink).toMatchObject([
-				{
-					content: [
-						{ type: "text", text: "[fake]" },
-						image,
-						{ type: "text", text: "[fake]" },
-						{ type: "text", text: "plain" },
-					],
-				},
-			]);
+		for (const sink of Object.values(output)) expect(sink).toMatchObject([{ content: content(expected) }]);
 	});
 	it.each(["tool_result", "tool_execution_end"] as const)(
 		"TM-21 TM-23 masks %s handlers and forwarded error message and stack",
@@ -434,7 +421,7 @@ describe("AgentSession model and extension characterization", () => {
 		},
 	);
 	it.each(["compaction", "refinement", "auto-review"])(
-		"TM-30 late registration masks %s requests without changing history",
+		"TM-30 late registration masks %s requests and session state, not the file",
 		async (kind) => {
 			let api!: ExtensionAPI;
 			const h = await secretHarness((pi) => {
@@ -448,10 +435,6 @@ describe("AgentSession model and extension characterization", () => {
 			await secretTurn(h);
 			await secretTurn(h);
 			if (kind !== "compaction") api.registerSecretValues([{ label: "late", value: secret }]);
-			const history = h.sessionManager
-				.getEntries()
-				.filter((e) => e.type === "message" && e.message.role === "toolResult");
-			const before = JSON.stringify(history);
 			const captured: unknown[] = [];
 			h.setResponses(
 				[1, 2].map(() => (ctx) => {
@@ -470,10 +453,40 @@ describe("AgentSession model and extension characterization", () => {
 			expect(captured).toHaveLength(kind === "compaction" ? 2 : 1);
 			expect(JSON.stringify(captured)).toContain("[late]");
 			expect(JSON.stringify(captured)).not.toContain(secret);
-			expect(JSON.stringify(history)).toBe(before);
-			expect(before).toContain(secret);
+			expect(JSON.stringify(h.session.messages)).not.toContain(secret);
+			expect(readFileSync(h.session.sessionFile!, "utf8")).toContain(secret);
 		},
 	);
+
+	it("TM-30 late registration masks tool results and send receipts that tree navigation restores", async () => {
+		let api!: ExtensionAPI;
+		const h = await secretHarness((pi) => {
+			api = pi;
+		});
+		await secretTurn(h);
+		const late = {
+			id: "agentmsg_1",
+			message: secret,
+			deliveryStatus: "delivered",
+			target: { activeSessionId: "a", sessionId: "s" },
+		};
+		h.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "ipython_1",
+			toolName: "ipython",
+			content: [],
+			isError: false,
+			timestamp: 0,
+		});
+		h.sessionManager.appendCustomEntry("ipython_sent_agent_message", { toolCallId: "ipython_1", message: late });
+		const leaf = h.sessionManager.getLeafId()!;
+		const user = h.sessionManager.getEntries().find((e) => e.type === "message" && e.message.role === "user")!;
+		await h.session.navigateTree(user.id, { summarize: false });
+		api.registerSecretValues([{ label: "late", value: secret }]);
+		await h.session.navigateTree(leaf, { summarize: false });
+		expect(JSON.stringify(h.session.messages)).toContain('"id":"agentmsg_1","message":"[late]"');
+		expect(JSON.stringify(h.session.messages)).not.toContain(secret);
+	});
 
 	/** Harness whose model_select handler blocks until the returned deferred is resolved. */
 	async function createSlowModelSelectHarness(options?: { nextTurnMessage?: string }): Promise<{

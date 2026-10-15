@@ -49,6 +49,10 @@ export function createSecretMatcher(entries: readonly SecretValue[]): SecretMatc
 }
 
 export function redactText(text: string, matcher: SecretMatcher): string {
+	return maskSlice(text, 0, matchRanges(text, matcher));
+}
+
+function matchRanges(text: string, matcher: SecretMatcher): MatchRange[] {
 	const ranges: MatchRange[] = [];
 	for (const { label, value } of matcher.exact) {
 		let start = text.indexOf(value);
@@ -68,13 +72,20 @@ export function redactText(text: string, matcher: SecretMatcher): string {
 		if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
 		else merged.push({ ...range });
 	}
+	return merged;
+}
+
+/** Mask the part of a joined text that starts at `from`; a range's label goes where the range starts. */
+function maskSlice(text: string, from: number, ranges: readonly MatchRange[]): string {
 	let output = "";
-	let end = 0;
-	for (const range of merged) {
-		output += `${text.slice(end, range.start)}[${range.label}]`;
-		end = range.end;
+	let cursor = from;
+	for (const range of ranges) {
+		if (range.end <= cursor || range.start >= from + text.length) continue;
+		output += text.slice(cursor - from, Math.max(range.start, cursor) - from);
+		if (range.start >= from) output += `[${range.label}]`;
+		cursor = Math.min(range.end, from + text.length);
 	}
-	return output + text.slice(end);
+	return output + text.slice(cursor - from);
 }
 
 function redactDetails(value: unknown, matcher: SecretMatcher, copies: WeakMap<object, object>): unknown {
@@ -96,26 +107,19 @@ function redactDetails(value: unknown, matcher: SecretMatcher, copies: WeakMap<o
 }
 
 export function redactToolOutput(output: AgentToolResult<unknown>, matcher: SecretMatcher): AgentToolResult<unknown> {
-	const content: AgentToolResult<unknown>["content"] = [];
-	for (let index = 0; index < output.content.length; ) {
-		const part = output.content[index];
-		if (part.type !== "text") {
-			content.push(part);
-			index++;
-			continue;
-		}
-		const run = [];
-		while (index < output.content.length) {
-			const next = output.content[index];
-			if (next.type !== "text") break;
-			run.push(next);
-			index++;
-		}
-		const masked = run.map((text) => ({ ...text, text: redactText(text.text, matcher) }));
-		const joined = redactText(run.map((text) => text.text).join(""), matcher);
-		content.push(
-			...(joined === masked.map((text) => text.text).join("") ? masked : [{ type: "text" as const, text: joined }]),
-		);
+	// Serializers join all text parts and drop images, so match across every text part.
+	const joined = output.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+	const ranges = matchRanges(joined, matcher);
+	let content = output.content;
+	if (ranges.length > 0) {
+		// Each part keeps its place; a part emptied by a range that started earlier is dropped.
+		let offset = 0;
+		content = output.content.flatMap<(typeof output.content)[number]>((part) => {
+			if (part.type !== "text") return [part];
+			const text = maskSlice(part.text, offset, ranges);
+			offset += part.text.length;
+			return text || !part.text ? [{ ...part, text }] : [];
+		});
 	}
 	return {
 		content,
