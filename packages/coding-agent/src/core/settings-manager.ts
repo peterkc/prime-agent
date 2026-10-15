@@ -447,7 +447,7 @@ export class SettingsManager {
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
-	private warnedCompactionSettings = new Set<keyof CompactionSettings>();
+	private readonly warnedCompactionSettings = new Set<keyof CompactionSettings>();
 
 	private constructor(
 		storage: SettingsStorage,

@@ -100,7 +100,7 @@ describe("AgentSession compaction auxiliary model", () => {
 			harness.cleanup();
 			vi.restoreAllMocks();
 		});
-		harness.session.setThinkingLevel("medium");
+		harness.session.setThinkingLevel("low");
 		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
 		await harness.session.prompt("one");
 		await harness.session.prompt("two");
