@@ -242,11 +242,12 @@ export async function removeEnrollment(
 	meshRoot: string,
 	sessionId: string,
 	deletedPath: string,
-): Promise<EnrollmentRecord | undefined> {
+): Promise<"absent" | "mismatch" | EnrollmentRecord> {
 	return withDirectoryLock(meshRoot, sessionId, async () => {
 		const path = enrollmentPath(meshRoot, sessionId);
 		const record = existsSync(path) ? readEnrollment(meshRoot, sessionId) : undefined;
-		if (!record || canonicalSessionPath(record.sessionFile) !== deletedPath) return undefined;
+		if (!record) return "absent";
+		if (canonicalSessionPath(record.sessionFile) !== deletedPath) return "mismatch";
 		await rm(directoryPath(meshRoot, sessionId), { force: true });
 		await rm(path, { force: true });
 		return record;

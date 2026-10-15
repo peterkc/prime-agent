@@ -119,7 +119,7 @@ describe("mesh enrollment", () => {
 	});
 
 	it("AC-18 removes the directory before the record and mints only a lifecycle-exact deprovisioner", async () => {
-		const { meshRoot, sessionId, sessionFile } = await fixture();
+		const { meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
 		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
 		await publishDirectory(meshRoot, record, "home");
 		const removeFile = fsPromises.rm;
@@ -132,6 +132,8 @@ describe("mesh enrollment", () => {
 		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
 		expect(await readDirectoryAsync(meshRoot, sessionId)).toBeUndefined();
 		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		await mesh.unenroll(sessionId, canonicalSessionPath(sessionFile));
+		expect(log).not.toHaveBeenCalled();
 		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
 		await deprovisionEnrollment(meshRoot, { space: "prime", server: "nats://127.0.0.1:1" }, record);
 		const call = remove.mock.calls[0]![0];

@@ -301,7 +301,8 @@ export class MeshEndpoints {
 
 	async unenroll(sessionId: string, sessionFile: string): Promise<void> {
 		const record = await removeEnrollment(this.options.meshRoot, sessionId, canonicalSessionPath(sessionFile));
-		if (!record) {
+		if (record === "absent") return;
+		if (record === "mismatch") {
 			this.options.log(`Mesh session ${sessionId}: deleted file is not the enrolled file; inbox unchanged`);
 			return;
 		}

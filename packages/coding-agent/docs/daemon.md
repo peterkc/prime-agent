@@ -128,10 +128,13 @@ record under that lock, so stale publication cannot restore the entry.
 
 Deleting a session closes its endpoint before removing its lifecycle's inbox while
 holding its claim. If another live supervisor holds the claim, deletion leaves the inbox
-and logs the session ID. The holder removes it when it next finds the entry gone at
-endpoint start or before a handoff. A partial removal is logged and not retried; consumers
-left still count toward the limit. Failed endpoint stops keep the claim and prevent a
-second endpoint. Queued deliveries and late persistence frames settle nothing after close.
+and logs the session ID.
+
+The holder removes the inbox when it next finds the entry gone, before a handoff or at an
+endpoint start. An idle holder keeps the inbox until one of those checks runs. A partial
+removal is logged and not retried; consumers left still count toward the limit. Failed
+endpoint stops keep the claim and prevent a second endpoint. Queued deliveries and late
+persistence frames settle nothing after close.
 
 When the mesh is on, deleting a session discards stored, unacknowledged messages, and
 restoring it from Trash does not restore them. Deleting while the transport is native
