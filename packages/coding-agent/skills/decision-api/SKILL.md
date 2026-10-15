@@ -1,12 +1,15 @@
 ---
 name: decision-api
-description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is the model named by the decisionApi.systemOneModel setting, called directly through the host bridge to pick every action from observations; System 2 is you, updating the goal each later decision reads. You design, measure, and optimize the whole loop. Requires the decisionApi.systemOneModel setting.
+description: Experimental System 1 / System 2 loop. System 1 is the model named by the decisionApi.systemOneModel setting, called directly through the host bridge to pick an action from observations; System 2 is you, updating the goal each later decision reads. Use it for real-time, low-latency control tasks, where you design, measure and optimize the whole loop, and for one-off classification of eval runs on synthetic test fixtures into a fixed set of groups, such as sorting failed skill-eval runs by cause. Not for other choices or task text. Requires the decisionApi.systemOneModel setting.
 ---
 
 # Decision API (System 1 / System 2)
 
 Use this for real-time control tasks where every step is one choice from an
 action set (a game, a device, a UI) and a full agent turn per step is too slow.
+It also serves one-off classification: sorting the facts of one eval run into
+a fixed set of groups with a single `decide()` call (see the single-decision
+paragraph under Usage).
 
 - **System 1** is the decision model the user configured: the
   `decisionApi.systemOneModel` setting names it. This fork uses Jev
@@ -89,9 +92,20 @@ and makes every provider call. No key enters the kernel. If a call reports
 that the setting is unset or unresolvable, ask the user to fix the setting.
 Do not ask for keys yourself.
 
-Data rule: `state` holds the control task's observations only, never code,
-file contents, secrets or personal data. The host logs the full state and
+Data rule: `state` (the observation you pass to `decide()` becomes `state`)
+holds only the control task's observations, or the facts
+of one eval run on synthetic test fixtures: its case, arm, check results, tool
+calls and the agent's whole final reply. Never put code or file contents from a
+real repository, secrets, credentials or personal data in `state`. Each call
+sends `state` to the configured provider, and the host logs the full state and
 decision results locally.
+
+Pass each text field in `state` whole. Do not cut, truncate or summarize it in
+your own code: a reply cut at a fixed length makes System 1 decide from partial
+facts. If a field holds anything the data rule forbids, do not call `decide()`
+for that run, and report which part of the data rule it breaks, without
+quoting the content. If the provider rejects a state as too large,
+report that instead of shortening the text.
 
 ## Usage
 

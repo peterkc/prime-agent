@@ -18,12 +18,22 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { AGENT_FAMILY_REACH_ERROR, type AgentSessionMessageController } from "../src/core/agent-messages.js";
+import {
+	AGENT_FAMILY_REACH_ERROR,
+	type AgentSessionMessage,
+	type AgentSessionMessageController,
+	createAgentMessageHostHandlers,
+} from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
-import { type CreateAgentSessionRuntimeFactory, rlmSubagentRuntimeSpec } from "../src/core/agent-session-runtime.js";
+import {
+	AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	rlmSubagentRuntimeSpec,
+} from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
@@ -38,6 +48,7 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
 import {
 	AgentDaemon,
@@ -54,7 +65,11 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
-import { type DaemonWorkerFrameHeader, isDaemonWorkerFrameHeader } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	type DaemonWorkerCommand,
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import {
 	createSnapshotTranscriptChunks,
@@ -64,6 +79,9 @@ import {
 
 import { type PrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
+import { createHarness } from "./suite/harness.js";
+import { createDeferred } from "./suite/scheduling.js";
+import { userMsg } from "./utilities.js";
 
 describe("daemon mode helpers", () => {
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -918,12 +936,12 @@ describe("daemon mode helpers", () => {
 		await expect(observe.recentMessages({ target: "helper" })).resolves.toMatchObject({
 			agent: { activeSessionId: familyHelper.state.activeSessionId },
 		});
+		const controller = internals.createAgentMessageController(() => observer.state);
+		const handlers = createAgentMessageHostHandlers({ ...controller, family: async () => controller.family!() });
 		await expect(
-			internals
-				.createAgentMessageController(() => observer.state)
-				.sendAgentMessage({ target: "helper", message: "report progress" }),
-		).resolves.toMatchObject({ target: { activeSessionId: familyHelper.state.activeSessionId } });
-		expect(familyHelper.acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+			handlers["agent_message.send"]!({ receiver_name: "helper", message: "report progress" }),
+		).rejects.toThrow('agentMessageTransport "cotal"');
+		expect(familyHelper.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 		expect(unrelatedHelper.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
@@ -4347,5 +4365,881 @@ describe("update restart checkpoint wait", () => {
 				undefined,
 			),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe("mesh worker persistence", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+	function harness(createRuntime?: CreateAgentSessionRuntimeFactory) {
+		const root = mkdtempSync(join(tmpdir(), "prime-mesh-worker-"));
+		roots.push(root);
+		vi.stubEnv(ENV_AGENT_DIR, root); // Default session files follow this variable, not defaultSessionConfig.
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime:
+				createRuntime ??
+				(async () => {
+					throw new Error("unused");
+				}),
+			worker: { authenticationToken: "token" },
+		});
+		const internals = daemon as unknown as {
+			agentMessageTransport: "native" | "cotal";
+			supervisorClaims: Map<DaemonSocketClient, unknown>;
+			sessions: Map<string, ActiveSessionState>;
+			assertSupervisorClaimCurrent(): Promise<string>;
+			scheduleSupervisorFenceCheck(): void;
+			scheduleRosterFlush(): void;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			getOrHydrateBoundSessionState(): Promise<ActiveSessionState>;
+			receiveMeshMessage(
+				client: DaemonSocketClient,
+				command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+			): Promise<void>;
+		};
+		internals.assertSupervisorClaimCurrent = async () => "fingerprint";
+		internals.scheduleSupervisorFenceCheck = () => undefined;
+		internals.scheduleRosterFlush = () => undefined;
+		const written: Buffer[] = [];
+		const socket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			write: (data: Buffer) => {
+				written.push(data);
+				return true;
+			},
+			end: vi.fn(),
+		});
+		const client = {
+			...makeClient("supervisor", "target"),
+			socket,
+			transport: "private-framed",
+		} as unknown as DaemonSocketClient;
+		const frames = () =>
+			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(written))
+				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+		const authenticate = (mode?: string) =>
+			internals.handleLine(
+				client,
+				JSON.stringify({
+					id: "auth",
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "generation",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(root, "supervisor.sock"),
+					...(mode ? { agentMessageTransport: mode } : {}),
+				}),
+			);
+		return { root, internals, client, socket, written, frames, authenticate };
+	}
+
+	it.each(["cotal", "native", undefined])(
+		"follows authenticated mode %s rather than edited worker settings",
+		async (mode) => {
+			const h = harness();
+			writeFileSync(
+				join(h.root, "settings.json"),
+				JSON.stringify({ agentMessageTransport: mode === "cotal" ? "native" : "cotal" }),
+			);
+			await h.authenticate(mode);
+			expect(h.internals.agentMessageTransport).toBe(mode ?? "native");
+			expect(h.frames()[0]).toMatchObject({
+				command: "worker_auth",
+				success: true,
+				data: { capabilities: expect.arrayContaining(["mesh_delivery"]) },
+			});
+			writeFileSync(join(h.root, "settings.json"), "{}");
+			expect(h.internals.agentMessageTransport).toBe(mode ?? "native");
+		},
+	);
+
+	it.each(["old", "stored", "names"])("mesh send: refusal, receipt and rate limit (%s)", async (mode) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		const worker = h.internals as unknown as {
+			createAgentFamily(): Promise<unknown[]>;
+			supervisorLink(): unknown;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+		};
+		worker.createAgentFamily = async () => [
+			{ relationship: "sibling", entry: { id: "session-b", sessionPath: join(h.root, "b.jsonl") } },
+		];
+		const receipt = { deliveryStatus: "stored", cotalId: "stored", sequence: 42 };
+		const request = vi.fn(async () => {
+			if (mode === "old") throw new DaemonCapabilityUnavailableError("mesh_send", "mesh_send");
+			return { success: true, data: receipt };
+		});
+		worker.supervisorLink = () => ({ ensureConnected: async () => undefined, request });
+		const source = makeState("a");
+		source.runtime = {
+			session: { sessionFile: join(h.root, "a.jsonl") },
+		} as unknown as ActiveSessionState["runtime"];
+		const controller = worker.createAgentMessageController(() => source);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			const sending = controller.sendAgentMessage({ target: "session-b", message: "hello" });
+			if (mode === "old") await expect(sending).rejects.toThrow("not stored");
+			else await expect(sending).resolves.toEqual(receipt);
+			if (mode === "names") {
+				for (const target of ["SESSION-B", "session-b"])
+					await controller.sendAgentMessage({ target, targetKind: "name", message: "hello" });
+				await expect(
+					controller.sendAgentMessage({ target: "Session-B", targetKind: "name", message: "hello" }),
+				).rejects.toThrow("rate limit exceeded");
+			} else
+				expect(request).toHaveBeenCalledExactlyOnceWith(
+					{ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "session-b", message: "hello" },
+					35_000,
+				);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["native", "cotal"])(
+		"makes a new Cotal session file readable before binding can publish its roster (%s)",
+		async (mode) => {
+			const gate = createDeferred();
+			const reached = createDeferred();
+			let manager!: SessionManager;
+			const h = harness(async (options) => {
+				manager = options.sessionManager;
+				const session = Object.assign(makeRuntimeSession(manager), {
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				});
+				session.bindExtensions = async () => {
+					reached.resolve();
+					await gate.promise;
+				};
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				} as never;
+			});
+			await h.authenticate(mode);
+			const creating = h.internals.handleLine(h.client, JSON.stringify({ id: "new", type: "create" }));
+			try {
+				await reached.promise;
+				expect(h.internals.sessions.size).toBe(1);
+				expect(existsSync(manager.getSessionFile()!)).toBe(mode === "cotal");
+				if (mode === "cotal")
+					expect(await readSessionInfo(manager.getSessionFile()!)).toMatchObject({
+						id: manager.getSessionId(),
+						messageCount: 0,
+					});
+			} finally {
+				gate.resolve();
+				await creating;
+			}
+			expect(h.frames().at(-1)).toMatchObject({ command: "create", success: true });
+		},
+	);
+
+	it.each(["new_session", "fork", "new_session_setup"])(
+		"publishes and enrolls a readable replacement before binding (%s)",
+		async (command) => {
+			let built = 0;
+			let h: ReturnType<typeof harness>;
+			let readableAtPublication = false;
+			const replacing = createDeferred();
+			const release = createDeferred();
+			h = harness(async (options) => {
+				const replacement = ++built > 1;
+				const session = Object.assign(makeRuntimeSession(options.sessionManager), {
+					setCurrentRecap: () => undefined,
+					agent: { state: { messages: [] } },
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					bindExtensions: async () => {
+						if (replacement && command !== "new_session_setup") {
+							readableAtPublication = existsSync(options.sessionManager.getSessionFile()!);
+							(h.internals as unknown as { flushRoster(): void }).flushRoster();
+							replacing.resolve();
+							await release.promise;
+						}
+					},
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				} as never;
+			});
+			(h.internals as unknown as { clients: Set<DaemonSocketClient> }).clients.add(h.client);
+			await h.authenticate("cotal");
+			await h.internals.handleLine(h.client, JSON.stringify({ id: "initial", type: "create" }));
+			const state = [...h.internals.sessions.values()][0]!;
+			const oldId = state.runtime.session.sessionId;
+			const entryId = state.runtime.session.sessionManager.appendMessage({
+				role: "user",
+				content: "before assistant",
+				timestamp: 1,
+			});
+			h.written.length = 0;
+			const replacement =
+				command === "new_session_setup"
+					? state.runtime.newSession({
+							setup: async (manager) => {
+								readableAtPublication = existsSync(manager.getSessionFile()!);
+								(h.internals as unknown as { flushRoster(): void }).flushRoster();
+								replacing.resolve();
+								await release.promise;
+							},
+						})
+					: h.internals.handleLine(
+							h.client,
+							JSON.stringify({
+								id: "replacement",
+								type: command,
+								activeSessionId: state.activeSessionId,
+								...(command === "fork" ? { entryId } : {}),
+							}),
+						);
+			const supervisor = new DaemonSupervisor(join(h.root, "enrollment.sock"), {
+				defaultSessionConfig: { agentDir: h.root, cwd: h.root },
+			});
+			const enrolled = createDeferred();
+			let enrolledInfo: SessionInfo | null | undefined;
+			let enrolledId: string | undefined;
+			const sup = supervisor as unknown as {
+				mesh: unknown;
+				writeRosterEntry(entry: unknown): unknown;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			sup.mesh = {
+				enqueueEnrollment: async (id: string, file: string) => {
+					enrolledId = id;
+					enrolledInfo = await readSessionInfo(file);
+					enrolled.resolve();
+				},
+				stop: async () => undefined,
+			};
+			try {
+				await replacing.promise;
+				expect(readableAtPublication).toBe(true);
+				const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader).push(Buffer.concat(h.written));
+				const frame = frames.find(
+					(frame) => frame.header.kind === "outbound" && frame.header.outboundType === "roster_delta",
+				);
+				expect(frame).toBeDefined();
+				const delta = JSON.parse(frame!.payload.toString("utf8"));
+				const row = delta.entries.find(
+					(entry: { summary: SessionSummary }) => entry.summary.sessionId === state.runtime.session.sessionId,
+				);
+				expect(row.summary.sessionId).not.toBe(oldId);
+				expect(existsSync(row.summary.sessionFile)).toBe(true);
+				sup.writeRosterEntry(row);
+				await enrolled.promise;
+				expect(enrolledId).toBe(row.summary.sessionId);
+				expect(enrolledInfo).toMatchObject({ id: row.summary.sessionId, messageCount: 0 });
+			} finally {
+				release.resolve();
+				await replacement;
+				await sup.cleanupSupervisorResources();
+				await state.runtime.dispose();
+			}
+			if (command !== "new_session_setup") expect(h.frames().at(-1)).toMatchObject({ command, success: true });
+		},
+	);
+
+	it.each(["new_session", "fork", "switch_session", "import_jsonl", "repeat"])(
+		"closes or deduplicates the old session's queued mesh delivery (%s)",
+		async (command) => {
+			const gate = createDeferred();
+			const started = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				tools: [
+					{
+						name: "wait",
+						label: "Wait",
+						description: "Hold the running turn",
+						parameters: Type.Object({}),
+						execute: async () => {
+							started.resolve();
+							await gate.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			const createRuntime: CreateAgentSessionRuntimeFactory = async (options) =>
+				({
+					session: Object.assign(makeRuntimeSession(options.sessionManager), {
+						setCurrentRecap: () => undefined,
+						state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+						hasRunningRlmChildren: () => false,
+						getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					}),
+					services: { cwd: live.tempDir, agentDir: live.tempDir },
+					diagnostics: [],
+				}) as never;
+			const h = harness(createRuntime);
+			await h.authenticate("cotal");
+			const runtime = new AgentSessionRuntime(
+				live.session,
+				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				createRuntime,
+			);
+			const state = await (
+				h.internals as unknown as {
+					addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState>;
+				}
+			).addRuntime(runtime);
+			h.client.attachedActiveSessionIds.add(state.activeSessionId);
+			state.clients.add(h.client);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			const running = live.session.prompt("start");
+			try {
+				await started.promise;
+				const oldId = live.session.sessionId;
+				const entryId = live.sessionManager
+					.getEntries()
+					.find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
+				const saved = SessionManager.create(live.tempDir, join(live.tempDir, "saved"));
+				saved.flushNow();
+				h.written.length = 0;
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "delivery",
+						type: "worker_deliver_message",
+						targetActiveSessionId: state.activeSessionId,
+						message: "hello",
+						sender: { sessionName: "sender" },
+						cotal: { id: "replaced", deliveryCount: 1 },
+					}),
+				);
+				expect(h.frames().filter((frame) => frame.command === "worker_deliver_message")).toMatchObject([
+					{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
+				]);
+				if (command === "repeat") {
+					h.socket.emit("close");
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({
+							id: "redelivery",
+							type: "worker_deliver_message",
+							targetActiveSessionId: state.activeSessionId,
+							message: "hello",
+							sender: { sessionName: "sender" },
+							cotal: { id: "replaced", deliveryCount: 2 },
+						}),
+					);
+					expect(live.session.getSessionActionSnapshot().queuedCount).toBe(1);
+					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(0);
+					gate.resolve();
+					await running;
+					expect(
+						live.sessionManager
+							.getEntries()
+							.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+					).toHaveLength(1);
+					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(1);
+					return;
+				}
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "replacement",
+						type: command,
+						activeSessionId: state.activeSessionId,
+						...(command === "fork" ? { entryId } : {}),
+						...(command === "switch_session" ? { sessionPath: saved.getSessionFile() } : {}),
+						...(command === "import_jsonl" ? { inputPath: saved.getSessionFile() } : {}),
+					}),
+				);
+				expect(h.frames().at(-1)).toMatchObject({ command, success: true });
+				expect(
+					h
+						.frames()
+						.filter(
+							(frame) => frame.type === "agent_message_dropped" || frame.type === "agent_message_persisted",
+						),
+				).toEqual([{ type: "agent_message_dropped", cotalId: "replaced", reason: "closed" }]);
+				expect(state.runtime.session.sessionId).not.toBe(oldId);
+				expect(
+					live.sessionManager
+						.getEntries()
+						.some((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+				).toBe(false);
+				const replaced = (h.internals as unknown as { replacedSessions: WeakSet<object> }).replacedSessions;
+				expect(replaced.has(live.session)).toBe(true);
+				expect(replaced.has(state.runtime.session)).toBe(false);
+			} finally {
+				gate.resolve();
+				await running.catch(() => undefined);
+				await runtime.dispose();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each([
+		"clear",
+		"abort-clear",
+		"agent-clear",
+		"pause",
+		"dispose",
+		"killed",
+		"completed",
+		"shutdown",
+		"update",
+		"update-discard",
+		"update-commit-discard",
+		"persist-race",
+	])("reports a terminal queued delivery once without dropping a written entry (%s)", async (outcome) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		h.written.length = 0;
+		const gate = createDeferred();
+		const started = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "wait",
+					label: "Wait",
+					description: "Hold the running turn",
+					parameters: Type.Object({}),
+					execute: async () => {
+						started.resolve();
+						await gate.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		const running = live.session.prompt("start");
+		try {
+			await started.promise;
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			(live.session as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
+			await h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					id: "delivery",
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionName: "parent" },
+					fromRelationship: "parent",
+					cotal: { id: "terminal", deliveryCount: 1 },
+				}),
+			);
+			expect(h.frames()).toMatchObject([
+				{ command: "worker_deliver_message", success: true, data: { deliveryStatus: "queued" } },
+			]);
+			expect(live.session.getSteeringMessages()).toHaveLength(1);
+			expect(live.session.getSteeringMessages()[0]).toContain("parent:parent");
+			expect(live.session.repliedToParentSinceTask).toBe(false);
+			if (outcome === "persist-race") {
+				live.sessionManager.appendCustomMessageEntry("agent_message", "already written", true, {
+					id: "agentmsg_terminal",
+				});
+			}
+			if (outcome === "pause") {
+				await h.internals.handleLine(h.client, JSON.stringify({ id: "pause", type: "agent_messages_pause" }));
+			} else if (outcome === "update-commit-discard") {
+				state.runtime.dispose = async () => live.session.disposeAsync({ kernelSnapshot: false });
+				const transactionId = Symbol("prepared update");
+				const internals = h.internals as unknown as {
+					updateRestart: unknown;
+					commitPreparedUpdateRestart(id: symbol): Promise<unknown>;
+				};
+				internals.updateRestart = {
+					id: transactionId,
+					manifest: { formatVersion: 1, createdAt: new Date().toISOString(), sessions: [] },
+				};
+				await internals.commitPreparedUpdateRestart(transactionId);
+			} else if (["killed", "completed", "shutdown", "update", "update-discard"].includes(outcome)) {
+				state.runtime.dispose = async () => live.session.disposeAsync({ kernelSnapshot: false });
+				await (
+					h.internals as unknown as {
+						closeSession(
+							state: ActiveSessionState,
+							reason: "killed" | "completed" | "shutdown" | "update",
+							wait?: boolean,
+							cascade?: boolean,
+							descendants?: Set<ActiveSessionState>,
+							disposal?: { kernelSnapshot?: boolean },
+							drop?: "other",
+						): Promise<void>;
+					}
+				).closeSession(
+					state,
+					(outcome === "update-discard" ? "killed" : outcome) as "killed" | "completed" | "shutdown" | "update",
+					true,
+					true,
+					undefined,
+					undefined,
+					outcome === "update-discard" ? "other" : undefined,
+				);
+			} else if (outcome === "dispose" || outcome === "persist-race") live.session.dispose();
+			else if (outcome === "agent-clear") live.session.clearQueuedAgentMessages();
+			else {
+				live.session.clearQueue();
+				if (outcome === "abort-clear") void live.session.abort();
+			}
+			await Promise.resolve();
+			const terminalFrames = () => h.frames().filter((frame) => frame.command !== "agent_messages_pause");
+			expect(terminalFrames()[1]).toEqual(
+				outcome === "persist-race"
+					? { type: "agent_message_persisted", cotalId: "terminal" }
+					: {
+							type: "agent_message_dropped",
+							cotalId: "terminal",
+							reason:
+								outcome === "killed" || outcome === "completed"
+									? "closed"
+									: ["dispose", "shutdown", "update", "update-discard", "update-commit-discard"].includes(
+												outcome,
+											)
+										? "other"
+										: "cleared",
+						},
+			);
+			live.sessionManager.appendCustomEntry("later");
+			expect(terminalFrames()).toHaveLength(2);
+		} finally {
+			gate.resolve();
+			await running.catch(() => undefined);
+			live.cleanup();
+		}
+	});
+
+	it.each(["killed", "completed"] as const)(
+		"reports closed for an existing unwritten own entry (%s)",
+		async (reason) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
+			const id = live.sessionManager.appendCustomMessageEntry("agent_message", "buffered", true, {
+				id: "agentmsg_buffered",
+			});
+			expect(live.sessionManager.isEntryPersisted(id)).toBe(false);
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const archive = vi.spyOn(live.sessionManager, "appendSessionState").mockImplementation(() => {
+				throw new Error("Archive write failed");
+			});
+			try {
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "buffered",
+						type: "worker_deliver_message",
+						targetActiveSessionId: "target",
+						message: "hello",
+						sender: { sessionName: "sender" },
+						cotal: { id: "buffered", deliveryCount: 2 },
+					}),
+				);
+				expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
+				await (
+					h.internals as unknown as {
+						closeSession(state: ActiveSessionState, reason: "killed" | "completed"): Promise<void>;
+					}
+				)
+					.closeSession(state, reason)
+					.catch(() => undefined);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual([
+					{ type: "agent_message_dropped", cotalId: "buffered", reason: "closed" },
+				]);
+			} finally {
+				archive.mockRestore();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("unregisters native disposal callbacks after an operation finishes", async () => {
+		const live = await createHarness();
+		const called = vi.fn();
+		const unregister = live.session.registerDisposeCallback(called);
+		try {
+			unregister();
+			live.session.dispose();
+			expect(called).not.toHaveBeenCalled();
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["paused", "clear-race"])(
+		"settles native outcome waiters when mesh acceptance fails (%s)",
+		async (failure) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const completion = live.session.waitForAgentMessagePromptCompletion("agentmsg_failed");
+			const delivery = live.session.waitForAgentMessagePromptDelivery("agentmsg_failed");
+			let completionEnded = false;
+			let deliveryEnded = false;
+			void completion.catch(() => {
+				completionEnded = true;
+			});
+			void delivery.catch(() => {
+				deliveryEnded = true;
+			});
+			const original = live.session.acceptAgentMessagePrompt.bind(live.session);
+			const admission = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) =>
+				original(text, {
+					...options,
+					admissionCommitted: () => {
+						options?.admissionCommitted?.();
+						if (failure === "clear-race") live.session.clearQueuedAgentMessages();
+					},
+				}),
+			);
+			if (failure === "paused")
+				(h.internals as unknown as { agentMessagesPaused: boolean }).agentMessagesPaused = true;
+			try {
+				await h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "failed",
+						type: "worker_deliver_message",
+						targetActiveSessionId: "target",
+						message: "hello",
+						sender: { sessionName: "sender" },
+						cotal: { id: "failed", deliveryCount: 1 },
+					}),
+				);
+				await Promise.resolve();
+				expect(completionEnded).toBe(true);
+				expect(deliveryEnded).toBe(true);
+				expect(live.session.waitForAgentMessagePromptCompletion("agentmsg_failed")).not.toBe(completion);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
+					failure === "clear-race"
+						? [{ type: "agent_message_dropped", cotalId: "failed", reason: "cleared" }]
+						: [],
+				);
+				expect(h.frames().at(-1)).toMatchObject({ command: "worker_deliver_message", success: false });
+			} finally {
+				admission.mockRestore();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["abort", "dispose", "append-event-error"])(
+		"tracks the own entry when ending a native delivery after message_start (%s)",
+		async (outcome) => {
+			const h = harness();
+			await h.authenticate("cotal");
+			h.written.length = 0;
+			const live = await createHarness({ persistSession: true });
+			const gate = createDeferred();
+			const started = createDeferred();
+			const original = live.session.extensionRunner.emit.bind(live.session.extensionRunner);
+			const blocked = vi.spyOn(live.session.extensionRunner, "emit").mockImplementation(async (event) => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === "agent_message"
+				) {
+					started.resolve();
+					await gate.promise;
+				}
+				return original(event);
+			});
+			const originalEnd = live.session.extensionRunner.emitMessageEnd.bind(live.session.extensionRunner);
+			const appendEvent = vi
+				.spyOn(live.session.extensionRunner, "emitMessageEnd")
+				.mockImplementation(async (event) => {
+					if (
+						outcome === "append-event-error" &&
+						event.message.role === "custom" &&
+						event.message.customType === "agent_message"
+					)
+						throw new Error("Message-end processing failed before append");
+					return originalEnd(event);
+				});
+			let copiesAtCompletion = -1;
+			const countOwn = () =>
+				live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message").length;
+			const completion = live.session.waitForAgentMessagePromptCompletion("agentmsg_started");
+			void completion.then(
+				() => {
+					copiesAtCompletion = countOwn();
+				},
+				() => {
+					copiesAtCompletion = countOwn();
+				},
+			);
+			live.setResponses([fauxAssistantMessage("done")]);
+			const state = makeState("target");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: live.session,
+			} as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const receiving = h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					id: "started",
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionName: "sender" },
+					cotal: { id: "started", deliveryCount: 1 },
+				}),
+			);
+			try {
+				await started.promise;
+				if (outcome === "dispose") live.session.dispose();
+				const aborting = live.session.abort();
+				gate.resolve();
+				await aborting;
+				await receiving;
+				await completion.catch(() => undefined);
+				expect(countOwn()).toBe(outcome === "append-event-error" ? 0 : 1);
+				expect(copiesAtCompletion).toBe(outcome === "abort" ? 1 : 0);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
+					outcome !== "abort" ? [{ type: "agent_message_dropped", cotalId: "started", reason: "other" }] : [],
+				);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual(
+					outcome === "abort" ? [{ type: "agent_message_persisted", cotalId: "started" }] : [],
+				);
+			} finally {
+				gate.resolve();
+				await receiving;
+				blocked.mockRestore();
+				appendEvent.mockRestore();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["pending", "flushed", "unreadable"])("accepts, writes and deduplicates (%s)", async (mode) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		h.written.length = 0;
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendSessionInfo("disk-known");
+		manager.appendMessage(mode === "flushed" ? fauxAssistantMessage("ready") : userMsg("pending"));
+		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
+			throw new Error("name append failed");
+		});
+		expect(() => manager.appendSessionInfo("holder-newer")).toThrow("name append failed");
+		if (mode !== "pending") writeFileSync(manager.getSessionFile()!, "null\nprivate-json-fragment");
+		const log = vi.spyOn(h.internals as unknown as { log(message: string): void }, "log");
+		let accepted!: AgentSessionMessage;
+		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
+			expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
+			accepted = options.customMessage;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: () => undefined,
+				hasQueuedAgentMessage: () => false,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const command = {
+			id: "delivery",
+			type: "worker_deliver_message",
+			targetActiveSessionId: "target",
+			message: "hello",
+			sender: { sessionName: "sender" },
+			cotal: { id: "stable", deliveryCount: 2 },
+		} as const;
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
+		expect(accepted.details.id).toBe("agentmsg_stable");
+		expect(manager.getSessionName()).toBe("holder-newer");
+		if (mode === "unreadable") expect(log).toHaveBeenCalledWith(expect.stringContaining(manager.getSessionId()));
+		else expect(log).not.toHaveBeenCalled();
+		expect(log.mock.calls.flat().join()).not.toContain("private-json-fragment");
+		expect(accepted.content).toContain("Possibly repeated");
+		expect(accepted.content).toContain("sender");
+		vi.spyOn(manager, "_persist").mockImplementationOnce(() => {
+			throw new Error("append failed");
+		});
+		expect(() =>
+			manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details),
+		).toThrow("append failed");
+		h.socket.emit("close"); // The supervisor connection ended while the failed append was only in memory.
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(
+			h
+				.frames()
+				.slice(1)
+				.some((frame) => frame.type === "agent_message_persisted"),
+		).toBe(false);
+		h.written.splice(1);
+		manager.appendCustomEntry("unrelated");
+		expect(h.frames()).toHaveLength(1);
+		(manager as unknown as { _rewriteFile(): void })._rewriteFile();
+		expect(h.frames()[1]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		manager.appendCustomEntry("later");
+		expect(h.frames()).toHaveLength(2);
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(h.frames()[3]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		accept.mockRejectedValueOnce(new Error("accept failed"));
+		await expect(
+			h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "error", deliveryCount: 1 } }),
+		).rejects.toThrow("accept failed");
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		await h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "closed", deliveryCount: 1 } });
+		const count = h.frames().length;
+		h.socket.emit("close");
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
+		expect(h.frames()).toHaveLength(count);
 	});
 });

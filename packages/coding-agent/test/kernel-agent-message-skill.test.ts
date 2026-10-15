@@ -1,11 +1,18 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getBundledSkillsDir } from "../src/config.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR, getBundledSkillsDir } from "../src/config.js";
+import {
+	type AgentFamilyMember,
+	type AgentSessionMessageController,
+	createAgentMessageHostHandlers,
+} from "../src/core/agent-messages.js";
 import type { KernelSentAgentMessage } from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 
 /** Runtime info for a bundled Python skill, e.g. ("agent-message", "agent_message"). */
 function bundledSkill(name: string, importName: string): PythonSkillRuntimeInfo {
@@ -22,12 +29,85 @@ describe("agent-message skill over the kernel host bridge", () => {
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-agent-message-skill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		vi.stubEnv(ENV_AGENT_DIR, tempDir);
 	});
 
 	afterEach(async () => {
 		await provisioner?.dispose();
 		provisioner = undefined;
+		vi.unstubAllEnvs();
 		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it.each([
+		[{ receiver_role: "parent" }, ["parent"]],
+		[{ receiver_role: "sibling", receiver_name: "sibling" }, ["sibling"]],
+		[{ receiver_role: "child", receiver_name: "child" }, ["child"]],
+		[{ receiver_name: "outside-family" }, ["outside-family"]],
+		[{ receiver_name: "external-id" }, ["external-id"]],
+		[{ receiver_role: "child", receiver_name: "outside-family" }, []],
+		[{ target: "all" }, ["parent", "sibling", "child"]],
+	] as const)("carries the real host target %j through the worker", async (selectors, expected) => {
+		const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			createRuntime: async () => {
+				throw new Error("unused runtime");
+			},
+			worker: { authenticationToken: "test" },
+		});
+		const state = {
+			activeSessionId: "self",
+			runtime: { session: { sessionFile: join(tempDir, "self.jsonl") } },
+		} as ActiveSessionState;
+		const family: AgentFamilyMember[] = ["parent", "sibling", "child"].map((relationship) => ({
+			relationship: relationship as AgentFamilyMember["relationship"],
+			entry: {
+				id: relationship,
+				name:
+					"receiver_role" in selectors && selectors.receiver_role === "child" && relationship === "sibling"
+						? "child"
+						: undefined,
+				depth: 0,
+				status: "idle",
+				sessionPath: join(tempDir, `${relationship}.jsonl`),
+			},
+		}));
+		const worker = daemon as unknown as {
+			agentMessageTransport: string;
+			createAgentFamily(): Promise<AgentFamilyMember[]>;
+			supervisorLink(): unknown;
+			createAgentMessageController(getState: () => ActiveSessionState): AgentSessionMessageController;
+		};
+		worker.agentMessageTransport = "cotal";
+		worker.createAgentFamily = async () => family;
+		const targets: string[] = [];
+		worker.supervisorLink = () => ({
+			ensureConnected: async () => undefined,
+			request: async (command: { targetSessionId: string }) => {
+				targets.push(command.targetSessionId);
+				return { success: true, data: { deliveryStatus: "stored" } };
+			},
+		});
+		const handlers = createAgentMessageHostHandlers({
+			...worker.createAgentMessageController(() => state),
+			family: async () => family,
+		});
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAgentMessageSkill()],
+			hostHandlers: handlers,
+		});
+		const manager = await provisioner.ensure();
+		const args = Object.entries(selectors)
+			.filter(([key]) => key !== "target")
+			.map(([key, value]) => `${key}=${JSON.stringify(value)}`);
+		const call =
+			"target" in selectors
+				? `agent_message.send("all", "hello")`
+				: `agent_message.send("hello", ${args.join(", ")})`;
+		const result = await manager.execute(`await ${call}`);
+		expect(result.status).toBe(expected.length ? "ok" : "error");
+		if (!expected.length) expect(JSON.stringify(result)).toContain("No child matches");
+		expect(targets).toEqual(expected);
 	});
 
 	it("sends without exposing a spoofable sender and rejects the removed roster call", async () => {
@@ -87,6 +167,10 @@ print(json.dumps({"has_list_agents": hasattr(agent_message, "list_agents"), "rec
 			},
 		});
 		expect(requests[0].payload).not.toHaveProperty("from");
+		const named = await manager.execute(`await agent_message.send("hello name", receiver_name="Beta")`);
+		expect(named.status).toBe("ok");
+		expect(requests[1].payload).toMatchObject({ receiver_name: "Beta", message: "hello name" });
+		expect(requests[1].payload).not.toHaveProperty("receiver_role");
 	});
 
 	it("emits successful broadcast receipts and leaves short errors in the result", async () => {

@@ -1737,6 +1737,7 @@ export class SessionManager {
 	// and must not hold it across an append.
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
+	private persistedEntryIds = new Set<string>();
 
 	private constructor(
 		cwd: string,
@@ -1765,6 +1766,7 @@ export class SessionManager {
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+		this.persistedEntryIds.clear();
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
@@ -1795,6 +1797,7 @@ export class SessionManager {
 			}
 
 			this._buildIndex();
+			this.persistedEntryIds = new Set(this.getEntries().map((entry) => entry.id));
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1847,6 +1850,7 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header];
+		this.persistedEntryIds.clear();
 		this.hasAssistantEntry = false;
 		this.byId.clear();
 		this.labelsById.clear();
@@ -1903,6 +1907,7 @@ export class SessionManager {
 				if (metadata !== undefined) chownSync(tempPath, metadata.uid, metadata.gid);
 			},
 		});
+		this.persistedEntryIds = new Set(this.getEntries().map((entry) => entry.id));
 		this._notifyPersistListeners();
 	}
 
@@ -1928,6 +1933,15 @@ export class SessionManager {
 
 	isPersisted(): boolean {
 		return this.persist;
+	}
+
+	rewritesOnNextPersist(): boolean {
+		return !this.flushed || !this.hasAssistantEntry;
+	}
+
+	/** A successful append, rewrite or file load covered this entry, not merely another entry. */
+	isEntryPersisted(entryId: string): boolean {
+		return this.persistedEntryIds.has(entryId);
 	}
 
 	getCwd(): string {
@@ -2016,6 +2030,7 @@ export class SessionManager {
 		} else {
 			mkdirSync(dirname(this.sessionFile), { recursive: true });
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this.persistedEntryIds.add(entry.id);
 			this._notifyPersistListeners();
 		}
 	}
@@ -2594,6 +2609,7 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 
+			this.persistedEntryIds.clear();
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this._refreshHasAssistantEntry();
 			this.sessionId = newSessionId;
@@ -2629,6 +2645,7 @@ export class SessionManager {
 			labelEntries.push(labelEntry);
 			parentId = labelEntry.id;
 		}
+		this.persistedEntryIds.clear();
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this._refreshHasAssistantEntry();
 		this.sessionId = newSessionId;

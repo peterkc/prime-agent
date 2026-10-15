@@ -41,6 +41,7 @@
 - Tests using subprocesses, sockets, concurrency, or shared process state must bind port `0`, use unique temporary paths, restore environment/cwd/globals/fake timers, and close every resource in `finally`.
 - Run every modified test file directly. For concurrency, process, timer, or ordering changes, also run the focused suite repeatedly with multiple shuffle seeds. Stop on the first failure; repeated runs are evidence, never retries.
 - A change may not add more lines of test than source. A test-only change must delete at least as many test lines as it adds.
+- After `npm run check`, run `node scripts/fork-pr-check.mjs`. It reports the counts for the line rule above, including new files, and runs each changed test file with shuffle seeds 17, 43 and 101.
 - Regressions go in the existing suite for the module that broke, with the issue number in the test name. Never create one file per issue. One test file per source module; repeated cases belong in an `it.each` table.
 - Deleting code deletes its tests. A flaky test is made deterministic or deleted, never skipped or retried.
 
@@ -65,6 +66,7 @@
 
 - A 7-day minimum release age applies to all dependency updates: `.npmrc` sets `min-release-age=7` and `.github/dependabot.yml` uses a matching `cooldown`. Never bypass it for routine updates.
 - Enforcement requires npm >= 11.10; older npm silently ignores the setting, so use a current npm when updating dependencies.
+- `@cotal-ai/core` is exempt via `.npmrc` `min-release-age-exclude`; its dependencies remain subject to the 7-day minimum release age (user approval, 2026-10-12).
 - For an urgent security patch younger than 7 days, override explicitly: `npm install --min-release-age=0 <pkg>`.
 
 ## GitHub Workflow

@@ -513,6 +513,22 @@ describe("daemon session summarizer", () => {
 			expect(appended.at(-1)).toMatchObject({ taskState: "completed" });
 		});
 
+		test.each([
+			["error", false, [{ summary: "", taskState: "needs_input", basedOnMessageCount: 4 }]],
+			["completed", false, []],
+			["error", true, []],
+		] as const)("a cached error after a normal turn, branch %s, navigating %s", async (branch, nav, expected) => {
+			const messages = [...erroredTranscript(providerError), userMessage("retry"), assistantMessage("Done")];
+			const persistedStatus = { summary: "x", taskState: branch, basedOnMessageCount: 2 };
+			const { state, appended } = erroredState({ messages, persistedStatus });
+			let reads = 0; // a new leaf on each read stands in for branch navigation during the call
+			Object.assign(state.runtime.session.sessionManager, { getLeafId: () => (nav ? `${++reads}` : null) });
+			state.summaryState = { summary: "Model request failed", taskState: "error", basedOnMessageCount: 2 };
+			await runSummarize(state, async () => undefined);
+			await runSummarize(state, async () => undefined);
+			expect(appended).toEqual(expected); // a restart seeds the latest entry on this branch
+		});
+
 		test("a working session is never error-settled, even with an errored trailing assistant message", async () => {
 			// While working (e.g. mid-retry) the model refresh keeps recapping;
 			// verdicts settle only when the session goes idle.

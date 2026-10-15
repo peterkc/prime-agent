@@ -21,7 +21,7 @@ async def send(
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
 ) -> dict[str, Any]:
-    """Send one direct role-addressed message or broadcast to ``"all"``."""
+    """Send by family role, local-space name or ID, or broadcast."""
     roles = ("parent", "sibling", "child")
     if broadcast_message is not None:
         if message != "all":
@@ -36,7 +36,7 @@ async def send(
             "message": broadcast_message,
         }
     else:
-        if receiver_role not in roles:
+        if receiver_role is not None and receiver_role not in roles:
             raise ValueError('receiver_role must be "parent", "sibling", or "child"')
         if not isinstance(message, str):
             raise TypeError(f"message must be str, got {type(message).__name__}")
@@ -44,12 +44,14 @@ async def send(
             if receiver_name is not None:
                 raise ValueError("receiver_name must be omitted for parent messages")
         elif not isinstance(receiver_name, str) or not receiver_name.strip():
+            if receiver_role is None:
+                raise ValueError(
+                    "receiver_name is required when receiver_role is omitted"
+                )
             raise ValueError("receiver_name is required for sibling and child messages")
-        payload = {
-            "message": message,
-            "receiver_role": receiver_role,
-            "receiver_name": receiver_name,
-        }
+        payload = {"message": message, "receiver_name": receiver_name}
+        if receiver_role is not None:
+            payload["receiver_role"] = receiver_role
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):

@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import {
 	chmodSync,
 	existsSync,
@@ -10,10 +11,11 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
@@ -25,9 +27,12 @@ import {
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { AgentRoster } from "../src/modes/daemon/agent-roster.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
-import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
+import type { DaemonCommand, DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
@@ -101,11 +106,14 @@ function spawnSupervisor(
 	cwd: string,
 	extraArgs: readonly string[] = [],
 	extraEnv: NodeJS.ProcessEnv = {},
+	entrypoint = cliPath,
 ): ChildProcess {
 	daemonSockets.add(socketPath);
 	const child = spawn(
 		process.execPath,
-		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs],
+		entrypoint === cliPath
+			? [tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs]
+			: ["--import", resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs"), entrypoint, socketPath, cwd],
 		{
 			cwd,
 			env: {
@@ -1066,6 +1074,23 @@ export default function(pi) {
 		await waitForSocketGone(socketPath);
 	});
 
+	it("exits and frees its socket when a client never ends its side", async () => {
+		const agentDir = join(tempDir(), "agent");
+		const socketPath = join(tmpdir(), `prime-supervisor-half-open-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		const supervisor = spawnSupervisor(agentDir, socketPath, tmpdir());
+		const client = await connectEventually(socketPath, supervisor);
+		const halfOpen = createConnection({ path: socketPath, allowHalfOpen: true });
+		try {
+			await once(halfOpen, "data");
+			expect((await client.request({ type: "shutdown" })).success).toBe(true);
+			await waitForExit(supervisor);
+			(await connectEventually(socketPath, spawnSupervisor(agentDir, socketPath, tmpdir()))).close();
+		} finally {
+			halfOpen.destroy();
+			client.close();
+		}
+	});
+
 	it("survives a worker process spawn error", { tags: ["process-stress"] }, async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
@@ -2006,5 +2031,697 @@ describe("issue #879 stable daemon process identity across timezone changes", ()
 				env: { LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
 			});
 		}
+	});
+});
+
+function meshSignal(child: ChildProcess, type: string, id?: string): Promise<void> {
+	return new Promise((resolveSignal, reject) => {
+		function finish(error?: Error): void {
+			child.stdout?.off("data", inspect);
+			child.stderr?.off("data", inspect);
+			child.off("exit", exited);
+			if (error) reject(error);
+			else resolveSignal();
+		}
+		function inspect(): void {
+			const diagnostics = childDiagnostics.get(child);
+			const matched = `${diagnostics?.stdout ?? ""}\n${diagnostics?.stderr ?? ""}`
+				.split("\n")
+				.filter(Boolean)
+				.some((line) => {
+					try {
+						const value = JSON.parse(line);
+						if (type === "log")
+							return (
+								value.component === "coding-agent.daemon-supervisor" &&
+								typeof value.msg === "string" &&
+								id !== undefined &&
+								value.msg.includes(id)
+							);
+						return value.type === type && (id === undefined || value.id === id);
+					} catch {
+						return false;
+					}
+				});
+			if (matched) finish();
+		}
+		function exited(): void {
+			finish(new Error(`Fixture exited: ${childDiagnostics.get(child)?.stderr}`));
+		}
+		child.stdout?.on("data", inspect);
+		child.stderr?.on("data", inspect);
+		child.once("exit", exited);
+		inspect();
+	});
+}
+
+async function meshFixture() {
+	const root = tempDir();
+	const agentDir = join(root, "agent");
+	mkdirSync(join(agentDir, "mesh"), { recursive: true });
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
+	writeFileSync(join(agentDir, "mesh", "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+	writeFileSync(
+		join(agentDir, "mesh", "signer.json"),
+		JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))),
+		{ mode: 0o600 },
+	);
+	const start = async (socket: string) => {
+		const child = spawnSupervisor(agentDir, socket, root, [], {}, resolve(__dirname, "fixtures/mesh-supervisor.ts"));
+		await meshSignal(child, "ready");
+		const client = new DaemonClient(socket);
+		await client.connect();
+		await client.waitForHello();
+		return { child, client };
+	};
+	const request = async (client: DaemonClient, command: DaemonCommand) => {
+		const response = await client.request(command);
+		if (!response.success) throw new Error(response.error);
+		return response.data;
+	};
+	const create = async (owner: Awaited<ReturnType<typeof start>>, name: string) => {
+		const summary = requireSummary(await request(owner.client, { type: "create", name }));
+		if (summary.workerPid) workerPids.add(summary.workerPid);
+		await meshSignal(owner.child, "endpoint", summary.sessionId);
+		return summary;
+	};
+	return { root, agentDir, start, request, create };
+}
+
+describe("mesh supervisor compatibility", () => {
+	it("AC-22 keeps one transcript entry when the supervisor dies after persistence before ack", async () => {
+		const f = await meshFixture();
+		const socket = join(f.root, "holder.sock");
+		let holder = await f.start(socket);
+		try {
+			const sender = await f.create(holder, "sender");
+			const target = await f.create(holder, "target");
+			writeFileSync(join(f.agentDir, "kill-before-ack"), "armed");
+			const stored = (await f.request(holder.client, {
+				type: "mesh_send",
+				fromActiveSessionId: sender.activeSessionId!,
+				targetSessionId: target.sessionId,
+				message: "stable across ack loss",
+			})) as { id: string; cotalId: string };
+			await meshSignal(holder.child, "before-ack", stored.cotalId);
+			await waitForExit(holder.child);
+			holder.client.close();
+			const copies = () =>
+				readFileSync(target.sessionFile!, "utf8")
+					.split("\n")
+					.filter((line) => line.includes(stored.id));
+			expect(copies()).toHaveLength(1);
+			expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+			rmSync(join(f.agentDir, "kill-before-ack"));
+			holder = await f.start(socket);
+			await meshSignal(holder.child, "ack", stored.cotalId);
+			await f.request(holder.client, { type: "wait_for_idle", activeSessionId: target.activeSessionId! });
+			expect(copies()).toHaveLength(1);
+			expect(
+				readFileSync(join(f.agentDir, "acks.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line).id),
+			).toEqual([stored.cotalId]);
+		} finally {
+			holder.client.close();
+		}
+	});
+
+	it.each(["saved", "live", "other", "live-saved", "directory-error"] as const)(
+		"AC-25 changes directory addressing after a %s rename and holder restart",
+		async (path) => {
+			const f = await meshFixture();
+			const socket = join(f.root, "holder.sock");
+			let holder = await f.start(socket);
+			const other = await f.start(join(f.root, "other.sock"));
+			try {
+				const target = await f.create(holder, "old-name");
+				const sender = await f.create(other, "sender");
+				if (path === "saved")
+					await f.request(holder.client, { type: "kill", activeSessionId: target.activeSessionId! });
+				const before = JSON.parse(
+					readFileSync(join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`), "utf8"),
+				);
+				if (path === "directory-error")
+					writeFileSync(
+						join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`),
+						"private-json-fragment",
+					);
+				await f.request(
+					path === "other" ? other.client : holder.client,
+					path === "live"
+						? { type: "set_session_name", activeSessionId: target.activeSessionId!, name: "new-name" }
+						: {
+								type: "rename_saved_session",
+								sessionPath: target.sessionFile!,
+								name: "new-name",
+								...(path === "live-saved" ? { activeSessionId: target.activeSessionId! } : {}),
+							},
+				);
+				if (path === "directory-error") {
+					expect((await readSessionInfo(target.sessionFile!))?.name).toBe("new-name");
+					await meshSignal(holder.child, "log", target.sessionId);
+					expect(childDiagnostics.get(holder.child)?.stderr).not.toContain("private-json-fragment");
+					return;
+				}
+				const entry = JSON.parse(
+					readFileSync(join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`), "utf8"),
+				);
+				expect(entry).toEqual({ ...before, name: "new-name" });
+				const send = (name: string) =>
+					other.client.request({
+						type: "mesh_send",
+						fromActiveSessionId: sender.activeSessionId!,
+						targetSessionId: name,
+						message: "renamed target",
+					});
+				for (const restart of [false, true]) {
+					if (restart) {
+						holder.child.kill("SIGKILL");
+						await waitForExit(holder.child);
+						holder.client.close();
+						holder = await f.start(socket);
+					}
+					expect(await send("old-name")).toMatchObject({
+						success: false,
+						error: expect.stringContaining("Unknown mesh target"),
+					});
+					const response = await send("new-name");
+					expect(response.success).toBe(true);
+					if (!response.success) throw new Error(response.error);
+					const stored = response.data as { id: string; cotalId: string };
+					await meshSignal(holder.child, "ack", stored.cotalId);
+					expect(
+						readFileSync(target.sessionFile!, "utf8")
+							.split("\n")
+							.filter((line) => line.includes(stored.id)),
+					).toHaveLength(1);
+				}
+			} finally {
+				holder.client.close();
+				other.client.close();
+			}
+		},
+	);
+
+	beforeEach(() => vi.stubEnv(ENV_AGENT_DIR, tempDir())); // Supervisor logs follow this variable.
+	afterEach(() => vi.unstubAllEnvs());
+	it("publishes a stored mesh receipt to any directory target, rejects self and hands off a parent message without awaiting enrollment", async () => {
+		const root = tempDir();
+		const socketPath = join(root, "mesh.sock");
+		const supervisor = new DaemonSupervisor(socketPath, { defaultSessionConfig: { agentDir: root, cwd: root } });
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			workers: Map<string, unknown>;
+			roster(): AgentRoster;
+			handoffMeshMessage(
+				record: { sessionFile: string; sessionId: string },
+				message: unknown,
+				count: number,
+				bind: (recipient: object) => void,
+			): Promise<void>;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		await supervisor.start();
+		const client = new DaemonClient(socketPath);
+		let releaseEnrollment!: () => void;
+		const enrolling = new Promise<void>((resolveEnroll) => {
+			releaseEnrollment = resolveEnroll;
+		});
+		const send = vi.fn(async () => ({ deliveryStatus: "stored", cotalId: "published", sequence: 42 }));
+		const enroll = vi.fn(() => enrolling);
+		internals.mesh = {
+			send,
+			resolveAddress: (selector: string) => {
+				if (selector === "missing" || selector === "ambiguous")
+					throw new Error(`Message was not stored: ${selector} target`);
+				return selector;
+			},
+			enroll,
+			start: async () => undefined,
+			stop: async () => undefined,
+			sessionIdForPrincipal: () => "parent",
+		};
+		const requestWorker = vi.fn(async (_command: unknown, _timeout: number) => ({ success: true }));
+		const recipient = { requestWorker };
+		const targetFile = join(root, "target.jsonl");
+		const parentFile = join(root, "parent.jsonl");
+		const sourceSummary = {
+			id: "source",
+			activeSessionId: "source",
+			sessionId: "parent",
+			sessionFile: parentFile,
+			cwd: root,
+			rlmDepth: 0,
+		};
+		const targetSummary = {
+			id: "target",
+			activeSessionId: "target",
+			sessionId: "child",
+			sessionFile: targetFile,
+			cwd: root,
+			rlmDepth: 1,
+			parentSessionId: "parent",
+		};
+		const worker = {
+			descriptor: {
+				workerId: "w",
+				rootActiveSessionId: "source",
+				lifecycle: "ready",
+				createCommand: { type: "create" },
+			},
+			client: recipient,
+			meshDeliveryCapable: true,
+			summaries: new Map([
+				["source", sourceSummary],
+				["target", targetSummary],
+			]),
+		};
+		internals.workers.set("w", worker);
+		for (const summary of [
+			sourceSummary,
+			targetSummary,
+			{
+				...targetSummary,
+				id: "stranger",
+				activeSessionId: "stranger",
+				sessionId: "stranger",
+				sessionFile: join(root, "stranger.jsonl"),
+				parentSessionId: "another",
+			},
+		])
+			internals.roster().write({ agentId: summary.id, summary } as never, "w");
+		const message = {
+			id: "incoming",
+			from: { id: "local.parent", name: "parent" },
+			parts: [{ kind: "text", text: " hello " }],
+		};
+		try {
+			await client.connect();
+			const command = {
+				type: "mesh_send",
+				fromActiveSessionId: "source",
+				targetSessionId: "child",
+				message: " hello ",
+			} as const;
+			expect(await client.request(command)).toMatchObject({
+				success: true,
+				data: { deliveryStatus: "stored", cotalId: "published", sequence: 42 },
+			});
+			expect(send).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ sessionId: "parent" }),
+				"child",
+				"hello",
+			);
+			expect(await client.request({ ...command, targetSessionId: "parent" })).toMatchObject({
+				success: false,
+				error: expect.stringContaining("cannot target the sending session"),
+			});
+			expect(await client.request({ ...command, targetSessionId: "stranger" })).toMatchObject({ success: true });
+			expect(send).toHaveBeenCalledTimes(2);
+			for (const targetSessionId of ["missing", "ambiguous"])
+				expect(await client.request({ ...command, targetSessionId })).toMatchObject({
+					success: false,
+					error: expect.stringContaining("Message was not stored:"),
+				});
+			expect(send).toHaveBeenCalledTimes(2);
+			const bind = vi.fn();
+			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			expect(bind).toHaveBeenCalledExactlyOnceWith(recipient);
+			expect(requestWorker).toHaveBeenCalledExactlyOnceWith(
+				{
+					type: "worker_deliver_message",
+					targetActiveSessionId: "target",
+					message: "hello",
+					sender: { sessionId: "parent", sessionName: "parent", clientId: "local.parent" },
+					fromRelationship: "parent",
+					cotal: { id: "incoming", deliveryCount: 2 },
+				},
+				86_400_000,
+			);
+			expect(enroll).toHaveBeenCalledExactlyOnceWith("parent", parentFile);
+			const catalog = (supervisor as unknown as { catalog: { list: () => Promise<unknown[]> } }).catalog;
+			const scan = vi.spyOn(catalog, "list").mockRejectedValue(new Error("catalog unavailable"));
+			await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+			expect(scan).not.toHaveBeenCalled();
+			const resolver = vi.spyOn(
+				internals.mesh as { sessionIdForPrincipal: () => string | undefined },
+				"sessionIdForPrincipal",
+			);
+			for (const lookup of ["unresolved", "error"]) {
+				if (lookup === "error")
+					resolver.mockImplementation(() => {
+						throw new Error("directory unavailable");
+					});
+				else resolver.mockReturnValue(undefined);
+				await internals.handoffMeshMessage({ sessionFile: targetFile, sessionId: "child" }, message, 2, bind);
+				expect(requestWorker.mock.calls.at(-1)?.[0]).toMatchObject({
+					fromRelationship: undefined,
+					sender: { sessionId: undefined, sessionName: "parent" },
+				});
+			}
+			expect(requestWorker).toHaveBeenCalledTimes(4);
+			resolver.mockRestore();
+			scan.mockRestore();
+			expect(enroll).toHaveBeenCalledTimes(4);
+		} finally {
+			releaseEnrollment();
+			client.close();
+			internals.workers.clear();
+			await internals.cleanupSupervisorResources();
+		}
+	});
+
+	it("F12 F14 enrolls queued-to-bound and adopted children, with direct reopen and one failure log on launch", async () => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const summary = { id: "a", activeSessionId: "a", sessionId: "saved", sessionFile: "saved.jsonl" };
+		const worker = {
+			descriptor: {
+				workerId: "w",
+				rootActiveSessionId: "a",
+				rootSessionId: "saved",
+				lifecycle: "ready",
+				sessionFile: "saved.jsonl",
+				createCommand: { type: "create" },
+			},
+			summaries: new Map([["a", summary]]),
+			client: {},
+		};
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			workers: Map<string, unknown>;
+			log(message: string): void;
+			roster(): unknown;
+			writeRosterEntry(entry: unknown, worker?: unknown, label?: undefined, queueMeshEnrollment?: boolean): unknown;
+			enrollMeshSession(sessionId: string, file?: string): Promise<void>;
+			seedRosterLedger(): Promise<void>;
+			applyWorkerRosterSnapshot(worker: unknown, delta: unknown): Promise<void>;
+			rlmSpawnLedger(): unknown;
+			hydratedSeedEntry(entry: unknown): Promise<unknown>;
+			reuseWorkerForCreate(worker: unknown, owner: undefined, path: string): Promise<unknown>;
+		};
+		const enroll = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("child refused"))
+			.mockRejectedValueOnce(new Error("provisioning refused"))
+			.mockResolvedValue(undefined);
+		const roster = new AgentRoster((path) => path);
+		internals.roster = () => roster;
+		internals.writeRosterEntry({ agentId: "a", summary }, worker);
+		const enqueueEnrollment = vi.fn((id: string, file?: string) => enroll(id, file));
+		internals.mesh = { enroll, enqueueEnrollment };
+		internals.log = vi.fn();
+		internals.workers.set("w", worker);
+		const child = {
+			agentId: "child",
+			summary: {
+				...summary,
+				id: "child",
+				sessionId: "child-saved",
+				sessionFile: "child.jsonl",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "a",
+			},
+		};
+		internals.writeRosterEntry(
+			{ ...child, queuedChild: true, summary: { ...child.summary, sessionFile: undefined } },
+			worker,
+		);
+		expect(enroll).not.toHaveBeenCalled();
+		for (let n = 0; n < 3; n++) {
+			internals.writeRosterEntry(child, worker);
+			internals.writeRosterEntry({ agentId: "a", summary }, worker);
+		}
+		expect(enroll).toHaveBeenCalledExactlyOnceWith("child-saved", "child.jsonl");
+		await expect(internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl")).resolves.toBe(worker);
+		expect(internals.log).toHaveBeenCalledWith(
+			expect.stringContaining("Mesh session child-saved: enrollment failed: Error: child refused"),
+		);
+		expect(internals.log).toHaveBeenCalledWith(expect.stringContaining("provisioning refused"));
+		internals.writeRosterEntry(child, worker);
+		expect(enroll).toHaveBeenCalledTimes(2);
+		await internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl");
+		expect(enroll).toHaveBeenCalledTimes(3);
+		expect(enroll).toHaveBeenLastCalledWith("saved", "saved.jsonl");
+		const movedChild = { ...child, summary: { ...child.summary, sessionFile: "child-next.jsonl" } };
+		internals.writeRosterEntry(movedChild, worker);
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("child-saved", "child-next.jsonl");
+		internals.writeRosterEntry({ ...movedChild, summary: { ...movedChild.summary, sessionId: "switched" } }, worker);
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("switched", "child-next.jsonl");
+		expect(enqueueEnrollment).toHaveBeenCalledTimes(3);
+		internals.rlmSpawnLedger = () => ({
+			liveEdges: async () => [{ parent: "saved.jsonl", child: "adopted.jsonl", depth: 1, childId: "adopted" }],
+		});
+		internals.hydratedSeedEntry = async (entry) => entry;
+		await internals.seedRosterLedger();
+		expect(enqueueEnrollment).toHaveBeenLastCalledWith("adopted", "adopted.jsonl");
+		internals.rlmSpawnLedger = () => ({
+			liveEdges: async () => [{ parent: "saved.jsonl", child: "snapshot.jsonl", depth: 1, childId: "snapshot" }],
+		});
+		enqueueEnrollment.mockClear();
+		await internals.applyWorkerRosterSnapshot(worker, {
+			type: "roster_delta",
+			snapshot: true,
+			entries: [{ agentId: "a", summary }],
+		});
+		expect(enqueueEnrollment).toHaveBeenCalledExactlyOnceWith("snapshot", "snapshot.jsonl");
+		const passive = roster.bySessionFile("snapshot.jsonl")!;
+		expect(passive.summary).toMatchObject({ sessionId: "snapshot", sessionFile: "snapshot.jsonl" });
+		internals.writeRosterEntry({ ...passive, summary: { ...passive.summary, isSessionActive: true } }, worker);
+		expect(enqueueEnrollment).toHaveBeenCalledTimes(1);
+		enqueueEnrollment.mockClear();
+		enroll.mockClear().mockRejectedValue(new Error("launch refused"));
+		vi.mocked(internals.log).mockClear();
+		roster.delete("a");
+		for (let attempt = 0; attempt < 2; attempt++) {
+			internals.writeRosterEntry({ agentId: "a", summary }, worker, undefined, false);
+			await internals.enrollMeshSession(summary.sessionId, summary.sessionFile);
+		}
+		expect(enqueueEnrollment).not.toHaveBeenCalled();
+		expect(enroll).toHaveBeenCalledTimes(2);
+		expect(internals.log).toHaveBeenCalledTimes(2);
+		for (const [message] of vi.mocked(internals.log).mock.calls) expect(message).toContain("launch refused");
+		let release!: () => void;
+		enroll.mockImplementationOnce(
+			() =>
+				new Promise<void>((resolveEnroll) => {
+					release = resolveEnroll;
+				}),
+		);
+		let reused = false;
+		const opening = internals.reuseWorkerForCreate(worker, undefined, "saved.jsonl").then(() => {
+			reused = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(reused).toBe(true);
+		} finally {
+			release();
+			await opening;
+		}
+	});
+
+	it.each(["shutdown", "reject-shutdown", "cleanup"])("orders mesh stop and teardown (%s)", async (mode) => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			shuttingDown: boolean;
+			workers: Map<string, unknown>;
+			clients: Set<unknown>;
+			descriptorDir: string;
+			stopWorker(): Promise<void>;
+			log(message: string): void;
+			cleanupSupervisorResources(): Promise<void>;
+			shutdown(
+				code: number,
+				stopWorkers: boolean,
+				relaunch: boolean,
+				force: boolean,
+				reason: "shutdown",
+			): Promise<never>;
+		};
+		const events: string[] = [];
+		let finish: () => void = () => undefined;
+		mkdirSync(internals.descriptorDir, { recursive: true });
+		internals.mesh = {
+			stop: async () => {
+				events.push("mesh-start");
+				await new Promise<void>((resolve) => {
+					finish = resolve;
+				});
+				events.push("mesh-finished");
+				if (mode !== "shutdown") throw new Error("mesh stop failed");
+			},
+		};
+		if (mode !== "shutdown") {
+			internals.log = () => {
+				throw new Error("log sink failed");
+			};
+			vi.spyOn(console, "error").mockImplementation(() => undefined);
+		}
+		if (mode !== "cleanup") internals.workers.set("worker", {});
+		internals.stopWorker = async () => {
+			events.push("worker-stop");
+		};
+		const destroy = vi.fn();
+		internals.clients.add({
+			id: "test",
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			socket: {
+				write: (data: string) => {
+					events.push(JSON.parse(data).type);
+				},
+				end: vi.fn(),
+				destroy,
+			},
+		});
+		const exited = new Error("isolated exit");
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			throw exited;
+		});
+		const stopped =
+			mode === "cleanup"
+				? internals.cleanupSupervisorResources()
+				: internals.shutdown(0, true, false, false, "shutdown");
+		try {
+			expect(internals.shuttingDown).toBe(true);
+			expect(events).toEqual(["mesh-start"]);
+			finish();
+			if (mode === "cleanup") {
+				await stopped;
+				expect(destroy).toHaveBeenCalledTimes(1);
+			} else {
+				await expect(stopped).rejects.toBe(exited);
+				expect(events).toEqual(["mesh-start", "mesh-finished", "daemon_closing", "worker-stop"]);
+			}
+		} finally {
+			finish();
+			await stopped.catch(() => undefined);
+			exit.mockRestore();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it.each([true, false, undefined])("guards native and mesh compatibility for origin=%s", async (agentOrigin) => {
+		const root = tempDir();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const confirm = vi.fn();
+		const dropped = vi.fn();
+		const publish = vi.fn();
+		const recipient = { requestWorker: vi.fn() };
+		const worker = { client: recipient, meshDeliveryCapable: false, descriptor: { workerId: "worker" } };
+		const internals = supervisor as unknown as {
+			mesh: unknown;
+			shuttingDown: boolean;
+			clearRosterStaleness(): void;
+			createOrReuseWorker(): Promise<unknown>;
+			handoffMeshMessage(
+				record: { sessionFile: string; sessionId: string },
+				message: unknown,
+				count: number,
+				bind: (recipient: object) => void,
+			): Promise<void>;
+			findWorkerForClient(): Promise<unknown>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			handleWorkerFrame(worker: unknown, frame: unknown, source: unknown): void;
+		};
+		internals.mesh = { confirmPersisted: confirm, confirmDropped: dropped, send: publish };
+		internals.clearRosterStaleness = () => undefined;
+		internals.findWorkerForClient = async () => ({
+			worker,
+			summary: { id: "a", sessionId: "a", sessionFile: "a.jsonl" },
+		});
+		await expect(
+			internals.handleCommand({} as DaemonSocketClient, {
+				type: "send_message",
+				targetActiveSessionId: "b",
+				message: "hello",
+				agentOrigin,
+			}),
+		).rejects.toThrow(
+			agentOrigin === true
+				? "restart that session"
+				: 'agent messages from daemon clients are not supported while agentMessageTransport is "cotal"',
+		);
+		await expect(
+			internals.handleCommand({} as DaemonSocketClient, {
+				type: "mesh_send",
+				fromActiveSessionId: "a",
+				targetSessionId: "b",
+				message: "hello",
+			}),
+		).rejects.toThrow("restart that session");
+		expect(publish).not.toHaveBeenCalled();
+		internals.createOrReuseWorker = async () => worker;
+		const bind = vi.fn();
+		await expect(
+			internals.handoffMeshMessage(
+				{ sessionFile: "a.jsonl", sessionId: "a" },
+				{ id: "legacy", from: { id: "local.sender", name: "sender" }, parts: [{ kind: "text", text: "hello" }] },
+				1,
+				bind,
+			),
+		).rejects.toThrow("Restart that session");
+		expect(bind).not.toHaveBeenCalled();
+		expect(recipient.requestWorker).not.toHaveBeenCalled();
+		const frame = {
+			header: { kind: "outbound", outboundType: "agent_message_persisted" },
+			payload: Buffer.from(JSON.stringify({ type: "agent_message_persisted", cotalId: "message" })),
+		};
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).not.toHaveBeenCalled();
+		worker.meshDeliveryCapable = true;
+		internals.handleWorkerFrame(worker, frame, {});
+		expect(confirm).not.toHaveBeenCalled();
+		internals.shuttingDown = true;
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).not.toHaveBeenCalled();
+		internals.shuttingDown = false;
+		internals.handleWorkerFrame(worker, frame, recipient);
+		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient);
+		const drop = {
+			header: { kind: "outbound", outboundType: "agent_message_dropped" },
+			payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "cleared" })),
+		};
+		worker.meshDeliveryCapable = false;
+		internals.handleWorkerFrame(worker, drop, recipient);
+		worker.meshDeliveryCapable = true;
+		internals.handleWorkerFrame(worker, drop, {});
+		internals.shuttingDown = true;
+		internals.handleWorkerFrame(worker, drop, recipient);
+		internals.shuttingDown = false;
+		internals.handleWorkerFrame(
+			worker,
+			{
+				...drop,
+				payload: Buffer.from(
+					JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "invalid" }),
+				),
+			},
+			recipient,
+		);
+		expect(dropped).not.toHaveBeenCalled();
+		for (const reason of ["cleared", "closed", "other"]) {
+			internals.handleWorkerFrame(
+				worker,
+				{
+					...drop,
+					payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason })),
+				},
+				recipient,
+			);
+			expect(dropped).toHaveBeenLastCalledWith("message", recipient, reason);
+		}
+		expect(dropped).toHaveBeenCalledTimes(3);
 	});
 });

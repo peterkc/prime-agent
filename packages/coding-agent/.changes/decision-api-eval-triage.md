@@ -1,0 +1,1 @@
+- Changed the decision-api skill to allow one-off classification of eval-run facts from synthetic test fixtures and to require passing text to `decide()` whole.

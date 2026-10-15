@@ -1,0 +1,1 @@
+- Added `prime-agent mesh` to manage the local Cotal broker service and report stored message counts.

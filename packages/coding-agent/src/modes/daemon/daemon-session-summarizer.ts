@@ -364,7 +364,15 @@ export class DaemonSessionSummarizer {
 		// errored at this same message count. Only the error branch below repairs
 		// it, so exempt terminal errors from the unchanged-content fast return.
 		const owesErrorVerdict = turnError !== undefined && previous?.taskState !== "error";
-		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict) {
+		// A later turn ended normally: the old error recap no longer describes the
+		// session, so drop it even when the classifier call below fails. Only while
+		// the active branch still holds that error: branch navigation keeps the cache.
+		const supersedesError =
+			!isWorking &&
+			turnError === undefined &&
+			previous?.taskState === "error" &&
+			session.sessionManager.getLatestAgentStatus()?.taskState === "error";
+		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict && !supersedesError) {
 			return;
 		}
 		if (turnError !== undefined) {
@@ -379,7 +387,8 @@ export class DaemonSessionSummarizer {
 		}
 		// The leaf entry id is the branch-tip identity (appends, edits, and branch
 		// navigation all move it; counts and timestamps collide across siblings).
-		const contentKey = `${session.sessionManager.getLeafId() ?? "root"}:${messageCount}`;
+		const leafId = session.sessionManager.getLeafId();
+		const contentKey = `${leafId ?? "root"}:${messageCount}`;
 		const failed = this.failedIdleGenerations.get(id);
 		if (
 			!isWorking &&
@@ -422,19 +431,20 @@ export class DaemonSessionSummarizer {
 			// carries a current verdict.
 			const result =
 				generated ??
-				(!isWorking && (owesIdleVerdict || owesSummary)
-					? { summary: previous?.summary ?? "", taskState: "needs_input" as const }
+				(!isWorking && (owesIdleVerdict || owesSummary || supersedesError)
+					? { summary: supersedesError ? "" : (previous?.summary ?? ""), taskState: "needs_input" as const }
 					: undefined);
 			if (!result) {
 				return;
 			}
-			// Discard if the session closed, was swapped, or moved to a new turn
-			// during the async call — never write a verdict for stale state.
+			// Discard if the session closed, was swapped, moved to a new turn or
+			// switched branch during the async call — never write a verdict for stale state.
 			if (
 				controller.signal.aborted ||
 				state.runtime.session !== session ||
 				session.isSessionActive !== isWorking ||
-				session.messages.length !== messageCount
+				session.messages.length !== messageCount ||
+				session.sessionManager.getLeafId() !== leafId
 			) {
 				return;
 			}
@@ -443,12 +453,13 @@ export class DaemonSessionSummarizer {
 			const taskState =
 				result.taskState ?? (previous?.basedOnMessageCount === messageCount ? previous?.taskState : undefined);
 			// Only a real classification persists; the needs_input fallback above
-			// must not grow the journal.
+			// must not grow the journal, except once to replace a superseded error
+			// verdict so a restart does not seed it back.
 			this.commitStatus(
 				state,
 				session,
 				{ summary: result.summary, taskState, basedOnMessageCount: messageCount },
-				{ isWorking, previous, persist: generated !== undefined },
+				{ isWorking, previous, persist: generated !== undefined || supersedesError },
 			);
 		} finally {
 			this.inFlight.delete(id);
@@ -489,7 +500,8 @@ export class DaemonSessionSummarizer {
 	 * Publish an in-memory status and persist a settled idle verdict that differs
 	 * from the latest persisted entry: sweeps must not grow the journal. `persist`
 	 * is true only for real verdicts — model classifications and
-	 * transcript-derived error verdicts — never for the needs_input fallback.
+	 * transcript-derived error verdicts — and for the needs_input fallback only
+	 * when it replaces a superseded error verdict.
 	 */
 	private commitStatus(
 		state: ActiveSessionState,
