@@ -2168,7 +2168,7 @@ describe("mesh supervisor compatibility", () => {
 		"holder",
 		"no-offer",
 		"old-worker",
-	] as const)("pi-0spx rebinds a real worker without losing or repeating a delivery (%s)", async (mode) => {
+	] as const)("rebinds a real worker without losing or repeating a delivery (%s)", async (mode) => {
 		const f = await meshFixture();
 		const postcopy = mode === "postcopy" || mode === "postcopy-open";
 		mkdirSync(join(f.agentDir, "extensions"));
@@ -2501,7 +2501,7 @@ describe("mesh supervisor compatibility", () => {
 			holder.client.close();
 		}
 	});
-	it("pi-0spx switches a real worker to its current enrolled file without losing context", async () => {
+	it("switches a real worker to its current enrolled file without losing context", async () => {
 		const f = await meshFixture();
 		const holder = await f.start(join(f.root, "holder.sock"));
 		const cleanup = new AbortController();
