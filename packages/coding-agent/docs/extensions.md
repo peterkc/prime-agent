@@ -147,7 +147,7 @@ Prime Agent ships two built-in extensions, enabled by default:
   `<session directory>/observation-pack/<session ID>/`; decisions use
   `observation-pack-cycle` entries and failures use `observation-pack-error`.
 - **Herdr agent state** reports lifecycle state inside a Herdr pane. It defers
-  to Herdr's file-based integration when that extension is loaded.
+  to Herdr's file-based integration when that extension file is enabled.
 
 Set `enableBuiltinExtensions: false` to disable both, or disable one with
 `bundledExtensions.observationPack` or `bundledExtensions.herdrAgentState`.

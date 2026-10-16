@@ -76,21 +76,21 @@ describe("SettingsManager", () => {
 			["false", 0, null, {}].map((value) => ({ key, value })),
 		),
 	)("TM-53: invalid $key=$value warns once and defaults on", ({ key, value }) => {
-		const defaults = SettingsManager.inMemory();
-		expect(defaults.getEnableBuiltinExtensions()).toBe(true);
-		expect(defaults.getBundledExtensions()).toEqual({ observationPack: true, herdrAgentState: true });
-		const bundled = {
-			observationPack: false,
-			herdrAgentState: false,
-			...(key === "enableBuiltinExtensions" ? {} : { [key]: value }),
-		};
-		writeSettings(globalPath, {
-			enableBuiltinExtensions: key === "enableBuiltinExtensions" ? value : false,
-			bundledExtensions: bundled,
-		});
-		const manager = SettingsManager.create(projectDir, agentDir);
 		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
+			const defaults = SettingsManager.inMemory();
+			expect(defaults.getEnableBuiltinExtensions()).toBe(true);
+			expect(defaults.getBundledExtensions()).toEqual({ observationPack: true, herdrAgentState: true });
+			const bundled = {
+				observationPack: false,
+				herdrAgentState: false,
+				...(key === "enableBuiltinExtensions" ? {} : { [key]: value }),
+			};
+			writeSettings(globalPath, {
+				enableBuiltinExtensions: key === "enableBuiltinExtensions" ? value : false,
+				bundledExtensions: bundled,
+			});
+			const manager = SettingsManager.create(projectDir, agentDir);
 			for (let read = 0; read < 2; read++)
 				expect([manager.getEnableBuiltinExtensions(), ...Object.values(manager.getBundledExtensions())]).toEqual(
 					["enableBuiltinExtensions", "observationPack", "herdrAgentState"].map((field) => field === key),

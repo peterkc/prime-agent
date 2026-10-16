@@ -136,6 +136,7 @@ it.each(["joined UTF-8", "custom text tool", "TM-55 two fork copies"])(
 			const note = (first[0] as ToolResultMessage).content[0];
 			if (note.type !== "text") throw new Error("Expected a text placeholder");
 			expect(note.text).toContain("[large tool result shrunk when a new context cycle began]");
+			expect(note.text).toContain(`\nid: ${basename(path, ".txt")}\ntool: ${message.toolName}\n`);
 			for (const part of [head, tail, `original_bytes: ${Buffer.byteLength(text)}`, "original_lines: 3", path])
 				expect(note.text).toContain(part);
 			expect(first.slice(1)).toEqual(input.slice(1));
