@@ -8,6 +8,7 @@ Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.prime
 - [Full Example](#full-example)
 - [Supported APIs](#supported-apis)
 - [Provider Configuration](#provider-configuration)
+- [Model Discovery](#model-discovery)
 - [Model Configuration](#model-configuration)
 - [Overriding Built-in Providers](#overriding-built-in-providers)
 - [Per-model Overrides](#per-model-overrides)
@@ -139,7 +140,8 @@ Set `api` at provider level (default for all models) or model level (override pe
 | `headers` | Custom headers (see value resolution below) |
 | `authHeader` | Set `true` to add `Authorization: Bearer <apiKey>` automatically |
 | `models` | Array of model configurations |
-| `modelOverrides` | Per-model overrides for built-in models on this provider |
+| `modelOverrides` | Per-model overrides for built-in and discovered models on this provider |
+| `discover` | Fetch models from the provider; `{}` enables discovery (see below) |
 
 ### Value Resolution
 
@@ -183,6 +185,40 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
   }
 }
 ```
+
+## Model Discovery
+
+Set `discover: {}` on a provider to load `GET <baseUrl>/models` when available models refresh, including the model picker, CLI lists and RLM lookup. Both `baseUrl` and `api` are required.
+
+```json
+{
+  "providers": {
+    "proxy": {
+      "baseUrl": "http://localhost:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "PROXY_API_KEY",
+      "discover": { "defaults": { "maxTokens": 128000 } },
+      "models": [{ "id": "offline-fallback" }]
+    }
+  }
+}
+```
+
+The response must be an object with a `data` array. Each row needs a non-empty string `id`; invalid rows are skipped, and the first duplicate wins. Optional `metadata` fields map as follows:
+
+- `display_name` sets the model name.
+- Positive integer `context_window` and `max_output_tokens` set token limits. Null or absent values keep defaults.
+- `input_modalities` keeps `text` and `image`. If neither remains, input is `text` only.
+- `supported_reasoning_levels` contains objects with string `effort` values. Any entry enables reasoning. Listed `low`, `medium`, `high`, `xhigh` and `max` levels map to themselves; other levels, including `off` and `minimal`, are unsupported.
+- Numeric `priority` sorts discovered rows lowest first. Unnumbered rows follow. Equal priorities keep response order.
+
+Wrong-type metadata fields are ignored and counted in one warning. An invalid envelope or no valid rows is a discovery failure.
+
+Precedence, lowest first: core defaults, `discover.defaults`, response fields, `modelOverrides[id]`, explicit `models` rows. Defaults can set `contextWindow`, `maxTokens`, `input`, `reasoning` and `cost`. Explicit rows always remain as the offline fallback.
+
+Discovery keeps configured headers, including an explicit `Authorization`. It adds `Authorization: Bearer <key>` only when a key resolves and no Authorization header exists. With no key, it generates none. Keys use the same stored-auth-first resolution as inference, then `apiKey`. Command keys run on refresh, and an unset environment name is used as a literal.
+
+Requests have a five-second limit. A successful list is reused for 300 seconds for the same settings and resolved key. A failure logs one warning with the provider and failure kind, without credentials or response content, and keeps the last successful list for those settings and key. Settings or key changes drop the old list; late replies cannot restore it. Providers without `discover` send no discovery request.
 
 ## Model Configuration
 
@@ -284,7 +320,7 @@ Merge semantics:
 
 ## Per-model Overrides
 
-Use `modelOverrides` to customize specific built-in models without replacing the provider's full model list.
+Use `modelOverrides` to customize specific built-in or discovered models without replacing the provider's full model list.
 
 ```json
 {
@@ -308,7 +344,7 @@ Use `modelOverrides` to customize specific built-in models without replacing the
 `modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
 
 Behavior notes:
-- `modelOverrides` are applied to built-in provider models.
+- `modelOverrides` are applied to built-in and discovered provider models.
 - Unknown model IDs are ignored.
 - You can combine provider-level `baseUrl`/`headers` with `modelOverrides`.
 - If `models` is also defined for a provider, custom models are merged after built-in overrides. A custom model with the same `id` replaces the overridden built-in model entry.

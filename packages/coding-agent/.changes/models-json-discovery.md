@@ -1,0 +1,1 @@
+- Added optional models.json model discovery with metadata defaults, per-model overrides and credential-scoped caching.

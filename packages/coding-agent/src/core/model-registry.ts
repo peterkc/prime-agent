@@ -28,6 +28,7 @@ import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
+import { Value } from "typebox/value";
 import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
@@ -196,6 +197,18 @@ const ModelOverrideSchema = Type.Object({
 
 type ModelOverride = Static<typeof ModelOverrideSchema>;
 
+const DiscoverSchema = Type.Object({
+	defaults: Type.Optional(
+		Type.Object({
+			contextWindow: Type.Optional(Type.Integer({ minimum: 1 })),
+			maxTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+			input: ModelDefinitionSchema.properties.input,
+			reasoning: ModelDefinitionSchema.properties.reasoning,
+			cost: ModelDefinitionSchema.properties.cost,
+		}),
+	),
+});
+
 const ProviderConfigSchema = Type.Object({
 	name: Type.Optional(Type.String({ minLength: 1 })),
 	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
@@ -206,6 +219,7 @@ const ProviderConfigSchema = Type.Object({
 	authHeader: Type.Optional(Type.Boolean()),
 	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
 	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
+	discover: Type.Optional(DiscoverSchema),
 });
 
 const ModelsConfigSchema = Type.Object({
@@ -361,6 +375,81 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	return result;
 }
 
+const DiscoveryMetadataSchemas = {
+	display_name: Type.String(),
+	context_window: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+	max_output_tokens: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+	input_modalities: Type.Array(Type.String()),
+	supported_reasoning_levels: Type.Array(Type.Object({ effort: Type.String() })),
+	priority: Type.Number(),
+};
+
+function parseDiscoveredModels(
+	value: unknown,
+): { ok: true; models: Static<typeof ModelDefinitionSchema>[]; invalidFields: number } | { ok: false; kind: string } {
+	if (!value || typeof value !== "object" || !("data" in value) || !Array.isArray(value.data)) {
+		return { ok: false, kind: "invalid envelope" };
+	}
+	const rows: { model: Static<typeof ModelDefinitionSchema>; priority: number }[] = [];
+	const seen = new Set<string>();
+	let invalidFields = 0;
+	for (const row of value.data) {
+		if (!row || typeof row !== "object" || typeof row.id !== "string" || !row.id || seen.has(row.id)) continue;
+		seen.add(row.id);
+		const model: Static<typeof ModelDefinitionSchema> = { id: row.id };
+		let priority = Infinity;
+		if (
+			row.metadata !== undefined &&
+			(!row.metadata || typeof row.metadata !== "object" || Array.isArray(row.metadata))
+		) {
+			invalidFields++;
+		} else {
+			const metadata: Record<string, unknown> = row.metadata ?? {};
+			for (const [field, schema] of Object.entries(DiscoveryMetadataSchemas)) {
+				const fieldValue = metadata[field];
+				if (fieldValue === undefined) continue;
+				if (!Value.Check(schema, fieldValue)) {
+					invalidFields++;
+					continue;
+				}
+				switch (field) {
+					case "display_name":
+						model.name = fieldValue as string;
+						break;
+					case "context_window":
+						if (fieldValue !== null) model.contextWindow = fieldValue as number;
+						break;
+					case "max_output_tokens":
+						if (fieldValue !== null) model.maxTokens = fieldValue as number;
+						break;
+					case "input_modalities": {
+						const input = (fieldValue as string[]).filter(
+							(modality): modality is "text" | "image" => modality === "text" || modality === "image",
+						);
+						model.input = input.length > 0 ? input : ["text"];
+						break;
+					}
+					case "supported_reasoning_levels": {
+						const efforts = (fieldValue as { effort: string }[]).map((entry) => entry.effort);
+						model.reasoning = efforts.length > 0;
+						model.thinkingLevelMap = { off: null, minimal: null };
+						for (const effort of ["low", "medium", "high", "xhigh", "max"] as const)
+							model.thinkingLevelMap[effort] = efforts.includes(effort) ? effort : null;
+						break;
+					}
+					case "priority":
+						priority = fieldValue as number;
+						break;
+				}
+			}
+		}
+		rows.push({ model, priority });
+	}
+	return rows.length > 0
+		? { ok: true, models: rows.sort((a, b) => a.priority - b.priority).map((row) => row.model), invalidFields }
+		: { ok: false, kind: "no valid rows" };
+}
+
 function readOpenAICodexAccountId(token: string): string | undefined {
 	try {
 		const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as {
@@ -450,6 +539,11 @@ function isOfflineModeEnabled(): boolean {
 export class ModelRegistry {
 	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
+	private discoveryConfigs = new Map<string, Static<typeof ProviderConfigSchema>>();
+	private discoveryCache = new Map<
+		string,
+		{ settings: string; fingerprint: string; models: Static<typeof ModelDefinitionSchema>[]; refreshedAt: number }
+	>();
 	private xaiModelSources = new WeakMap<Model<Api>, Model<Api>>();
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
 	private staleProviderRequestAuthSources: Map<string, AuthSourceToken[]> = new Map();
@@ -578,6 +672,7 @@ export class ModelRegistry {
 	}
 
 	private loadModels(): void {
+		this.discoveryConfigs.clear();
 		const {
 			models: customModels,
 			overrides,
@@ -589,6 +684,10 @@ export class ModelRegistry {
 			this.loadError = error;
 		}
 
+		for (const [provider, cached] of this.discoveryCache) {
+			if (cached.settings !== JSON.stringify(this.discoveryConfigs.get(provider)))
+				this.discoveryCache.delete(provider);
+		}
 		this.explicitPrivatePrimeInferenceModelIds = new Set(
 			customModels.filter(isPrivatePrimeInferenceModel).map((model) => model.id),
 		);
@@ -667,6 +766,27 @@ export class ModelRegistry {
 			const content = readFileSync(modelsJsonPath, "utf-8");
 			const parsed = JSON.parse(stripJsonComments(content)) as unknown;
 
+			if (
+				parsed &&
+				typeof parsed === "object" &&
+				"providers" in parsed &&
+				parsed.providers &&
+				typeof parsed.providers === "object"
+			) {
+				for (const [providerName, provider] of Object.entries(parsed.providers)) {
+					if (
+						provider &&
+						typeof provider === "object" &&
+						"discover" in provider &&
+						!Value.Check(DiscoverSchema, provider.discover)
+					) {
+						return emptyCustomModelsResult(
+							`Invalid models.json schema:\n  - providers.${providerName}.discover: invalid discover configuration\n\nFile: ${modelsJsonPath}`,
+						);
+					}
+				}
+			}
+
 			if (!validateModelsConfig) {
 				// Validator not loaded yet (first refresh during startup): proceed on
 				// validateConfig() below and report schema errors asynchronously once
@@ -705,6 +825,7 @@ export class ModelRegistry {
 					});
 				}
 
+				if (providerConfig.discover !== undefined) this.discoveryConfigs.set(providerName, providerConfig);
 				this.storeProviderRequestConfig(providerName, providerConfig);
 
 				if (providerConfig.modelOverrides) {
@@ -730,6 +851,15 @@ export class ModelRegistry {
 		const builtInProviders = new Set<string>(getProviders());
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers)) {
+			if (
+				providerConfig.discover !== undefined &&
+				(typeof providerConfig.baseUrl !== "string" ||
+					!providerConfig.baseUrl ||
+					typeof providerConfig.api !== "string" ||
+					!providerConfig.api)
+			) {
+				throw new Error(`Provider ${providerName}: "baseUrl" and "api" are required when using "discover".`);
+			}
 			const isBuiltIn = builtInProviders.has(providerName);
 			const hasProviderApi = !!providerConfig.api;
 			const models = providerConfig.models ?? [];
@@ -786,12 +916,19 @@ export class ModelRegistry {
 		};
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers)) {
-			const modelDefs = providerConfig.models ?? [];
+			const cached = this.discoveryCache.get(providerName);
+			const discovered =
+				providerConfig.discover && cached?.settings === JSON.stringify(providerConfig)
+					? cached.models
+							.filter((model) => !providerConfig.models?.some((explicit) => explicit.id === model.id))
+							.map((model) => ({ ...providerConfig.discover?.defaults, ...model }))
+					: [];
+			const modelDefs = [...discovered, ...(providerConfig.models ?? [])];
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
 
 			const builtInDefaults = getBuiltInDefaults(providerName);
 
-			for (const modelDef of modelDefs) {
+			for (const [index, modelDef] of modelDefs.entries()) {
 				const api = modelDef.api ?? providerConfig.api ?? builtInDefaults?.api;
 				if (!api) continue;
 
@@ -799,10 +936,15 @@ export class ModelRegistry {
 				if (!baseUrl) continue;
 
 				const compat = mergeCompat(providerConfig.compat, modelDef.compat);
-				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
+				this.storeModelHeaders(
+					providerName,
+					modelDef.id,
+					modelDef.headers ??
+						(index < discovered.length ? providerConfig.modelOverrides?.[modelDef.id]?.headers : undefined),
+				);
 
 				const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-				models.push({
+				const model = {
 					id: modelDef.id,
 					name: modelDef.name ?? modelDef.id,
 					api: api as Api,
@@ -816,7 +958,9 @@ export class ModelRegistry {
 					maxTokens: modelDef.maxTokens ?? 16384,
 					headers: undefined,
 					compat,
-				} as Model<Api>);
+				} as Model<Api>;
+				const override = index < discovered.length ? providerConfig.modelOverrides?.[model.id] : undefined;
+				models.push(override ? applyModelOverride(model, override) : model);
 			}
 		}
 
@@ -876,6 +1020,7 @@ export class ModelRegistry {
 			const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
 			const previousPrivateModels = this.authorizedPrivatePrimeInferenceModels;
 			this.refresh();
+			await this.refreshDiscoveredModels();
 			const cachePath = this.primeInferenceCatalogCachePath();
 			if (cachePath) {
 				const primeInferenceApiKey = await this.authStorage.getApiKey(PRIME_INFERENCE_PROVIDER_ID);
@@ -913,6 +1058,75 @@ export class ModelRegistry {
 			void this.pendingProviderCatalogRefresh;
 			return this.getAvailable();
 		});
+	}
+
+	private async discoveryFingerprint(provider: string, config: Static<typeof ProviderConfigSchema>) {
+		const { apiKey } = await this.getProviderRequestAuth(provider);
+		const headers = {
+			...this.authStorage.getProviderHeaders(provider),
+			...resolveHeadersOrThrow(config.headers, `provider "${provider}"`),
+		};
+		if (apiKey && !Object.keys(headers).some((name) => name.toLowerCase() === "authorization"))
+			headers.Authorization = `Bearer ${apiKey}`;
+		const settings = JSON.stringify(config);
+		const fingerprint = createHash("sha256")
+			.update(JSON.stringify([settings, apiKey, headers]))
+			.digest("hex");
+		return { settings, fingerprint, headers };
+	}
+
+	private async refreshDiscoveredModels(): Promise<void> {
+		for (const [provider, config] of [...this.discoveryConfigs]) {
+			let failure = "auth resolution";
+			try {
+				const request = await this.discoveryFingerprint(provider, config);
+				const cached = this.discoveryCache.get(provider);
+				if (cached?.fingerprint === request.fingerprint && Date.now() - cached.refreshedAt < 300_000) continue;
+				if (cached?.fingerprint !== request.fingerprint) {
+					this.discoveryCache.delete(provider);
+					this.reloadModelsAfterCatalogChange();
+				}
+				let parsed: ReturnType<typeof parseDiscoveredModels>;
+				try {
+					failure = "network or timeout";
+					const response = await fetch(`${config.baseUrl!.replace(/\/+$/, "")}/models`, {
+						headers: request.headers,
+						signal: AbortSignal.timeout(5_000),
+					});
+					failure = `HTTP ${response.status}`;
+					if (!response.ok) throw new Error(failure);
+					failure = "invalid JSON";
+					parsed = parseDiscoveredModels(await response.json());
+				} catch {
+					parsed = { ok: false, kind: failure };
+				}
+				// Neither an auth rotation nor a config reload may publish an old response.
+				failure = "auth resolution";
+				const current = this.discoveryConfigs.get(provider);
+				if (!current || (await this.discoveryFingerprint(provider, current)).fingerprint !== request.fingerprint) {
+					if (this.discoveryCache.get(provider)?.fingerprint === request.fingerprint)
+						this.discoveryCache.delete(provider);
+					this.reloadModelsAfterCatalogChange();
+					continue;
+				}
+				if (!parsed.ok) {
+					failure = parsed.kind;
+					throw new Error(failure);
+				}
+				this.discoveryCache.set(provider, { ...request, models: parsed.models, refreshedAt: Date.now() });
+				this.reloadModelsAfterCatalogChange();
+				if (parsed.invalidFields)
+					console.warn(
+						`Provider ${provider}: model discovery ignored ${parsed.invalidFields} invalid metadata fields`,
+					);
+			} catch {
+				if (failure === "auth resolution") {
+					this.discoveryCache.delete(provider);
+					this.reloadModelsAfterCatalogChange();
+				}
+				console.warn(`Provider ${provider}: model discovery failed (${failure})`);
+			}
+		}
 	}
 
 	private scheduleCatalogRefresh(): Promise<void> {
@@ -1571,33 +1785,33 @@ export class ModelRegistry {
 		this.modelRequestHeaders.set(key, headers);
 	}
 
+	private async getProviderRequestAuth(provider: string) {
+		const providerConfig = this.providerRequestConfigs.get(provider);
+		const authStorageAuth = await this.authStorage.getApiKeyWithSourceToken(provider, {
+			includeFallback: false,
+		});
+		let apiKey = authStorageAuth.apiKey;
+		let authSourceToken = authStorageAuth.sourceToken;
+		if (apiKey === undefined && providerConfig?.apiKey) {
+			const resolvedApiKey = resolveConfigValueOrThrow(providerConfig.apiKey, `API key for provider "${provider}"`);
+			const providerRequestAuthSource = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
+			if (providerRequestAuthSource && !this.isProviderRequestAuthStale(provider, providerRequestAuthSource)) {
+				this.clearStaleProviderRequestAuthSource(provider, providerRequestAuthSource);
+				apiKey = resolvedApiKey;
+				authSourceToken = this.getProviderRequestAuthSourceToken(provider, providerRequestAuthSource);
+			}
+		}
+		this.setLastProviderAuthSourceToken(provider, apiKey === undefined ? undefined : authSourceToken);
+		return { apiKey, authSourceToken, credentialType: authStorageAuth.credentialType };
+	}
+
 	/**
 	 * Get API key and request headers for a model.
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>, requestHeaders?: Record<string, string>): Promise<ResolvedRequestAuth> {
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
-			const authStorageAuth = await this.authStorage.getApiKeyWithSourceToken(model.provider, {
-				includeFallback: false,
-			});
-			let apiKey = authStorageAuth.apiKey;
-			let authSourceToken = authStorageAuth.sourceToken;
-			if (apiKey === undefined && providerConfig?.apiKey) {
-				const resolvedApiKey = resolveConfigValueOrThrow(
-					providerConfig.apiKey,
-					`API key for provider "${model.provider}"`,
-				);
-				const providerRequestAuthSource = this.getProviderRequestAuthSource(model.provider, { resolvedApiKey });
-				if (
-					providerRequestAuthSource &&
-					!this.isProviderRequestAuthStale(model.provider, providerRequestAuthSource)
-				) {
-					this.clearStaleProviderRequestAuthSource(model.provider, providerRequestAuthSource);
-					apiKey = resolvedApiKey;
-					authSourceToken = this.getProviderRequestAuthSourceToken(model.provider, providerRequestAuthSource);
-				}
-			}
-			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
+			const { apiKey, authSourceToken, credentialType } = await this.getProviderRequestAuth(model.provider);
 
 			let requestModel: Model<Api> | undefined;
 			if (model.provider === "xai") {
@@ -1608,7 +1822,7 @@ export class ModelRegistry {
 					};
 				}
 				const configuredModel = this.xaiModelSources.get(model) ?? model;
-				const subscription = authStorageAuth.credentialType === "oauth" && authSourceToken?.source === "stored";
+				const subscription = credentialType === "oauth" && authSourceToken?.source === "stored";
 				requestModel = subscription ? this.getXaiSubscriptionModel(configuredModel) : configuredModel;
 				if (!requestModel) {
 					return {
@@ -1638,11 +1852,7 @@ export class ModelRegistry {
 			}
 
 			if (requestHeaders) headers = { ...headers, ...requestHeaders };
-			if (
-				model.provider === "xai" &&
-				authStorageAuth.credentialType === "oauth" &&
-				authSourceToken?.source === "stored"
-			) {
+			if (model.provider === "xai" && credentialType === "oauth" && authSourceToken?.source === "stored") {
 				for (const [name, value] of Object.entries(headers ?? {})) {
 					if (name.toLowerCase() === "authorization" && value !== `Bearer ${apiKey}`) {
 						return {

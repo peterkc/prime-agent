@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getApiProvider, getModels } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { getBundledModels } from "../src/core/bundled-model-catalog.js";
 import { ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.js";
@@ -72,6 +74,277 @@ describe("ModelRegistry", () => {
 	function writeRawModelsJson(providers: Record<string, unknown>) {
 		writeFileSync(modelsJsonPath, JSON.stringify({ providers }));
 	}
+
+	describe("models.json discovery (pi-3ctln)", () => {
+		let server: Server;
+		let baseUrl: string;
+		let requests: IncomingMessage[];
+		let respond: (response: ServerResponse) => void;
+		const catalog = { data: [{ id: "remote" }] };
+		const defaults = {
+			contextWindow: 210000,
+			maxTokens: 22000,
+			reasoning: true,
+			input: ["image"],
+			cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+		};
+		function configure(fields: Record<string, unknown> = {}) {
+			writeRawModelsJson({
+				discovery: { baseUrl, api: "openai-completions", apiKey: "dummy-key", discover: {}, ...fields },
+			});
+		}
+		beforeEach(async () => {
+			vi.stubEnv("PI_OFFLINE", "1");
+			requests = [];
+			respond = (response) => response.end(JSON.stringify(catalog));
+			server = createServer((request, response) => {
+				requests.push(request);
+				respond(response);
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+		});
+		afterEach(async () => {
+			server.closeAllConnections();
+			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+			vi.restoreAllMocks();
+		});
+		it("TM-41 loads a discovered model into available and RLM lists with a five-second request limit", async () => {
+			configure();
+			const timeout = vi.spyOn(AbortSignal, "timeout");
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(
+				(await registry.refreshAvailableModels()).filter((m) => m.provider === "discovery").map((m) => m.id),
+			).toEqual(["remote"]);
+			expect(
+				(await registry.getExecutableModels()).filter((m) => m.provider === "discovery").map((m) => m.id),
+			).toEqual(["remote"]);
+			expect(requests.map((r) => [r.method, r.url])).toEqual([["GET", "/v1/models"]]);
+			expect(timeout).toHaveBeenCalledWith(5000);
+		});
+		const core = {
+			name: "remote",
+			contextWindow: 128000,
+			maxTokens: 16384,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+		const responseLimits = { display_name: "Response", context_window: 310000, max_output_tokens: 33000 };
+		const override = { name: "Override", contextWindow: 410000, maxTokens: 44000, cost: { output: 9 } };
+		const explicit = { id: "remote", name: "Explicit", contextWindow: 510000, maxTokens: 55000 };
+		const levels = { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" };
+		it.each([
+			["core defaults", {}, {}, {}, core, 0],
+			[
+				"configured defaults and null fields",
+				{ context_window: null, max_output_tokens: null },
+				defaults,
+				{},
+				defaults,
+				0,
+			],
+			[
+				"response fields",
+				{
+					...responseLimits,
+					input_modalities: ["text", "image", "audio"],
+					supported_reasoning_levels: [{ effort: "high" }, { effort: "max" }],
+				},
+				defaults,
+				{},
+				{
+					name: "Response",
+					contextWindow: 310000,
+					maxTokens: 33000,
+					input: ["text", "image"],
+					reasoning: true,
+					thinkingLevelMap: levels,
+				},
+				0,
+			],
+			[
+				"empty modalities and reasoning",
+				{ input_modalities: ["audio"], supported_reasoning_levels: [] },
+				defaults,
+				{},
+				{ input: ["text"], reasoning: false },
+				0,
+			],
+			[
+				"invalid metadata fields",
+				{
+					display_name: 3,
+					context_window: -1,
+					max_output_tokens: 1.5,
+					input_modalities: "image",
+					supported_reasoning_levels: ["high"],
+					priority: "first",
+				},
+				defaults,
+				{},
+				{ ...defaults, name: "remote" },
+				6,
+			],
+			[
+				"override precedence",
+				responseLimits,
+				defaults,
+				{ modelOverrides: { remote: override } },
+				{ ...override, cost: { input: 1, output: 9, cacheRead: 3, cacheWrite: 4 } },
+				0,
+			],
+			[
+				"explicit precedence",
+				responseLimits,
+				defaults,
+				{ modelOverrides: { remote: override }, models: [explicit] },
+				{ ...core, ...explicit },
+				0,
+			],
+		] as const)("TM-42 maps %s", async (_label, metadata, configuredDefaults, fields, expected, warnings) => {
+			configure({ discover: { defaults: configuredDefaults }, ...fields });
+			respond = (response) => response.end(JSON.stringify({ data: [{ id: "remote", metadata }] }));
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			expect(registry.find("discovery", "remote")).toMatchObject(expected);
+			expect(warn).toHaveBeenCalledTimes(warnings ? 1 : 0);
+			if (warnings)
+				expect(warn.mock.calls).toEqual([
+					[`Provider discovery: model discovery ignored ${warnings} invalid metadata fields`],
+				]);
+		});
+		it("TM-42 keeps first duplicate before stable priority sorting and skips invalid IDs", async () => {
+			configure();
+			const data = [
+				{ id: "last" },
+				{ id: "tie-a", metadata: { priority: 2 } },
+				{ id: "first", metadata: { priority: 1 } },
+				{ id: "tie-b", metadata: { priority: 2 } },
+				{ id: "last", metadata: { priority: 0, display_name: "Duplicate" } },
+				{ id: "" },
+				{},
+				{ id: 2 },
+				{ id: "unranked" },
+			];
+			respond = (response) => response.end(JSON.stringify({ data }));
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			expect(getModelsForProvider(registry, "discovery").map((m) => [m.id, m.name])).toEqual(
+				["first", "tie-a", "tie-b", "last", "unranked"].map((id) => [id, id]),
+			);
+		});
+		it.each([
+			["HTTP 500", 500, catalog],
+			["invalid envelope", 200, []],
+			["no valid rows", 200, { data: [{}] }],
+			["empty list", 200, { data: [] }],
+		] as const)("TM-43 cold failure: %s keeps explicit rows and warns safely", async (_kind, status, body) => {
+			configure({ models: [{ id: "offline" }] });
+			respond = (response) => {
+				response.statusCode = status;
+				response.end(JSON.stringify(body));
+			};
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			expect(getModelsForProvider(registry, "discovery").map((m) => m.id)).toEqual(["offline"]);
+			expect(warn.mock.calls).toEqual([
+				[`Provider discovery: model discovery failed (${_kind === "empty list" ? "no valid rows" : _kind})`],
+			]);
+		});
+		it("TM-44 sends no discovery request without discover", async () => {
+			configure({ discover: undefined, models: [{ id: "offline" }] });
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			expect(requests).toHaveLength(0);
+			expect(registry.find("discovery", "offline")).toBeDefined();
+		});
+		it.each([
+			["settings", 200],
+			["key", 200],
+			["settings", 500],
+			["key", 500],
+		] as const)(
+			"TM-45 drops cached rows and ignores a late response after a %s change (HTTP %i)",
+			async (change, status) => {
+				const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+				vi.spyOn(Date, "now").mockReturnValue(1000000);
+				vi.stubEnv("DISCOVERY_TEST_KEY", "key-one");
+				configure({ apiKey: "DISCOVERY_TEST_KEY" });
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				await registry.refreshAvailableModels();
+				vi.mocked(Date.now).mockReturnValue(1300000);
+				const received = new Promise<ServerResponse>((resolve) => {
+					respond = resolve;
+				});
+				const pending = registry.refreshAvailableModels();
+				const held = await received;
+				if (change === "settings")
+					configure({ apiKey: "DISCOVERY_TEST_KEY", discover: { defaults: { maxTokens: 777 } } });
+				else vi.stubEnv("DISCOVERY_TEST_KEY", "key-two");
+				registry.refresh();
+				held.statusCode = status;
+				held.end(JSON.stringify({ data: [{ id: "late" }] }));
+				await pending;
+				expect(getModelsForProvider(registry, "discovery")).toEqual([]);
+				expect(warn).not.toHaveBeenCalled();
+			},
+		);
+		it.each([
+			["boolean", { discover: true }],
+			["null", { discover: null }],
+			["bad defaults", { discover: { defaults: { maxTokens: "wrong" } } }],
+			["missing URL", { baseUrl: undefined }],
+			["missing API", { api: undefined }],
+		] as const)("TM-46 rejects %s before a request or usable custom row", async (_name, fields) => {
+			configure(fields);
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toMatch(/Invalid models.json schema|Provider discovery:/);
+			await registry.refreshAvailableModels();
+			expect(getModelsForProvider(registry, "discovery")).toEqual([]);
+			expect(requests).toHaveLength(0);
+		});
+		it.each([
+			["key", "dummy-key", undefined, "Bearer dummy-key"],
+			["explicit with key", "dummy-key", "Explicit header", "Explicit header"],
+			["explicit without key", undefined, "Explicit header", "Explicit header"],
+			["no key", undefined, undefined, undefined],
+			["unset env is literal", "DISCOVERY_UNSET_KEY", undefined, "Bearer DISCOVERY_UNSET_KEY"],
+			["command", "!printf command-key", undefined, "Bearer command-key"],
+			["stored beats configured", "configured-key", undefined, "Bearer stored-key"],
+		] as const)("TM-47 request auth: %s", async (label, apiKey, authorization, expected) => {
+			vi.stubEnv("DISCOVERY_UNSET_KEY", undefined);
+			if (label === "stored beats configured") authStorage.setRuntimeApiKey("discovery", "stored-key");
+			configure({ apiKey, headers: { "X-Custom": "kept", ...(authorization ? { authorization } : {}) } });
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			expect(requests).toHaveLength(1);
+			expect(requests[0].headers.authorization).toBe(expected);
+			expect(requests[0].headers["x-custom"]).toBe("kept");
+		});
+		it("TM-48 reuses successes under 300 seconds and keeps last good rows after failure", async () => {
+			const clock = vi.spyOn(Date, "now").mockReturnValue(1000000);
+			configure({ models: [{ id: "offline" }] });
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			await registry.refreshAvailableModels();
+			clock.mockReturnValue(1299999);
+			await registry.refreshAvailableModels();
+			expect(requests).toHaveLength(1);
+			clock.mockReturnValue(1300000);
+			respond = (response) => {
+				response.statusCode = 500;
+				response.end("private body");
+			};
+			await registry.refreshAvailableModels();
+			expect(requests).toHaveLength(2);
+			expect(getModelsForProvider(registry, "discovery").map((m) => m.id)).toEqual(["remote", "offline"]);
+			expect(warn.mock.calls).toEqual([["Provider discovery: model discovery failed (HTTP 500)"]]);
+		});
+	});
 
 	describe("baseUrl override (no custom models)", () => {
 		test("overriding baseUrl keeps every built-in model and rewrites only that provider", () => {
