@@ -6527,17 +6527,27 @@ export class AgentDaemon {
 		)
 			throw new Error("Mesh replacement refused: invalid barrier response");
 		const token = barrier.required ? (barrier.token as string) : undefined;
-		if (previous.sessionId === info.id) this.sameIdReplacements.add(previous);
-		if (token === undefined) return undefined;
-		this.unsafeMeshSessions.add(previous);
+		const sameId = previous.sessionId === info.id;
+		if (sameId) this.sameIdReplacements.add(previous);
+		if (token === undefined)
+			return sameId
+				? {
+						finish: async (outcome: "completed" | "cancelled" | "failed") => {
+							if (outcome !== "completed") this.sameIdReplacements.delete(previous);
+						},
+					}
+				: undefined;
+		if (sameId) this.unsafeMeshSessions.add(previous);
 		let release: () => void;
 		const cancellation = new AbortController();
-		const drainTimer = setTimeout(() => cancellation.abort(), Math.max(0, deadline - Date.now()));
+		const drainTimer = setTimeout(() => cancellation.abort(), Math.max(0, deadline - 3000 - Date.now()));
 		try {
-			release = await previous.prepareAgentMessageReplacement(
-				[...(this.meshMessageIds.get(previous) ?? [])],
-				cancellation.signal,
-			);
+			release = sameId
+				? await previous.prepareAgentMessageReplacement(
+						[...(this.meshMessageIds.get(previous) ?? [])],
+						cancellation.signal,
+					)
+				: () => undefined;
 		} catch (error) {
 			this.unsafeMeshSessions.delete(previous);
 			this.sameIdReplacements.delete(previous);
@@ -6566,7 +6576,6 @@ export class AgentDaemon {
 		}
 		return {
 			finish: async (outcome: "completed" | "cancelled" | "failed") => {
-				if (outcome === "failed") this.unsafeMeshSessions.add(state.runtime.session);
 				if (outcome === "cancelled") {
 					release();
 					this.unsafeMeshSessions.delete(previous);
@@ -6580,6 +6589,11 @@ export class AgentDaemon {
 					sessionFile: targetPath,
 					token,
 				});
+				if (
+					(!result.success || (result.data as { outcome?: unknown } | undefined)?.outcome === "failed") &&
+					state.runtime.session.sessionId === info.id
+				)
+					this.unsafeMeshSessions.add(state.runtime.session);
 				if (!result.success) throw deserializeDaemonError(result);
 			},
 		};

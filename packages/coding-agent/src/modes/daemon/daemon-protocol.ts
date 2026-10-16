@@ -72,7 +72,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 32 adds opt-in session runtime reload notifications.
 // Revision 33 adds capability-gated native questionnaire forms.
 // Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
-// Revision 35 adds capability-gated mesh replacement barriers and handoff attempt tokens.
+// Revision 35 adds capability-gated mesh replacement barriers, recorded finish outcomes and handoff attempt tokens.
 export const DAEMON_SCHEMA_REVISION = 35;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-35-mesh-replacement";
 

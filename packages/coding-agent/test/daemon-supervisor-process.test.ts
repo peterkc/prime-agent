@@ -2160,11 +2160,15 @@ describe("mesh supervisor compatibility", () => {
 		"buffered",
 		"cancelled",
 		"postcopy",
+		"postcopy-open",
+		"cross-id",
+		"same-daemon-holder",
 		"holder",
 		"no-offer",
 		"old-worker",
 	] as const)("pi-0spx rebinds a real worker without losing or repeating a delivery (%s)", async (mode) => {
 		const f = await meshFixture();
+		const postcopy = mode === "postcopy" || mode === "postcopy-open";
 		mkdirSync(join(f.agentDir, "extensions"));
 		writeFileSync(
 			join(f.agentDir, "extensions", "rebind.ts"),
@@ -2220,13 +2224,57 @@ describe("mesh supervisor compatibility", () => {
 				).toMatchObject({ success: false, error: expect.stringContaining("restart that session") });
 				return;
 			}
-			if (mode === "holder" || mode === "no-offer") {
+			if (mode === "cross-id") {
+				const saved = await f.create(holder, "saved-import");
+				const savedRecordPath = join(f.agentDir, "mesh", "enrollments", `${saved.sessionId}.json`);
+				const savedRecord = JSON.parse(readFileSync(savedRecordPath, "utf8"));
+				const incoming = join(f.root, "cross-id.jsonl");
+				copyFileSync(saved.sessionFile!, incoming);
+				await f.request(holder.client, { type: "kill", activeSessionId: saved.activeSessionId! });
+				writeFileSync(join(f.agentDir, "hold-turn"), "hold");
+				await f.request(holder.client, { type: "prompt", activeSessionId, message: "hold" });
+				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+				const queued = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: target.sessionId!,
+					message: "closed on import",
+				})) as { cotalId: string };
+				await meshSignal(holder.child, "accepted", queued.cotalId);
+				await f.request(holder.client, { type: "import_jsonl", activeSessionId, inputPath: incoming });
+				await meshSignal(holder.child, "ack", queued.cotalId);
+				await meshSignal(holder.child, "log", `Cotal ID ${queued.cotalId}, delivery count 2: dropped closed`);
+				const destination = join(dirname(target.sessionFile!), "cross-id.jsonl");
+				expect(readFileSync(target.sessionFile!, "utf8")).not.toContain(queued.cotalId);
+				expect(readFileSync(destination, "utf8")).not.toContain(queued.cotalId);
+				expect(JSON.parse(readFileSync(savedRecordPath, "utf8"))).toEqual({
+					...savedRecord,
+					sessionFile: canonicalSessionPath(destination),
+				});
+				expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(before);
+				rmSync(join(f.agentDir, "hold-turn"));
+				const next = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: saved.sessionId!,
+					message: "new target",
+				})) as { cotalId: string };
+				await meshSignal(holder.child, "ack", next.cotalId);
+				expect(readFileSync(destination, "utf8").split(next.cotalId)).toHaveLength(2);
+				return;
+			}
+			if (mode === "holder" || mode === "no-offer" || mode === "same-daemon-holder") {
 				const input = join(f.root, "refused.jsonl");
 				copyFileSync(target.sessionFile!, input);
 				SessionManager.open(input).appendSessionInfo("must-not-copy");
 				const other = mode === "holder" ? await f.start(join(f.root, "other.sock")) : holder;
 				try {
-					const importing = mode === "holder" ? await f.create(other, "importer") : target;
+					const importing =
+						mode === "holder"
+							? await f.create(other, "importer")
+							: mode === "same-daemon-holder"
+								? sender
+								: target;
 					const original = readFileSync(importing.sessionFile!, "utf8");
 					const response = await other.client.request({
 						type: "import_jsonl",
@@ -2235,7 +2283,13 @@ describe("mesh supervisor compatibility", () => {
 					});
 					expect(response).toMatchObject({
 						success: false,
-						error: expect.stringContaining(mode === "holder" ? "already active" : "does not offer"),
+						error: expect.stringContaining(
+							mode === "holder"
+								? "already active"
+								: mode === "same-daemon-holder"
+									? "another holder"
+									: "does not offer",
+						),
 					});
 					expect(readFileSync(importing.sessionFile!, "utf8")).toBe(original);
 					expect(existsSync(join(dirname(importing.sessionFile!), "refused.jsonl"))).toBe(false);
@@ -2263,15 +2317,15 @@ describe("mesh supervisor compatibility", () => {
 				await f.request(holder.client, { type: "prompt", activeSessionId, message: "hold" });
 				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
 			}
-			if (mode === "postcopy") writeFileSync(join(f.agentDir, "hold-acks"), "hold");
-			if (mode === "postcopy") rmSync(join(f.agentDir, "hold-turn"));
+			if (postcopy) writeFileSync(join(f.agentDir, "hold-acks"), "hold");
+			if (postcopy) rmSync(join(f.agentDir, "hold-turn"));
 			const stored = (await f.request(holder.client, {
 				type: "mesh_send",
 				fromActiveSessionId: sender.activeSessionId!,
 				targetSessionId: target.sessionId!,
 				message: "held",
 			})) as { cotalId: string };
-			await meshSignal(holder.child, mode === "postcopy" ? "before-ack" : "accepted", stored.cotalId);
+			await meshSignal(holder.child, postcopy ? "before-ack" : "accepted", stored.cotalId);
 			if (mode === "started") await meshPath(join(f.agentDir, "event-held"), cleanup.signal);
 			if (mode === "buffered") await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
 			const count = (file: string) =>
@@ -2280,7 +2334,7 @@ describe("mesh supervisor compatibility", () => {
 					.filter((line) => line.includes(`agentmsg_${stored.cotalId}`)).length;
 			if (mode === "buffered" || mode === "started") expect(count(target.sessionFile!)).toBe(0);
 			if (mode === "cancelled") writeFileSync(join(f.agentDir, "cancel-before-copy"), "cancel");
-			if (mode === "postcopy") {
+			if (postcopy) {
 				const lines = readFileSync(incoming, "utf8").trimEnd().split("\n");
 				lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(f.root, "missing-cwd") });
 				writeFileSync(incoming, `${lines.join("\n")}\n`);
@@ -2298,17 +2352,25 @@ describe("mesh supervisor compatibility", () => {
 			await meshSignal(holder.child, "endpoint-stopped", target.sessionId);
 			if (mode === "started") rmSync(join(f.agentDir, "hold-event"));
 			const result = await replacing;
-			if (mode === "postcopy") {
+			if (postcopy) {
 				expect(result).toMatchObject({ success: false, error: expect.stringContaining("missing-cwd") });
 				expect(count(destination)).toBe(0);
 				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
 				rmSync(join(f.agentDir, "hold-acks"));
-				await f.request(holder.client, {
-					type: "switch_session",
-					activeSessionId,
-					sessionPath: destination,
-					cwdOverride: f.root,
-				});
+				if (mode === "postcopy-open") {
+					await f.request(holder.client, { type: "kill", activeSessionId });
+					const opened = requireSummary(
+						await f.request(holder.client, { type: "create", sessionPath: destination, config: { cwd: f.root } }),
+					);
+					if (opened.workerPid) workerPids.add(opened.workerPid);
+				} else {
+					await f.request(holder.client, {
+						type: "switch_session",
+						activeSessionId,
+						sessionPath: destination,
+						cwdOverride: f.root,
+					});
+				}
 			} else {
 				if (!result.success) throw new Error(result.error);
 				expect(result).toMatchObject({ success: true });
@@ -2320,7 +2382,7 @@ describe("mesh supervisor compatibility", () => {
 			}
 			const after = JSON.parse(readFileSync(recordPath, "utf8"));
 			expect(after).toEqual({ ...before, sessionFile: canonicalSessionPath(destination) });
-			if (mode !== "postcopy") {
+			if (!postcopy) {
 				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
 				rmSync(join(f.agentDir, "hold-turn"));
 			}

@@ -78,6 +78,16 @@ interface PendingPersistence {
 	recipient?: object;
 }
 
+type ReplacementOutcome = "completed" | "cancelled" | "failed";
+
+interface SessionReplacement {
+	readonly token: string;
+	readonly record: EnrollmentRecord;
+	readonly claim: SessionLease;
+	readonly requester: object;
+	state: "active" | "failed";
+}
+
 export class MeshEndpoints {
 	private readonly config?: MeshConfiguration;
 	private readonly refusal?: string;
@@ -87,14 +97,10 @@ export class MeshEndpoints {
 	private readonly enrolling = new Map<string, Promise<void>>();
 	private enrollmentQueue = Promise.resolve();
 	private readonly pending = new Map<string, PendingPersistence>();
-	private readonly replacements = new Map<
+	private readonly replacements = new Map<string, SessionReplacement>();
+	private readonly replacementOutcomes = new Map<
 		string,
-		{
-			readonly token: string;
-			readonly record: EnrollmentRecord;
-			readonly claim: SessionLease;
-			state: "active" | "failed";
-		}
+		{ readonly sessionId: string; readonly result: Promise<ReplacementOutcome> }
 	>();
 	private closing = false;
 	private stopping?: Promise<void>;
@@ -174,6 +180,22 @@ export class MeshEndpoints {
 			() => this.enrolling.delete(sessionId),
 		);
 		return work;
+	}
+
+	async openSession(sessionId: string, sessionFile?: string): Promise<void> {
+		const replacement = this.replacements.get(sessionId);
+		if (replacement?.state !== "failed" || !sessionFile) return this.enroll(sessionId, sessionFile);
+		const existing = this.enrolling.get(sessionId);
+		if (existing) return existing;
+		const opening = this.finishReplacementOnce(sessionId, replacement, "completed", sessionFile).then(
+			() => undefined,
+		);
+		this.enrolling.set(sessionId, opening);
+		try {
+			await opening;
+		} finally {
+			this.enrolling.delete(sessionId);
+		}
 	}
 
 	private async startSession(sessionId: string, sessionFile: string, retainedClaim?: SessionLease): Promise<void> {
@@ -295,7 +317,12 @@ export class MeshEndpoints {
 		}
 	}
 
-	async beginReplacement(sessionId: string, sessionFile: string, overwrite: boolean): Promise<string | undefined> {
+	async beginReplacement(
+		sessionId: string,
+		sessionFile: string,
+		overwrite: boolean,
+		requester: object,
+	): Promise<string | undefined> {
 		if (this.closing || this.refusal) throw new Error(this.refusal ?? "Mesh is shutting down");
 		await this.enrolling.get(sessionId);
 		if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) return undefined;
@@ -308,22 +335,47 @@ export class MeshEndpoints {
 		const claim =
 			previous?.claim ?? session?.claim ?? claimEnrollment(this.options.meshRoot, sessionId, record.sessionFile);
 		const token = randomUUID();
-		this.replacements.set(sessionId, { token, record, claim, state: "active" });
-		await this.closeSession(sessionId);
+		const replacement: SessionReplacement = { token, record, claim, requester, state: "active" };
+		this.replacements.set(sessionId, replacement);
+		try {
+			await this.closeSession(sessionId);
+		} catch (error) {
+			if (this.replacements.get(sessionId) === replacement) this.replacements.delete(sessionId);
+			throw error;
+		}
 		return token;
 	}
 
-	async finishReplacement(
+	replacementOutcome(sessionId: string, token: string): Promise<ReplacementOutcome> | undefined {
+		const recorded = this.replacementOutcomes.get(token);
+		return recorded?.sessionId === sessionId ? recorded.result : undefined;
+	}
+
+	finishReplacement(
 		sessionId: string,
 		token: string,
-		outcome: "completed" | "cancelled" | "failed",
+		outcome: ReplacementOutcome,
 		sessionFile: string,
-	): Promise<void> {
+	): Promise<ReplacementOutcome> {
+		const recorded = this.replacementOutcome(sessionId, token);
+		if (recorded) return recorded;
 		const replacement = this.replacements.get(sessionId);
-		if (!replacement || replacement.token !== token) throw new Error(`Session ${sessionId}: stale replacement token`);
+		if (!replacement || replacement.token !== token)
+			return Promise.reject(new Error(`Session ${sessionId}: stale replacement token`));
+		const result = this.finishReplacementOnce(sessionId, replacement, outcome, sessionFile);
+		this.replacementOutcomes.set(token, { sessionId, result });
+		return result;
+	}
+
+	private async finishReplacementOnce(
+		sessionId: string,
+		replacement: SessionReplacement,
+		outcome: ReplacementOutcome,
+		sessionFile: string,
+	): Promise<ReplacementOutcome> {
 		if (outcome === "failed") {
 			replacement.state = "failed";
-			return;
+			return outcome;
 		}
 		try {
 			if (outcome === "completed") await updateEnrollmentPath(this.options.meshRoot, sessionId, sessionFile);
@@ -334,6 +386,7 @@ export class MeshEndpoints {
 				replacement.claim,
 			);
 			this.replacements.delete(sessionId);
+			return outcome;
 		} catch (error) {
 			replacement.state = "failed";
 			if (
@@ -350,7 +403,7 @@ export class MeshEndpoints {
 	}
 
 	private async rebindSession(session: SessionEndpoint, sessionFile: string): Promise<void> {
-		const token = await this.beginReplacement(session.record.sessionId, sessionFile, false);
+		const token = await this.beginReplacement(session.record.sessionId, sessionFile, false, this);
 		if (token) await this.finishReplacement(session.record.sessionId, token, "completed", sessionFile);
 	}
 
@@ -745,6 +798,9 @@ export class MeshEndpoints {
 	}
 
 	disconnect(recipient: object): void {
+		for (const replacement of this.replacements.values()) {
+			if (replacement.requester === recipient && replacement.state === "active") replacement.state = "failed";
+		}
 		for (const pending of this.pending.values()) {
 			if (pending.recipient === recipient)
 				pending.reject(new Error("Mesh recipient disconnected before persistence"));
@@ -794,6 +850,7 @@ export class MeshEndpoints {
 			}
 			for (const replacement of this.replacements.values()) replacement.claim.release();
 			this.replacements.clear();
+			this.replacementOutcomes.clear();
 			this.sessions.clear();
 		}
 	}

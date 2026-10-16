@@ -2898,17 +2898,39 @@ export class DaemonSupervisor {
 			if (!source.worker.meshDeliveryCapable || !source.worker.meshReplacementCapable)
 				throw new Error("Mesh replacement refused: restart that session");
 			if (command.phase === "begin") {
-				const token = await this.mesh.beginReplacement(command.sessionId, command.sessionFile, command.overwrite);
+				for (const entry of this.roster().values()) {
+					if (
+						!entry.queuedChild &&
+						entry.workerId !== undefined &&
+						this.workers.has(entry.workerId) &&
+						entry.summary.sessionId === command.sessionId &&
+						(entry.summary.activeSessionId ?? entry.summary.id) !== command.fromActiveSessionId
+					)
+						throw new Error("Mesh replacement refused: session is active in another holder of this daemon");
+				}
+				const token = await this.mesh.beginReplacement(
+					command.sessionId,
+					command.sessionFile,
+					command.overwrite,
+					source.worker,
+				);
 				return success(command.id, command.type, { required: token !== undefined, token });
 			}
+			const recorded = this.mesh.replacementOutcome(command.sessionId, command.token);
+			if (recorded) return success(command.id, command.type, { outcome: await recorded });
 			if (command.phase === "completed") {
 				await this.refreshWorkerSummaries(source.worker, false, true);
 				const replacement = this.findSummaryInWorker(source.worker, command.sessionFile);
 				if (replacement?.sessionId !== command.sessionId)
 					throw new Error("Mesh replacement refused: worker has not published the replacement file");
 			}
-			await this.mesh.finishReplacement(command.sessionId, command.token, command.phase, command.sessionFile);
-			return success(command.id, command.type);
+			const outcome = await this.mesh.finishReplacement(
+				command.sessionId,
+				command.token,
+				command.phase,
+				command.sessionFile,
+			);
+			return success(command.id, command.type, { outcome });
 		}
 
 		if (command.type === "mesh_send") {
@@ -3686,6 +3708,7 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
+			child.once("exit", () => this.mesh?.disconnect(worker));
 		} catch (error) {
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
@@ -3730,7 +3753,12 @@ export class DaemonSupervisor {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
-			if (summary.sessionId) void this.enrollMeshSession(summary.sessionId, summary.sessionFile);
+			if (summary.sessionId)
+				void this.mesh
+					?.openSession(summary.sessionId, summary.sessionFile)
+					.catch((error: unknown) =>
+						this.log(`Mesh session ${summary.sessionId}: enrollment failed: ${redactMeshError(error)}`),
+					);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
@@ -4096,6 +4124,7 @@ export class DaemonSupervisor {
 		}
 		worker.client = undefined;
 		this.mesh?.disconnect(client);
+		this.mesh?.disconnect(worker);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
 		for (const [activeSessionId, generations] of worker.snapshotGenerations ?? []) {
@@ -7281,6 +7310,7 @@ export class DaemonSupervisor {
 			} else {
 				await worker.client.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
 			}
+			this.mesh?.disconnect(worker);
 			worker.client.close();
 			worker.client = undefined;
 		} else if (directChild) {

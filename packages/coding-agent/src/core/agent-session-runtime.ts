@@ -103,7 +103,7 @@ export interface AgentSessionRuntimeDisposeOptions {
 	kernelSnapshot?: boolean;
 }
 
-export interface SessionReplacementBarrier {
+interface SessionReplacementBarrier {
 	finish(outcome: "completed" | "cancelled" | "failed"): Promise<void>;
 }
 
@@ -748,16 +748,17 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	): Promise<{ cancelled: boolean }> {
 		const barrier = await this.replacementBarrier?.(inputPath, targetPath, overwrite);
 		let started = false;
+		let result: { cancelled: boolean };
 		try {
-			const result = await replace(() => {
+			result = await replace(() => {
 				started = true;
 			});
-			await barrier?.finish(result.cancelled ? "cancelled" : "completed");
-			return result;
 		} catch (error) {
 			await barrier?.finish(started ? "failed" : "cancelled");
 			throw error;
 		}
+		await barrier?.finish(result.cancelled ? "cancelled" : "completed");
+		return result;
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {

@@ -4485,6 +4485,7 @@ describe("mesh worker persistence", () => {
 			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
 			expect(state.runtime.session).toBe(live.session);
 			expect(request.mock.calls.at(-1)?.[0]).toMatchObject({ phase: "cancelled" });
+			expect(request.mock.calls.at(-1)?.[1]).toBeGreaterThanOrEqual(3000);
 		} finally {
 			vi.useRealTimers();
 			queue.resolve();
@@ -4492,6 +4493,77 @@ describe("mesh worker persistence", () => {
 			live.cleanup();
 		}
 	});
+
+	it.each(["transport", "supervisor"] as const)(
+		"pi-0spx finishes once and preserves mesh admission after a %s failure",
+		async (failure) => {
+			const live = await createHarness({ persistSession: true });
+			let next: Awaited<ReturnType<typeof createHarness>> | undefined;
+			const factory: CreateAgentSessionRuntimeFactory = async (options) => {
+				next = await createHarness({
+					persistSession: true,
+					existingSessionFile: options.sessionManager.getSessionFile()!,
+				});
+				return {
+					session: next.session,
+					services: { cwd: next.tempDir, agentDir: next.tempDir },
+					diagnostics: [],
+				} as never;
+			};
+			const h = harness(factory);
+			await h.authenticate("cotal");
+			const runtime = new AgentSessionRuntime(
+				live.session,
+				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				factory,
+			);
+			const state = await (
+				h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+			).addRuntime(runtime);
+			const phases: string[] = [];
+			Object.assign(h.internals, {
+				meshReplacementOffered: true,
+				supervisorLink: () => ({
+					request: async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
+						phases.push(command.phase);
+						if (command.phase === "begin") return { success: true, data: { required: true, token: "barrier" } };
+						if (failure === "transport") throw new Error("lost completed response");
+						return { success: false, error: "endpoint restart failed" };
+					},
+				}),
+			});
+			const incoming = join(live.tempDir, "finish-once.jsonl");
+			copyFileSync(live.session.sessionFile!, incoming);
+			try {
+				await expect(runtime.importFromJsonl(incoming)).rejects.toThrow(
+					failure === "transport" ? "lost completed response" : "endpoint restart failed",
+				);
+				expect(phases).toEqual(["begin", "completed"]);
+				expect(runtime.session).not.toBe(live.session);
+				const receiving = h.internals.receiveMeshMessage(h.client, {
+					type: "worker_deliver_message",
+					targetActiveSessionId: state.activeSessionId,
+					message: "after finish",
+					sender: { sessionName: "sender" },
+					cotal: { id: "after-finish", deliveryCount: 1, attemptToken: "attempt" },
+				});
+				if (failure === "supervisor") await expect(receiving).rejects.toThrow("reopened from disk");
+				else {
+					await receiving;
+					await runtime.session.waitForAgentMessagePromptCompletion("agentmsg_after-finish");
+					expect(h.frames()).toContainEqual({
+						type: "agent_message_persisted",
+						cotalId: "after-finish",
+						attemptToken: "attempt",
+					});
+				}
+			} finally {
+				await runtime.dispose();
+				next?.cleanup();
+				live.cleanup();
+			}
+		},
+	);
 
 	it.each(["cotal", "native", undefined])(
 		"follows authenticated mode %s rather than edited worker settings",
@@ -4708,7 +4780,18 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["new_session", "fork", "switch_session", "import_jsonl", "same-id", "repeat"] as const)(
+	const queuedMeshReplacementCommands = [
+		"new_session",
+		"fork",
+		"switch_session",
+		"import_jsonl",
+		"same-id",
+		"cross-id",
+		"no-token-cancelled",
+		"no-token-failed",
+		"repeat",
+	] as const;
+	it.each(queuedMeshReplacementCommands)(
 		"closes or deduplicates the old session's queued mesh delivery (%s)",
 		async (command) => {
 			const gate = createDeferred();
@@ -4718,7 +4801,8 @@ describe("mesh worker persistence", () => {
 			const live = await createHarness({
 				extensionFactories: [
 					(pi) =>
-						pi.on("session_before_switch", async () => {
+						pi.on("session_before_switch", async (event) => {
+							if (command === "no-token-cancelled" && event.reason === "resume") return { cancel: true };
 							if (command === "same-id") {
 								beforeCopy.resolve();
 								await copyGate.promise;
@@ -4778,12 +4862,15 @@ describe("mesh worker persistence", () => {
 					.find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
 				const saved = SessionManager.create(live.tempDir, join(live.tempDir, "saved"));
 				saved.flushNow();
-				if (command === "same-id") {
-					copyFileSync(live.session.sessionFile!, saved.getSessionFile()!);
+				if (["same-id", "cross-id", "no-token-cancelled", "no-token-failed"].includes(command)) {
+					if (command !== "cross-id") copyFileSync(live.session.sessionFile!, saved.getSessionFile()!);
 					Object.assign(h.internals, {
 						meshReplacementOffered: true,
 						supervisorLink: () => ({
-							request: async () => ({ success: true, data: { required: true, token: "barrier" } }),
+							request: async () => ({
+								success: true,
+								data: { required: !command.startsWith("no-token"), token: "barrier" },
+							}),
 						}),
 					});
 				}
@@ -4827,15 +4914,38 @@ describe("mesh worker persistence", () => {
 					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(1);
 					return;
 				}
+				if (command.startsWith("no-token")) {
+					if (command === "no-token-failed") {
+						const lines = readFileSync(saved.getSessionFile()!, "utf8").trimEnd().split("\n");
+						lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(live.tempDir, "missing") });
+						writeFileSync(saved.getSessionFile()!, `${lines.join("\n")}\n`);
+					}
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({
+							id: "no-token",
+							type: "import_jsonl",
+							activeSessionId: state.activeSessionId,
+							inputPath: saved.getSessionFile(),
+						}),
+					);
+					expect(h.frames().at(-1)).toMatchObject({ success: command === "no-token-cancelled" });
+				}
 				const replacement = h.internals.handleLine(
 					h.client,
 					JSON.stringify({
 						id: "replacement",
-						type: command === "same-id" ? "import_jsonl" : command,
+						type: command.startsWith("no-token")
+							? "new_session"
+							: command === "same-id" || command === "cross-id"
+								? "import_jsonl"
+								: command,
 						activeSessionId: state.activeSessionId,
 						...(command === "fork" ? { entryId } : {}),
 						...(command === "switch_session" ? { sessionPath: saved.getSessionFile() } : {}),
-						...(command === "import_jsonl" || command === "same-id" ? { inputPath: saved.getSessionFile() } : {}),
+						...(command === "import_jsonl" || command === "same-id" || command === "cross-id"
+							? { inputPath: saved.getSessionFile() }
+							: {}),
 					}),
 				);
 				if (command === "same-id") {
@@ -4845,7 +4955,11 @@ describe("mesh worker persistence", () => {
 				}
 				await replacement;
 				expect(h.frames().at(-1)).toMatchObject({
-					command: command === "same-id" ? "import_jsonl" : command,
+					command: command.startsWith("no-token")
+						? "new_session"
+						: command === "same-id" || command === "cross-id"
+							? "import_jsonl"
+							: command,
 					success: true,
 				});
 				expect(

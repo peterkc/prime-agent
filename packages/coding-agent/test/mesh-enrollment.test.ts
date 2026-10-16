@@ -110,7 +110,7 @@ describe("mesh enrollment", () => {
 			const target = join(root, "replacement.jsonl");
 			copyFileSync(sessionFile, target);
 			const endpoint = FakeEndpoint.instances.at(-1)!;
-			const token = await mesh.beginReplacement(sessionId, target, true);
+			const token = await mesh.beginReplacement(sessionId, target, true, mesh);
 			expect(endpoint.stop).toHaveBeenCalledTimes(1);
 			expect(token).toEqual(expect.any(String));
 			const count = FakeEndpoint.instances.length;
@@ -119,7 +119,7 @@ describe("mesh enrollment", () => {
 				expect(FakeEndpoint.instances).toHaveLength(count);
 				await mesh.enqueueEnrollment(sessionId, target);
 				expect(FakeEndpoint.instances).toHaveLength(count);
-				const reopened = await mesh.beginReplacement(sessionId, target, false);
+				const reopened = await mesh.beginReplacement(sessionId, target, false, mesh);
 				await mesh.finishReplacement(sessionId, reopened!, "completed", target);
 			}
 			const expectedPath = canonicalSessionPath(outcome === "cancelled" ? sessionFile : target);
@@ -135,6 +135,54 @@ describe("mesh enrollment", () => {
 				expect(readDirectory(meshRoot, sessionId)).toBeDefined();
 				expect(readEnrollment(meshRoot, sessionId).sessionFile).toBe(expectedPath);
 			}
+		},
+	);
+
+	it.each(["disconnect", "failed", "stop-failed"] as const)(
+		"pi-0spx recovers a replacement through a disk open (%s)",
+		async (mode) => {
+			const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+			await mesh.enroll(sessionId, sessionFile);
+			const before = readEnrollment(meshRoot, sessionId);
+			const target = join(root, "reopened.jsonl");
+			copyFileSync(sessionFile, target);
+			const endpoint = FakeEndpoint.instances.at(-1)!;
+			const requester = {};
+			if (mode === "stop-failed") {
+				endpoint.stop.mockRejectedValueOnce(new Error("stop-failed"));
+				await expect(mesh.beginReplacement(sessionId, target, true, requester)).rejects.toThrow("stop-failed");
+				await expect(mesh.beginReplacement(sessionId, target, true, requester)).rejects.toThrow("stop-failed");
+				return;
+			}
+			const token = await mesh.beginReplacement(sessionId, target, true, requester);
+			if (mode === "disconnect") mesh.disconnect(requester);
+			else await mesh.finishReplacement(sessionId, token!, "failed", target);
+			const count = FakeEndpoint.instances.length;
+			await mesh.enqueueEnrollment(sessionId, target);
+			expect(FakeEndpoint.instances).toHaveLength(count);
+			await mesh.openSession(sessionId, target);
+			expect(FakeEndpoint.instances.at(-1)).not.toBe(endpoint);
+			expect(readEnrollment(meshRoot, sessionId)).toEqual({ ...before, sessionFile: canonicalSessionPath(target) });
+			expect(FakeEndpoint.instances.at(-1)!.options.card?.id).toBe(before.identity.id);
+		},
+	);
+
+	it.each(["completed", "cancelled", "failed"] as const)(
+		"pi-0spx returns the recorded replacement outcome without repeating effects (%s)",
+		async (outcome) => {
+			const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+			await mesh.enroll(sessionId, sessionFile);
+			const target = join(root, "once.jsonl");
+			copyFileSync(sessionFile, target);
+			const token = await mesh.beginReplacement(sessionId, target, true, mesh);
+			expect(await mesh.finishReplacement(sessionId, token!, outcome, target)).toBe(outcome);
+			const count = FakeEndpoint.instances.length;
+			const before = readEnrollment(meshRoot, sessionId);
+			expect(
+				await mesh.finishReplacement(sessionId, token!, outcome === "failed" ? "completed" : "failed", target),
+			).toBe(outcome);
+			expect(FakeEndpoint.instances).toHaveLength(count);
+			expect(readEnrollment(meshRoot, sessionId)).toEqual(before);
 		},
 	);
 

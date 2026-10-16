@@ -123,6 +123,13 @@ before mesh support must be restarted; restarting only the supervisor can leave 
 running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
 clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.
 
+Same-ID import and switch refuse when another holder is live, the supervisor offers
+no replacement barrier (restart the daemon), or the worker predates the barrier
+(restart that session). After a post-copy failure, stop the failed session and reopen
+its file from disk before mesh delivery resumes. The barrier clears queued mesh
+messages. They return after the broker's acknowledgement wait, even when the
+replacement is cancelled.
+
 `<mesh home>/directory/` carries IDs, names, principals and home sockets, never secrets.
 An exact ID wins; otherwise a case-insensitive name must match exactly one entry.
 Unknown targets, ambiguous names and another space have distinct errors. Renames update
