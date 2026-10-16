@@ -1,0 +1,1 @@
+- Fixed same-ID Cotal session imports and moved-file opens to preserve pending messages, identity, and inbox ownership.

@@ -103,7 +103,16 @@ export interface AgentSessionRuntimeDisposeOptions {
 	kernelSnapshot?: boolean;
 }
 
+interface SessionReplacementBarrier {
+	finish(outcome: "completed" | "cancelled" | "failed"): Promise<void>;
+}
+
 export class AgentSessionRuntime implements SubagentRuntimeHost {
+	private replacementBarrier?: (
+		inputPath: string,
+		targetPath: string,
+		overwrite: boolean,
+	) => Promise<SessionReplacementBarrier | undefined>;
 	private rebindSession?: (session: AgentSession) => Promise<void>;
 	private readonly sessionReplacedListeners = new Set<(session: AgentSession) => void | Promise<void>>();
 	private runtimeEnvScope?: <T>(fn: () => Promise<T>) => Promise<T>;
@@ -184,6 +193,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	private scopedBuild<T>(fn: () => Promise<T>): Promise<T> {
 		return this.runtimeEnvScope ? this.runtimeEnvScope(fn) : fn();
+	}
+
+	setReplacementBarrier(barrier: NonNullable<AgentSessionRuntime["replacementBarrier"]>): void {
+		this.replacementBarrier = barrier;
 	}
 
 	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
@@ -427,6 +440,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 	): Promise<{ cancelled: boolean }> {
+		return this.withReplacementBarrier(sessionPath, sessionPath, false, (start) =>
+			this.openReplacementSession(sessionPath, options, start),
+		);
+	}
+
+	private async openReplacementSession(
+		sessionPath: string,
+		options: Parameters<AgentSessionRuntime["switchSession"]>[1],
+		start: () => void,
+	): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -436,6 +459,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const lease = this.acquireReplacementLease(sessionPath);
 		let sessionManager: SessionManager;
 		try {
+			start();
 			sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 		} catch (error) {
@@ -659,6 +683,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const destinationPath = join(sessionDir, basename(resolvedPath));
+		return this.withReplacementBarrier(
+			resolvedPath,
+			destinationPath,
+			resolve(destinationPath) !== resolvedPath,
+			(start) => this.copyReplacementSession(resolvedPath, destinationPath, sessionDir, cwdOverride, start),
+		);
+	}
+
+	private async copyReplacementSession(
+		resolvedPath: string,
+		destinationPath: string,
+		sessionDir: string,
+		cwdOverride: string | undefined,
+		start: () => void,
+	): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -668,6 +707,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const lease = this.acquireReplacementLease(destinationPath);
 		let sessionManager: SessionManager;
 		try {
+			start();
 			if (resolve(destinationPath) !== resolvedPath) {
 				copyFileSync(resolvedPath, destinationPath);
 			}
@@ -698,6 +738,44 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		);
 		await this.finishSessionReplacement();
 		return { cancelled: false };
+	}
+
+	private async withReplacementBarrier(
+		inputPath: string,
+		targetPath: string,
+		overwrite: boolean,
+		replace: (start: () => void) => Promise<{ cancelled: boolean }>,
+	): Promise<{ cancelled: boolean }> {
+		const barrier = await this.replacementBarrier?.(inputPath, targetPath, overwrite);
+		let started = false;
+		let result: { cancelled: boolean };
+		try {
+			result = await replace(() => {
+				started = true;
+			});
+		} catch (error) {
+			try {
+				await barrier?.finish(started ? "failed" : "cancelled");
+			} catch (finishError) {
+				if (!(error instanceof Error))
+					throw new AggregateError([error, finishError], "Session replacement failed", { cause: error });
+				error.cause =
+					error.cause === undefined
+						? finishError
+						: new AggregateError([error.cause, finishError], "Mesh replacement cleanup failed");
+			}
+			throw error;
+		}
+		try {
+			await barrier?.finish(result.cancelled ? "cancelled" : "completed");
+		} catch (error) {
+			throw new Error(
+				`Session switch or import ${result.cancelled ? "was cancelled" : "completed"}, but the mesh endpoint was not confirmed. ` +
+					"Reopen the session from disk to restore delivery.",
+				{ cause: error },
+			);
+		}
+		return result;
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {

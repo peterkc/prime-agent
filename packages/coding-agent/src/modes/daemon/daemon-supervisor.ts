@@ -152,6 +152,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -206,6 +207,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	"agent_roster",
 	"direct_peer_transport",
 	"mesh_send",
+	"mesh_replacement",
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -310,6 +312,7 @@ interface ResidentWorker {
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
 	peerTransportCapable?: boolean;
 	meshDeliveryCapable?: boolean;
+	meshReplacementCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
 	pendingClient?: DaemonWorkerClient;
 	/** Consecutive defer->probe rounds against a live-but-silent worker; bounded by MAX_DEFERRED_RECOVERY_ROUNDS. */
@@ -562,6 +565,12 @@ function workerAuthAdvertisesMeshDelivery(data: unknown): boolean {
 	if (typeof data !== "object" || data === null) return false;
 	const capabilities = (data as { capabilities?: unknown }).capabilities;
 	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_MESH_DELIVERY_CAPABILITY);
+}
+
+function workerAuthAdvertisesMeshReplacement(data: unknown): boolean {
+	if (typeof data !== "object" || data === null) return false;
+	const capabilities = (data as { capabilities?: unknown }).capabilities;
+	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY);
 }
 
 function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[] {
@@ -868,8 +877,8 @@ export class DaemonSupervisor {
 					homeSocket: this.socketPath,
 					credentialLifetimeSeconds: this.meshCredentialLifetimeSeconds,
 					log: (message) => this.log(message),
-					handoff: (record, message, count, bind, isOpen) =>
-						this.handoffMeshMessage(record, message, count, bind, isOpen),
+					handoff: (record, message, count, bind, isOpen, attemptToken) =>
+						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
 				});
 			}
 			await this.seedRosterLedger();
@@ -1617,6 +1626,7 @@ export class DaemonSupervisor {
 		supervisorProcessStartId?: string;
 		supervisorSocketPath: string;
 		agentMessageTransport: "native" | "cotal";
+		capabilities: readonly string[];
 	} {
 		const record = this.ownership?.record;
 		if (!record) {
@@ -1628,6 +1638,7 @@ export class DaemonSupervisor {
 			...(record.processStartId ? { supervisorProcessStartId: record.processStartId } : {}),
 			supervisorSocketPath: record.socketPath,
 			agentMessageTransport: this.agentMessageTransport,
+			capabilities: [DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY],
 		};
 	}
 
@@ -2881,10 +2892,59 @@ export class DaemonSupervisor {
 			}
 		}
 
+		if (command.type === "mesh_replace") {
+			if (!this.mesh) throw new Error("Mesh replacement refused: Cotal transport is not enabled");
+			const source = await this.findWorkerForClient(client, command.fromActiveSessionId);
+			if (!source.worker.meshDeliveryCapable || !source.worker.meshReplacementCapable)
+				throw new Error("Mesh replacement refused: restart that session");
+			if (command.phase === "begin") {
+				for (const entry of this.roster().values()) {
+					if (
+						!entry.queuedChild &&
+						entry.workerId !== undefined &&
+						this.workers.has(entry.workerId) &&
+						entry.summary.sessionId === command.sessionId &&
+						(entry.summary.activeSessionId ?? entry.summary.id) !== command.fromActiveSessionId
+					)
+						throw new Error("Mesh replacement refused: session is active in another holder of this daemon");
+				}
+				const token = await this.mesh.beginReplacement(
+					command.sessionId,
+					command.sessionFile,
+					command.overwrite,
+					source.worker,
+					command.token,
+				);
+				return success(command.id, command.type, { required: token !== undefined, token });
+			}
+			try {
+				if (command.phase === "completed") {
+					await this.refreshWorkerSummaries(source.worker, false, true);
+					const replacement = this.findSummaryInWorker(source.worker, command.sessionFile);
+					if (replacement?.sessionId !== command.sessionId)
+						throw new Error("Mesh replacement refused: worker has not published the replacement file");
+				}
+			} catch (error) {
+				try {
+					await this.mesh.finishReplacement(command.sessionId, command.token, "failed", command.sessionFile);
+				} catch (finishError) {
+					this.log(`Mesh replacement cleanup failed: ${redactMeshError(finishError, false)}`);
+				}
+				throw error;
+			}
+			const outcome = await this.mesh.finishReplacement(
+				command.sessionId,
+				command.token,
+				command.phase,
+				command.sessionFile,
+			);
+			return success(command.id, command.type, { outcome });
+		}
+
 		if (command.type === "mesh_send") {
 			if (!this.mesh) throw new Error("Message was not stored: Cotal transport is not enabled");
 			const source = await this.findWorkerForClient(client, command.fromActiveSessionId);
-			if (!source.worker.meshDeliveryCapable)
+			if (!source.worker.meshDeliveryCapable || !source.worker.meshReplacementCapable)
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
@@ -3656,6 +3716,7 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
+			child.once("exit", () => this.mesh?.disconnect(worker));
 		} catch (error) {
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
@@ -3700,7 +3761,12 @@ export class DaemonSupervisor {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
-			if (summary.sessionId) void this.enrollMeshSession(summary.sessionId, summary.sessionFile);
+			if (summary.sessionId)
+				void this.mesh
+					?.openSession(summary.sessionId, summary.sessionFile)
+					.catch((error: unknown) =>
+						this.log(`Mesh session ${summary.sessionId}: enrollment failed: ${redactMeshError(error)}`),
+					);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
@@ -3813,6 +3879,7 @@ export class DaemonSupervisor {
 					}
 					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
 					worker.meshDeliveryCapable = workerAuthAdvertisesMeshDelivery(authResponse.data);
+					worker.meshReplacementCapable = workerAuthAdvertisesMeshReplacement(authResponse.data);
 					worker.lastFrameAt = Date.now();
 					worker.client?.close();
 					worker.client = client;
@@ -3845,6 +3912,7 @@ export class DaemonSupervisor {
 		deliveryCount: number,
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
+		attemptToken: string,
 	): Promise<void> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		const text = meshMessageText(message);
@@ -3854,7 +3922,8 @@ export class DaemonSupervisor {
 			continueRecent: false,
 		});
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
-		if (!worker.meshDeliveryCapable) throw new Error("Restart that session to receive mesh messages");
+		if (!worker.meshDeliveryCapable || !worker.meshReplacementCapable)
+			throw new Error("Restart that session to receive mesh messages");
 		const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
 		const summary =
 			this.findSummaryInWorker(worker, record.sessionFile) ??
@@ -3895,7 +3964,7 @@ export class DaemonSupervisor {
 				message: text,
 				fromRelationship,
 				sender: { sessionId: senderSessionId, sessionName: message.from.name, clientId: message.from.id },
-				cotal: { id: message.id, deliveryCount },
+				cotal: { id: message.id, deliveryCount, attemptToken },
 			},
 			WORKER_REQUEST_TIMEOUT_MS,
 		);
@@ -4063,6 +4132,7 @@ export class DaemonSupervisor {
 		}
 		worker.client = undefined;
 		this.mesh?.disconnect(client);
+		this.mesh?.disconnect(worker);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
 		for (const [activeSessionId, generations] of worker.snapshotGenerations ?? []) {
@@ -6189,7 +6259,14 @@ export class DaemonSupervisor {
 			return;
 		}
 		if (outboundType === "agent_message_persisted" || outboundType === "agent_message_dropped") {
-			if (this.shuttingDown || !source || source !== worker.client || !worker.meshDeliveryCapable) return;
+			if (
+				this.shuttingDown ||
+				!source ||
+				source !== worker.client ||
+				!worker.meshDeliveryCapable ||
+				!worker.meshReplacementCapable
+			)
+				return;
 			try {
 				const persisted: unknown = JSON.parse(frame.payload.toString("utf8"));
 				if (
@@ -6198,14 +6275,17 @@ export class DaemonSupervisor {
 					"type" in persisted &&
 					persisted.type === outboundType &&
 					"cotalId" in persisted &&
-					typeof persisted.cotalId === "string"
+					typeof persisted.cotalId === "string" &&
+					"attemptToken" in persisted &&
+					typeof persisted.attemptToken === "string"
 				) {
-					if (persisted.type === "agent_message_persisted") this.mesh?.confirmPersisted(persisted.cotalId, source);
+					if (persisted.type === "agent_message_persisted")
+						this.mesh?.confirmPersisted(persisted.cotalId, source, persisted.attemptToken);
 					else if (
 						"reason" in persisted &&
 						(persisted.reason === "cleared" || persisted.reason === "closed" || persisted.reason === "other")
 					)
-						this.mesh?.confirmDropped(persisted.cotalId, source, persisted.reason);
+						this.mesh?.confirmDropped(persisted.cotalId, source, persisted.reason, persisted.attemptToken);
 				}
 			} catch {
 				this.log("Mesh worker sent an invalid persistence frame");
@@ -7238,6 +7318,7 @@ export class DaemonSupervisor {
 			} else {
 				await worker.client.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
 			}
+			this.mesh?.disconnect(worker);
 			worker.client.close();
 			worker.client = undefined;
 		} else if (directChild) {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	appendFileSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -17,6 +18,7 @@ import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { CotalEndpoint, createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -39,6 +41,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
+import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
@@ -48,6 +51,7 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
 import {
@@ -4438,6 +4442,407 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it("pi-0spx drains a late started message before switching to the current enrolled file", async () => {
+		const messageStarted = createDeferred();
+		const releaseMessage = createDeferred();
+		const shutdownStarted = createDeferred();
+		const releaseShutdown = createDeferred();
+		const barrierReady = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", async (event) => {
+						if (event.message.role === "custom" && event.message.customType === "agent_message") {
+							messageStarted.resolve();
+							await releaseMessage.promise;
+						}
+					});
+					pi.on("session_shutdown", async (event) => {
+						if (event.reason === "resume") {
+							shutdownStarted.resolve();
+							await releaseShutdown.promise;
+						}
+					});
+				},
+			],
+		});
+		const factory: CreateAgentSessionRuntimeFactory = async (options) =>
+			({
+				session: Object.assign(makeRuntimeSession(options.sessionManager), {
+					messages: options.sessionManager.buildSessionContext().messages,
+					registerDisposeCallback: () => () => undefined,
+					hasQueuedAgentMessage: () => false,
+					setCurrentRecap: () => undefined,
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				}),
+				services: { cwd: live.tempDir, agentDir: live.tempDir },
+				diagnostics: [],
+			}) as never;
+		const h = harness(factory);
+		await h.authenticate("cotal");
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			factory,
+		);
+		const state = await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		const stop = vi.spyOn(CotalEndpoint.prototype, "stop").mockResolvedValue(undefined);
+		const brokerMocks = [
+			stop,
+			...(["start", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map((method) =>
+				vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			),
+		];
+		let mesh: MeshEndpoints | undefined;
+		let receiving: Promise<void> | undefined;
+		let switching: Promise<unknown> | undefined;
+		try {
+			const meshRoot = join(live.tempDir, "mesh");
+			mkdirSync(meshRoot);
+			writeFileSync(join(meshRoot, "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+			writeFileSync(join(meshRoot, "signer.json"), JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))), {
+				mode: 0o600,
+			});
+			mesh = new MeshEndpoints({
+				meshRoot,
+				homeSocket: join(live.tempDir, "mesh.sock"),
+				handoff: vi.fn(),
+				log: vi.fn(),
+			});
+			await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+			stop.mockClear();
+			let closedAtBegin = 0;
+			const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
+				let data:
+					| { required: boolean; token: string | undefined }
+					| { outcome: "completed" | "cancelled" | "failed" };
+				if (command.phase === "begin") {
+					const token = await mesh!.beginReplacement(
+						command.sessionId,
+						command.sessionFile,
+						command.overwrite,
+						h.client,
+						command.token,
+					);
+					closedAtBegin = stop.mock.calls.length;
+					if (token) barrierReady.resolve();
+					data = { required: token !== undefined, token };
+				} else {
+					await mesh!.finishReplacement(command.sessionId, command.token, command.phase, command.sessionFile);
+					data = { outcome: command.phase };
+				}
+				return { success: true, data };
+			});
+			Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
+			const ackOnDisk: boolean[] = [];
+			const write = h.socket.write;
+			h.socket.write = (data) => {
+				const accepted = write(data);
+				if (h.frames().at(-1)?.type === "agent_message_persisted")
+					ackOnDisk.push(readFileSync(live.session.sessionFile!, "utf8").includes("agentmsg_samefile"));
+				return accepted;
+			};
+			live.setResponses([fauxAssistantMessage("done")]);
+			receiving = h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: state.activeSessionId,
+				message: "late",
+				sender: { sessionName: "sender" },
+				cotal: { id: "samefile", deliveryCount: 1, attemptToken: "attempt" },
+			});
+			await messageStarted.promise;
+			switching = runtime.switchSession(live.session.sessionFile!);
+			// The full barrier releases the old event before opening; the old exemption reaches shutdown first.
+			await Promise.race([barrierReady.promise, shutdownStarted.promise]);
+			releaseMessage.resolve();
+			await receiving;
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_samefile");
+			live.sessionManager.flushNow();
+			await shutdownStarted.promise;
+			releaseShutdown.resolve();
+			await switching;
+			expect(runtime.session).not.toBe(live.session);
+			expect(runtime.session.messages).toEqual(
+				expect.arrayContaining([expect.objectContaining({ role: "custom", customType: "agent_message" })]),
+			);
+			expect(runtime.session.sessionManager.getEntries()).toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "custom_message", customType: "agent_message" })]),
+			);
+			await h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: state.activeSessionId,
+				message: "late",
+				sender: { sessionName: "sender" },
+				cotal: { id: "samefile", deliveryCount: 2, attemptToken: "redelivery" },
+			});
+			expect(ackOnDisk).toEqual([true]);
+			expect(request.mock.calls.map(([command]) => command.phase)).toEqual(["begin", "completed"]);
+			expect(closedAtBegin).toBe(1);
+		} finally {
+			releaseMessage.resolve();
+			releaseShutdown.resolve();
+			await receiving?.catch(() => undefined);
+			await switching?.catch(() => undefined);
+			await mesh?.stop();
+			await runtime.dispose();
+			live.cleanup();
+			for (const mock of brokerMocks) mock.mockRestore();
+		}
+	});
+
+	it("pi-0spx refuses an enrolled own-file switch without a supervisor barrier", async () => {
+		const live = await createHarness({ persistSession: true });
+		const h = harness();
+		await h.authenticate("cotal");
+		const factory = vi.fn(async () => {
+			throw new Error("must not build");
+		});
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			factory,
+		);
+		await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		try {
+			const directory = join(live.tempDir, "mesh", "directory");
+			mkdirSync(directory, { recursive: true });
+			writeFileSync(join(directory, `${live.session.sessionId}.json`), "{}");
+			const before = readFileSync(live.session.sessionFile!, "utf8");
+			await expect(runtime.switchSession(live.session.sessionFile!)).rejects.toThrow(
+				"Mesh replacement refused: supervisor does not offer the replacement barrier; restart the daemon",
+			);
+			expect(factory).not.toHaveBeenCalled();
+			expect(runtime.session).toBe(live.session);
+			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
+	it("pi-0spx preserves a supervisor begin refusal without cancelling", async () => {
+		const live = await createHarness({ persistSession: true });
+		const h = harness();
+		await h.authenticate("cotal");
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			async () => {
+				throw new Error("must not build");
+			},
+		);
+		await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => ({
+			success: false,
+			error:
+				command.phase === "begin"
+					? "Mesh replacement refused: session is active in another holder of this daemon"
+					: "Session target: stale replacement token",
+		}));
+		Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
+		const incoming = join(live.tempDir, "refused.jsonl");
+		copyFileSync(live.session.sessionFile!, incoming);
+		const before = readFileSync(live.session.sessionFile!, "utf8");
+		try {
+			await expect(runtime.importFromJsonl(incoming)).rejects.toThrow(
+				/^Mesh replacement refused: session is active in another holder of this daemon$/,
+			);
+			expect(request.mock.calls.map(([command]) => command.phase)).toEqual(["begin"]);
+			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
+			expect(runtime.session).toBe(live.session);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
+	it.each(["begin", "drain"])("pi-0spx cancels a timed-out replacement %s", async (phase) => {
+		const live = await createHarness({ persistSession: true });
+		const h = harness();
+		await h.authenticate("cotal");
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			async () => {
+				throw new Error("must not build");
+			},
+		);
+		const state = await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		const queue = createDeferred();
+		Object.assign(live.session, { _agentEventQueue: queue.promise });
+		const ready = createDeferred();
+		const expired = createDeferred();
+		const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>, _timeout?: number) => ({
+			success: true,
+			data: { required: true, token: command.token },
+		}));
+		request.mockImplementationOnce(async (command) => {
+			ready.resolve();
+			if (phase === "begin") {
+				await expired.promise;
+				throw new Error("begin timeout");
+			}
+			return { success: true, data: { required: true, token: command.token } };
+		});
+		Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
+		(h.internals as unknown as { meshMessageIds: WeakMap<object, Set<string>> }).meshMessageIds.set(
+			live.session,
+			new Set(["agentmsg_waiting"]),
+		);
+		const incomingDir = join(live.tempDir, "incoming");
+		mkdirSync(incomingDir);
+		const incoming = join(incomingDir, basename(live.session.sessionFile!));
+		copyFileSync(live.session.sessionFile!, incoming);
+		const before = readFileSync(live.session.sessionFile!, "utf8");
+		try {
+			vi.useFakeTimers();
+			const replacing = state.runtime.importFromJsonl(incoming);
+			const refused = expect(replacing).rejects.toThrow(phase === "begin" ? "begin timeout" : "agentmsg_waiting");
+			await ready.promise;
+			expect(request.mock.calls[0]?.[1]).toBe(27_000);
+			await vi.advanceTimersByTimeAsync(27_000);
+			expired.resolve();
+			await refused;
+			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
+			expect(state.runtime.session).toBe(live.session);
+			expect(request.mock.calls.at(-1)?.[0]).toMatchObject({
+				phase: "cancelled",
+				token: request.mock.calls[0]?.[0].token,
+			});
+			expect(request.mock.calls.at(-1)?.[1]).toBeGreaterThanOrEqual(3000);
+		} finally {
+			vi.useRealTimers();
+			queue.resolve();
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
+	it("pi-0spx preserves an import error when mesh finish fails", async () => {
+		const live = await createHarness({ persistSession: true });
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			async () => {
+				throw new Error("must not build");
+			},
+		);
+		const finishError = new Error("mesh cleanup failed");
+		const finish = vi.fn(async () => {
+			throw finishError;
+		});
+		runtime.setReplacementBarrier(async () => ({ finish }));
+		try {
+			live.session.sessionManager.flushNow();
+			const incomingDir = join(live.tempDir, "incoming");
+			mkdirSync(incomingDir);
+			const incoming = join(incomingDir, basename(live.session.sessionFile!));
+			const [header, ...entries] = readFileSync(live.session.sessionFile!, "utf8").split("\n");
+			writeFileSync(
+				incoming,
+				[JSON.stringify({ ...JSON.parse(header!), cwd: join(live.tempDir, "missing") }), ...entries].join("\n"),
+			);
+			const replacing = runtime.importFromJsonl(incoming);
+			await expect(replacing).rejects.toBeInstanceOf(MissingSessionCwdError);
+			await expect(replacing).rejects.toHaveProperty("cause", finishError);
+			expect(finish).toHaveBeenCalledTimes(1);
+			expect(finish).toHaveBeenCalledWith("failed");
+			expect(runtime.session).toBe(live.session);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
+	it.each(["transport", "supervisor"] as const)(
+		"pi-0spx finishes once and preserves mesh admission after a %s failure",
+		async (failure) => {
+			const live = await createHarness({ persistSession: true });
+			let next: Awaited<ReturnType<typeof createHarness>> | undefined;
+			const factory: CreateAgentSessionRuntimeFactory = async (options) => {
+				next = await createHarness({
+					persistSession: true,
+					existingSessionFile: options.sessionManager.getSessionFile()!,
+				});
+				return {
+					session: next.session,
+					services: { cwd: next.tempDir, agentDir: next.tempDir },
+					diagnostics: [],
+				} as never;
+			};
+			const h = harness(factory);
+			await h.authenticate("cotal");
+			const runtime = new AgentSessionRuntime(
+				live.session,
+				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				factory,
+			);
+			const state = await (
+				h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+			).addRuntime(runtime);
+			const phases: string[] = [];
+			Object.assign(h.internals, {
+				meshReplacementOffered: true,
+				supervisorLink: () => ({
+					request: async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
+						phases.push(command.phase);
+						if (command.phase === "begin")
+							return { success: true, data: { required: true, token: command.token } };
+						if (failure === "transport") throw new Error("lost completed response");
+						return { success: false, error: "endpoint restart failed" };
+					},
+				}),
+			});
+			const incoming = join(live.tempDir, "finish-once.jsonl");
+			copyFileSync(live.session.sessionFile!, incoming);
+			try {
+				const replacing = runtime.importFromJsonl(incoming);
+				await expect(replacing).rejects.toThrow(
+					"Session switch or import completed, but the mesh endpoint was not confirmed. " +
+						"Reopen the session from disk to restore delivery.",
+				);
+				await expect(replacing).rejects.toHaveProperty(
+					"cause.message",
+					failure === "transport" ? "lost completed response" : "endpoint restart failed",
+				);
+				expect(phases).toEqual(["begin", "completed"]);
+				expect(runtime.session).not.toBe(live.session);
+				const receiving = h.internals.receiveMeshMessage(h.client, {
+					type: "worker_deliver_message",
+					targetActiveSessionId: state.activeSessionId,
+					message: "after finish",
+					sender: { sessionName: "sender" },
+					cotal: { id: "after-finish", deliveryCount: 1, attemptToken: "attempt" },
+				});
+				if (failure === "supervisor") await expect(receiving).rejects.toThrow("reopened from disk");
+				else {
+					await receiving;
+					await runtime.session.waitForAgentMessagePromptCompletion("agentmsg_after-finish");
+					expect(h.frames()).toContainEqual({
+						type: "agent_message_persisted",
+						cotalId: "after-finish",
+						attemptToken: "attempt",
+					});
+				}
+			} finally {
+				await runtime.dispose();
+				next?.cleanup();
+				live.cleanup();
+			}
+		},
+	);
+
 	it.each(["cotal", "native", undefined])(
 		"follows authenticated mode %s rather than edited worker settings",
 		async (mode) => {
@@ -4653,12 +5058,35 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["new_session", "fork", "switch_session", "import_jsonl", "repeat"])(
+	const queuedMeshReplacementCommands = [
+		"new_session",
+		"fork",
+		"switch_session",
+		"import_jsonl",
+		"same-id",
+		"cross-id",
+		"no-token-cancelled",
+		"no-token-failed",
+		"repeat",
+	] as const;
+	it.each(queuedMeshReplacementCommands)(
 		"closes or deduplicates the old session's queued mesh delivery (%s)",
 		async (command) => {
 			const gate = createDeferred();
 			const started = createDeferred();
+			const beforeCopy = createDeferred();
+			const copyGate = createDeferred();
 			const live = await createHarness({
+				extensionFactories: [
+					(pi) =>
+						pi.on("session_before_switch", async (event) => {
+							if (command === "no-token-cancelled" && event.reason === "resume") return { cancel: true };
+							if (command === "same-id") {
+								beforeCopy.resolve();
+								await copyGate.promise;
+							}
+						}),
+				],
 				persistSession: true,
 				tools: [
 					{
@@ -4712,6 +5140,18 @@ describe("mesh worker persistence", () => {
 					.find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
 				const saved = SessionManager.create(live.tempDir, join(live.tempDir, "saved"));
 				saved.flushNow();
+				if (["same-id", "cross-id", "no-token-cancelled", "no-token-failed"].includes(command)) {
+					if (command !== "cross-id") copyFileSync(live.session.sessionFile!, saved.getSessionFile()!);
+					Object.assign(h.internals, {
+						meshReplacementOffered: true,
+						supervisorLink: () => ({
+							request: async (replacement: Extract<DaemonCommand, { type: "mesh_replace" }>) => ({
+								success: true,
+								data: { required: !command.startsWith("no-token"), token: replacement.token },
+							}),
+						}),
+					});
+				}
 				h.written.length = 0;
 				await h.internals.handleLine(
 					h.client,
@@ -4721,7 +5161,7 @@ describe("mesh worker persistence", () => {
 						targetActiveSessionId: state.activeSessionId,
 						message: "hello",
 						sender: { sessionName: "sender" },
-						cotal: { id: "replaced", deliveryCount: 1 },
+						cotal: { id: "replaced", deliveryCount: 1, attemptToken: "attempt" },
 					}),
 				);
 				expect(h.frames().filter((frame) => frame.command === "worker_deliver_message")).toMatchObject([
@@ -4737,7 +5177,7 @@ describe("mesh worker persistence", () => {
 							targetActiveSessionId: state.activeSessionId,
 							message: "hello",
 							sender: { sessionName: "sender" },
-							cotal: { id: "replaced", deliveryCount: 2 },
+							cotal: { id: "replaced", deliveryCount: 2, attemptToken: "attempt" },
 						}),
 					);
 					expect(live.session.getSessionActionSnapshot().queuedCount).toBe(1);
@@ -4752,35 +5192,80 @@ describe("mesh worker persistence", () => {
 					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(1);
 					return;
 				}
-				await h.internals.handleLine(
+				if (command.startsWith("no-token")) {
+					if (command === "no-token-failed") {
+						const lines = readFileSync(saved.getSessionFile()!, "utf8").trimEnd().split("\n");
+						lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(live.tempDir, "missing") });
+						writeFileSync(saved.getSessionFile()!, `${lines.join("\n")}\n`);
+					}
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({
+							id: "no-token",
+							type: "import_jsonl",
+							activeSessionId: state.activeSessionId,
+							inputPath: saved.getSessionFile(),
+						}),
+					);
+					expect(h.frames().at(-1)).toMatchObject({ success: command === "no-token-cancelled" });
+				}
+				const replacement = h.internals.handleLine(
 					h.client,
 					JSON.stringify({
 						id: "replacement",
-						type: command,
+						type: command.startsWith("no-token")
+							? "new_session"
+							: command === "same-id" || command === "cross-id"
+								? "import_jsonl"
+								: command,
 						activeSessionId: state.activeSessionId,
 						...(command === "fork" ? { entryId } : {}),
 						...(command === "switch_session" ? { sessionPath: saved.getSessionFile() } : {}),
-						...(command === "import_jsonl" ? { inputPath: saved.getSessionFile() } : {}),
+						...(command === "import_jsonl" || command === "same-id" || command === "cross-id"
+							? { inputPath: saved.getSessionFile() }
+							: {}),
 					}),
 				);
-				expect(h.frames().at(-1)).toMatchObject({ command, success: true });
+				if (command === "same-id") {
+					await beforeCopy.promise;
+					expect(live.session.getSessionActionSnapshot().queuedCount).toBe(0);
+					copyGate.resolve();
+				}
+				await replacement;
+				expect(h.frames().at(-1)).toMatchObject({
+					command: command.startsWith("no-token")
+						? "new_session"
+						: command === "same-id" || command === "cross-id"
+							? "import_jsonl"
+							: command,
+					success: true,
+				});
 				expect(
 					h
 						.frames()
 						.filter(
 							(frame) => frame.type === "agent_message_dropped" || frame.type === "agent_message_persisted",
 						),
-				).toEqual([{ type: "agent_message_dropped", cotalId: "replaced", reason: "closed" }]);
-				expect(state.runtime.session.sessionId).not.toBe(oldId);
+				).toEqual([
+					{
+						type: "agent_message_dropped",
+						cotalId: "replaced",
+						attemptToken: "attempt",
+						reason: command === "same-id" ? "other" : "closed",
+					},
+				]);
+				if (command === "same-id") expect(state.runtime.session.sessionId).toBe(oldId);
+				else expect(state.runtime.session.sessionId).not.toBe(oldId);
 				expect(
 					live.sessionManager
 						.getEntries()
 						.some((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
 				).toBe(false);
 				const replaced = (h.internals as unknown as { replacedSessions: WeakSet<object> }).replacedSessions;
-				expect(replaced.has(live.session)).toBe(true);
+				expect(replaced.has(live.session)).toBe(command !== "same-id");
 				expect(replaced.has(state.runtime.session)).toBe(false);
 			} finally {
+				copyGate.resolve();
 				gate.resolve();
 				await running.catch(() => undefined);
 				await runtime.dispose();
@@ -4848,7 +5333,7 @@ describe("mesh worker persistence", () => {
 					message: "hello",
 					sender: { sessionName: "parent" },
 					fromRelationship: "parent",
-					cotal: { id: "terminal", deliveryCount: 1 },
+					cotal: { id: "terminal", deliveryCount: 1, attemptToken: "attempt" },
 				}),
 			);
 			expect(h.frames()).toMatchObject([
@@ -4909,10 +5394,11 @@ describe("mesh worker persistence", () => {
 			const terminalFrames = () => h.frames().filter((frame) => frame.command !== "agent_messages_pause");
 			expect(terminalFrames()[1]).toEqual(
 				outcome === "persist-race"
-					? { type: "agent_message_persisted", cotalId: "terminal" }
+					? { type: "agent_message_persisted", cotalId: "terminal", attemptToken: "attempt" }
 					: {
 							type: "agent_message_dropped",
 							cotalId: "terminal",
+							attemptToken: "attempt",
 							reason:
 								outcome === "killed" || outcome === "completed"
 									? "closed"
@@ -4963,7 +5449,7 @@ describe("mesh worker persistence", () => {
 						targetActiveSessionId: "target",
 						message: "hello",
 						sender: { sessionName: "sender" },
-						cotal: { id: "buffered", deliveryCount: 2 },
+						cotal: { id: "buffered", deliveryCount: 2, attemptToken: "attempt" },
 					}),
 				);
 				expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
@@ -4975,7 +5461,7 @@ describe("mesh worker persistence", () => {
 					.closeSession(state, reason)
 					.catch(() => undefined);
 				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual([
-					{ type: "agent_message_dropped", cotalId: "buffered", reason: "closed" },
+					{ type: "agent_message_dropped", cotalId: "buffered", attemptToken: "attempt", reason: "closed" },
 				]);
 			} finally {
 				archive.mockRestore();
@@ -5042,7 +5528,7 @@ describe("mesh worker persistence", () => {
 						targetActiveSessionId: "target",
 						message: "hello",
 						sender: { sessionName: "sender" },
-						cotal: { id: "failed", deliveryCount: 1 },
+						cotal: { id: "failed", deliveryCount: 1, attemptToken: "attempt" },
 					}),
 				);
 				await Promise.resolve();
@@ -5051,7 +5537,7 @@ describe("mesh worker persistence", () => {
 				expect(live.session.waitForAgentMessagePromptCompletion("agentmsg_failed")).not.toBe(completion);
 				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
 					failure === "clear-race"
-						? [{ type: "agent_message_dropped", cotalId: "failed", reason: "cleared" }]
+						? [{ type: "agent_message_dropped", cotalId: "failed", attemptToken: "attempt", reason: "cleared" }]
 						: [],
 				);
 				expect(h.frames().at(-1)).toMatchObject({ command: "worker_deliver_message", success: false });
@@ -5125,7 +5611,7 @@ describe("mesh worker persistence", () => {
 					targetActiveSessionId: "target",
 					message: "hello",
 					sender: { sessionName: "sender" },
-					cotal: { id: "started", deliveryCount: 1 },
+					cotal: { id: "started", deliveryCount: 1, attemptToken: "attempt" },
 				}),
 			);
 			try {
@@ -5139,10 +5625,14 @@ describe("mesh worker persistence", () => {
 				expect(countOwn()).toBe(outcome === "append-event-error" ? 0 : 1);
 				expect(copiesAtCompletion).toBe(outcome === "abort" ? 1 : 0);
 				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual(
-					outcome !== "abort" ? [{ type: "agent_message_dropped", cotalId: "started", reason: "other" }] : [],
+					outcome !== "abort"
+						? [{ type: "agent_message_dropped", cotalId: "started", attemptToken: "attempt", reason: "other" }]
+						: [],
 				);
 				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual(
-					outcome === "abort" ? [{ type: "agent_message_persisted", cotalId: "started" }] : [],
+					outcome === "abort"
+						? [{ type: "agent_message_persisted", cotalId: "started", attemptToken: "attempt" }]
+						: [],
 				);
 			} finally {
 				gate.resolve();
@@ -5193,7 +5683,7 @@ describe("mesh worker persistence", () => {
 			targetActiveSessionId: "target",
 			message: "hello",
 			sender: { sessionName: "sender" },
-			cotal: { id: "stable", deliveryCount: 2 },
+			cotal: { id: "stable", deliveryCount: 2, attemptToken: "attempt" },
 		} as const;
 		await h.internals.receiveMeshMessage(h.client, command);
 		expect(h.frames()).toMatchObject([{ command: "worker_deliver_message", success: true }]);
@@ -5223,19 +5713,25 @@ describe("mesh worker persistence", () => {
 		manager.appendCustomEntry("unrelated");
 		expect(h.frames()).toHaveLength(1);
 		(manager as unknown as { _rewriteFile(): void })._rewriteFile();
-		expect(h.frames()[1]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		expect(h.frames()[1]).toEqual({ type: "agent_message_persisted", cotalId: "stable", attemptToken: "attempt" });
 		manager.appendCustomEntry("later");
 		expect(h.frames()).toHaveLength(2);
 		await h.internals.receiveMeshMessage(h.client, command);
 		expect(accept).toHaveBeenCalledTimes(1);
-		expect(h.frames()[3]).toEqual({ type: "agent_message_persisted", cotalId: "stable" });
+		expect(h.frames()[3]).toEqual({ type: "agent_message_persisted", cotalId: "stable", attemptToken: "attempt" });
 		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
 		accept.mockRejectedValueOnce(new Error("accept failed"));
 		await expect(
-			h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "error", deliveryCount: 1 } }),
+			h.internals.receiveMeshMessage(h.client, {
+				...command,
+				cotal: { id: "error", deliveryCount: 1, attemptToken: "attempt" },
+			}),
 		).rejects.toThrow("accept failed");
 		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
-		await h.internals.receiveMeshMessage(h.client, { ...command, cotal: { id: "closed", deliveryCount: 1 } });
+		await h.internals.receiveMeshMessage(h.client, {
+			...command,
+			cotal: { id: "closed", deliveryCount: 1, attemptToken: "attempt" },
+		});
 		const count = h.frames().length;
 		h.socket.emit("close");
 		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);

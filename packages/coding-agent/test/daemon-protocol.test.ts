@@ -76,35 +76,62 @@ describe("daemon protocol helpers", () => {
 				expect.objectContaining({ id: "old-list", command: "list", success: true }),
 			);
 			expect(JSON.stringify(write.mock.calls)).not.toContain("mesh_send");
+			expect(JSON.stringify(write.mock.calls)).not.toContain("mesh_replace");
 		} finally {
 			await internals.cleanupSupervisorResources();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("checks a new client against schema revisions 33 and 34 before sending mesh_send", async () => {
+	it.each(["mesh_send", "mesh_replace"] as const)(
+		"checks new-client/old-supervisor capability for %s",
+		checkMeshCapability,
+	);
+
+	async function checkMeshCapability(type: "mesh_send" | "mesh_replace") {
 		const client = new DaemonClient("unused");
 		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
 		const state = client as unknown as {
 			socket: { destroyed: boolean };
-			helloMessage: { protocol: typeof DAEMON_PROTOCOL_INFO; schemaRevision: number; serverCapabilities: string[] };
+			helloMessage: {
+				protocol: typeof DAEMON_PROTOCOL_INFO;
+				schemaRevision: number;
+				serverCapabilities: string[];
+			};
 			requestWire: typeof wire;
 		};
 		state.socket = { destroyed: false };
 		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
 		state.requestWire = wire;
-		const command = { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" } as const;
+		const capability = type === "mesh_send" ? "mesh_send" : "mesh_replacement";
+		const revision = type === "mesh_send" ? 34 : 35;
+		const command: DaemonCommand =
+			type === "mesh_send"
+				? { type, fromActiveSessionId: "a", targetSessionId: "b", message: "hello" }
+				: {
+						type,
+						fromActiveSessionId: "a",
+						phase: "begin",
+						token: "replacement",
+						sessionId: "b",
+						sessionFile: "b.jsonl",
+						overwrite: true,
+					};
 		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
 		expect(wire).not.toHaveBeenCalled();
 		await expect(client.request({ type: "list" })).resolves.toMatchObject({ command: "list", success: true });
 		expect(wire.mock.calls[0]![0]).toEqual({ type: "list" });
-		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: [] };
+		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: revision, serverCapabilities: [] };
 		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
 		expect(wire).toHaveBeenCalledTimes(1);
-		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 34, serverCapabilities: ["mesh_send"] };
-		await expect(client.request(command)).resolves.toMatchObject({ command: "mesh_send", success: true });
+		state.helloMessage = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: revision,
+			serverCapabilities: [capability],
+		};
+		await expect(client.request(command)).resolves.toMatchObject({ command: type, success: true });
 		expect(wire).toHaveBeenCalledTimes(2);
-	});
+	}
 
 	it.each([
 		["new TUI / old daemon", true, false, false],
@@ -238,8 +265,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(34);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-34-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(35);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-35-/);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -296,6 +323,7 @@ describe("daemon protocol helpers", () => {
 	// capability name, and whether a default server advertises that capability.
 	it.each([
 		["mesh_send", { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" }, false],
+		["mesh_replace", { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
 		["replace_acp_mcp_servers", { minProtocol: 7, minSchemaRevision: 22, capability: "acp_mcp_servers" }, true],
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],
@@ -479,6 +507,7 @@ describe("daemon protocol helpers", () => {
 			"get_direct_worker_transport",
 			"list_agent_peers",
 			"mesh_send",
+			"mesh_replace",
 			"promote_owned_session",
 			"reattach",
 			"roster_subscribe",

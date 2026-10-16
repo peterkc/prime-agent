@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, type MessageMeta } from "@cotal-ai/core";
 import {
@@ -21,9 +22,11 @@ import {
 	provisionEnrollment,
 	publishDirectory,
 	readDirectory,
+	readEnrollment,
 	readSigner,
 	removeEnrollment,
 	renameDirectory,
+	updateEnrollmentPath,
 	withDirectoryLock,
 } from "./enrollment.js";
 import { InvalidMeshPayloadError, meshMessageText, redactMeshError } from "./mesh-shared.js";
@@ -39,6 +42,7 @@ export interface MeshEndpointOptions {
 		deliveryCount: number,
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
+		attemptToken: string,
 	) => Promise<void>;
 }
 
@@ -65,12 +69,30 @@ interface SessionEndpoint {
 }
 
 interface PendingPersistence {
+	readonly attemptToken: string;
 	readonly deliveryCount: number;
 	readonly sessionId: string;
 	readonly delivery: Delivery;
 	readonly resolve: () => void;
 	readonly reject: (error: Error) => void;
 	recipient?: object;
+}
+
+type ReplacementOutcome = "completed" | "cancelled" | "failed";
+
+interface ReplacementBegin {
+	readonly token: string;
+	readonly requester: object;
+	readonly ready: Promise<void>;
+	state: "active" | "cancelled" | "failed";
+}
+
+interface SessionReplacement {
+	readonly token: string;
+	readonly record: EnrollmentRecord;
+	readonly claim: SessionLease;
+	readonly requester: object;
+	state: "active" | "failed";
 }
 
 export class MeshEndpoints {
@@ -82,6 +104,8 @@ export class MeshEndpoints {
 	private readonly enrolling = new Map<string, Promise<void>>();
 	private enrollmentQueue = Promise.resolve();
 	private readonly pending = new Map<string, PendingPersistence>();
+	private readonly replacements = new Map<string, SessionReplacement>();
+	private readonly replacementBegins = new Map<string, ReplacementBegin>();
 	private closing = false;
 	private stopping?: Promise<void>;
 
@@ -143,11 +167,14 @@ export class MeshEndpoints {
 		}
 		const existing = this.enrolling.get(sessionId);
 		if (existing) return existing;
+		if (this.replacements.has(sessionId) || this.replacementBegins.has(sessionId)) return Promise.resolve();
 		const session = this.sessions.get(sessionId);
-		if (session)
-			return session.state === "closed"
-				? Promise.reject(new Error(`Session ${sessionId}: mesh endpoint is closed`))
-				: Promise.resolve();
+		if (session?.state === "closed")
+			return Promise.reject(new Error(`Session ${sessionId}: mesh endpoint is closed`));
+		if (session && canonicalSessionPath(sessionFile) !== canonicalSessionPath(session.record.sessionFile)) {
+			return this.rebindSession(session, sessionFile);
+		}
+		if (session) return Promise.resolve();
 		const work = this.startSession(sessionId, sessionFile).catch((error: unknown) => {
 			throw new Error(this.recordEnrollmentFailure(sessionId, error));
 		});
@@ -159,12 +186,29 @@ export class MeshEndpoints {
 		return work;
 	}
 
-	private async startSession(sessionId: string, sessionFile: string): Promise<void> {
+	async openSession(sessionId: string, sessionFile?: string): Promise<void> {
+		await this.replacementBegins.get(sessionId)?.ready;
+		const replacement = this.replacements.get(sessionId);
+		if (replacement?.state !== "failed" || !sessionFile) return this.enroll(sessionId, sessionFile);
+		const existing = this.enrolling.get(sessionId);
+		if (existing) return existing;
+		const opening = this.finishReplacementOnce(sessionId, replacement, "completed", sessionFile).then(
+			() => undefined,
+		);
+		this.enrolling.set(sessionId, opening);
+		try {
+			await opening;
+		} finally {
+			this.enrolling.delete(sessionId);
+		}
+	}
+
+	private async startSession(sessionId: string, sessionFile: string, retainedClaim?: SessionLease): Promise<void> {
 		const config = this.config;
 		if (!config) throw new Error(this.refusal ?? "Mesh configuration is unavailable");
 		let claim: SessionLease;
 		try {
-			claim = claimEnrollment(this.options.meshRoot, sessionId, sessionFile);
+			claim = retainedClaim ?? claimEnrollment(this.options.meshRoot, sessionId, sessionFile);
 		} catch (error) {
 			if (error instanceof SessionAlreadyActiveError) {
 				this.enrollmentFailures.set(sessionId, "claimed by another daemon");
@@ -181,6 +225,8 @@ export class MeshEndpoints {
 				if (!existsSync(sessionFile)) throw new Error(`Session ${sessionId}: session file is missing`);
 				return ensureEnrollmentRecord(this.options.meshRoot, sessionId, sessionFile);
 			});
+			if (canonicalSessionPath(sessionFile) !== canonicalSessionPath(record.sessionFile))
+				record = await updateEnrollmentPath(this.options.meshRoot, sessionId, sessionFile);
 			await provisionEnrollment(this.options.meshRoot, config, record);
 			if (this.closing) throw new Error(`Session ${sessionId}: mesh is shutting down`);
 			const directory = await publishDirectory(this.options.meshRoot, record, this.options.homeSocket);
@@ -263,17 +309,132 @@ export class MeshEndpoints {
 				} else {
 					await this.closeSession(sessionId);
 					this.sessions.delete(sessionId);
-					claim.release();
+					if (!retainedClaim) claim.release();
 				}
 			} else {
 				// An unpublished first enrollment is not a delete. Only missing persisted state authorizes removal.
 				if (record && !existsSync(enrollmentPath(this.options.meshRoot, sessionId))) {
 					await this.removeInbox(record);
 				}
-				claim.release();
+				if (!retainedClaim) claim.release();
 			}
 			throw error;
 		}
+	}
+
+	async beginReplacement(
+		sessionId: string,
+		_sessionFile: string,
+		_overwrite: boolean,
+		requester: object,
+		token: string,
+	): Promise<string | undefined> {
+		if (this.closing || this.refusal) throw new Error(this.refusal ?? "Mesh is shutting down");
+		if (typeof token !== "string" || !token) throw new Error("Mesh replacement refused: invalid replacement token");
+		if (this.replacements.get(sessionId)?.token === token || this.replacementBegins.get(sessionId)?.token === token)
+			throw new Error(`Session ${sessionId}: stale replacement token`);
+		if (this.replacementBegins.has(sessionId))
+			throw new Error(`Session ${sessionId}: replacement is already pending`);
+		let complete!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			complete = resolve;
+		});
+		const beginning: ReplacementBegin = { token, requester, ready, state: "active" };
+		this.replacementBegins.set(sessionId, beginning);
+		let replacement: SessionReplacement | undefined;
+		try {
+			await this.enrolling.get(sessionId);
+			if (beginning.state === "failed") throw new Error(`Session ${sessionId}: replacement begin failed`);
+			if (beginning.state === "cancelled") return undefined;
+			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) return undefined;
+			const record = readEnrollment(this.options.meshRoot, sessionId);
+			const previous = this.replacements.get(sessionId);
+			if (previous?.state === "active") throw new Error(`Session ${sessionId}: replacement is already pending`);
+			const session = this.sessions.get(sessionId);
+			const claim =
+				previous?.claim ?? session?.claim ?? claimEnrollment(this.options.meshRoot, sessionId, record.sessionFile);
+			replacement = { token, record, claim, requester, state: "active" };
+			this.replacements.set(sessionId, replacement);
+			await this.closeSession(sessionId);
+			return token;
+		} catch (error) {
+			beginning.state = "failed";
+			if (replacement && this.replacements.get(sessionId) === replacement) this.replacements.delete(sessionId);
+			throw error;
+		} finally {
+			this.replacementBegins.delete(sessionId);
+			complete();
+		}
+	}
+
+	async finishReplacement(
+		sessionId: string,
+		token: string,
+		outcome: ReplacementOutcome,
+		sessionFile: string,
+	): Promise<ReplacementOutcome> {
+		const beginning = this.replacementBegins.get(sessionId);
+		const current = this.replacements.get(sessionId);
+		if ((!beginning || beginning.token !== token) && (!current || current.token !== token))
+			throw new Error(`Session ${sessionId}: stale replacement token`);
+		if (outcome !== "completed") {
+			if (beginning && beginning.token === token) beginning.state = outcome;
+			if (current && current.token === token) current.state = "failed";
+		}
+		if (beginning && beginning.token === token) await beginning.ready;
+		await this.enrolling.get(sessionId);
+		const replacement = this.replacements.get(sessionId);
+		if (!replacement && beginning && beginning.token === token && outcome !== "completed")
+			return beginning.state === "failed" ? "failed" : outcome;
+		if (!replacement || replacement.token !== token) throw new Error(`Session ${sessionId}: stale replacement token`);
+		const work = this.finishReplacementOnce(sessionId, replacement, outcome, sessionFile).then(() => undefined);
+		this.enrolling.set(sessionId, work);
+		try {
+			await work;
+			return outcome;
+		} finally {
+			this.enrolling.delete(sessionId);
+		}
+	}
+
+	private async finishReplacementOnce(
+		sessionId: string,
+		replacement: SessionReplacement,
+		outcome: ReplacementOutcome,
+		sessionFile: string,
+	): Promise<ReplacementOutcome> {
+		if (outcome === "failed") {
+			replacement.state = "failed";
+			return outcome;
+		}
+		try {
+			if (outcome === "completed") await updateEnrollmentPath(this.options.meshRoot, sessionId, sessionFile);
+			this.sessions.delete(sessionId);
+			await this.startSession(
+				sessionId,
+				outcome === "cancelled" ? replacement.record.sessionFile : sessionFile,
+				replacement.claim,
+			);
+			this.replacements.delete(sessionId);
+			return outcome;
+		} catch (error) {
+			replacement.state = "failed";
+			if (
+				!existsSync(enrollmentPath(this.options.meshRoot, sessionId)) &&
+				this.replacements.get(sessionId) === replacement
+			) {
+				await this.removeInbox(replacement.record);
+				replacement.claim.release();
+				this.sessions.delete(sessionId);
+				this.replacements.delete(sessionId);
+			}
+			throw error;
+		}
+	}
+
+	private async rebindSession(session: SessionEndpoint, sessionFile: string): Promise<void> {
+		const token = await this.beginReplacement(session.record.sessionId, sessionFile, false, this, randomUUID());
+		if (token) await this.finishReplacement(session.record.sessionId, token, "completed", sessionFile);
 	}
 
 	closeSession(sessionId: string): Promise<void> {
@@ -304,6 +465,15 @@ export class MeshEndpoints {
 		if (record === "absent") return;
 		if (record === "mismatch") {
 			this.options.log(`Mesh session ${sessionId}: deleted file is not the enrolled file; inbox unchanged`);
+			return;
+		}
+		const replacement = this.replacements.get(sessionId);
+		if (replacement) {
+			await this.closeSession(sessionId);
+			await this.removeInbox(record);
+			replacement.claim.release();
+			this.replacements.delete(sessionId);
+			this.sessions.delete(sessionId);
 			return;
 		}
 		const session = this.sessions.get(sessionId);
@@ -570,7 +740,14 @@ export class MeshEndpoints {
 			}
 			if (this.pending.has(message.id)) throw new Error("A copy is already in flight");
 			const persisted = new Promise<void>((resolve, reject) => {
-				pending = { sessionId: session.record.sessionId, deliveryCount, delivery, resolve, reject };
+				pending = {
+					sessionId: session.record.sessionId,
+					attemptToken: randomUUID(),
+					deliveryCount,
+					delivery,
+					resolve,
+					reject,
+				};
 				this.pending.set(message.id, pending);
 			});
 			// A disconnect may reject this while wake/acceptance is still pending.
@@ -588,6 +765,7 @@ export class MeshEndpoints {
 					void this.retireSession(session).catch(() => undefined); // close logs a failed stop and keeps custody.
 					return false;
 				},
+				pending!.attemptToken,
 			);
 			await persisted;
 		} catch (error) {
@@ -613,10 +791,10 @@ export class MeshEndpoints {
 		}
 	}
 
-	confirmPersisted(cotalId: string, recipient: object): void {
+	confirmPersisted(cotalId: string, recipient: object, attemptToken: string): void {
 		if (this.closing) return;
 		const pending = this.pending.get(cotalId);
-		if (!pending || pending.recipient !== recipient) return;
+		if (!pending || pending.recipient !== recipient || pending.attemptToken !== attemptToken) return;
 		this.pending.delete(cotalId);
 		try {
 			pending.delivery.ack();
@@ -626,10 +804,15 @@ export class MeshEndpoints {
 		}
 	}
 
-	confirmDropped(cotalId: string, recipient: object, reason: "cleared" | "closed" | "other"): void {
+	confirmDropped(
+		cotalId: string,
+		recipient: object,
+		reason: "cleared" | "closed" | "other",
+		attemptToken: string,
+	): void {
 		if (this.closing) return;
 		const pending = this.pending.get(cotalId);
-		if (!pending || pending.recipient !== recipient) return;
+		if (!pending || pending.recipient !== recipient || pending.attemptToken !== attemptToken) return;
 		this.pending.delete(cotalId);
 		let outcome = reason === "other" ? "left unacknowledged" : "acknowledged";
 		try {
@@ -645,6 +828,12 @@ export class MeshEndpoints {
 	}
 
 	disconnect(recipient: object): void {
+		for (const beginning of this.replacementBegins.values()) {
+			if (beginning.requester === recipient) beginning.state = "failed";
+		}
+		for (const replacement of this.replacements.values()) {
+			if (replacement.requester === recipient && replacement.state === "active") replacement.state = "failed";
+		}
 		for (const pending of this.pending.values()) {
 			if (pending.recipient === recipient)
 				pending.reject(new Error("Mesh recipient disconnected before persistence"));
@@ -654,6 +843,7 @@ export class MeshEndpoints {
 	stop(): Promise<void> {
 		if (this.stopping) return this.stopping;
 		this.closing = true;
+		for (const beginning of this.replacementBegins.values()) beginning.state = "failed";
 		// stop() is the public pull-stop operation. It also closes the connection; no ack is permitted now.
 		const stops = Promise.allSettled([...this.sessions.values()].map((session) => session.endpoint.stop()));
 		this.stopping = this.finishStop(stops);
@@ -665,7 +855,11 @@ export class MeshEndpoints {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await Promise.race([
-				Promise.allSettled([...handoffs, ...this.enrolling.values()]),
+				Promise.allSettled([
+					...handoffs,
+					...this.enrolling.values(),
+					...[...this.replacementBegins.values()].map((beginning) => beginning.ready),
+				]),
 				new Promise<void>((resolve) => {
 					timer = setTimeout(resolve, 5000);
 				}),
@@ -692,6 +886,9 @@ export class MeshEndpoints {
 				session.queue.length = 0;
 				session.claim.release();
 			}
+			for (const replacement of this.replacements.values()) replacement.claim.release();
+			this.replacements.clear();
+			this.replacementBegins.clear();
 			this.sessions.clear();
 		}
 	}

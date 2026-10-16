@@ -72,8 +72,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 32 adds opt-in session runtime reload notifications.
 // Revision 33 adds capability-gated native questionnaire forms.
 // Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
-export const DAEMON_SCHEMA_REVISION = 34;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-add8a0791f06";
+// Revision 35 adds capability-gated mesh replacement barriers with worker-created nonces and handoff attempt tokens.
+export const DAEMON_SCHEMA_REVISION = 35;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-35-mesh-replacement";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -122,6 +123,7 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
 	| "mesh_send"
+	| "mesh_replacement"
 	| "abort_and_send_queued"
 	| "render_mode";
 
@@ -529,6 +531,25 @@ export type DaemonCommand =
 	// targetSessionId carries an exact ID or a directory address. IDs win over names;
 	// Supervisors built before name addressing (same revision 34) refuse names before storage.
 	| { id?: string; type: "mesh_send"; fromActiveSessionId: string; targetSessionId: string; message: string }
+	| {
+			id?: string;
+			type: "mesh_replace";
+			fromActiveSessionId: string;
+			sessionId: string;
+			sessionFile: string;
+			phase: "begin";
+			token: string;
+			overwrite: boolean;
+	  }
+	| {
+			id?: string;
+			type: "mesh_replace";
+			fromActiveSessionId: string;
+			sessionId: string;
+			sessionFile: string;
+			phase: "completed" | "cancelled" | "failed";
+			token: string;
+	  }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
@@ -778,6 +799,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
 	mesh_send: { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" },
+	mesh_replace: { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -871,6 +893,7 @@ const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
 	"get_direct_worker_transport",
 	"list_agent_peers",
 	"mesh_send",
+	"mesh_replace",
 	"promote_owned_session",
 	"reattach",
 	"roster_subscribe",
@@ -918,6 +941,7 @@ export const DAEMON_COMMAND_PLANE = {
 	resume_queue: "session",
 	send_message: "control",
 	mesh_send: "control",
+	mesh_replace: "control",
 	agent_messages_status: "control",
 	agent_messages_pause: "control",
 	agent_messages_resume: "control",

@@ -152,7 +152,7 @@ export function ensureEnrollmentRecord(meshRoot: string, sessionId: string, sess
 	try {
 		record = {
 			sessionId,
-			sessionFile,
+			sessionFile: canonicalSessionPath(sessionFile),
 			identity: newIdentity(),
 			lifecycleUid: mintLifecycleUid(),
 			allowSubscribe: [],
@@ -167,6 +167,22 @@ export function ensureEnrollmentRecord(meshRoot: string, sessionId: string, sess
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		return readEnrollment(meshRoot, sessionId);
 	}
+}
+
+export async function updateEnrollmentPath(
+	meshRoot: string,
+	sessionId: string,
+	sessionFile: string,
+): Promise<EnrollmentRecord> {
+	return withDirectoryLock(meshRoot, sessionId, async () => {
+		if (!existsSync(enrollmentPath(meshRoot, sessionId)) || !readDirectory(meshRoot, sessionId))
+			throw new Error(`Session ${sessionId}: enrollment was removed during replacement`);
+		const info = await readSessionInfo(sessionFile);
+		if (!info || info.id !== sessionId) throw new Error(`Session ${sessionId}: invalid replacement file`);
+		const record = { ...readEnrollment(meshRoot, sessionId), sessionFile: canonicalSessionPath(sessionFile) };
+		writeFileAtomicSync(enrollmentPath(meshRoot, sessionId), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+		return record;
+	});
 }
 
 export function credentialSource(
