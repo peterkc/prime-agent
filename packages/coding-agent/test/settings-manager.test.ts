@@ -71,6 +71,40 @@ describe("SettingsManager", () => {
 		}
 	});
 
+	it.each(
+		["enableBuiltinExtensions", "observationPack", "herdrAgentState"].flatMap((key) =>
+			["false", 0, null, {}].map((value) => ({ key, value })),
+		),
+	)("TM-53: invalid $key=$value warns once and defaults on", ({ key, value }) => {
+		const defaults = SettingsManager.inMemory();
+		expect(defaults.getEnableBuiltinExtensions()).toBe(true);
+		expect(defaults.getBundledExtensions()).toEqual({ observationPack: true, herdrAgentState: true });
+		const bundled = {
+			observationPack: false,
+			herdrAgentState: false,
+			...(key === "enableBuiltinExtensions" ? {} : { [key]: value }),
+		};
+		writeSettings(globalPath, {
+			enableBuiltinExtensions: key === "enableBuiltinExtensions" ? value : false,
+			bundledExtensions: bundled,
+		});
+		const manager = SettingsManager.create(projectDir, agentDir);
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			for (let read = 0; read < 2; read++)
+				expect([manager.getEnableBuiltinExtensions(), ...Object.values(manager.getBundledExtensions())]).toEqual(
+					["enableBuiltinExtensions", "observationPack", "herdrAgentState"].map((field) => field === key),
+				);
+			expect(warning.mock.calls).toEqual([
+				[
+					`Warning: ${key === "enableBuiltinExtensions" ? key : `bundledExtensions.${key}`} is invalid; ignoring it.`,
+				],
+			]);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
 	describe("on-disk settings file", () => {
 		it("preserves keys it does not own, including ones written after load", async () => {
 			writeSettings(globalPath, { theme: "dark", defaultModel: "claude-sonnet" });

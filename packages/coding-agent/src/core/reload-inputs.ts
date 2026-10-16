@@ -23,6 +23,8 @@ export const RELOAD_SETTINGS_KEYS = [
 	"enableSkillCommands",
 	"enableBuiltinSkills",
 	"bundledSkills",
+	"enableBuiltinExtensions",
+	"bundledExtensions",
 	"codemode",
 	"codemodeOpenAPI",
 	"codemodeExcludeTools",

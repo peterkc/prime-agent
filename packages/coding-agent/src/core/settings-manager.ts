@@ -131,6 +131,11 @@ export interface BundledSkillsSettings {
 	websearch?: boolean; // default: true
 }
 
+export interface BundledExtensionsSettings {
+	observationPack?: boolean; // default: true
+	herdrAgentState?: boolean; // default: true
+}
+
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
@@ -264,6 +269,8 @@ export interface Settings {
 	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
 	bundledSkills?: BundledSkillsSettings; // Configure built-in skills shipped with Prime Agent
 	enableBuiltinSkills?: boolean; // default: true - load built-in skills shipped with prime-agent
+	enableBuiltinExtensions?: boolean; // default: true - load built-in extensions shipped with prime-agent
+	bundledExtensions?: BundledExtensionsSettings;
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
@@ -448,6 +455,7 @@ export class SettingsManager {
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
 	private readonly warnedCompactionSettings = new Set<keyof CompactionSettings>();
+	private readonly warnedBuiltinExtensionSettings = new Set<string>();
 
 	private constructor(
 		storage: SettingsStorage,
@@ -1375,6 +1383,32 @@ export class SettingsManager {
 		this.globalSettings.enableBuiltinSkills = enabled;
 		this.markModified("enableBuiltinSkills");
 		this.save();
+	}
+
+	getEnableBuiltinExtensions(): boolean {
+		return this.builtinExtensionBoolean("enableBuiltinExtensions", this.settings.enableBuiltinExtensions);
+	}
+
+	getBundledExtensions(): { observationPack: boolean; herdrAgentState: boolean } {
+		return {
+			observationPack: this.builtinExtensionBoolean(
+				"bundledExtensions.observationPack",
+				this.settings.bundledExtensions?.observationPack,
+			),
+			herdrAgentState: this.builtinExtensionBoolean(
+				"bundledExtensions.herdrAgentState",
+				this.settings.bundledExtensions?.herdrAgentState,
+			),
+		};
+	}
+
+	private builtinExtensionBoolean(key: string, value: unknown): boolean {
+		if (typeof value === "boolean") return value;
+		if (value !== undefined && !this.warnedBuiltinExtensionSettings.has(key)) {
+			this.warnedBuiltinExtensionSettings.add(key);
+			console.warn(`Warning: ${key} is invalid; ignoring it.`);
+		}
+		return true;
 	}
 
 	getThinkingBudgets(): ThinkingBudgetsSettings | undefined {
