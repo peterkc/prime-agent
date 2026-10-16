@@ -447,6 +447,9 @@ Paths in `~/.prime/agent/settings.json` resolve relative to `~/.prime/agent`. Pa
 | `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
 | `enableBuiltinSkills` | boolean | `true` | Load built-in skills shipped with prime-agent |
 | `bundledSkills.websearch` | boolean | `true` | Load the built-in `websearch` skill |
+| `enableBuiltinExtensions` | boolean | `true` | Load built-in extensions |
+| `bundledExtensions.observationPack` | boolean | `true` | Archive large kept tool results after compaction |
+| `bundledExtensions.herdrAgentState` | boolean | `true` | Report agent state when running inside Herdr |
 
 Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
 
@@ -459,6 +462,12 @@ Disable the built-in `websearch` skill while keeping normal skill discovery enab
   }
 }
 ```
+
+The built-in extension switches take effect on `/reload`. A non-boolean switch
+logs one warning naming the field and uses its default. Disabling a built-in
+keeps its archives and session entries. These switches do not disable user
+extensions; `--no-extensions` disables built-ins and file discovery.
+See [built-in extensions](extensions.md#built-in-extensions) for behavior and cutover.
 
 #### packages
 

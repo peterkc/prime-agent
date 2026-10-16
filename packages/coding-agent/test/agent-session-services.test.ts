@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerFauxProvider } from "@earendil-works/pi-ai";
+import { registerFauxProvider, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { AGENT_MESSAGE_SKILL_NAME, type AgentSessionMessageController } from "../src/core/agent-messages.js";
@@ -11,6 +11,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { McpConnectionStore } from "../src/core/mcp/connection-store.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { digestReloadInputs } from "../src/core/reload-inputs.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
@@ -18,6 +19,7 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 describe("createAgentSessionFromServices", () => {
 	const cleanupPaths: string[] = [];
 	const unregisters: Array<() => void> = [];
+	const noResources = { noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true };
 
 	afterEach(() => {
 		vi.unstubAllEnvs();
@@ -31,6 +33,122 @@ describe("createAgentSessionFromServices", () => {
 			}
 		}
 	});
+
+	it.each(["enableBuiltinExtensions", "observationPack", "herdrAgentState"])(
+		"TM-52: %s reloads both ways and preserves data",
+		async (key) => {
+			const root = mkdtempSync(join(tmpdir(), "builtin-reload-"));
+			cleanupPaths.push(root);
+			vi.stubEnv("HERDR_ENV", "1");
+			vi.stubEnv("HERDR_SOCKET_PATH", join(root, "unused.sock"));
+			vi.stubEnv("HERDR_PANE_ID", "test");
+			const settingsPath = join(root, "settings.json");
+			const save = (enabled: boolean) =>
+				writeFileSync(
+					settingsPath,
+					JSON.stringify(
+						key === "enableBuiltinExtensions" ? { [key]: enabled } : { bundledExtensions: { [key]: enabled } },
+					),
+				);
+			save(false);
+			const faux = registerFauxProvider();
+			unregisters.push(() => faux.unregister());
+			const authStorage = AuthStorage.inMemory();
+			const services = await createAgentSessionServices({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				modelRegistry: ModelRegistry.inMemory(authStorage),
+				telemetryDisabled: true,
+				resourceLoaderOptions: noResources,
+			});
+			const sm = SessionManager.create(root, join(root, "sessions"));
+			const result: ToolResultMessage = {
+				role: "toolResult",
+				toolName: "ipython",
+				toolCallId: "large",
+				content: [{ type: "text", text: "x".repeat(12000) }],
+				isError: false,
+				timestamp: 1,
+			};
+			const kept = sm.appendMessage(result);
+			sm.appendCompaction("summary", kept, 20000);
+			const { session } = await createAgentSessionFromServices({
+				services,
+				sessionManager: sm,
+				model: faux.getModel(),
+				prewarmIpythonKernel: false,
+			});
+			let archived = false;
+			try {
+				let previous = digestReloadInputs(services.resourceLoader.getReloadInputSnapshot!()!).settings;
+				for (const enabled of [false, true, false, true]) {
+					save(enabled);
+					await session.reload();
+					const current = digestReloadInputs(services.resourceLoader.getReloadInputSnapshot!()!).settings;
+					if (enabled || archived) expect(current).not.toBe(previous);
+					previous = current;
+					const observationOn = key === "herdrAgentState" || enabled;
+					expect(session.extensionRunner.hasHandlers("agent_start")).toBe(key === "observationPack" || enabled);
+					const projected = await session.extensionRunner.emitContext([result]);
+					expect(projected).toHaveLength(1);
+					if (observationOn) expect(JSON.stringify(projected)).toContain("[large tool result shrunk");
+					else expect(projected).toEqual([result]);
+					const archiveDir = join(sm.getSessionDir(), "observation-pack", sm.getSessionId());
+					archived ||= observationOn;
+					expect(existsSync(archiveDir)).toBe(archived);
+					if (archived) {
+						expect(readdirSync(archiveDir)).toHaveLength(1);
+						expect(readFileSync(join(archiveDir, readdirSync(archiveDir)[0]), "utf8")).toBe("x".repeat(12000));
+						expect(
+							sm
+								.getEntries()
+								.filter((entry) => entry.type === "custom" && entry.customType === "observation-pack-cycle"),
+						).toHaveLength(1);
+					}
+				}
+			} finally {
+				session.dispose();
+			}
+		},
+	);
+
+	it.each(["noExtensions", "noBuiltinHerdrReporter", "settings-off"])(
+		"TM-54: %s keeps user factories independent",
+		async (mode) => {
+			const root = mkdtempSync(join(tmpdir(), "builtin-optout-"));
+			cleanupPaths.push(root);
+			vi.stubEnv("HERDR_ENV", "1");
+			vi.stubEnv("HERDR_SOCKET_PATH", join(root, "unused.sock"));
+			vi.stubEnv("HERDR_PANE_ID", "test");
+			const authStorage = AuthStorage.inMemory();
+			const services = await createAgentSessionServices({
+				cwd: root,
+				agentDir: root,
+				authStorage,
+				modelRegistry: ModelRegistry.inMemory(authStorage),
+				telemetryDisabled: true,
+				settingsManager: SettingsManager.inMemory({ enableBuiltinExtensions: mode !== "settings-off" }),
+				noBuiltinHerdrReporter: mode === "noBuiltinHerdrReporter",
+				resourceLoaderOptions: {
+					noExtensions: mode === "noExtensions",
+					...noResources,
+					extensionFactories: [
+						(pi) => {
+							pi.registerFlag("user-still-loaded", { type: "boolean", default: true });
+						},
+					],
+				},
+			});
+			const loaded = services.resourceLoader.getExtensions();
+			expect(loaded.errors).toEqual([]);
+			expect(loaded.runtime.flagValues.get("user-still-loaded")).toBe(true);
+			expect(loaded.extensions.flatMap((extension) => extension.handlers.get("context") ?? [])).toHaveLength(
+				mode === "noBuiltinHerdrReporter" ? 1 : 0,
+			);
+			expect(loaded.extensions.flatMap((extension) => extension.handlers.get("agent_start") ?? [])).toHaveLength(0);
+		},
+	);
 
 	it("enables CLI login reuse only for default services storage", async () => {
 		const tempDir = join(tmpdir(), `pi-default-services-auth-${Date.now()}`);
