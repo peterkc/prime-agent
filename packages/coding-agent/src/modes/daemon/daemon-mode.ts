@@ -6514,11 +6514,12 @@ export class AgentDaemon {
 		const token = randomUUID();
 		const sameId = previous.sessionId === info.id;
 		let draining = false;
+		let response: DaemonResponse | undefined;
 		let release: () => void;
 		const cancellation = new AbortController();
 		const drainTimer = setTimeout(() => cancellation.abort(), Math.max(0, deadline - 3000 - Date.now()));
 		try {
-			const response = await link.request(
+			response = await link.request(
 				{
 					type: "mesh_replace",
 					phase: "begin",
@@ -6552,6 +6553,7 @@ export class AgentDaemon {
 					)
 				: () => undefined;
 		} catch (error) {
+			if (response?.success === false) throw error;
 			if (draining) {
 				this.unsafeMeshSessions.delete(previous);
 				this.sameIdReplacements.delete(previous);

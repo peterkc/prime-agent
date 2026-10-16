@@ -4439,6 +4439,44 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it("pi-0spx preserves a supervisor begin refusal without cancelling", async () => {
+		const live = await createHarness({ persistSession: true });
+		const h = harness();
+		await h.authenticate("cotal");
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			async () => {
+				throw new Error("must not build");
+			},
+		);
+		await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => ({
+			success: false,
+			error:
+				command.phase === "begin"
+					? "Mesh replacement refused: session is active in another holder of this daemon"
+					: "Session target: stale replacement token",
+		}));
+		Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
+		const incoming = join(live.tempDir, "refused.jsonl");
+		copyFileSync(live.session.sessionFile!, incoming);
+		const before = readFileSync(live.session.sessionFile!, "utf8");
+		try {
+			await expect(runtime.importFromJsonl(incoming)).rejects.toThrow(
+				/^Mesh replacement refused: session is active in another holder of this daemon$/,
+			);
+			expect(request.mock.calls.map(([command]) => command.phase)).toEqual(["begin"]);
+			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
+			expect(runtime.session).toBe(live.session);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
 	it.each(["begin", "drain"])("pi-0spx cancels a timed-out replacement %s", async (phase) => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
