@@ -4442,7 +4442,7 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
-	it("pi-0spx drains a late started message before switching to the current enrolled file", async () => {
+	it("drains a late started message before switching to the current enrolled file", async () => {
 		const messageStarted = createDeferred();
 		const releaseMessage = createDeferred();
 		const shutdownStarted = createDeferred();
@@ -4522,13 +4522,7 @@ describe("mesh worker persistence", () => {
 					| { required: boolean; token: string | undefined }
 					| { outcome: "completed" | "cancelled" | "failed" };
 				if (command.phase === "begin") {
-					const token = await mesh!.beginReplacement(
-						command.sessionId,
-						command.sessionFile,
-						command.overwrite,
-						h.client,
-						command.token,
-					);
+					const token = await mesh!.beginReplacement(command.sessionId, h.client, command.token);
 					closedAtBegin = stop.mock.calls.length;
 					if (token) barrierReady.resolve();
 					data = { required: token !== undefined, token };
@@ -4595,7 +4589,7 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it("pi-0spx refuses an enrolled own-file switch without a supervisor barrier", async () => {
+	it("refuses an enrolled own-file switch without a supervisor barrier", async () => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
 		await h.authenticate("cotal");
@@ -4627,7 +4621,7 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it("pi-0spx preserves a supervisor begin refusal without cancelling", async () => {
+	it("preserves a supervisor begin refusal without cancelling", async () => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
 		await h.authenticate("cotal");
@@ -4665,7 +4659,7 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it.each(["begin", "drain"])("pi-0spx cancels a timed-out replacement %s", async (phase) => {
+	it.each(["begin", "drain"])("cancels a timed-out replacement %s", async (phase) => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
 		await h.authenticate("cotal");
@@ -4729,7 +4723,7 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it("pi-0spx preserves an import error when mesh finish fails", async () => {
+	it("preserves an import error when mesh finish fails", async () => {
 		const live = await createHarness({ persistSession: true });
 		const runtime = new AgentSessionRuntime(
 			live.session,
@@ -4766,7 +4760,7 @@ describe("mesh worker persistence", () => {
 	});
 
 	it.each(["transport", "supervisor"] as const)(
-		"pi-0spx finishes once and preserves mesh admission after a %s failure",
+		"finishes once and preserves mesh admission after a %s failure",
 		async (failure) => {
 			const live = await createHarness({ persistSession: true });
 			let next: Awaited<ReturnType<typeof createHarness>> | undefined;

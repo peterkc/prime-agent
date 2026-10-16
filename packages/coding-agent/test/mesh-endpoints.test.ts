@@ -132,7 +132,7 @@ async function settled(mesh: MeshEndpoints, id: string) {
 
 describe("mesh endpoints", () => {
 	it.each(["persisted", "cleared", "closed", "other"] as const)(
-		"pi-0spx ignores a stale %s attempt",
+		"ignores a stale %s delivery attempt",
 		async (reason) => {
 			const { mesh, target, handoff } = await fixture();
 			const first = delivery("same");
