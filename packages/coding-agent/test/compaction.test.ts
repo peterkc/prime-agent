@@ -356,6 +356,26 @@ describe("prepareCompaction recency anchor", () => {
 			estimateSummaryRequestTokens({ ...preparation!, recentStateAnchor: undefined }),
 		);
 	});
+	it.each([undefined, "Previous summary"])(
+		"TM-38 keeps defaults out of split-turn prefix (%s)",
+		async (previousSummary) => {
+			const preparation = { ...anchoredPreparation("Previous summary", ["newest kept text"])!, previousSummary };
+			completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("Test summary"));
+			const model = { provider: "faux", id: "faux-1" } as unknown as Model<string>;
+			await compact(
+				{ ...preparation!, isSplitTurn: true, turnPrefixMessages: [createUserMessage("Prefix")] },
+				model,
+				"test-key",
+				undefined,
+				"Default emphasis",
+			);
+			const prompts = completeSimpleMock.mock.calls.map((call) => JSON.stringify(call[1]));
+			expect(prompts).toHaveLength(2);
+			expect(prompts[0]).toContain("Default emphasis");
+			expect(prompts[1]).toContain("Prefix");
+			expect(prompts[1]).not.toContain("Default emphasis");
+		},
+	);
 	it("sizes the window from the exact wire bodies compact() issues", async () => {
 		const preparation = anchoredPreparation("First summary", ["newest kept text"]);
 		completeSimpleMock.mockReset().mockResolvedValue(fauxAssistantMessage("Test summary"));

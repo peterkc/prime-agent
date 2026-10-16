@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
@@ -49,6 +49,26 @@ describe("SettingsManager", () => {
 			true,
 			true,
 		]);
+	});
+
+	it.each([
+		["thinkingLevel", "unknown"],
+		["thinkingLevel", 3],
+		["summaryInstructions", false],
+		["summaryInstructions", null],
+	])("TM-36 invalid compaction.%s (%s) warns once and acts as absent", (key, value) => {
+		writeSettings(globalPath, { compaction: { [key]: value } });
+		const manager = SettingsManager.create(projectDir, agentDir);
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			for (let read = 0; read < 2; read++) {
+				expect(manager.getCompactionThinkingLevel()).toBeUndefined();
+				expect(manager.getCompactionSummaryInstructions()).toBeUndefined();
+			}
+			expect(warning.mock.calls).toEqual([[`Warning: compaction.${key} is invalid; ignoring it.`]]);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	describe("on-disk settings file", () => {
