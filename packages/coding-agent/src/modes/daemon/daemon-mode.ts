@@ -217,6 +217,7 @@ import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } f
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -503,6 +504,10 @@ export class AgentDaemon {
 	 */
 	private readonly passivatingSessions = new Map<string, Promise<void>>();
 	private readonly replacedSessions = new WeakSet<AgentSession>();
+	private readonly sameIdReplacements = new WeakSet<AgentSession>();
+	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
+	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
+	private meshReplacementOffered = false;
 	private readonly closingSessions = new Map<
 		string,
 		{
@@ -1734,8 +1739,14 @@ export class AgentDaemon {
 		// Roster publication can run during binding; enrollment needs a readable header before visibility.
 		if (this.agentMessageTransport === "cotal") {
 			runtime.session.sessionManager.flushNow();
+			runtime.setReplacementBarrier((input, target, overwrite) =>
+				this.prepareMeshReplacement(state, input, target, overwrite),
+			);
 			runtime.setBeforeSessionInvalidate((reason) => {
-				if (reason === "new" || reason === "resume" || reason === "fork")
+				if (
+					!this.sameIdReplacements.has(runtime.session) &&
+					(reason === "new" || reason === "resume" || reason === "fork")
+				)
 					this.replacedSessions.add(runtime.session);
 			});
 		}
@@ -3886,6 +3897,9 @@ export class AgentDaemon {
 				client.authenticationRole = "supervisor";
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
 				this.agentMessageTransport = claim.agentMessageTransport ?? "native";
+				this.meshReplacementOffered =
+					Array.isArray(parsed.capabilities) &&
+					parsed.capabilities.includes(DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY);
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
 				this.write(client, {
@@ -3897,6 +3911,7 @@ export class AgentDaemon {
 						capabilities: [
 							DAEMON_WORKER_ROSTER_CAPABILITY,
 							DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+							DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 							...(this.options.worker.workerInstanceId !== undefined
 								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
 								: []),
@@ -6470,11 +6485,116 @@ export class AgentDaemon {
 		return response.data as AgentSessionMessageReceipt;
 	}
 
+	private async prepareMeshReplacement(
+		state: ActiveSessionState,
+		inputPath: string,
+		targetPath: string,
+		overwrite: boolean,
+	) {
+		if (this.agentMessageTransport !== "cotal") return undefined;
+		const info = await readSessionInfo(inputPath);
+		if (!info) throw new Error("Mesh replacement refused: invalid session file");
+		if (!/^[A-Za-z0-9_-]+$/.test(info.id)) throw new Error("Mesh replacement refused: invalid session ID");
+		const previous = state.runtime.session;
+		if (!this.meshReplacementOffered) {
+			const enrolled = existsSync(join(state.runtime.services.agentDir, "mesh", "directory", `${info.id}.json`));
+			const ownFile =
+				previous.sessionId === info.id &&
+				previous.sessionFile &&
+				canonicalSessionPath(previous.sessionFile) === canonicalSessionPath(targetPath);
+			if (enrolled && (overwrite || !ownFile))
+				throw new Error(
+					"Mesh replacement refused: supervisor does not offer the replacement barrier; restart the daemon",
+				);
+			return undefined;
+		}
+		const link = this.supervisorLink();
+		if (!link) throw new Error("Mesh replacement refused: supervisor link is unavailable");
+		const deadline = Date.now() + 30_000;
+		const response = await link.request({
+			type: "mesh_replace",
+			phase: "begin",
+			fromActiveSessionId: state.activeSessionId,
+			sessionId: info.id,
+			sessionFile: targetPath,
+			overwrite,
+		});
+		if (!response.success) throw deserializeDaemonError(response);
+		const barrier = response.data as { required?: unknown; token?: unknown } | undefined;
+		if (
+			typeof barrier?.required !== "boolean" ||
+			(barrier.required && (typeof barrier.token !== "string" || !barrier.token))
+		)
+			throw new Error("Mesh replacement refused: invalid barrier response");
+		const token = barrier.required ? (barrier.token as string) : undefined;
+		if (previous.sessionId === info.id) this.sameIdReplacements.add(previous);
+		if (token === undefined) return undefined;
+		this.unsafeMeshSessions.add(previous);
+		let release: () => void;
+		const cancellation = new AbortController();
+		const drainTimer = setTimeout(() => cancellation.abort(), Math.max(0, deadline - Date.now()));
+		try {
+			release = await previous.prepareAgentMessageReplacement(
+				[...(this.meshMessageIds.get(previous) ?? [])],
+				cancellation.signal,
+			);
+		} catch (error) {
+			this.unsafeMeshSessions.delete(previous);
+			this.sameIdReplacements.delete(previous);
+			try {
+				const cancelled = await link.request(
+					{
+						type: "mesh_replace",
+						phase: "cancelled",
+						fromActiveSessionId: state.activeSessionId,
+						sessionId: info.id,
+						sessionFile: targetPath,
+						token,
+					},
+					Math.max(1, deadline - Date.now()),
+				);
+				if (!cancelled.success) throw deserializeDaemonError(cancelled);
+			} catch {
+				throw new Error(
+					`${error instanceof Error ? error.message : "Mesh replacement drain failed"}; old endpoint restart was not confirmed`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		} finally {
+			clearTimeout(drainTimer);
+		}
+		return {
+			finish: async (outcome: "completed" | "cancelled" | "failed") => {
+				if (outcome === "failed") this.unsafeMeshSessions.add(state.runtime.session);
+				if (outcome === "cancelled") {
+					release();
+					this.unsafeMeshSessions.delete(previous);
+					this.sameIdReplacements.delete(previous);
+				}
+				const result = await link.request({
+					type: "mesh_replace",
+					phase: outcome,
+					fromActiveSessionId: state.activeSessionId,
+					sessionId: info.id,
+					sessionFile: targetPath,
+					token,
+				});
+				if (!result.success) throw deserializeDaemonError(result);
+			},
+		};
+	}
+
 	private async receiveMeshMessage(
 		client: DaemonSocketClient,
 		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
 	): Promise<void> {
-		if (this.agentMessageTransport !== "cotal" || !command.cotal)
+		if (
+			this.agentMessageTransport !== "cotal" ||
+			!command.cotal ||
+			typeof command.cotal.attemptToken !== "string" ||
+			!command.cotal.attemptToken
+		)
 			throw new Error("Mesh delivery requires the authenticated Cotal transport mode");
 		let target: ActiveSessionState;
 		try {
@@ -6485,6 +6605,8 @@ export class AgentDaemon {
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
 		const recipientSession = target.runtime.session;
+		if (this.unsafeMeshSessions.has(recipientSession))
+			throw new Error("Mesh session must be reopened from disk after replacement failure");
 		const manager = recipientSession.sessionManager;
 		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
 		if (manager.rewritesOnNextPersist()) {
@@ -6522,6 +6644,9 @@ export class AgentDaemon {
 						"id" in entry.details &&
 						entry.details.id === payload.id,
 				);
+		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
+		this.meshMessageIds.set(recipientSession, messageIds);
+		messageIds.add(payload.id);
 		let accepted = false;
 		let sent = false;
 		let active = true;
@@ -6530,12 +6655,13 @@ export class AgentDaemon {
 		let unregisterDispose: (() => void) | undefined;
 		const cleanup = () => {
 			active = false;
+			messageIds.delete(payload.id);
 			unsubscribe?.();
 			unregisterDispose?.();
 			client.socket.off("close", cleanup);
 		};
 		const check = () => {
-			if (!accepted || sent || !active) return;
+			if (!accepted || sent || !active || this.unsafeMeshSessions.has(recipientSession)) return;
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();
 				return;
@@ -6547,15 +6673,22 @@ export class AgentDaemon {
 			client.socket.write(
 				encodePrivateFrame<DaemonWorkerFrameHeader>(
 					{ kind: "outbound", outboundType: "agent_message_persisted" },
-					Buffer.from(serializeJsonLine({ type: "agent_message_persisted", cotalId: command.cotal!.id })),
+					Buffer.from(
+						serializeJsonLine({
+							type: "agent_message_persisted",
+							cotalId: command.cotal!.id,
+							attemptToken: command.cotal!.attemptToken,
+						}),
+					),
 				),
 			);
 		};
 		const dropped = (error: unknown) => {
 			deliveryFailure = error;
 			check();
-			const reason =
-				error instanceof AgentMessageClearedError
+			const reason = this.unsafeMeshSessions.has(recipientSession)
+				? "other"
+				: error instanceof AgentMessageClearedError
 					? "cleared"
 					: this.replacedSessions.has(recipientSession)
 						? "closed"
@@ -6574,6 +6707,7 @@ export class AgentDaemon {
 						serializeJsonLine({
 							type: "agent_message_dropped",
 							cotalId: command.cotal!.id,
+							attemptToken: command.cotal!.attemptToken,
 							reason,
 						}),
 					),
@@ -6594,6 +6728,7 @@ export class AgentDaemon {
 			}, dropped);
 		}
 		try {
+			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 			const status = ownEntry()
 				? "delivered"
 				: queued

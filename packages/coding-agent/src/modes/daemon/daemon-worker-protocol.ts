@@ -40,9 +40,11 @@ export const DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY = "peer_transport";
 /** Advertised by workers that report persistence before mesh acknowledgement. */
 export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
 
+export const DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY = "mesh_replacement";
+
 export type DaemonWorkerPersistenceOutbound =
-	| { type: "agent_message_persisted"; cotalId: string }
-	| { type: "agent_message_dropped"; cotalId: string; reason: "cleared" | "closed" | "other" };
+	| { type: "agent_message_persisted"; cotalId: string; attemptToken: string }
+	| { type: "agent_message_dropped"; cotalId: string; attemptToken: string; reason: "cleared" | "closed" | "other" };
 
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -122,6 +124,7 @@ export type DaemonWorkerCommand =
 			supervisorProcessStartId?: string;
 			supervisorSocketPath: string;
 			agentMessageTransport?: "native" | "cotal";
+			capabilities?: readonly string[];
 	  }
 	| {
 			id?: string;
@@ -147,7 +150,7 @@ export type DaemonWorkerCommand =
 			sender: AgentSessionMessageSender;
 			fromRelationship?: AgentFamilyRelationship;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
-			cotal?: { id: string; deliveryCount: number };
+			cotal?: { id: string; deliveryCount: number; attemptToken: string };
 	  }
 	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }

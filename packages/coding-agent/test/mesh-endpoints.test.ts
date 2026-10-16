@@ -120,11 +120,39 @@ function delivery(id: string, count = 1) {
 	};
 }
 
+function attempt(mesh: MeshEndpoints, id: string): string {
+	return (
+		(mesh as unknown as { pending: Map<string, { attemptToken: string }> }).pending.get(id)?.attemptToken ?? "stale"
+	);
+}
+
 async function settled(mesh: MeshEndpoints, id: string) {
 	await (mesh as unknown as { sessions: Map<string, { handoff?: Promise<void> }> }).sessions.get(id)?.handoff;
 }
 
 describe("mesh endpoints", () => {
+	it.each(["persisted", "cleared", "closed", "other"] as const)(
+		"pi-0spx ignores a stale %s attempt",
+		async (reason) => {
+			const { mesh, target, handoff } = await fixture();
+			const first = delivery("same");
+			target.emit("message", first.message, first.delivery, { kind: "dm" });
+			const oldToken = attempt(mesh, "same");
+			mesh.confirmDropped("same", recipient, "other", oldToken);
+			await settled(mesh, "b");
+			const next = delivery("same", 2);
+			target.emit("message", next.message, next.delivery, { kind: "dm" });
+			if (reason === "persisted") mesh.confirmPersisted("same", recipient, oldToken);
+			else mesh.confirmDropped("same", recipient, reason, oldToken);
+			expect(handoff).toHaveBeenCalledTimes(2);
+			expect(next.ack).not.toHaveBeenCalled();
+			expect(attempt(mesh, "same")).not.toBe(oldToken);
+			mesh.confirmPersisted("same", recipient, attempt(mesh, "same"));
+			await settled(mesh, "b");
+			expect(first.ack).not.toHaveBeenCalled();
+			expect(next.ack).toHaveBeenCalledTimes(1);
+		},
+	);
 	it("AC-18 missing session file never provisions or creates an endpoint", async () => {
 		const { mesh, root } = await fixture();
 		vi.mocked(enrollment.provisionEnrollment).mockClear();
@@ -262,8 +290,8 @@ describe("mesh endpoints", () => {
 			const stopped = mesh.closeSession("b");
 			expect(isOpen()).toBe(false);
 			expect(releaseClaim).not.toHaveBeenCalled();
-			if (frame === "persisted") mesh.confirmPersisted("held", recipient);
-			else mesh.confirmDropped("held", recipient, frame);
+			if (frame === "persisted") mesh.confirmPersisted("held", recipient, attempt(mesh, "held"));
+			else mesh.confirmDropped("held", recipient, frame, attempt(mesh, "held"));
 			finishWake();
 			await settled(mesh, "b");
 			await vi.advanceTimersByTimeAsync(6000);
@@ -582,7 +610,7 @@ describe("mesh endpoints", () => {
 		const { mesh, target, handoff, log } = await fixture();
 		expect(handoff).toHaveBeenCalledTimes(1);
 		expect(early.ack).not.toHaveBeenCalled();
-		mesh.confirmPersisted("early", recipient);
+		mesh.confirmPersisted("early", recipient, attempt(mesh, "early"));
 		await settled(mesh, "b");
 		expect(early.ack).toHaveBeenCalledTimes(1);
 		handoff.mockClear();
@@ -603,10 +631,10 @@ describe("mesh endpoints", () => {
 		]);
 		expect(first.working).toHaveBeenCalledTimes(7);
 		expect(second.ack).not.toHaveBeenCalled();
-		mesh.confirmPersisted("second", recipient);
-		mesh.confirmPersisted("first", {});
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
+		mesh.confirmPersisted("first", {}, attempt(mesh, "first"));
 		expect(first.ack).not.toHaveBeenCalled();
-		mesh.confirmPersisted("first", recipient);
+		mesh.confirmPersisted("first", recipient, attempt(mesh, "first"));
 		await settled(mesh, "b");
 		expect(first.ack).toHaveBeenCalledTimes(1);
 		expect(handoff).toHaveBeenCalledTimes(2);
@@ -615,10 +643,10 @@ describe("mesh endpoints", () => {
 			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
 			["Mesh session b, Cotal ID second, delivery count 2: persistence still pending; queued behind 0"],
 		]);
-		mesh.confirmPersisted("second", recipient);
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
 		await settled(mesh, "b");
 		expect(second.ack).toHaveBeenCalledTimes(1);
-		mesh.confirmPersisted("second", recipient);
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
 		expect(second.ack).toHaveBeenCalledTimes(1);
 		expect(handoff.mock.calls[1]![2]).toBe(2);
 	});
@@ -632,23 +660,23 @@ describe("mesh endpoints", () => {
 			const next = delivery("next");
 			target.emit("message", first.message, first.delivery, { kind: "dm" });
 			target.emit("message", next.message, next.delivery, { kind: "dm" });
-			mesh.confirmDropped("dropped", {}, reason);
-			mesh.confirmDropped("next", recipient, reason);
+			mesh.confirmDropped("dropped", {}, reason, attempt(mesh, "dropped"));
+			mesh.confirmDropped("next", recipient, reason, attempt(mesh, "next"));
 			expect(first.ack).not.toHaveBeenCalled();
 			expect(first.delivery.nak).not.toHaveBeenCalled();
 			expect(handoff).toHaveBeenCalledTimes(1);
 			const firstHandoff = settled(mesh, "b");
-			mesh.confirmDropped("dropped", recipient, reason);
+			mesh.confirmDropped("dropped", recipient, reason, attempt(mesh, "dropped"));
 			await vi.advanceTimersByTimeAsync(0);
 			expect(handoff).toHaveBeenCalledTimes(2);
 			await firstHandoff;
 			expect(first.ack).toHaveBeenCalledTimes(reason !== "other" ? 1 : 0);
 			expect(first.delivery.nak).toHaveBeenCalledTimes(0);
 			expect(handoff).toHaveBeenCalledTimes(2);
-			mesh.confirmPersisted("next", recipient);
+			mesh.confirmPersisted("next", recipient, attempt(mesh, "next"));
 			await settled(mesh, "b");
-			mesh.confirmDropped("dropped", recipient, "other");
-			mesh.confirmDropped("next", recipient, "other");
+			mesh.confirmDropped("dropped", recipient, "other", attempt(mesh, "dropped"));
+			mesh.confirmDropped("next", recipient, "other", attempt(mesh, "next"));
 			await vi.advanceTimersByTimeAsync(6000);
 			expect(first.working).toHaveBeenCalledTimes(1);
 			expect(next.working).toHaveBeenCalledTimes(1);
@@ -663,7 +691,7 @@ describe("mesh endpoints", () => {
 		const first = delivery("race");
 		handoff.mockImplementationOnce(async (_record, _message, _count, bind) => {
 			bind(recipient);
-			mesh.confirmDropped("race", recipient, "cleared");
+			mesh.confirmDropped("race", recipient, "cleared", attempt(mesh, "race"));
 			throw new Error("Acceptance was cleared");
 		});
 		target.emit("message", first.message, first.delivery, { kind: "dm" });
@@ -721,7 +749,7 @@ describe("mesh endpoints", () => {
 		if (failure === "directory") target.emit("message", queued.message, queued.delivery, { kind: "dm" });
 		if (failure === "disconnect") mesh.disconnect(recipient);
 		await settled(mesh, "b");
-		mesh.confirmPersisted("failed", recipient);
+		mesh.confirmPersisted("failed", recipient, attempt(mesh, "failed"));
 		expect(item.ack).not.toHaveBeenCalled();
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("left unacknowledged"));
 		if (failure === "directory") {
@@ -752,7 +780,7 @@ describe("mesh endpoints", () => {
 		const stopped = mesh.stop();
 		expect(source.stop).toHaveBeenCalledTimes(1);
 		expect(target.stop).toHaveBeenCalledTimes(1);
-		mesh.confirmPersisted("in-flight", recipient);
+		mesh.confirmPersisted("in-flight", recipient, attempt(mesh, "in-flight"));
 		expect(item.ack).not.toHaveBeenCalled();
 		expect(releaseClaim).not.toHaveBeenCalled();
 		await vi.advanceTimersByTimeAsync(5000);

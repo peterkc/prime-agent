@@ -1,26 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
+import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, mintCreds, newIdentity } from "@cotal-ai/core";
 import {
-	type CotalEndpoint,
-	type CotalMessage,
-	credsClaims,
-	type Delivery,
-	mintCreds,
-	newIdentity,
-} from "@cotal-ai/core";
-import { fauxAssistantMessage, getApiProvider, registerFauxProvider } from "../../../ai/src/index.js";
+	type FauxResponseFactory,
+	fauxAssistantMessage,
+	getApiProvider,
+	registerFauxProvider,
+} from "../../../ai/src/index.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import type { SessionLease } from "../../src/core/session-lease.js";
 import { main } from "../../src/main.js";
-import {
-	claimEnrollment,
-	type EnrollmentRecord,
-	ensureEnrollmentRecord,
-	publishDirectory,
-	readDirectory,
-	readSigner,
-} from "../../src/modes/daemon/cotal/enrollment.js";
+import { type EnrollmentRecord, readDirectory, readSigner } from "../../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../../src/modes/daemon/cotal/mesh-endpoints.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import { DaemonSupervisor } from "../../src/modes/daemon/daemon-supervisor.js";
@@ -34,6 +25,30 @@ const socketPath = process.argv.includes("--daemon-socket")
 // The test owns the replacement supervisor, so an orphan worker must not launch a competing fixture.
 (AgentDaemon.prototype as unknown as { launchReplacementSupervisor(): Promise<void> }).launchReplacementSupervisor =
 	async () => undefined;
+const authPrototype = DaemonSupervisor.prototype as unknown as {
+	supervisorAuthenticationClaim(): { capabilities: readonly string[] };
+};
+const productionAuth = authPrototype.supervisorAuthenticationClaim;
+authPrototype.supervisorAuthenticationClaim = function () {
+	const claim = productionAuth.call(this);
+	return existsSync(join(agentDir, "no-barrier")) ? { ...claim, capabilities: [] } : claim;
+};
+const workerPrototype = AgentDaemon.prototype as unknown as {
+	write(client: unknown, message: { command?: string; data?: { capabilities?: string[] } }): boolean;
+};
+const workerWrite = workerPrototype.write;
+workerPrototype.write = function (client, message) {
+	if (message.command === "worker_auth" && existsSync(join(agentDir, "legacy-worker")) && message.data?.capabilities) {
+		message = {
+			...message,
+			data: {
+				...message.data,
+				capabilities: message.data.capabilities.filter((capability) => capability !== "mesh_replacement"),
+			},
+		};
+	}
+	return workerWrite.call(this, client, message);
+};
 const supervisorPrototype = DaemonSupervisor.prototype as unknown as {
 	persistWorker(worker: { descriptor: { pid: number } }): void;
 };
@@ -66,7 +81,26 @@ for (const factory of ["create", "inMemory"] as const) {
 		return registry;
 	}) as typeof original;
 }
-faux.setResponses(Array.from({ length: 20 }, () => fauxAssistantMessage("observed")));
+const response: FauxResponseFactory = async (_context, options) => {
+	const path = join(agentDir, "hold-turn");
+	if (existsSync(path)) {
+		writeFileAtomicSync(join(agentDir, "turn-held"), "held");
+		await new Promise<void>((resolve) => {
+			const finish = () => {
+				watcher.close();
+				options?.signal?.removeEventListener("abort", finish);
+				resolve();
+			};
+			const watcher = watch(agentDir, () => {
+				if (!existsSync(path)) finish();
+			});
+			options?.signal?.addEventListener("abort", finish, { once: true });
+			if (options?.signal?.aborted || !existsSync(path)) finish();
+		});
+	}
+	return fauxAssistantMessage("observed");
+};
+faux.setResponses(Array.from({ length: 40 }, () => response));
 
 interface StubSession {
 	record: EnrollmentRecord;
@@ -75,11 +109,12 @@ interface StubSession {
 	queue: unknown[];
 	state: "connected";
 	abort: AbortController;
+	pull?: () => void;
 }
 interface StubMesh {
 	sessions: Map<string, StubSession>;
 	enqueue(session: StubSession, message: CotalMessage, delivery: Delivery): void;
-	startSession(id: string, file: string): Promise<void>;
+	startSession(id: string, file: string, claim?: SessionLease): Promise<void>;
 	removeInbox(record: EnrollmentRecord): Promise<void>;
 }
 
@@ -111,12 +146,17 @@ interface StubMesh {
 	signal("removed", record.sessionId);
 };
 
-// Only the broker boundary is fake. The production handoff, frame routing, queue and ack logic run.
-(MeshEndpoints.prototype as unknown as StubMesh).startSession = async function (id, file) {
+// Production start owns enrollment, claims and path updates. These methods fake only the broker.
+CotalEndpoint.prototype.start = async () => undefined;
+CotalEndpoint.prototype.stop = async () => undefined;
+CotalEndpoint.prototype.provisionDmInbox = async () => undefined;
+CotalEndpoint.prototype.provisionDlvInbox = async () => undefined;
+CotalEndpoint.prototype.reissueAcl = async () => undefined;
+const starts = new Map<string, number>();
+const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSession;
+(MeshEndpoints.prototype as unknown as StubMesh).startSession = async function (id, file, claim) {
 	const meshRoot = join(agentDir, "mesh");
-	const claim = claimEnrollment(meshRoot, id, file);
 	try {
-		const record = ensureEnrollmentRecord(meshRoot, id, file);
 		if (existsSync(join(agentDir, `pause-publication-${id}`))) {
 			signal("publication-paused", id);
 			await new Promise<void>((resolve) => {
@@ -128,12 +168,18 @@ interface StubMesh {
 				});
 			});
 		}
-		const directory = await publishDirectory(meshRoot, record, socketPath);
+		await productionStart.call(this, id, file, claim);
+		const session = this.sessions.get(id);
+		if (!session) throw new Error("Production endpoint did not start");
+		const record = session.record;
+		const directory = readDirectory(meshRoot, id);
+		if (!directory) throw new Error("Production directory was not published");
 		for (const stream of ["dm", "dlv"]) writeFileAtomicSync(join(agentDir, `${stream}-${id}`), "inbox");
+		let stopped = false;
 		mkdirSync(mailbox, { recursive: true });
 		const seen = new Set<string>();
 		const pull = () => {
-			if (existsSync(join(agentDir, `hold-pulls-${id}`))) return;
+			if (stopped || existsSync(join(agentDir, `hold-pulls-${id}`))) return;
 			for (const name of readdirSync(mailbox)) {
 				if (!name.endsWith(".json") || seen.has(name)) continue;
 				const stored = JSON.parse(readFileSync(join(mailbox, name), "utf8")) as {
@@ -147,29 +193,38 @@ interface StubMesh {
 					nak: () => undefined,
 					redelivery: { deliveryCount: 2, ackWaitMs: 3000, working: () => undefined },
 					ack: () => {
+						if (existsSync(join(agentDir, "hold-acks"))) {
+							signal("before-ack", stored.message.id);
+							return;
+						}
 						if (existsSync(join(agentDir, "kill-before-ack"))) {
 							signal("before-ack", stored.message.id);
 							process.kill(process.pid, "SIGKILL");
 							return;
 						}
+						const covered = readFileSync(record.sessionFile, "utf8")
+							.split("\n")
+							.some((line) => line.includes(`agentmsg_${stored.message.id}`));
+						appendFileSync(
+							join(agentDir, "ack-disk.jsonl"),
+							`${JSON.stringify({ id: stored.message.id, covered })}\n`,
+						);
 						appendFileSync(join(agentDir, "acks.jsonl"), `${JSON.stringify({ id: stored.message.id })}\n`);
 						unlinkSync(join(mailbox, name));
 						signal("ack", stored.message.id);
 					},
 				});
+				signal("pulled", stored.message.id);
 			}
 		};
 		const watcher = watch(mailbox, () => {
 			void deliveryReady.then(pull);
 		});
-		const session: StubSession = {
-			record,
-			claim,
-			queue: [],
-			state: "connected",
-			abort: new AbortController(),
+		session.pull = pull;
+		const broker: Pick<StubSession, "endpoint"> = {
 			endpoint: {
 				stop: async () => {
+					stopped = true;
 					watcher.close();
 					appendFileSync(join(agentDir, "cleanup-order.jsonl"), `${JSON.stringify({ type: "stop", id })}\n`);
 					signal("endpoint-stopped", id);
@@ -192,17 +247,34 @@ interface StubMesh {
 						join(mailbox, `${message.id}.json`),
 						JSON.stringify({ target: target.sessionId, message }),
 					);
+					void deliveryReady.then(() => this.sessions.get(target.sessionId)?.pull?.());
 					return { msg: message, ack: { seq: 1, duplicate: false } };
 				},
 			},
 		};
-		this.sessions.set(id, session);
+		Object.assign(session.endpoint, broker.endpoint);
 		void deliveryReady.then(pull);
-		signal("endpoint", id);
+		const count = (starts.get(id) ?? 0) + 1;
+		starts.set(id, count);
+		signal(count === 1 ? "endpoint" : "rebound", id);
 	} catch (error) {
-		claim.release();
+		if (!claim) this.sessions.get(id)?.claim.release();
 		throw error;
 	}
+};
+
+const supervisorMesh = DaemonSupervisor.prototype as unknown as {
+	handoffMeshMessage(...args: unknown[]): Promise<void>;
+};
+const productionHandoff = supervisorMesh.handoffMeshMessage;
+supervisorMesh.handoffMeshMessage = async function (...args) {
+	try {
+		await productionHandoff.apply(this, args);
+	} catch (error) {
+		signal("handoff-refused", (args[1] as CotalMessage).id);
+		throw error;
+	}
+	signal("accepted", (args[1] as CotalMessage).id);
 };
 
 if (isDaemonWorkerProcess()) await main([...process.argv.slice(2), "--offline"]);
@@ -215,7 +287,7 @@ else {
 			provider: "faux",
 			model: "mesh-faux",
 			noTools: true,
-			noExtensions: true,
+			noExtensions: !existsSync(join(agentDir, "extensions", "rebind.ts")),
 			telemetryDisabled: true,
 		},
 	});

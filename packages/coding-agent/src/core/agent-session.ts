@@ -1668,6 +1668,7 @@ export class AgentSession {
 		  }
 		| undefined = undefined;
 	private _agentMessageClearEpoch = 0;
+	private readonly _replacingAgentMessageIds = new Set<string>();
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
@@ -5823,6 +5824,8 @@ export class AgentSession {
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
+			if (customMessage && this._replacingAgentMessageIds.has(customMessage.details.id))
+				throw new Error(`Agent message ${customMessage.details.id} is held for session replacement`);
 			options?.admissionCommitted?.();
 			if (clearEpoch !== this._agentMessageClearEpoch) {
 				throw new AgentMessageClearedError("Agent message was cleared before admission");
@@ -7729,6 +7732,77 @@ export class AgentSession {
 				isAgentSessionMessage(primaryDeliveryRecord(action).message) ||
 				isAgentSessionMessagePrompt(action.payload.text),
 		);
+	}
+
+	async prepareAgentMessageReplacement(messageIds: readonly string[], signal: AbortSignal): Promise<() => void> {
+		const ids = new Set(messageIds);
+		for (const id of ids) this._replacingAgentMessageIds.add(id);
+		const release = () => {
+			for (const id of ids) this._replacingAgentMessageIds.delete(id);
+		};
+		const started = new Set(
+			this._actionStore
+				.ownedActions()
+				.filter(
+					(action) =>
+						action.agentMessageId !== undefined &&
+						ids.has(action.agentMessageId) &&
+						action.payload.kind === "turn" &&
+						primaryDeliveryRecord(action).started,
+				)
+				.map((action) => action.agentMessageId!),
+		);
+		this._clearQueuedTurnActionsMatching(
+			(action) => action.agentMessageId !== undefined && ids.has(action.agentMessageId),
+		);
+		let waiting = messageIds[0] ?? this.sessionId;
+		try {
+			while (true) {
+				let nextMessage!: () => void;
+				const next = new Promise<void>((resolve) => {
+					nextMessage = resolve;
+				});
+				const unsubscribe = this.subscribe((event) => {
+					if (
+						event.type === "message_end" &&
+						isAgentSessionMessage(event.message) &&
+						started.has(event.message.details.id)
+					)
+						nextMessage();
+				});
+				try {
+					const queue = this._agentEventQueue;
+					await waitForPromiseOrAbort(queue, signal, `Mesh replacement waiting for message ${waiting}`);
+					if (signal.aborted) throw new Error(`Mesh replacement waiting for message ${waiting}: request aborted`);
+					this.sessionManager.flushNow();
+					const entries = this.sessionManager.getEntries();
+					const missing = messageIds.filter((id) => {
+						const entry = entries.find(
+							(entry) =>
+								entry.type === "custom_message" &&
+								entry.customType === AGENT_MESSAGE_CUSTOM_TYPE &&
+								entry.details !== null &&
+								typeof entry.details === "object" &&
+								"id" in entry.details &&
+								entry.details.id === id,
+						);
+						return entry ? !this.sessionManager.isEntryPersisted(entry.id) : started.has(id);
+					});
+					if (missing.length === 0) return release;
+					waiting = missing[0]!;
+					if (queue === this._agentEventQueue)
+						await waitForPromiseOrAbort(next, signal, `Mesh replacement waiting for message ${waiting}`);
+				} finally {
+					unsubscribe();
+				}
+			}
+		} catch (error) {
+			release();
+			throw new Error(
+				`Mesh replacement could not persist message ${waiting}: ${error instanceof Error ? error.message : "write failed"}`,
+				{ cause: error },
+			);
+		}
 	}
 
 	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {

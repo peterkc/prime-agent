@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -36,6 +37,7 @@ import {
 	redactMeshError,
 	removeEnrollment,
 	renameDirectory,
+	updateEnrollmentPath,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
@@ -99,6 +101,94 @@ async function fixture() {
 }
 
 describe("mesh enrollment", () => {
+	it.each(["rebind", "cancelled", "failed"] as const)(
+		"pi-0spx preserves the lifecycle through %s",
+		async (outcome) => {
+			const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+			await mesh.enroll(sessionId, sessionFile);
+			const before = readEnrollment(meshRoot, sessionId);
+			const target = join(root, "replacement.jsonl");
+			copyFileSync(sessionFile, target);
+			const endpoint = FakeEndpoint.instances.at(-1)!;
+			const token = await mesh.beginReplacement(sessionId, target, true);
+			expect(endpoint.stop).toHaveBeenCalledTimes(1);
+			expect(token).toEqual(expect.any(String));
+			const count = FakeEndpoint.instances.length;
+			await mesh.finishReplacement(sessionId, token!, outcome === "rebind" ? "completed" : outcome, target);
+			if (outcome === "failed") {
+				expect(FakeEndpoint.instances).toHaveLength(count);
+				await mesh.enqueueEnrollment(sessionId, target);
+				expect(FakeEndpoint.instances).toHaveLength(count);
+				const reopened = await mesh.beginReplacement(sessionId, target, false);
+				await mesh.finishReplacement(sessionId, reopened!, "completed", target);
+			}
+			const expectedPath = canonicalSessionPath(outcome === "cancelled" ? sessionFile : target);
+			expect(readEnrollment(meshRoot, sessionId)).toEqual({ ...before, sessionFile: expectedPath });
+			expect(FakeEndpoint.instances.at(-1)!.options.card?.id).toBe(before.identity.id);
+			if (outcome !== "cancelled") {
+				rmSync(sessionFile);
+				const remove = vi
+					.spyOn(core, "deprovisionAgent")
+					.mockResolvedValue({} as core.DeprovisionResourceAccounting);
+				await mesh.unenroll(sessionId, canonicalSessionPath(sessionFile));
+				expect(remove).not.toHaveBeenCalled();
+				expect(readDirectory(meshRoot, sessionId)).toBeDefined();
+				expect(readEnrollment(meshRoot, sessionId).sessionFile).toBe(expectedPath);
+			}
+		},
+	);
+
+	it("pi-0spx rebinds a moved file during ordinary enrollment", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const before = readEnrollment(meshRoot, sessionId);
+		const endpoint = FakeEndpoint.instances.at(-1)!;
+		const target = join(root, "moved.jsonl");
+		renameSync(sessionFile, target);
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await mesh.enqueueEnrollment(sessionId, target);
+		expect(endpoint.stop).toHaveBeenCalledTimes(1);
+		expect(FakeEndpoint.instances.at(-1)).not.toBe(endpoint);
+		expect(FakeEndpoint.instances.at(-1)!.start).toHaveBeenCalledTimes(1);
+		expect(readEnrollment(meshRoot, sessionId)).toEqual({ ...before, sessionFile: canonicalSessionPath(target) });
+		expect(FakeEndpoint.instances.at(-1)!.options.card?.id).toBe(before.identity.id);
+		expect(remove).not.toHaveBeenCalled();
+	});
+
+	it("pi-0spx never recreates an enrollment deleted while a path update waits for the lock", async () => {
+		const { root, meshRoot, sessionId, sessionFile } = await fixture();
+		const before = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+		await publishDirectory(meshRoot, before, "home");
+		const target = join(root, "moved.jsonl");
+		copyFileSync(sessionFile, target);
+		rmSync(sessionFile);
+		let deleting!: () => void;
+		let resume!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			deleting = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		const remove = fsPromises.rm;
+		vi.spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+			if (path === enrollmentPath(meshRoot, sessionId)) {
+				deleting();
+				await gate;
+			}
+			await remove(path, options);
+		});
+		const deleted = removeEnrollment(meshRoot, sessionId, canonicalSessionPath(sessionFile));
+		await ready;
+		const updated = expect(updateEnrollmentPath(meshRoot, sessionId, target)).rejects.toThrow(
+			"removed during replacement",
+		);
+		resume();
+		await deleted;
+		await updated;
+		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+	});
 	it("AC-18 deleting a copy with the same ID preserves the enrolled session and inbox", async () => {
 		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
 		await mesh.enroll(sessionId, sessionFile);

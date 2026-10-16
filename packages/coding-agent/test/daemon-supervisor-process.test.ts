@@ -3,13 +3,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
+	watch,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -22,6 +25,7 @@ import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLease,
+	canonicalSessionPath,
 	getPsProcessStartId,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
@@ -2093,6 +2097,26 @@ function meshSignal(child: ChildProcess, type: string, id?: string): Promise<voi
 	});
 }
 
+function meshPath(path: string, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const finish = () => {
+			watcher.close();
+			signal.removeEventListener("abort", abort);
+			resolve();
+		};
+		const abort = () => {
+			watcher.close();
+			reject(new Error("Mesh file wait cancelled"));
+		};
+		const watcher = watch(dirname(path), () => {
+			if (existsSync(path)) finish();
+		});
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+		else if (existsSync(path)) finish();
+	});
+}
+
 async function meshFixture() {
 	const root = tempDir();
 	const agentDir = join(root, "agent");
@@ -2127,6 +2151,213 @@ async function meshFixture() {
 }
 
 describe("mesh supervisor compatibility", () => {
+	it.each([
+		"import",
+		"overwrite",
+		"move",
+		"queued",
+		"started",
+		"buffered",
+		"cancelled",
+		"postcopy",
+		"holder",
+		"no-offer",
+		"old-worker",
+	] as const)("pi-0spx rebinds a real worker without losing or repeating a delivery (%s)", async (mode) => {
+		const f = await meshFixture();
+		mkdirSync(join(f.agentDir, "extensions"));
+		writeFileSync(
+			join(f.agentDir, "extensions", "rebind.ts"),
+			`
+				import { existsSync, writeFileSync, watch } from "node:fs";
+				import { join } from "node:path";
+				export default function(pi) {
+					const root = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+					pi.on("message_end", async (event) => {
+						const path = join(root, "hold-event");
+						if (event.message.role !== "custom" || event.message.customType !== "agent_message" || !existsSync(path)) return;
+						writeFileSync(join(root, "event-held"), "held");
+						await new Promise(resolve => { const w = watch(root, () => { if (!existsSync(path)) { w.close(); resolve(); } }); });
+					});
+					pi.on("session_before_switch", () => existsSync(join(root, "cancel-before-copy")) ? { cancel: true } : undefined);
+				}
+			`,
+		);
+		if (mode === "no-offer") writeFileSync(join(f.agentDir, "no-barrier"), "old");
+		const holder = await f.start(join(f.root, "holder.sock"));
+		const cleanup = new AbortController();
+		try {
+			const sender = await f.create(holder, "sender");
+			if (mode === "old-worker") writeFileSync(join(f.agentDir, "legacy-worker"), "legacy");
+			const target = await f.create(holder, "target");
+			const activeSessionId = target.activeSessionId;
+			if (!activeSessionId) throw new Error("Missing active target");
+			const recordPath = join(f.agentDir, "mesh", "enrollments", `${target.sessionId}.json`);
+			const before = JSON.parse(readFileSync(recordPath, "utf8"));
+			if (mode === "old-worker") {
+				const stored = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: target.sessionId!,
+					message: "legacy",
+				})) as { cotalId: string };
+				await Promise.race([
+					meshSignal(holder.child, "handoff-refused", stored.cotalId),
+					meshSignal(holder.child, "accepted", stored.cotalId).then(() =>
+						expect.fail("Legacy worker accepted a mesh handoff"),
+					),
+				]);
+				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+				expect(readFileSync(target.sessionFile!, "utf8")).not.toContain(stored.cotalId);
+				expect(
+					await holder.client.request({
+						type: "send_message",
+						targetActiveSessionId: sender.activeSessionId!,
+						fromActiveSessionId: activeSessionId,
+						message: "native",
+						agentOrigin: true,
+					}),
+				).toMatchObject({ success: false, error: expect.stringContaining("restart that session") });
+				return;
+			}
+			if (mode === "holder" || mode === "no-offer") {
+				const input = join(f.root, "refused.jsonl");
+				copyFileSync(target.sessionFile!, input);
+				SessionManager.open(input).appendSessionInfo("must-not-copy");
+				const other = mode === "holder" ? await f.start(join(f.root, "other.sock")) : holder;
+				try {
+					const importing = mode === "holder" ? await f.create(other, "importer") : target;
+					const original = readFileSync(importing.sessionFile!, "utf8");
+					const response = await other.client.request({
+						type: "import_jsonl",
+						activeSessionId: importing.activeSessionId!,
+						inputPath: input,
+					});
+					expect(response).toMatchObject({
+						success: false,
+						error: expect.stringContaining(mode === "holder" ? "already active" : "does not offer"),
+					});
+					expect(readFileSync(importing.sessionFile!, "utf8")).toBe(original);
+					expect(existsSync(join(dirname(importing.sessionFile!), "refused.jsonl"))).toBe(false);
+					expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(before);
+				} finally {
+					if (other !== holder) other.client.close();
+				}
+				return;
+			}
+			const incomingDir = join(f.root, "incoming");
+			mkdirSync(incomingDir);
+			const samePath = !["import", "move"].includes(mode);
+			const incoming = join(incomingDir, samePath ? target.sessionFile!.split("/").at(-1)! : "different.jsonl");
+			copyFileSync(target.sessionFile!, incoming);
+			SessionManager.open(incoming).appendSessionInfo("replacement");
+			writeFileSync(join(f.agentDir, "hold-turn"), "hold");
+			if (mode === "started") writeFileSync(join(f.agentDir, "hold-event"), "hold");
+			if (
+				mode === "queued" ||
+				mode === "import" ||
+				mode === "move" ||
+				mode === "overwrite" ||
+				mode === "cancelled"
+			) {
+				await f.request(holder.client, { type: "prompt", activeSessionId, message: "hold" });
+				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+			}
+			if (mode === "postcopy") writeFileSync(join(f.agentDir, "hold-acks"), "hold");
+			if (mode === "postcopy") rmSync(join(f.agentDir, "hold-turn"));
+			const stored = (await f.request(holder.client, {
+				type: "mesh_send",
+				fromActiveSessionId: sender.activeSessionId!,
+				targetSessionId: target.sessionId!,
+				message: "held",
+			})) as { cotalId: string };
+			await meshSignal(holder.child, mode === "postcopy" ? "before-ack" : "accepted", stored.cotalId);
+			if (mode === "started") await meshPath(join(f.agentDir, "event-held"), cleanup.signal);
+			if (mode === "buffered") await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+			const count = (file: string) =>
+				readFileSync(file, "utf8")
+					.split("\n")
+					.filter((line) => line.includes(`agentmsg_${stored.cotalId}`)).length;
+			if (mode === "buffered" || mode === "started") expect(count(target.sessionFile!)).toBe(0);
+			if (mode === "cancelled") writeFileSync(join(f.agentDir, "cancel-before-copy"), "cancel");
+			if (mode === "postcopy") {
+				const lines = readFileSync(incoming, "utf8").trimEnd().split("\n");
+				lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(f.root, "missing-cwd") });
+				writeFileSync(incoming, `${lines.join("\n")}\n`);
+			}
+			let destination = join(dirname(target.sessionFile!), incoming.split("/").at(-1)!);
+			if (mode === "move") {
+				destination = join(f.root, "moved.jsonl");
+				renameSync(target.sessionFile!, destination);
+			}
+			const replacing = holder.client.request(
+				mode === "move"
+					? { type: "switch_session", activeSessionId, sessionPath: destination }
+					: { type: "import_jsonl", activeSessionId, inputPath: incoming },
+			);
+			await meshSignal(holder.child, "endpoint-stopped", target.sessionId);
+			if (mode === "started") rmSync(join(f.agentDir, "hold-event"));
+			const result = await replacing;
+			if (mode === "postcopy") {
+				expect(result).toMatchObject({ success: false, error: expect.stringContaining("missing-cwd") });
+				expect(count(destination)).toBe(0);
+				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+				rmSync(join(f.agentDir, "hold-acks"));
+				await f.request(holder.client, {
+					type: "switch_session",
+					activeSessionId,
+					sessionPath: destination,
+					cwdOverride: f.root,
+				});
+			} else {
+				if (!result.success) throw new Error(result.error);
+				expect(result).toMatchObject({ success: true });
+			}
+			if (mode === "cancelled") {
+				if (!result.success) throw new Error(result.error);
+				destination = target.sessionFile!;
+				expect((result.data as { cancelled: boolean }).cancelled).toBe(true);
+			}
+			const after = JSON.parse(readFileSync(recordPath, "utf8"));
+			expect(after).toEqual({ ...before, sessionFile: canonicalSessionPath(destination) });
+			if (mode !== "postcopy") {
+				expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
+				rmSync(join(f.agentDir, "hold-turn"));
+			}
+			await meshSignal(holder.child, "ack", stored.cotalId);
+			expect(count(destination)).toBe(1);
+			expect(
+				readFileSync(join(f.agentDir, "ack-disk.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line)),
+			).toContainEqual({ id: stored.cotalId, covered: true });
+			const second = (await f.request(holder.client, {
+				type: "mesh_send",
+				fromActiveSessionId: sender.activeSessionId!,
+				targetSessionId: target.sessionId!,
+				message: "second",
+			})) as { cotalId: string };
+			await meshSignal(holder.child, "ack", second.cotalId);
+			expect(readFileSync(destination, "utf8").split(second.cotalId)).toHaveLength(2);
+			if (!samePath && mode !== "move") expect(count(target.sessionFile!)).toBe(0);
+			await f.request(holder.client, { type: "shutdown" });
+			holder.client.close();
+			await waitForExit(holder.child);
+			const restarted = await f.start(join(f.root, "holder.sock"));
+			try {
+				await meshSignal(restarted.child, "endpoint", target.sessionId);
+				expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(after);
+			} finally {
+				restarted.client.close();
+			}
+		} finally {
+			cleanup.abort();
+			for (const file of ["hold-turn", "hold-event", "fail-after-copy", "cancel-before-copy", "hold-acks"])
+				rmSync(join(f.agentDir, file), { force: true });
+			holder.client.close();
+		}
+	});
 	it("AC-18 fileless rename calls no directory write and logs no failure", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "fileless.sock"), {
@@ -2414,6 +2645,7 @@ describe("mesh supervisor compatibility", () => {
 				count: number,
 				bind: (recipient: object) => void,
 				open: () => boolean,
+				attemptToken: string,
 			): Promise<void>;
 			cleanupSupervisorResources(): Promise<void>;
 		};
@@ -2467,6 +2699,7 @@ describe("mesh supervisor compatibility", () => {
 			},
 			client: recipient,
 			meshDeliveryCapable: true,
+			meshReplacementCapable: true,
 			summaries: new Map([
 				["source", sourceSummary],
 				["target", targetSummary],
@@ -2527,6 +2760,7 @@ describe("mesh supervisor compatibility", () => {
 				2,
 				bind,
 				() => true,
+				"attempt",
 			);
 			expect(bind).toHaveBeenCalledExactlyOnceWith(recipient);
 			expect(requestWorker).toHaveBeenCalledExactlyOnceWith(
@@ -2536,7 +2770,7 @@ describe("mesh supervisor compatibility", () => {
 					message: "hello",
 					sender: { sessionId: "parent", sessionName: "parent", clientId: "local.parent" },
 					fromRelationship: "parent",
-					cotal: { id: "incoming", deliveryCount: 2 },
+					cotal: { id: "incoming", deliveryCount: 2, attemptToken: "attempt" },
 				},
 				86_400_000,
 			);
@@ -2549,6 +2783,7 @@ describe("mesh supervisor compatibility", () => {
 				2,
 				bind,
 				() => true,
+				"attempt",
 			);
 			expect(scan).not.toHaveBeenCalled();
 			const resolver = vi.spyOn(
@@ -2567,6 +2802,7 @@ describe("mesh supervisor compatibility", () => {
 					2,
 					bind,
 					() => true,
+					"attempt",
 				);
 				expect(requestWorker.mock.calls.at(-1)?.[0]).toMatchObject({
 					fromRelationship: undefined,
@@ -2581,6 +2817,7 @@ describe("mesh supervisor compatibility", () => {
 					2,
 					bind,
 					() => false,
+					"attempt",
 				),
 			).rejects.toThrow("closed before handoff");
 			expect(requestWorker).toHaveBeenCalledTimes(4);
@@ -2812,7 +3049,13 @@ describe("mesh supervisor compatibility", () => {
 		}
 	});
 
-	it.each([true, false, undefined])("guards native and mesh compatibility for origin=%s", async (agentOrigin) => {
+	it.each([true, false, undefined, "legacy-replacement"] as const)(
+		"guards native and mesh compatibility for origin=%s",
+		checkWorkerCompatibility,
+	);
+
+	async function checkWorkerCompatibility(origin: boolean | undefined | "legacy-replacement") {
+		const agentOrigin = typeof origin === "boolean" ? origin : origin === "legacy-replacement" ? true : undefined;
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { agentDir: root, cwd: root },
@@ -2821,7 +3064,12 @@ describe("mesh supervisor compatibility", () => {
 		const dropped = vi.fn();
 		const publish = vi.fn();
 		const recipient = { requestWorker: vi.fn() };
-		const worker = { client: recipient, meshDeliveryCapable: false, descriptor: { workerId: "worker" } };
+		const worker = {
+			client: recipient,
+			meshDeliveryCapable: origin === "legacy-replacement",
+			meshReplacementCapable: origin !== "legacy-replacement",
+			descriptor: { workerId: "worker" },
+		};
 		const internals = supervisor as unknown as {
 			mesh: unknown;
 			shuttingDown: boolean;
@@ -2833,6 +3081,7 @@ describe("mesh supervisor compatibility", () => {
 				count: number,
 				bind: (recipient: object) => void,
 				open: () => boolean,
+				attemptToken: string,
 			): Promise<void>;
 			findWorkerForClient(): Promise<unknown>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
@@ -2874,17 +3123,21 @@ describe("mesh supervisor compatibility", () => {
 				1,
 				bind,
 				() => true,
+				"attempt",
 			),
 		).rejects.toThrow("Restart that session");
 		expect(bind).not.toHaveBeenCalled();
 		expect(recipient.requestWorker).not.toHaveBeenCalled();
 		const frame = {
 			header: { kind: "outbound", outboundType: "agent_message_persisted" },
-			payload: Buffer.from(JSON.stringify({ type: "agent_message_persisted", cotalId: "message" })),
+			payload: Buffer.from(
+				JSON.stringify({ type: "agent_message_persisted", cotalId: "message", attemptToken: "attempt" }),
+			),
 		};
 		internals.handleWorkerFrame(worker, frame, recipient);
 		expect(confirm).not.toHaveBeenCalled();
 		worker.meshDeliveryCapable = true;
+		worker.meshReplacementCapable = true;
 		internals.handleWorkerFrame(worker, frame, {});
 		expect(confirm).not.toHaveBeenCalled();
 		internals.shuttingDown = true;
@@ -2892,10 +3145,17 @@ describe("mesh supervisor compatibility", () => {
 		expect(confirm).not.toHaveBeenCalled();
 		internals.shuttingDown = false;
 		internals.handleWorkerFrame(worker, frame, recipient);
-		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient);
+		expect(confirm).toHaveBeenCalledExactlyOnceWith("message", recipient, "attempt");
 		const drop = {
 			header: { kind: "outbound", outboundType: "agent_message_dropped" },
-			payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "cleared" })),
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "agent_message_dropped",
+					cotalId: "message",
+					attemptToken: "attempt",
+					reason: "cleared",
+				}),
+			),
 		};
 		worker.meshDeliveryCapable = false;
 		internals.handleWorkerFrame(worker, drop, recipient);
@@ -2909,7 +3169,12 @@ describe("mesh supervisor compatibility", () => {
 			{
 				...drop,
 				payload: Buffer.from(
-					JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason: "invalid" }),
+					JSON.stringify({
+						type: "agent_message_dropped",
+						cotalId: "message",
+						attemptToken: "attempt",
+						reason: "invalid",
+					}),
 				),
 			},
 			recipient,
@@ -2920,12 +3185,19 @@ describe("mesh supervisor compatibility", () => {
 				worker,
 				{
 					...drop,
-					payload: Buffer.from(JSON.stringify({ type: "agent_message_dropped", cotalId: "message", reason })),
+					payload: Buffer.from(
+						JSON.stringify({
+							type: "agent_message_dropped",
+							cotalId: "message",
+							attemptToken: "attempt",
+							reason,
+						}),
+					),
 				},
 				recipient,
 			);
-			expect(dropped).toHaveBeenLastCalledWith("message", recipient, reason);
+			expect(dropped).toHaveBeenLastCalledWith("message", recipient, reason, "attempt");
 		}
 		expect(dropped).toHaveBeenCalledTimes(3);
-	});
+	}
 });
