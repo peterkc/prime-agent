@@ -1069,8 +1069,10 @@ export class ModelRegistry {
 		if (apiKey && !Object.keys(headers).some((name) => name.toLowerCase() === "authorization"))
 			headers.Authorization = `Bearer ${apiKey}`;
 		const settings = JSON.stringify(config);
-		const fingerprint = createHash("sha256")
-			.update(JSON.stringify([settings, apiKey, headers]))
+		// Use the key as a MAC key, not a password to hash, as for private Prime authorization.
+		const fingerprint = createHmac("sha256", apiKey ?? "")
+			.update("prime-agent:models-json-discovery:v1\0")
+			.update(JSON.stringify([settings, headers]))
 			.digest("hex");
 		return { settings, fingerprint, headers };
 	}
