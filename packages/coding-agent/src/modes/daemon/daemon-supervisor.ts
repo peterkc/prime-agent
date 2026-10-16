@@ -2913,16 +2913,20 @@ export class DaemonSupervisor {
 					command.sessionFile,
 					command.overwrite,
 					source.worker,
+					command.token,
 				);
 				return success(command.id, command.type, { required: token !== undefined, token });
 			}
-			const recorded = this.mesh.replacementOutcome(command.sessionId, command.token);
-			if (recorded) return success(command.id, command.type, { outcome: await recorded });
-			if (command.phase === "completed") {
-				await this.refreshWorkerSummaries(source.worker, false, true);
-				const replacement = this.findSummaryInWorker(source.worker, command.sessionFile);
-				if (replacement?.sessionId !== command.sessionId)
-					throw new Error("Mesh replacement refused: worker has not published the replacement file");
+			try {
+				if (command.phase === "completed") {
+					await this.refreshWorkerSummaries(source.worker, false, true);
+					const replacement = this.findSummaryInWorker(source.worker, command.sessionFile);
+					if (replacement?.sessionId !== command.sessionId)
+						throw new Error("Mesh replacement refused: worker has not published the replacement file");
+				}
+			} catch (error) {
+				await this.mesh.finishReplacement(command.sessionId, command.token, "failed", command.sessionFile);
+				throw error;
 			}
 			const outcome = await this.mesh.finishReplacement(
 				command.sessionId,

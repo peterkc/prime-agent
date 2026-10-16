@@ -6511,37 +6511,40 @@ export class AgentDaemon {
 		const link = this.supervisorLink();
 		if (!link) throw new Error("Mesh replacement refused: supervisor link is unavailable");
 		const deadline = Date.now() + 30_000;
-		const response = await link.request({
-			type: "mesh_replace",
-			phase: "begin",
-			fromActiveSessionId: state.activeSessionId,
-			sessionId: info.id,
-			sessionFile: targetPath,
-			overwrite,
-		});
-		if (!response.success) throw deserializeDaemonError(response);
-		const barrier = response.data as { required?: unknown; token?: unknown } | undefined;
-		if (
-			typeof barrier?.required !== "boolean" ||
-			(barrier.required && (typeof barrier.token !== "string" || !barrier.token))
-		)
-			throw new Error("Mesh replacement refused: invalid barrier response");
-		const token = barrier.required ? (barrier.token as string) : undefined;
+		const token = randomUUID();
 		const sameId = previous.sessionId === info.id;
-		if (sameId) this.sameIdReplacements.add(previous);
-		if (token === undefined)
-			return sameId
-				? {
-						finish: async (outcome: "completed" | "cancelled" | "failed") => {
-							if (outcome !== "completed") this.sameIdReplacements.delete(previous);
-						},
-					}
-				: undefined;
-		if (sameId) this.unsafeMeshSessions.add(previous);
+		let draining = false;
 		let release: () => void;
 		const cancellation = new AbortController();
 		const drainTimer = setTimeout(() => cancellation.abort(), Math.max(0, deadline - 3000 - Date.now()));
 		try {
+			const response = await link.request(
+				{
+					type: "mesh_replace",
+					phase: "begin",
+					fromActiveSessionId: state.activeSessionId,
+					sessionId: info.id,
+					sessionFile: targetPath,
+					overwrite,
+					token,
+				},
+				Math.max(1, deadline - 3000 - Date.now()),
+			);
+			if (!response.success) throw deserializeDaemonError(response);
+			const barrier = response.data as { required?: unknown; token?: unknown } | undefined;
+			if (typeof barrier?.required !== "boolean" || (barrier.required && barrier.token !== token))
+				throw new Error("Mesh replacement refused: invalid barrier response");
+			if (sameId) this.sameIdReplacements.add(previous);
+			if (!barrier.required)
+				return sameId
+					? {
+							finish: async (outcome: "completed" | "cancelled" | "failed") => {
+								if (outcome !== "completed") this.sameIdReplacements.delete(previous);
+							},
+						}
+					: undefined;
+			draining = true;
+			if (sameId) this.unsafeMeshSessions.add(previous);
 			release = sameId
 				? await previous.prepareAgentMessageReplacement(
 						[...(this.meshMessageIds.get(previous) ?? [])],
@@ -6549,8 +6552,10 @@ export class AgentDaemon {
 					)
 				: () => undefined;
 		} catch (error) {
-			this.unsafeMeshSessions.delete(previous);
-			this.sameIdReplacements.delete(previous);
+			if (draining) {
+				this.unsafeMeshSessions.delete(previous);
+				this.sameIdReplacements.delete(previous);
+			}
 			try {
 				const cancelled = await link.request(
 					{
@@ -6564,6 +6569,8 @@ export class AgentDaemon {
 					Math.max(1, deadline - Date.now()),
 				);
 				if (!cancelled.success) throw deserializeDaemonError(cancelled);
+				if ((cancelled.data as { outcome?: unknown } | undefined)?.outcome === "failed")
+					throw new Error("Mesh replacement cancellation failed");
 			} catch {
 				throw new Error(
 					`${error instanceof Error ? error.message : "Mesh replacement drain failed"}; old endpoint restart was not confirmed`,

@@ -112,6 +112,7 @@ describe("daemon protocol helpers", () => {
 						type,
 						fromActiveSessionId: "a",
 						phase: "begin",
+						token: "replacement",
 						sessionId: "b",
 						sessionFile: "b.jsonl",
 						overwrite: true,

@@ -50,12 +50,19 @@ workerPrototype.write = function (client, message) {
 	return workerWrite.call(this, client, message);
 };
 const supervisorPrototype = DaemonSupervisor.prototype as unknown as {
-	persistWorker(worker: { descriptor: { pid: number } }): void;
+	persistWorker(worker: { descriptor: { pid: number; lifecycle: string }; recovery?: Promise<void> }): void;
 };
 const persistWorker = supervisorPrototype.persistWorker;
 supervisorPrototype.persistWorker = function (worker) {
 	appendFileSync(join(agentDir, "worker-pids.jsonl"), `${JSON.stringify({ pid: worker.descriptor.pid })}\n`);
 	persistWorker.call(this, worker);
+	if (worker.descriptor.lifecycle === "failed" && worker.recovery) {
+		const pid = worker.descriptor.pid;
+		void worker.recovery.then(
+			() => signal("worker-failed", String(pid)),
+			() => undefined,
+		);
+	}
 };
 const mailbox = join(agentDir, "mailbox");
 let releaseDelivery!: () => void;

@@ -2161,6 +2161,8 @@ describe("mesh supervisor compatibility", () => {
 		"cancelled",
 		"postcopy",
 		"postcopy-open",
+		"crash-before-copy",
+		"unpublished",
 		"cross-id",
 		"same-daemon-holder",
 		"holder",
@@ -2183,7 +2185,14 @@ describe("mesh supervisor compatibility", () => {
 						writeFileSync(join(root, "event-held"), "held");
 						await new Promise(resolve => { const w = watch(root, () => { if (!existsSync(path)) { w.close(); resolve(); } }); });
 					});
-					pi.on("session_before_switch", () => existsSync(join(root, "cancel-before-copy")) ? { cancel: true } : undefined);
+					pi.on("session_before_switch", async () => {
+						const path = join(root, "hold-before-copy");
+						if (existsSync(path)) {
+							writeFileSync(join(root, "before-copy-held"), "held");
+							await new Promise(resolve => { const w = watch(root, () => { if (!existsSync(path)) { w.close(); resolve(); } }); });
+						}
+						return existsSync(join(root, "cancel-before-copy")) ? { cancel: true } : undefined;
+					});
 				}
 			`,
 		);
@@ -2222,6 +2231,45 @@ describe("mesh supervisor compatibility", () => {
 						agentOrigin: true,
 					}),
 				).toMatchObject({ success: false, error: expect.stringContaining("restart that session") });
+				return;
+			}
+			if (mode === "unpublished") {
+				const unpublished = join(f.root, "unpublished.jsonl");
+				copyFileSync(target.sessionFile!, unpublished);
+				writeFileSync(join(f.agentDir, "hold-turn"), "hold");
+				await f.request(holder.client, { type: "prompt", activeSessionId, message: "hold" });
+				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+				const held = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: target.sessionId!,
+					message: "held before publication",
+				})) as { cotalId: string };
+				await meshSignal(holder.child, "accepted", held.cotalId);
+				const attempt = {
+					type: "mesh_replace" as const,
+					fromActiveSessionId: activeSessionId,
+					sessionId: target.sessionId!,
+					sessionFile: unpublished,
+					token: randomUUID(),
+				};
+				await f.request(holder.client, { ...attempt, phase: "begin", overwrite: true });
+				expect(await holder.client.request({ ...attempt, phase: "completed" })).toMatchObject({
+					success: false,
+					error: expect.stringContaining("has not published the replacement file"),
+				});
+				const next = { ...attempt, sessionFile: target.sessionFile!, token: randomUUID() };
+				expect(await f.request(holder.client, { ...next, phase: "begin", overwrite: true })).toMatchObject({
+					required: true,
+					token: next.token,
+				});
+				await f.request(holder.client, { ...next, phase: "cancelled" });
+				await meshSignal(holder.child, "rebound", target.sessionId);
+				expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(before);
+				rmSync(join(f.agentDir, "hold-turn"));
+				await meshSignal(holder.child, "ack", held.cotalId);
+				expect(readFileSync(target.sessionFile!, "utf8").split(`agentmsg_${held.cotalId}`)).toHaveLength(2);
+				expect(readFileSync(unpublished, "utf8")).not.toContain(held.cotalId);
 				return;
 			}
 			if (mode === "cross-id") {
@@ -2312,7 +2360,8 @@ describe("mesh supervisor compatibility", () => {
 				mode === "import" ||
 				mode === "move" ||
 				mode === "overwrite" ||
-				mode === "cancelled"
+				mode === "cancelled" ||
+				mode === "crash-before-copy"
 			) {
 				await f.request(holder.client, { type: "prompt", activeSessionId, message: "hold" });
 				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
@@ -2334,6 +2383,7 @@ describe("mesh supervisor compatibility", () => {
 					.filter((line) => line.includes(`agentmsg_${stored.cotalId}`)).length;
 			if (mode === "buffered" || mode === "started") expect(count(target.sessionFile!)).toBe(0);
 			if (mode === "cancelled") writeFileSync(join(f.agentDir, "cancel-before-copy"), "cancel");
+			if (mode === "crash-before-copy") writeFileSync(join(f.agentDir, "hold-before-copy"), "hold");
 			if (postcopy) {
 				const lines = readFileSync(incoming, "utf8").trimEnd().split("\n");
 				lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(f.root, "missing-cwd") });
@@ -2351,6 +2401,30 @@ describe("mesh supervisor compatibility", () => {
 			);
 			await meshSignal(holder.child, "endpoint-stopped", target.sessionId);
 			if (mode === "started") rmSync(join(f.agentDir, "hold-event"));
+			if (mode === "crash-before-copy") {
+				await meshPath(join(f.agentDir, "before-copy-held"), cleanup.signal);
+				if (!target.workerPid) throw new Error("Missing worker PID");
+				process.kill(target.workerPid, "SIGKILL");
+				expect(await replacing).toMatchObject({ success: false });
+				await meshSignal(holder.child, "worker-failed", String(target.workerPid));
+				rmSync(join(f.agentDir, "hold-before-copy"));
+				rmSync(join(f.agentDir, "hold-turn"));
+				const opened = requireSummary(
+					await f.request(holder.client, {
+						type: "create",
+						sessionPath: target.sessionFile!,
+						launchEnv: {},
+						config: { cwd: f.root },
+					}),
+				);
+				if (opened.workerPid) workerPids.add(opened.workerPid);
+				await meshSignal(holder.child, "rebound", target.sessionId);
+				await meshSignal(holder.child, "ack", stored.cotalId);
+				expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(before);
+				expect(count(target.sessionFile!)).toBe(1);
+				expect(readFileSync(join(f.agentDir, "acks.jsonl"), "utf8").split(stored.cotalId)).toHaveLength(2);
+				return;
+			}
 			const result = await replacing;
 			if (postcopy) {
 				expect(result).toMatchObject({ success: false, error: expect.stringContaining("missing-cwd") });
@@ -2415,7 +2489,14 @@ describe("mesh supervisor compatibility", () => {
 			}
 		} finally {
 			cleanup.abort();
-			for (const file of ["hold-turn", "hold-event", "fail-after-copy", "cancel-before-copy", "hold-acks"])
+			for (const file of [
+				"hold-turn",
+				"hold-event",
+				"fail-after-copy",
+				"cancel-before-copy",
+				"hold-acks",
+				"hold-before-copy",
+			])
 				rmSync(join(f.agentDir, file), { force: true });
 			holder.client.close();
 		}

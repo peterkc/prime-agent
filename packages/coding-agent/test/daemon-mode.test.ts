@@ -4439,7 +4439,7 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
-	it("pi-0spx refuses a timed-out replacement drain before copying or opening", async () => {
+	it.each(["begin", "drain"])("pi-0spx cancels a timed-out replacement %s", async (phase) => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
 		await h.authenticate("cotal");
@@ -4455,10 +4455,20 @@ describe("mesh worker persistence", () => {
 		).addRuntime(runtime);
 		const queue = createDeferred();
 		Object.assign(live.session, { _agentEventQueue: queue.promise });
-		const request = vi.fn(async (_command: DaemonCommand, _timeout?: number) => ({
+		const ready = createDeferred();
+		const expired = createDeferred();
+		const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>, _timeout?: number) => ({
 			success: true,
-			data: { required: true, token: "barrier" },
+			data: { required: true, token: command.token },
 		}));
+		request.mockImplementationOnce(async (command) => {
+			ready.resolve();
+			if (phase === "begin") {
+				await expired.promise;
+				throw new Error("begin timeout");
+			}
+			return { success: true, data: { required: true, token: command.token } };
+		});
 		Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
 		(h.internals as unknown as { meshMessageIds: WeakMap<object, Set<string>> }).meshMessageIds.set(
 			live.session,
@@ -4472,19 +4482,18 @@ describe("mesh worker persistence", () => {
 		try {
 			vi.useFakeTimers();
 			const replacing = state.runtime.importFromJsonl(incoming);
-			const refused = expect(replacing).rejects.toThrow("agentmsg_waiting");
-			// Wait for the real file-header read and the begin response before advancing the deadline.
-			await new Promise<void>((resolve) => {
-				request.mockImplementationOnce(async () => {
-					resolve();
-					return { success: true, data: { required: true, token: "barrier" } };
-				});
-			});
-			await vi.advanceTimersByTimeAsync(30_000);
+			const refused = expect(replacing).rejects.toThrow(phase === "begin" ? "begin timeout" : "agentmsg_waiting");
+			await ready.promise;
+			expect(request.mock.calls[0]?.[1]).toBe(27_000);
+			await vi.advanceTimersByTimeAsync(27_000);
+			expired.resolve();
 			await refused;
 			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
 			expect(state.runtime.session).toBe(live.session);
-			expect(request.mock.calls.at(-1)?.[0]).toMatchObject({ phase: "cancelled" });
+			expect(request.mock.calls.at(-1)?.[0]).toMatchObject({
+				phase: "cancelled",
+				token: request.mock.calls[0]?.[0].token,
+			});
 			expect(request.mock.calls.at(-1)?.[1]).toBeGreaterThanOrEqual(3000);
 		} finally {
 			vi.useRealTimers();
@@ -4526,7 +4535,8 @@ describe("mesh worker persistence", () => {
 				supervisorLink: () => ({
 					request: async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
 						phases.push(command.phase);
-						if (command.phase === "begin") return { success: true, data: { required: true, token: "barrier" } };
+						if (command.phase === "begin")
+							return { success: true, data: { required: true, token: command.token } };
 						if (failure === "transport") throw new Error("lost completed response");
 						return { success: false, error: "endpoint restart failed" };
 					},
@@ -4867,9 +4877,9 @@ describe("mesh worker persistence", () => {
 					Object.assign(h.internals, {
 						meshReplacementOffered: true,
 						supervisorLink: () => ({
-							request: async () => ({
+							request: async (replacement: Extract<DaemonCommand, { type: "mesh_replace" }>) => ({
 								success: true,
-								data: { required: !command.startsWith("no-token"), token: "barrier" },
+								data: { required: !command.startsWith("no-token"), token: replacement.token },
 							}),
 						}),
 					});
