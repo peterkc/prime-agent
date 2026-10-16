@@ -110,7 +110,7 @@ describe("ModelRegistry", () => {
 			vi.restoreAllMocks();
 		});
 		it("TM-41 loads a discovered model into available and RLM lists with a five-second request limit", async () => {
-			configure();
+			configure({ modelOverrides: { remote: { headers: { "X-Override": "yes" } } } });
 			const timeout = vi.spyOn(AbortSignal, "timeout");
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 			expect(registry.getError()).toBeUndefined();
@@ -122,6 +122,10 @@ describe("ModelRegistry", () => {
 			).toEqual(["remote"]);
 			expect(requests.map((r) => [r.method, r.url])).toEqual([["GET", "/v1/models"]]);
 			expect(timeout).toHaveBeenCalledWith(5000);
+			expect(await registry.getApiKeyAndHeaders(registry.find("discovery", "remote")!)).toMatchObject({
+				ok: true,
+				headers: { "X-Override": "yes" },
+			});
 		});
 		const core = {
 			name: "remote",
@@ -303,6 +307,8 @@ describe("ModelRegistry", () => {
 			configure(fields);
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 			expect(registry.getError()).toMatch(/Invalid models.json schema|Provider discovery:/);
+			if ("discover" in fields)
+				expect(registry.getError()).toContain("providers.discovery.discover: invalid discover configuration");
 			await registry.refreshAvailableModels();
 			expect(getModelsForProvider(registry, "discovery")).toEqual([]);
 			expect(requests).toHaveLength(0);
@@ -325,25 +331,32 @@ describe("ModelRegistry", () => {
 			expect(requests[0].headers.authorization).toBe(expected);
 			expect(requests[0].headers["x-custom"]).toBe("kept");
 		});
-		it("TM-48 reuses successes under 300 seconds and keeps last good rows after failure", async () => {
-			const clock = vi.spyOn(Date, "now").mockReturnValue(1000000);
-			configure({ models: [{ id: "offline" }] });
-			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-			await registry.refreshAvailableModels();
-			clock.mockReturnValue(1299999);
-			await registry.refreshAvailableModels();
-			expect(requests).toHaveLength(1);
-			clock.mockReturnValue(1300000);
-			respond = (response) => {
-				response.statusCode = 500;
-				response.end("private body");
-			};
-			await registry.refreshAvailableModels();
-			expect(requests).toHaveLength(2);
-			expect(getModelsForProvider(registry, "discovery").map((m) => m.id)).toEqual(["remote", "offline"]);
-			expect(warn.mock.calls).toEqual([["Provider discovery: model discovery failed (HTTP 500)"]]);
-		});
+		it.each([false, true])(
+			"TM-48 reuses successes and scopes fallback by key (key change: %s)",
+			async (changeKey) => {
+				const clock = vi.spyOn(Date, "now").mockReturnValue(1000000);
+				vi.stubEnv("DISCOVERY_TEST_KEY", "key-one");
+				const headers = { authorization: "Explicit header" };
+				configure({ apiKey: "DISCOVERY_TEST_KEY", headers, models: [{ id: "offline" }] });
+				const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				await registry.refreshAvailableModels();
+				clock.mockReturnValue(1299999);
+				await registry.refreshAvailableModels();
+				expect(requests).toHaveLength(1);
+				clock.mockReturnValue(changeKey ? 1299999 : 1300000);
+				if (changeKey) vi.stubEnv("DISCOVERY_TEST_KEY", "key-two");
+				respond = (response) => {
+					response.statusCode = 500;
+					response.end("private body");
+				};
+				await registry.refreshAvailableModels();
+				expect(requests).toHaveLength(2);
+				const expected = changeKey ? ["offline"] : ["remote", "offline"];
+				expect(getModelsForProvider(registry, "discovery").map((m) => m.id)).toEqual(expected);
+				expect(warn.mock.calls).toEqual([["Provider discovery: model discovery failed (HTTP 500)"]]);
+			},
+		);
 	});
 
 	describe("baseUrl override (no custom models)", () => {

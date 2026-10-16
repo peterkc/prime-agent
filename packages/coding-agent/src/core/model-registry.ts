@@ -1115,7 +1115,12 @@ export class ModelRegistry {
 					failure = parsed.kind;
 					throw new Error(failure);
 				}
-				this.discoveryCache.set(provider, { ...request, models: parsed.models, refreshedAt: Date.now() });
+				this.discoveryCache.set(provider, {
+					settings: request.settings,
+					fingerprint: request.fingerprint,
+					models: parsed.models,
+					refreshedAt: Date.now(),
+				});
 				this.reloadModelsAfterCatalogChange();
 				if (parsed.invalidFields)
 					console.warn(

@@ -188,7 +188,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 
 ## Model Discovery
 
-Set `discover: {}` on a provider to load `GET <baseUrl>/models` when available models refresh, including the model picker, CLI lists and RLM lookup. Both `baseUrl` and `api` are required.
+Set `discover: {}` on a provider to load `GET <baseUrl>/models` when available models refresh, including the model picker, CLI lists and RLM lookup. Both `baseUrl` and `api` are required. Discovered models, like custom models, are selectable in the picker, model list and RLM lookup only when the provider has a key from stored auth or `apiKey`; without one, the registry lists them but they are not available.
 
 ```json
 {
