@@ -41,6 +41,7 @@ import {
 	updateEnrollmentPath,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
+import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { createDeferred } from "./suite/scheduling.js";
 
@@ -226,6 +227,39 @@ describe("mesh enrollment", () => {
 		}
 	});
 
+	it("pi-0spx rejects an in-flight begin after requester failure", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+		const entered = createDeferred();
+		const resume = createDeferred();
+		FakeEndpoint.afterProvision = async () => {
+			entered.resolve();
+			await resume.promise;
+		};
+		const enrolling = mesh.enroll(sessionId, sessionFile);
+		try {
+			await entered.promise;
+			const requester = {};
+			const beginning = mesh.beginReplacement(
+				sessionId,
+				join(root, "failed-begin.jsonl"),
+				true,
+				requester,
+				randomUUID(),
+			);
+			const rejected = expect(beginning).rejects.toThrow(`Session ${sessionId}: replacement begin failed`);
+			mesh.disconnect(requester);
+			resume.resolve();
+			await enrolling;
+			await rejected;
+			expect(readEnrollment(meshRoot, sessionId).sessionFile).toBe(canonicalSessionPath(sessionFile));
+			expect(FakeEndpoint.instances.at(-1)!.stop).not.toHaveBeenCalled();
+		} finally {
+			resume.resolve();
+			FakeEndpoint.afterProvision = undefined;
+			await enrolling;
+		}
+	});
+
 	it("pi-0spx rebinds a moved file during ordinary enrollment", async () => {
 		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
 		await mesh.enroll(sessionId, sessionFile);
@@ -330,6 +364,49 @@ describe("mesh enrollment", () => {
 		expect(permissions).toContain(record.lifecycleUid);
 		expect(permissions).toContain(record.identity.id);
 		expect(remove).toHaveBeenCalledTimes(1);
+	});
+
+	it("pi-0spx preserves validation errors when failed cleanup also fails", async () => {
+		const { root, sessionId, sessionFile, mesh } = await fixture();
+		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+		});
+		const internals = supervisor as unknown as {
+			handleCommand(client: never, command: DaemonCommand): Promise<unknown>;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		const validationError = new Error("roster validation failed");
+		const finishError = Object.assign(new Error("private cleanup credential"), {
+			code: "CLEANUP_FAILED",
+			cause: { request: "private request credential" },
+		});
+		const finish = vi.spyOn(mesh, "finishReplacement").mockRejectedValueOnce(finishError);
+		const log = vi.fn();
+		Object.assign(internals, {
+			mesh,
+			findWorkerForClient: async () => ({ worker: { meshDeliveryCapable: true, meshReplacementCapable: true } }),
+			refreshWorkerSummaries: async () => {
+				throw validationError;
+			},
+			log,
+		});
+		try {
+			await expect(
+				internals.handleCommand({} as never, {
+					type: "mesh_replace",
+					phase: "completed",
+					fromActiveSessionId: "source",
+					sessionId,
+					sessionFile,
+					token: "replacement",
+				}),
+			).rejects.toBe(validationError);
+			expect(finish).toHaveBeenCalledTimes(1);
+			expect(finish).toHaveBeenCalledWith(sessionId, "replacement", "failed", sessionFile);
+			expect(log.mock.calls).toEqual([["Mesh replacement cleanup failed: Error (CLEANUP_FAILED)"]]);
+		} finally {
+			await internals.cleanupSupervisorResources();
+		}
 	});
 
 	it.each(["mesh.json", "signer.json", "invalid mesh.json", "signer mode"])(

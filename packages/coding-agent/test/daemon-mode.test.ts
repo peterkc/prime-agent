@@ -18,6 +18,7 @@ import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { CotalEndpoint, createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -40,6 +41,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
+import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
@@ -49,6 +51,7 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
 import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
 import {
@@ -4439,6 +4442,191 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it("pi-0spx drains a late started message before switching to the current enrolled file", async () => {
+		const messageStarted = createDeferred();
+		const releaseMessage = createDeferred();
+		const shutdownStarted = createDeferred();
+		const releaseShutdown = createDeferred();
+		const barrierReady = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", async (event) => {
+						if (event.message.role === "custom" && event.message.customType === "agent_message") {
+							messageStarted.resolve();
+							await releaseMessage.promise;
+						}
+					});
+					pi.on("session_shutdown", async (event) => {
+						if (event.reason === "resume") {
+							shutdownStarted.resolve();
+							await releaseShutdown.promise;
+						}
+					});
+				},
+			],
+		});
+		const factory: CreateAgentSessionRuntimeFactory = async (options) =>
+			({
+				session: Object.assign(makeRuntimeSession(options.sessionManager), {
+					messages: options.sessionManager.buildSessionContext().messages,
+					registerDisposeCallback: () => () => undefined,
+					hasQueuedAgentMessage: () => false,
+					setCurrentRecap: () => undefined,
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				}),
+				services: { cwd: live.tempDir, agentDir: live.tempDir },
+				diagnostics: [],
+			}) as never;
+		const h = harness(factory);
+		await h.authenticate("cotal");
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			factory,
+		);
+		const state = await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		const stop = vi.spyOn(CotalEndpoint.prototype, "stop").mockResolvedValue(undefined);
+		const brokerMocks = [
+			stop,
+			...(["start", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map((method) =>
+				vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			),
+		];
+		let mesh: MeshEndpoints | undefined;
+		let receiving: Promise<void> | undefined;
+		let switching: Promise<unknown> | undefined;
+		try {
+			const meshRoot = join(live.tempDir, "mesh");
+			mkdirSync(meshRoot);
+			writeFileSync(join(meshRoot, "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+			writeFileSync(join(meshRoot, "signer.json"), JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))), {
+				mode: 0o600,
+			});
+			mesh = new MeshEndpoints({
+				meshRoot,
+				homeSocket: join(live.tempDir, "mesh.sock"),
+				handoff: vi.fn(),
+				log: vi.fn(),
+			});
+			await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+			stop.mockClear();
+			let closedAtBegin = 0;
+			const request = vi.fn(async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
+				let data:
+					| { required: boolean; token: string | undefined }
+					| { outcome: "completed" | "cancelled" | "failed" };
+				if (command.phase === "begin") {
+					const token = await mesh!.beginReplacement(
+						command.sessionId,
+						command.sessionFile,
+						command.overwrite,
+						h.client,
+						command.token,
+					);
+					closedAtBegin = stop.mock.calls.length;
+					if (token) barrierReady.resolve();
+					data = { required: token !== undefined, token };
+				} else {
+					await mesh!.finishReplacement(command.sessionId, command.token, command.phase, command.sessionFile);
+					data = { outcome: command.phase };
+				}
+				return { success: true, data };
+			});
+			Object.assign(h.internals, { meshReplacementOffered: true, supervisorLink: () => ({ request }) });
+			const ackOnDisk: boolean[] = [];
+			const write = h.socket.write;
+			h.socket.write = (data) => {
+				const accepted = write(data);
+				if (h.frames().at(-1)?.type === "agent_message_persisted")
+					ackOnDisk.push(readFileSync(live.session.sessionFile!, "utf8").includes("agentmsg_samefile"));
+				return accepted;
+			};
+			live.setResponses([fauxAssistantMessage("done")]);
+			receiving = h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: state.activeSessionId,
+				message: "late",
+				sender: { sessionName: "sender" },
+				cotal: { id: "samefile", deliveryCount: 1, attemptToken: "attempt" },
+			});
+			await messageStarted.promise;
+			switching = runtime.switchSession(live.session.sessionFile!);
+			// The full barrier releases the old event before opening; the old exemption reaches shutdown first.
+			await Promise.race([barrierReady.promise, shutdownStarted.promise]);
+			releaseMessage.resolve();
+			await receiving;
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_samefile");
+			live.sessionManager.flushNow();
+			await shutdownStarted.promise;
+			releaseShutdown.resolve();
+			await switching;
+			expect(runtime.session).not.toBe(live.session);
+			expect(runtime.session.messages).toEqual(
+				expect.arrayContaining([expect.objectContaining({ role: "custom", customType: "agent_message" })]),
+			);
+			expect(runtime.session.sessionManager.getEntries()).toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "custom_message", customType: "agent_message" })]),
+			);
+			await h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: state.activeSessionId,
+				message: "late",
+				sender: { sessionName: "sender" },
+				cotal: { id: "samefile", deliveryCount: 2, attemptToken: "redelivery" },
+			});
+			expect(ackOnDisk).toEqual([true]);
+			expect(request.mock.calls.map(([command]) => command.phase)).toEqual(["begin", "completed"]);
+			expect(closedAtBegin).toBe(1);
+		} finally {
+			releaseMessage.resolve();
+			releaseShutdown.resolve();
+			await receiving?.catch(() => undefined);
+			await switching?.catch(() => undefined);
+			await mesh?.stop();
+			await runtime.dispose();
+			live.cleanup();
+			for (const mock of brokerMocks) mock.mockRestore();
+		}
+	});
+
+	it("pi-0spx refuses an enrolled own-file switch without a supervisor barrier", async () => {
+		const live = await createHarness({ persistSession: true });
+		const h = harness();
+		await h.authenticate("cotal");
+		const factory = vi.fn(async () => {
+			throw new Error("must not build");
+		});
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			factory,
+		);
+		await (
+			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+		).addRuntime(runtime);
+		try {
+			const directory = join(live.tempDir, "mesh", "directory");
+			mkdirSync(directory, { recursive: true });
+			writeFileSync(join(directory, `${live.session.sessionId}.json`), "{}");
+			const before = readFileSync(live.session.sessionFile!, "utf8");
+			await expect(runtime.switchSession(live.session.sessionFile!)).rejects.toThrow(
+				"Mesh replacement refused: supervisor does not offer the replacement barrier; restart the daemon",
+			);
+			expect(factory).not.toHaveBeenCalled();
+			expect(runtime.session).toBe(live.session);
+			expect(readFileSync(live.session.sessionFile!, "utf8")).toBe(before);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
 	it("pi-0spx preserves a supervisor begin refusal without cancelling", async () => {
 		const live = await createHarness({ persistSession: true });
 		const h = harness();
@@ -4541,6 +4729,42 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
+	it("pi-0spx preserves an import error when mesh finish fails", async () => {
+		const live = await createHarness({ persistSession: true });
+		const runtime = new AgentSessionRuntime(
+			live.session,
+			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			async () => {
+				throw new Error("must not build");
+			},
+		);
+		const finishError = new Error("mesh cleanup failed");
+		const finish = vi.fn(async () => {
+			throw finishError;
+		});
+		runtime.setReplacementBarrier(async () => ({ finish }));
+		try {
+			live.session.sessionManager.flushNow();
+			const incomingDir = join(live.tempDir, "incoming");
+			mkdirSync(incomingDir);
+			const incoming = join(incomingDir, basename(live.session.sessionFile!));
+			const [header, ...entries] = readFileSync(live.session.sessionFile!, "utf8").split("\n");
+			writeFileSync(
+				incoming,
+				[JSON.stringify({ ...JSON.parse(header!), cwd: join(live.tempDir, "missing") }), ...entries].join("\n"),
+			);
+			const replacing = runtime.importFromJsonl(incoming);
+			await expect(replacing).rejects.toBeInstanceOf(MissingSessionCwdError);
+			await expect(replacing).rejects.toHaveProperty("cause", finishError);
+			expect(finish).toHaveBeenCalledTimes(1);
+			expect(finish).toHaveBeenCalledWith("failed");
+			expect(runtime.session).toBe(live.session);
+		} finally {
+			await runtime.dispose();
+			live.cleanup();
+		}
+	});
+
 	it.each(["transport", "supervisor"] as const)(
 		"pi-0spx finishes once and preserves mesh admission after a %s failure",
 		async (failure) => {
@@ -4583,7 +4807,13 @@ describe("mesh worker persistence", () => {
 			const incoming = join(live.tempDir, "finish-once.jsonl");
 			copyFileSync(live.session.sessionFile!, incoming);
 			try {
-				await expect(runtime.importFromJsonl(incoming)).rejects.toThrow(
+				const replacing = runtime.importFromJsonl(incoming);
+				await expect(replacing).rejects.toThrow(
+					"Session switch or import completed, but the mesh endpoint was not confirmed. " +
+						"Reopen the session from disk to restore delivery.",
+				);
+				await expect(replacing).rejects.toHaveProperty(
+					"cause.message",
 					failure === "transport" ? "lost completed response" : "endpoint restart failed",
 				);
 				expect(phases).toEqual(["begin", "completed"]);

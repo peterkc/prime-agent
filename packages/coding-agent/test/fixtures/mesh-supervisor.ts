@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
 import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, mintCreds, newIdentity } from "@cotal-ai/core";
@@ -9,9 +9,14 @@ import {
 	registerFauxProvider,
 } from "../../../ai/src/index.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
-import type { SessionLease } from "../../src/core/session-lease.js";
+import { canonicalSessionPath, getProcessStartId, type SessionLease } from "../../src/core/session-lease.js";
 import { main } from "../../src/main.js";
-import { type EnrollmentRecord, readDirectory, readSigner } from "../../src/modes/daemon/cotal/enrollment.js";
+import {
+	type EnrollmentRecord,
+	enrollmentPath,
+	readDirectory,
+	readSigner,
+} from "../../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../../src/modes/daemon/cotal/mesh-endpoints.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import { DaemonSupervisor } from "../../src/modes/daemon/daemon-supervisor.js";
@@ -159,6 +164,32 @@ CotalEndpoint.prototype.stop = async () => undefined;
 CotalEndpoint.prototype.provisionDmInbox = async () => undefined;
 CotalEndpoint.prototype.provisionDlvInbox = async () => undefined;
 CotalEndpoint.prototype.reissueAcl = async () => undefined;
+function targetSupervisorPid(meshRoot: string, sessionId: string): number | undefined {
+	const path = canonicalSessionPath(enrollmentPath(meshRoot, sessionId));
+	const key = createHash("sha256").update(path).digest("hex");
+	let contents: string;
+	try {
+		contents = readFileSync(join(meshRoot, "session-leases", `${key}.lock`, "owner.json"), "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const owner = JSON.parse(contents) as {
+		pid: number;
+		processStartId?: string;
+		sessionPath: string;
+		activeSessionId?: string;
+	};
+	if (
+		!Number.isSafeInteger(owner.pid) ||
+		owner.pid <= 1 ||
+		owner.sessionPath !== path ||
+		owner.activeSessionId !== sessionId
+	)
+		throw new Error("Invalid fixture mesh claim owner");
+	return owner.processStartId && getProcessStartId(owner.pid) === owner.processStartId ? owner.pid : undefined;
+}
+
 const starts = new Map<string, number>();
 const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSession;
 (MeshEndpoints.prototype as unknown as StubMesh).startSession = async function (id, file, claim) {
@@ -250,10 +281,20 @@ const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSe
 						to: principal,
 						parts: [{ kind: "text", text }],
 					} as CotalMessage;
+					const targetPid = this.sessions.has(target.sessionId)
+						? undefined
+						: targetSupervisorPid(meshRoot, target.sessionId);
 					writeFileAtomicSync(
 						join(mailbox, `${message.id}.json`),
 						JSON.stringify({ target: target.sessionId, message }),
 					);
+					if (targetPid !== undefined) {
+						try {
+							process.kill(targetPid, "SIGUSR2");
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+						}
+					}
 					void deliveryReady.then(() => this.sessions.get(target.sessionId)?.pull?.());
 					return { msg: message, ack: { seq: 1, duplicate: false } };
 				},
@@ -297,6 +338,12 @@ else {
 			noExtensions: !existsSync(join(agentDir, "extensions", "rebind.ts")),
 			telemetryDisabled: true,
 		},
+	});
+	process.on("SIGUSR2", () => {
+		void deliveryReady.then(() => {
+			const mesh = (supervisor as unknown as { mesh?: StubMesh }).mesh;
+			for (const session of mesh?.sessions.values() ?? []) session.pull?.();
+		});
 	});
 	await supervisor.start();
 	releaseDelivery();

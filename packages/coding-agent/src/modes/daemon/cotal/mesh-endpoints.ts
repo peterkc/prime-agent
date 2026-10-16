@@ -324,8 +324,8 @@ export class MeshEndpoints {
 
 	async beginReplacement(
 		sessionId: string,
-		sessionFile: string,
-		overwrite: boolean,
+		_sessionFile: string,
+		_overwrite: boolean,
 		requester: object,
 		token: string,
 	): Promise<string | undefined> {
@@ -344,13 +344,12 @@ export class MeshEndpoints {
 		let replacement: SessionReplacement | undefined;
 		try {
 			await this.enrolling.get(sessionId);
-			if (beginning.state !== "active") return undefined;
+			if (beginning.state === "failed") throw new Error(`Session ${sessionId}: replacement begin failed`);
+			if (beginning.state === "cancelled") return undefined;
 			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) return undefined;
 			const record = readEnrollment(this.options.meshRoot, sessionId);
 			const previous = this.replacements.get(sessionId);
 			if (previous?.state === "active") throw new Error(`Session ${sessionId}: replacement is already pending`);
-			if (!overwrite && canonicalSessionPath(sessionFile) === canonicalSessionPath(record.sessionFile) && !previous)
-				return undefined;
 			const session = this.sessions.get(sessionId);
 			const claim =
 				previous?.claim ?? session?.claim ?? claimEnrollment(this.options.meshRoot, sessionId, record.sessionFile);

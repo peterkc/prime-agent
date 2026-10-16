@@ -2925,7 +2925,11 @@ export class DaemonSupervisor {
 						throw new Error("Mesh replacement refused: worker has not published the replacement file");
 				}
 			} catch (error) {
-				await this.mesh.finishReplacement(command.sessionId, command.token, "failed", command.sessionFile);
+				try {
+					await this.mesh.finishReplacement(command.sessionId, command.token, "failed", command.sessionFile);
+				} catch (finishError) {
+					this.log(`Mesh replacement cleanup failed: ${redactMeshError(finishError, false)}`);
+				}
 				throw error;
 			}
 			const outcome = await this.mesh.finishReplacement(

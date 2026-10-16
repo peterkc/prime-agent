@@ -6498,11 +6498,7 @@ export class AgentDaemon {
 		const previous = state.runtime.session;
 		if (!this.meshReplacementOffered) {
 			const enrolled = existsSync(join(state.runtime.services.agentDir, "mesh", "directory", `${info.id}.json`));
-			const ownFile =
-				previous.sessionId === info.id &&
-				previous.sessionFile &&
-				canonicalSessionPath(previous.sessionFile) === canonicalSessionPath(targetPath);
-			if (enrolled && (overwrite || !ownFile))
+			if (enrolled)
 				throw new Error(
 					"Mesh replacement refused: supervisor does not offer the replacement barrier; restart the daemon",
 				);

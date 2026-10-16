@@ -754,10 +754,27 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				started = true;
 			});
 		} catch (error) {
-			await barrier?.finish(started ? "failed" : "cancelled");
+			try {
+				await barrier?.finish(started ? "failed" : "cancelled");
+			} catch (finishError) {
+				if (!(error instanceof Error))
+					throw new AggregateError([error, finishError], "Session replacement failed", { cause: error });
+				error.cause =
+					error.cause === undefined
+						? finishError
+						: new AggregateError([error.cause, finishError], "Mesh replacement cleanup failed");
+			}
 			throw error;
 		}
-		await barrier?.finish(result.cancelled ? "cancelled" : "completed");
+		try {
+			await barrier?.finish(result.cancelled ? "cancelled" : "completed");
+		} catch (error) {
+			throw new Error(
+				`Session switch or import ${result.cancelled ? "was cancelled" : "completed"}, but the mesh endpoint was not confirmed. ` +
+					"Reopen the session from disk to restore delivery.",
+				{ cause: error },
+			);
+		}
 		return result;
 	}
 

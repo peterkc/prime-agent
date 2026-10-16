@@ -2501,6 +2501,53 @@ describe("mesh supervisor compatibility", () => {
 			holder.client.close();
 		}
 	});
+	it("pi-0spx switches a real worker to its current enrolled file without losing context", async () => {
+		const f = await meshFixture();
+		const holder = await f.start(join(f.root, "holder.sock"));
+		const cleanup = new AbortController();
+		try {
+			const sender = await f.create(holder, "sender");
+			const target = await f.create(holder, "target");
+			const activeSessionId = target.activeSessionId!;
+			const recordPath = join(f.agentDir, "mesh", "enrollments", `${target.sessionId}.json`);
+			const before = readFileSync(recordPath, "utf8");
+			writeFileSync(join(f.agentDir, "hold-turn"), "hold");
+			const stored = (await f.request(holder.client, {
+				type: "mesh_send",
+				fromActiveSessionId: sender.activeSessionId!,
+				targetSessionId: target.sessionId!,
+				message: "current-path context",
+			})) as { cotalId: string };
+			await meshSignal(holder.child, "accepted", stored.cotalId);
+			await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+			const switching = f.request(holder.client, {
+				type: "switch_session",
+				activeSessionId,
+				sessionPath: target.sessionFile!,
+			});
+			await meshSignal(holder.child, "endpoint-stopped", target.sessionId);
+			expect(await switching).toMatchObject({ cancelled: false, sessionFile: target.sessionFile });
+			rmSync(join(f.agentDir, "hold-turn"));
+			await meshSignal(holder.child, "ack", stored.cotalId);
+			expect(readFileSync(target.sessionFile!, "utf8").split(`agentmsg_${stored.cotalId}`)).toHaveLength(2);
+			expect(await f.request(holder.client, { type: "get_messages", activeSessionId })).toMatchObject({
+				messages: expect.arrayContaining([
+					expect.objectContaining({ role: "custom", customType: "agent_message" }),
+				]),
+			});
+			expect(readFileSync(recordPath, "utf8")).toBe(before);
+			expect(
+				readFileSync(join(f.agentDir, "ack-disk.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line)),
+			).toContainEqual({ id: stored.cotalId, covered: true });
+		} finally {
+			cleanup.abort();
+			rmSync(join(f.agentDir, "hold-turn"), { force: true });
+			holder.client.close();
+		}
+	});
 	it("AC-18 fileless rename calls no directory write and logs no failure", async () => {
 		const root = tempDir();
 		const supervisor = new DaemonSupervisor(join(root, "fileless.sock"), {
