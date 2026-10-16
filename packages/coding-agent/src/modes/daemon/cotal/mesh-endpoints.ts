@@ -322,13 +322,7 @@ export class MeshEndpoints {
 		}
 	}
 
-	async beginReplacement(
-		sessionId: string,
-		_sessionFile: string,
-		_overwrite: boolean,
-		requester: object,
-		token: string,
-	): Promise<string | undefined> {
+	async beginReplacement(sessionId: string, requester: object, token: string): Promise<string | undefined> {
 		if (this.closing || this.refusal) throw new Error(this.refusal ?? "Mesh is shutting down");
 		if (typeof token !== "string" || !token) throw new Error("Mesh replacement refused: invalid replacement token");
 		if (this.replacements.get(sessionId)?.token === token || this.replacementBegins.get(sessionId)?.token === token)
@@ -433,7 +427,7 @@ export class MeshEndpoints {
 	}
 
 	private async rebindSession(session: SessionEndpoint, sessionFile: string): Promise<void> {
-		const token = await this.beginReplacement(session.record.sessionId, sessionFile, false, this, randomUUID());
+		const token = await this.beginReplacement(session.record.sessionId, this, randomUUID());
 		if (token) await this.finishReplacement(session.record.sessionId, token, "completed", sessionFile);
 	}
 

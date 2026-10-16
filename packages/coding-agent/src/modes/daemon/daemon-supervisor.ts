@@ -2908,13 +2908,7 @@ export class DaemonSupervisor {
 					)
 						throw new Error("Mesh replacement refused: session is active in another holder of this daemon");
 				}
-				const token = await this.mesh.beginReplacement(
-					command.sessionId,
-					command.sessionFile,
-					command.overwrite,
-					source.worker,
-					command.token,
-				);
+				const token = await this.mesh.beginReplacement(command.sessionId, source.worker, command.token);
 				return success(command.id, command.type, { required: token !== undefined, token });
 			}
 			try {
