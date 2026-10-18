@@ -2454,7 +2454,8 @@ describe("mesh supervisor compatibility", () => {
 			writeFileSync(bad.ledgerPath, "malformed\n");
 			await f.request(holder.client, { type: "kill", activeSessionId: top.activeSessionId! });
 			await removed;
-			expect(childDiagnostics.get(holder.child)?.stderr).not.toContain("Mesh RLM deletion reconciliation failed");
+			// A different ledger error identifies the child-triggered pass, not a stale top-level failure.
+			writeFileSync(bad.ledgerPath, "{}\n");
 			expect(
 				await f.request(holder.client, {
 					type: "delete_rlm_subagent",
@@ -2462,7 +2463,11 @@ describe("mesh supervisor compatibility", () => {
 					childId: "child",
 				}),
 			).toEqual({ deleted: true });
-			await meshSignal(holder.child, "log", "Mesh RLM deletion reconciliation failed");
+			await meshSignal(holder.child, "log", "missing v/at");
+			const failures = (childDiagnostics.get(holder.child)?.stderr ?? "")
+				.split("\n")
+				.filter((line) => line.startsWith("Mesh RLM deletion reconciliation failed:"));
+			expect(failures).toHaveLength(1);
 			expect(childDiagnostics.get(holder.child)?.stderr).toContain(bad.ledgerPath);
 		} finally {
 			unsubscribe();

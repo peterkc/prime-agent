@@ -5016,7 +5016,9 @@ export class DaemonSupervisor {
 				(id) => this.roster().get(id)?.summary.runtimeKind === "subagent" || id.includes("#"),
 			)
 		)
-			void this.mesh.reconcileDeletedChildren();
+			void this.mesh
+				.reconcileDeletedChildren()
+				.catch((error: unknown) => this.log(`Mesh RLM deletion reconciliation failed: ${redactMeshError(error)}`));
 		if (delta.snapshot !== true && worker.rosterApplyChain === undefined) {
 			this.applyWorkerRosterDelta(worker, delta);
 			return;

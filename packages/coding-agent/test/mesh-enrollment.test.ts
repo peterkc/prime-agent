@@ -253,6 +253,26 @@ describe("mesh enrollment", () => {
 		await expect(mesh.resolveAddress(sessionId)).rejects.toThrow("Unknown mesh target");
 	});
 
+	it("AC-34 skips a badly named enrollment and still removes a deleted child", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const record = readEnrollment(meshRoot, sessionId);
+		copyFileSync(enrollmentPath(meshRoot, sessionId), join(meshRoot, "enrollments", "abc copy.json"));
+		await new RlmSpawnLedger(root, join(root, "sessions")).appendDelete({
+			childId: "child",
+			child: sessionFile,
+			reason: "user",
+		});
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		await expect(mesh.reconcileDeletedChildren()).resolves.toBeUndefined();
+		expect(log).toHaveBeenCalledWith("Mesh session abc copy: unenrollment failed: Error: Invalid mesh session ID");
+		expect(remove).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ targetId: record.identity.id, lifecycleUid: record.lifecycleUid }),
+		);
+		expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+	});
+
 	it.each(["rerun", "stop", "removed"] as const)("AC-34 drains one reconciliation before %s", async (mode) => {
 		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
 		await mesh.enroll(sessionId, sessionFile);

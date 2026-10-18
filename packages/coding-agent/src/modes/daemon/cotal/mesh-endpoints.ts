@@ -494,8 +494,8 @@ export class MeshEndpoints {
 		for (const file of files) {
 			if (this.closing) break;
 			const sessionId = file.slice(0, -5);
-			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) continue;
 			try {
+				if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) continue;
 				const record = readEnrollment(this.options.meshRoot, sessionId);
 				if (deleted.has(canonicalSessionPath(record.sessionFile)))
 					await this.unenroll(sessionId, record.sessionFile, deleted);
