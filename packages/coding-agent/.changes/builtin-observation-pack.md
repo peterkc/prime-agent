@@ -1,0 +1,1 @@
+- Added a built-in observation-pack extension that archives large kept tool results after compaction, and reloadable switches for it and the Herdr reporter.

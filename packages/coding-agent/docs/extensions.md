@@ -32,6 +32,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
 
 - [Quick Start](#quick-start)
 - [Extension Locations](#extension-locations)
+- [Built-in Extensions](#built-in-extensions)
 - [Available Imports](#available-imports)
 - [Writing an Extension](#writing-an-extension)
   - [Extension Styles](#extension-styles)
@@ -134,6 +135,30 @@ Additional paths via `settings.json`:
 ```
 
 To share extensions via npm or git as Prime Agent packages, see [packages.md](packages.md).
+
+## Built-in Extensions
+
+Prime Agent ships two built-in extensions, enabled by default:
+
+- **Observation-pack** archives text-only, successful tool results larger than
+  10,240 UTF-8 bytes when compaction keeps them for a new context cycle. With
+  `ipython` active, the model sees a stable placeholder with complete-line
+  excerpts and a read-back path. History stays unchanged. Archives live under
+  `<session directory>/observation-pack/<session ID>/`; decisions use
+  `observation-pack-cycle` entries and failures use `observation-pack-error`.
+- **Herdr agent state** reports lifecycle state inside a Herdr pane. It defers
+  to Herdr's file-based integration when that extension file is enabled.
+
+Set `enableBuiltinExtensions: false` to disable both, or disable one with
+`bundledExtensions.observationPack` or `bundledExtensions.herdrAgentState`.
+Each switch defaults to `true` and takes effect on `/reload`. Disabling one
+keeps existing archives and session entries. User extension factories are not
+controlled by these settings. `--no-extensions` disables built-ins and file
+discovery; the SDK's `noBuiltinHerdrReporter` skips only Herdr.
+
+Observation-pack does not detect a user-installed copy. Disable that copy when
+switching to the built-in. If both run, they share the recorded cycle decision
+and archive each large result once; the file is not duplicated.
 
 ## Available Imports
 

@@ -11,7 +11,8 @@ import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
-import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import observationPackExtension from "./extensions/builtin/observation-pack.js";
+import type { ExtensionFactory, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
@@ -187,12 +188,29 @@ export async function createAgentSessionServices(
 	// pane. Deferral is late-bound to the loader's loaded paths (inline
 	// factories run after file extensions load), so a file that exists but is
 	// disabled or never discovered does not silence the built-in.
-	// noExtensions is a full opt-out: it disables the built-in reporter too,
-	// not just discovered extension files.
-	const skipHerdrReporter = options.noBuiltinHerdrReporter || options.resourceLoaderOptions?.noExtensions;
-	const builtinExtensionFactories = skipHerdrReporter
+	const herdrReporter = createHerdrAgentStateExtension(() => resourceLoader.getLoadedExtensionPaths());
+	// Factories survive reloads, so read the switches on each invocation.
+	const builtinExtensionFactories: ExtensionFactory[] = options.resourceLoaderOptions?.noExtensions
 		? []
-		: [createHerdrAgentStateExtension(() => resourceLoader.getLoadedExtensionPaths())];
+		: [
+				(pi) => {
+					if (
+						settingsManager.getEnableBuiltinExtensions() &&
+						settingsManager.getBundledExtensions().observationPack
+					) {
+						observationPackExtension(pi);
+					}
+				},
+				(pi) => {
+					if (
+						!options.noBuiltinHerdrReporter &&
+						settingsManager.getEnableBuiltinExtensions() &&
+						settingsManager.getBundledExtensions().herdrAgentState
+					) {
+						return herdrReporter(pi);
+					}
+				},
+			];
 	const resourceLoader: DefaultResourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		extensionFactories: [...builtinExtensionFactories, ...userExtensionFactories],
