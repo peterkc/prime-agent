@@ -176,9 +176,9 @@ The retained transcript cannot re-enroll even on explicit reopen, so that sessio
 cannot send or receive agent messages in Cotal mode. There is no clear-on-open rule.
 
 For an ordinary session still writing in another daemon, delete it in that daemon.
-Deleting it elsewhere while native can let the live writer recreate the transcript.
-After restart it can re-enroll with a new identity and lifecycle; the old inbox's
-messages do not follow it. The directory lock does not prevent that recreation.
+Deleting it elsewhere can let the live writer recreate the transcript.
+With the mesh on, it can re-enroll after restart with a new identity and lifecycle,
+but the old inbox's messages are lost. The directory lock does not prevent that recreation.
 
 There is no per-daemon endpoint cap. NATS's default is 1000 consumers per stream, so the
 space supports about 1000 enrolled inboxes. Each uses one consumer in `DM_prime` and one

@@ -531,6 +531,7 @@ export class MeshEndpoints {
 			await this.retireSession(session);
 			return;
 		}
+		await this.enrolling.get(sessionId)?.catch(() => undefined);
 		let claim: SessionLease;
 		try {
 			claim = claimEnrollment(this.options.meshRoot, sessionId, sessionFile);

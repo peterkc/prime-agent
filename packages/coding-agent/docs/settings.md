@@ -401,7 +401,7 @@ missing-file behavior, locked replay cost and safe ledger recovery.
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
 | `autoReload` | `"off"` or `"idle"` | `"off"` | Reload changed runtime files when daemon sessions are idle. |
-| `agentMessageTransport` | `"native"` or `"cotal"` | `"native"` | Global-only agent message transport. Restart the daemon after changing it. |
+| `agentMessageTransport` | `"native"` or `"cotal"` | `"native"` | Global-only agent message transport. Run `prime-agent restart` after changing it. |
 
 `autoReload` reads only global settings; project settings and SDK overrides cannot enable it.
 The daemon reads the file every 15 seconds, so changing this setting needs no `/reload`.

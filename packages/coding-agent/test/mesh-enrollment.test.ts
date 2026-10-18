@@ -24,6 +24,7 @@ import { ENV_AGENT_DIR } from "../src/config.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import {
 	claimEnrollment,
 	credentialSource,
@@ -206,6 +207,49 @@ describe("mesh enrollment", () => {
 			}
 		},
 	);
+
+	it("AC-34 waits for its own parked enrollment before removing a deleted inbox", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+		await publishDirectory(meshRoot, record, join(root, "daemon.sock"));
+		const entered = createDeferred();
+		const release = createDeferred();
+		const lock = enrollment.withDirectoryLock;
+		vi.spyOn(enrollment, "withDirectoryLock").mockImplementationOnce(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return lock(...args);
+		});
+		const removeEnrollment = enrollment.removeEnrollment;
+		vi.spyOn(enrollment, "removeEnrollment").mockImplementation(async (...args) => {
+			const removed = await removeEnrollment(...args);
+			// Let unenroll observe the still-held claim before the enrollment resumes next turn.
+			setImmediate(() => release.resolve());
+			return removed;
+		});
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		const enrolling = mesh.enqueueEnrollment(sessionId, sessionFile);
+		void enrolling.catch(() => undefined);
+		try {
+			await entered.promise;
+			await new RlmSpawnLedger(root, join(root, "sessions")).appendDelete({
+				childId: "child",
+				child: sessionFile,
+				reason: "user",
+			});
+			await mesh.reconcileDeletedChildren();
+			await expect(enrolling).rejects.toThrow("RLM child was deliberately deleted");
+			expect(remove).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ targetId: record.identity.id, lifecycleUid: record.lifecycleUid }),
+			);
+			expect(log.mock.calls.flat().some((message) => message.includes("claimed by another daemon"))).toBe(false);
+			expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+			expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+		} finally {
+			release.resolve();
+			await enrolling.catch(() => undefined);
+		}
+	});
 
 	it("AC-34 removes only exact tombstoned paths in one shared reconciliation", async () => {
 		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();

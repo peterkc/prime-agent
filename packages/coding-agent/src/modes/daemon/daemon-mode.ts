@@ -6548,7 +6548,12 @@ export class AgentDaemon {
 			if (sameId) this.unsafeMeshSessions.add(previous);
 			release = sameId
 				? await previous.prepareAgentMessageReplacement(
-						[...(this.meshMessageIds.get(previous) ?? [])],
+						[
+							...new Set([
+								...(this.meshMessageIds.get(previous) ?? []),
+								...(this.meshAdmissions.get(previous)?.keys() ?? []),
+							]),
+						],
 						cancellation.signal,
 					)
 				: () => undefined;
@@ -6655,7 +6660,7 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(target),
 			possiblyRepeated: command.cotal.deliveryCount > 1,
 		};
-		const ownEntry = () =>
+		const ownEntry = (id = payload.id) =>
 			manager
 				.getEntries()
 				.find(
@@ -6665,11 +6670,25 @@ export class AgentDaemon {
 						entry.details !== null &&
 						typeof entry.details === "object" &&
 						"id" in entry.details &&
-						entry.details.id === payload.id,
+						entry.details.id === id,
 				);
 		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
-		this.meshMessageIds.set(recipientSession, messageIds);
-		messageIds.add(payload.id);
+		if (!this.meshMessageIds.has(recipientSession)) {
+			this.meshMessageIds.set(recipientSession, messageIds);
+			const stopTracking = manager.onPersist(() => {
+				for (const id of messageIds) {
+					const entry = ownEntry(id);
+					if (entry && manager.isEntryPersisted(entry.id)) messageIds.delete(id);
+				}
+			});
+			recipientSession.registerDisposeCallback(() => {
+				stopTracking();
+				messageIds.clear();
+				this.meshMessageIds.delete(recipientSession);
+			});
+		}
+		const existing = ownEntry();
+		if (!existing || !manager.isEntryPersisted(existing.id)) messageIds.add(payload.id);
 		let accepted = false;
 		let sent = false;
 		let active = true;
@@ -6678,7 +6697,6 @@ export class AgentDaemon {
 		let unregisterDispose: (() => void) | undefined;
 		const cleanup = () => {
 			active = false;
-			messageIds.delete(payload.id);
 			unsubscribe?.();
 			unregisterDispose?.();
 			client.socket.off("close", cleanup);
@@ -6707,6 +6725,7 @@ export class AgentDaemon {
 			);
 		};
 		const dropped = (error: unknown) => {
+			messageIds.delete(payload.id);
 			deliveryFailure = error;
 			check();
 			const reason = this.unsafeMeshSessions.has(recipientSession)
@@ -6834,14 +6853,16 @@ export class AgentDaemon {
 		payload: AgentSessionMessagePayload,
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
 		const message = createAgentSessionMessage(payload);
+		const recipientSession = targetState.runtime.session;
 		let preflightFailed = false;
 		let preflightQueued = false;
-		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
+		await recipientSession.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
 			streamingBehavior: "steer",
 			queueIfBusy: true,
 			customMessage: message,
 			admissionCommitted: () => {
+				if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 				if (this.agentMessagesPaused) {
 					throw new Error("Agent messaging is paused");
 				}
