@@ -39,10 +39,13 @@ import {
 	removeEnrollment,
 	renameDirectory,
 	updateEnrollmentPath,
+	withDirectoryLock,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import * as rlmLedger from "../src/modes/daemon/rlm-ledger.js";
+import { RlmSpawnLedger, readDeletedRlmChildPaths } from "../src/modes/daemon/rlm-ledger.js";
 import { createDeferred } from "./suite/scheduling.js";
 
 vi.mock("node:fs/promises", async (original) => ({ ...(await original<typeof fsPromises>()) }));
@@ -104,6 +107,151 @@ async function fixture() {
 }
 
 describe("mesh enrollment", () => {
+	it.each(["creation", "publication"] as const)(
+		"AC-34 rejects a parked enrollment after a committed delete (%s)",
+		async (phase) => {
+			const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+			const entered = createDeferred();
+			const release = createDeferred();
+			let holding: Promise<void> | undefined;
+			if (phase === "creation") {
+				holding = withDirectoryLock(meshRoot, sessionId, async () => {
+					entered.resolve();
+					await release.promise;
+				});
+				await entered.promise;
+			} else
+				FakeEndpoint.afterProvision = async () => {
+					entered.resolve();
+					await release.promise;
+				};
+			const enrolling = mesh.enqueueEnrollment(sessionId, sessionFile);
+			void enrolling.catch(() => undefined);
+			try {
+				if (phase === "publication") await entered.promise;
+				await new RlmSpawnLedger(root, join(root, "sessions")).appendDelete({
+					childId: "retained",
+					child: sessionFile,
+					reason: "user",
+				});
+				release.resolve();
+				await holding;
+				await expect(enrolling).rejects.toThrow("RLM child was deliberately deleted");
+				expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(phase === "publication");
+				expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+				expect(existsSync(sessionFile)).toBe(true);
+			} finally {
+				release.resolve();
+				await holding;
+				await enrolling.catch(() => undefined);
+				FakeEndpoint.afterProvision = undefined;
+			}
+		},
+	);
+
+	it.each([
+		["creation", "unreadable", 0],
+		["creation", "unreadable", 1],
+		["publication", "unreadable", 0],
+		["publication", "unreadable", 1],
+		["creation", "malformed", 0],
+		["creation", "malformed", 1],
+		["publication", "malformed", 0],
+		["publication", "malformed", 1],
+	] as const)(
+		"AC-34 refuses bad shared ledgers without creation, publication or cleanup (%s, %s, %s)",
+		async (phase, failure, badIndex) => {
+			const { root, meshRoot, sessionId, sessionFile, session, mesh, log } = await fixture();
+			await mesh.enroll(sessionId, sessionFile);
+			const record = readEnrollment(meshRoot, sessionId);
+			const directory = readDirectory(meshRoot, sessionId);
+			const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+			const ledgers = [new RlmSpawnLedger(root, join(root, "a")), new RlmSpawnLedger(root, join(root, "b"))];
+			for (const ledger of ledgers)
+				await ledger.appendDelete({ childId: "same", child: sessionFile, reason: "user" });
+			const paths = ledgers.map((ledger) => ledger.ledgerPath).sort();
+			const bad = paths[badIndex]!;
+			const candidate = SessionManager.create(root, join(root, "new-sessions"));
+			candidate.appendSessionInfo("new");
+			candidate.flushNow();
+			const candidateId = candidate.getSessionId();
+			const candidateFile = candidate.getSessionFile()!;
+			function poison(): void {
+				expect(readDeletedRlmChildPaths(root).has(canonicalSessionPath(sessionFile))).toBe(true);
+				const before = statSync(bad);
+				if (failure === "unreadable") {
+					chmodSync(bad, 0);
+					const after = statSync(bad);
+					expect([after.size, after.mtimeMs, after.ino]).toEqual([before.size, before.mtimeMs, before.ino]);
+				} else writeFileSync(bad, `${readFileSync(bad, "utf8")}malformed\n`);
+			}
+			try {
+				if (phase === "creation") poison();
+				else FakeEndpoint.afterProvision = poison;
+				const enrolling = mesh.enroll(candidateId, candidateFile);
+				await expect(enrolling).rejects.toThrow(bad);
+				await expect(enrolling).rejects.toThrow(failure === "unreadable" ? "EACCES" : "Malformed RLM ledger line");
+				expect(existsSync(enrollmentPath(meshRoot, candidateId))).toBe(phase === "publication");
+				expect(readDirectory(meshRoot, candidateId)).toBeUndefined();
+				await mesh.reconcileDeletedChildren();
+				expect(readEnrollment(meshRoot, sessionId)).toEqual(record);
+				expect(readDirectory(meshRoot, sessionId)).toEqual(directory);
+				expect(remove).not.toHaveBeenCalled();
+				expect(log).toHaveBeenCalledWith(expect.stringContaining(bad));
+				expect(session.getSessionFile()).toBe(sessionFile);
+			} finally {
+				chmodSync(bad, 0o600);
+				FakeEndpoint.afterProvision = undefined;
+			}
+		},
+	);
+
+	it("AC-34 removes only exact tombstoned paths in one shared reconciliation", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const record = readEnrollment(meshRoot, sessionId);
+		const endpoint = FakeEndpoint.instances.at(-1)!;
+		const before = readFileSync(sessionFile);
+		const other = SessionManager.create(root, join(root, "others"));
+		other.appendSessionInfo("other");
+		other.flushNow();
+		await mesh.enroll(other.getSessionId(), other.getSessionFile()!);
+		const otherRecord = readEnrollment(meshRoot, other.getSessionId());
+		const ledger = new RlmSpawnLedger(root, join(root, "sessions"));
+		for (const [parent, child] of [
+			[sessionFile, sessionFile],
+			[other.getSessionFile()!, other.getSessionFile()!],
+		])
+			await ledger.appendSpawn({ childId: "same", parent: parent!, child: child!, depth: 1, name: "child" });
+		await ledger.appendDelete({ childId: "same", child: sessionFile, reason: "user" });
+		const remove = vi.spyOn(core, "deprovisionAgent").mockImplementation(async () => {
+			expect(endpoint.stop).toHaveBeenCalledTimes(1);
+			expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+			expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+			return {} as core.DeprovisionResourceAccounting;
+		});
+		const rm = fsPromises.rm;
+		vi.spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+			if (path === enrollmentPath(meshRoot, sessionId)) expect(readDirectory(meshRoot, sessionId)).toBeUndefined();
+			return rm(path, options);
+		});
+		const lookup = vi.spyOn(rlmLedger, "readDeletedRlmChildPaths");
+		await mesh.reconcileDeletedChildren();
+		expect(lookup).toHaveBeenCalledTimes(1);
+		await mesh.reconcileDeletedChildren();
+		expect(lookup).toHaveBeenCalledTimes(2);
+		expect(remove).toHaveBeenCalledTimes(1);
+		expect(remove.mock.calls[0]![0]).toMatchObject({
+			targetId: record.identity.id,
+			lifecycleUid: record.lifecycleUid,
+		});
+		expect(readEnrollment(meshRoot, other.getSessionId())).toEqual(otherRecord);
+		expect(readFileSync(sessionFile)).toEqual(before);
+		const claim = claimEnrollment(meshRoot, sessionId, sessionFile);
+		claim.release();
+		await expect(mesh.resolveAddress(sessionId)).rejects.toThrow("Unknown mesh target");
+	});
+
 	it.each(["rebind", "cancelled", "failed"] as const)(
 		"preserves the enrollment lifecycle through %s",
 		async (outcome) => {
@@ -754,6 +902,7 @@ describe("mesh enrollment", () => {
 
 	it("leaves a live claim in another process alone and reclaims it after that process exits", async () => {
 		const { mesh, meshRoot, sessionId, sessionFile } = await fixture();
+		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
 		const script = `import { claimEnrollment } from ${JSON.stringify(resolve("src/modes/daemon/cotal/enrollment.ts"))}; claimEnrollment(...JSON.parse(process.argv[1])); console.log("claimed"); process.stdin.resume();`;
 		const child = spawn(
 			process.execPath,
@@ -770,6 +919,11 @@ describe("mesh enrollment", () => {
 			expect(() => claimEnrollment(meshRoot, sessionId, sessionFile)).toThrow("already active");
 			await mesh.enroll(sessionId, sessionFile);
 			await expect(mesh.send({ sessionId }, "target", "hello")).rejects.toThrow("claimed by another daemon");
+			await expect(mesh.beginReplacement(sessionId, mesh, randomUUID())).rejects.toThrow(
+				`Session ${sessionId}: claimed by another daemon`,
+			);
+			expect(readEnrollment(meshRoot, sessionId)).toEqual(record);
+			expect(FakeEndpoint.instances).toHaveLength(0);
 		} finally {
 			child.kill("SIGTERM");
 			await closed;

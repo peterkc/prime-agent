@@ -880,6 +880,7 @@ export class DaemonSupervisor {
 					handoff: (record, message, count, bind, isOpen, attemptToken) =>
 						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
 				});
+				await this.mesh.reconcileDeletedChildren();
 			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
@@ -3910,6 +3911,8 @@ export class DaemonSupervisor {
 	): Promise<void> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		const text = meshMessageText(message);
+		if (!existsSync(record.sessionFile))
+			throw new Error(`Mesh session ${record.sessionId}: session file is missing: ${record.sessionFile}`);
 		const worker = await this.createOrReuseWorker("mesh", {
 			type: "create",
 			sessionPath: record.sessionFile,
@@ -3924,23 +3927,14 @@ export class DaemonSupervisor {
 			(root ? sessionSummaryFromRosterEntry(root) : undefined);
 		if (!summary || summary.sessionId !== record.sessionId)
 			throw new Error("Woken worker has no matching mesh session");
-		let senderSessionId: string | undefined;
+		const sender = this.mesh?.directoryEntryForPrincipal(message.from.id);
+		const senderSessionId = sender?.sessionId;
 		let fromRelationship: ReturnType<typeof agentFamilyRelationship>;
 		try {
 			let family = [...this.roster().values()].map((entry) =>
 				this.familyCatalogEntry(sessionSummaryFromRosterEntry(entry)),
 			);
-			senderSessionId = this.mesh?.sessionIdForPrincipal(
-				message.from.id,
-				family.map((entry) => entry.id),
-			);
-			if (!senderSessionId) {
-				family = await this.familyCatalogEntries();
-				senderSessionId = this.mesh?.sessionIdForPrincipal(
-					message.from.id,
-					family.map((entry) => entry.id),
-				);
-			}
+			if (!family.some((entry) => entry.id === senderSessionId)) family = await this.familyCatalogEntries();
 			const senderEntry = family.find((entry) => entry.id === senderSessionId);
 			fromRelationship = senderEntry
 				? agentFamilyRelationship(this.familyCatalogEntry(summary), senderEntry)
@@ -3957,7 +3951,11 @@ export class DaemonSupervisor {
 				targetActiveSessionId: summary.activeSessionId ?? summary.id,
 				message: text,
 				fromRelationship,
-				sender: { sessionId: senderSessionId, sessionName: message.from.name, clientId: message.from.id },
+				sender: {
+					sessionId: senderSessionId,
+					sessionName: sender?.name ?? message.from.name,
+					clientId: message.from.id,
+				},
 				cotal: { id: message.id, deliveryCount, attemptToken },
 			},
 			WORKER_REQUEST_TIMEOUT_MS,
@@ -5011,6 +5009,13 @@ export class DaemonSupervisor {
 		worker.rosterEpoch = (worker.rosterEpoch ?? 0) + 1;
 		const applySource = source ?? worker.client ?? worker.pendingClient;
 		if (!this.isWorkerRosterApplyCurrent(worker, applySource)) return;
+		if (
+			this.mesh &&
+			delta.removedAgentIds?.some(
+				(id) => this.roster().get(id)?.summary.runtimeKind === "subagent" || id.includes("#"),
+			)
+		)
+			void this.mesh.reconcileDeletedChildren();
 		if (delta.snapshot !== true && worker.rosterApplyChain === undefined) {
 			this.applyWorkerRosterDelta(worker, delta);
 			return;

@@ -507,6 +507,10 @@ export class AgentDaemon {
 	private readonly sameIdReplacements = new WeakSet<AgentSession>();
 	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
 	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
+	private readonly meshAdmissions = new WeakMap<
+		AgentSession,
+		Map<string, Promise<{ status: AgentSessionMessageDeliveryStatus }>>
+	>();
 	private meshReplacementOffered = false;
 	private readonly closingSessions = new Map<
 		string,
@@ -6748,11 +6752,22 @@ export class AgentDaemon {
 		}
 		try {
 			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
-			const status = ownEntry()
-				? "delivered"
-				: queued
-					? "queued"
-					: (await this.acceptAgentSessionMessage(target, payload)).status;
+			let status: AgentSessionMessageDeliveryStatus;
+			const admissions = this.meshAdmissions.get(recipientSession) ?? new Map();
+			this.meshAdmissions.set(recipientSession, admissions);
+			let admission = admissions.get(payload.id);
+			if (admission) status = (await admission).status;
+			else if (ownEntry()) status = "delivered";
+			else if (queued) status = "queued";
+			else {
+				admission = this.acceptAgentSessionMessage(target, payload);
+				admissions.set(payload.id, admission);
+				try {
+					status = (await admission).status;
+				} finally {
+					admissions.delete(payload.id);
+				}
+			}
 			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
 			accepted = true;
 			check();

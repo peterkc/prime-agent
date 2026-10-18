@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as core from "@cotal-ai/core";
@@ -88,7 +88,9 @@ async function fixture(
 	const root = mkdtempSync(join(tmpdir(), "prime-mesh-endpoints-"));
 	roots.push(root);
 	vi.stubEnv(ENV_AGENT_DIR, root);
+	mkdirSync(join(root, "directory"));
 	for (const id of ["a", "b"]) {
+		writeFileSync(join(root, "directory", `${id}.json`), "{}");
 		writeFileSync(join(root, `${id}.json`), "{}");
 		directories.set(id, { sessionId: id, name: id, principal: `local.${id}`, homeSocket: "home" });
 	}
@@ -520,7 +522,7 @@ describe("mesh endpoints", () => {
 	});
 
 	it("publishes exactly once through the sender to the directory principal and returns broker storage proof", async () => {
-		const { mesh, source } = await fixture();
+		const { mesh, root, source } = await fixture();
 		expect(await mesh.send({ sessionId: "a" }, "b", "hello")).toMatchObject({
 			deliveryStatus: "stored",
 			sequence: 42,
@@ -528,15 +530,16 @@ describe("mesh endpoints", () => {
 			id: "agentmsg_published",
 		});
 		expect(source.unicastAttributed).toHaveBeenCalledExactlyOnceWith("local.b", "hello");
-		expect(mesh.sessionIdForPrincipal("local.a", ["b", "a"])).toBe("a");
-		expect(mesh.sessionIdForPrincipal("local.unknown", ["a", "b"])).toBeUndefined();
+		expect(mesh.directoryEntryForPrincipal("local.a")).toEqual(directories.get("a"));
+		expect(mesh.directoryEntryForPrincipal("local.unknown")).toBeUndefined();
+		writeFileSync(join(root, "directory", "broken.json"), "{}");
 		const get = directories.get.bind(directories);
 		const corrupt = vi.spyOn(directories, "get").mockImplementation((id) => {
 			if (id === "broken") throw new Error("Invalid mesh directory entry");
 			return get(id);
 		});
 		try {
-			expect(mesh.sessionIdForPrincipal("local.a", ["broken", "b", "a"])).toBe("a");
+			expect(mesh.directoryEntryForPrincipal("local.a")).toEqual(directories.get("a"));
 		} finally {
 			corrupt.mockRestore();
 		}

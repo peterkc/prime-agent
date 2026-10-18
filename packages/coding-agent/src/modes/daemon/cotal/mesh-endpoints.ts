@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, type MessageMeta } from "@cotal-ai/core";
 import {
 	AGENT_MESSAGE_ID_PREFIX,
@@ -8,6 +9,7 @@ import {
 	type AgentSessionMessageSender,
 } from "../../../core/agent-messages.js";
 import { canonicalSessionPath, SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
+import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
 import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
@@ -19,6 +21,7 @@ import {
 	homeEnrollments,
 	loadMeshConfiguration,
 	type MeshConfiguration,
+	type MeshDirectoryEntry,
 	provisionEnrollment,
 	publishDirectory,
 	readDirectory,
@@ -223,6 +226,8 @@ export class MeshEndpoints {
 			readSigner(this.options.meshRoot, config.space);
 			record = await withDirectoryLock(this.options.meshRoot, sessionId, async () => {
 				if (!existsSync(sessionFile)) throw new Error(`Session ${sessionId}: session file is missing`);
+				if (readDeletedRlmChildPaths(dirname(this.options.meshRoot)).has(canonicalSessionPath(sessionFile)))
+					throw new Error(`Session ${sessionId}: RLM child was deliberately deleted`);
 				return ensureEnrollmentRecord(this.options.meshRoot, sessionId, sessionFile);
 			});
 			if (canonicalSessionPath(sessionFile) !== canonicalSessionPath(record.sessionFile))
@@ -354,6 +359,8 @@ export class MeshEndpoints {
 		} catch (error) {
 			beginning.state = "failed";
 			if (replacement && this.replacements.get(sessionId) === replacement) this.replacements.delete(sessionId);
+			if (error instanceof SessionAlreadyActiveError)
+				throw new Error(`Session ${sessionId}: claimed by another daemon`, { cause: error });
 			throw error;
 		} finally {
 			this.replacementBegins.delete(sessionId);
@@ -454,8 +461,37 @@ export class MeshEndpoints {
 		return session.close;
 	}
 
-	async unenroll(sessionId: string, sessionFile: string): Promise<void> {
-		const record = await removeEnrollment(this.options.meshRoot, sessionId, canonicalSessionPath(sessionFile));
+	async reconcileDeletedChildren(): Promise<void> {
+		if (this.closing || this.refusal) return;
+		let deleted: ReadonlySet<string>;
+		let files: string[];
+		try {
+			deleted = readDeletedRlmChildPaths(dirname(this.options.meshRoot));
+			const directory = join(this.options.meshRoot, "enrollments");
+			files = existsSync(directory) ? readdirSync(directory).filter((file) => file.endsWith(".json")) : [];
+		} catch (error) {
+			this.options.log(`Mesh RLM deletion reconciliation failed: ${redactMeshError(error)}`);
+			return;
+		}
+		for (const file of files) {
+			const sessionId = file.slice(0, -5);
+			try {
+				const record = readEnrollment(this.options.meshRoot, sessionId);
+				if (deleted.has(canonicalSessionPath(record.sessionFile)))
+					await this.unenroll(sessionId, record.sessionFile, deleted);
+			} catch (error) {
+				this.options.log(`Mesh session ${sessionId}: unenrollment failed: ${redactMeshError(error)}`);
+			}
+		}
+	}
+
+	async unenroll(sessionId: string, sessionFile: string, deletedChildren?: ReadonlySet<string>): Promise<void> {
+		const record = await removeEnrollment(
+			this.options.meshRoot,
+			sessionId,
+			canonicalSessionPath(sessionFile),
+			deletedChildren,
+		);
 		if (record === "absent") return;
 		if (record === "mismatch") {
 			this.options.log(`Mesh session ${sessionId}: deleted file is not the enrolled file; inbox unchanged`);
@@ -532,14 +568,18 @@ export class MeshEndpoints {
 		await renameDirectory(this.options.meshRoot, sessionId, sessionFile);
 	}
 
-	sessionIdForPrincipal(principal: string, knownSessionIds: readonly string[]): string | undefined {
-		return knownSessionIds.find((sessionId) => {
+	directoryEntryForPrincipal(principal: string): MeshDirectoryEntry | undefined {
+		const directory = join(this.options.meshRoot, "directory");
+		for (const file of readdirSync(directory)) {
+			if (!file.endsWith(".json")) continue;
 			try {
-				return readDirectory(this.options.meshRoot, sessionId)?.principal === principal;
+				const entry = readDirectory(this.options.meshRoot, file.slice(0, -5));
+				if (entry?.principal === principal) return entry;
 			} catch {
-				return false;
+				// An unrelated invalid directory entry is not a sender match.
 			}
-		});
+		}
+		return undefined;
 	}
 
 	async send(

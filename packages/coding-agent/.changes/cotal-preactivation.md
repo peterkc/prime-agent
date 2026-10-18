@@ -1,0 +1,3 @@
+- Fixed deliberately deleted RLM children re-enrolling from retained transcripts, with agent-wide fail-closed ledger checks and documented operator recovery.
+- Fixed duplicate mesh admission across reconnects, stale sender names, foreign-claim replacement errors and missing-file wakes.
+- Changed mesh install and doctor to require Cotal CLI 0.79.0, and status to report the CLI version or read failure.

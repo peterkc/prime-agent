@@ -1,4 +1,6 @@
+import * as fs from "node:fs";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -33,6 +35,7 @@ import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { EventLog } from "../src/core/event-log.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import * as sessionManagerModule from "../src/core/session-manager.js";
@@ -46,6 +49,7 @@ import {
 	RLM_LEDGER_MAX_RECORDS,
 	type RlmLedgerDeleteReason,
 	RlmSpawnLedger,
+	readDeletedRlmChildPaths,
 	readLegacyRlmSubagentRegistry,
 	rlmLedgerPath,
 } from "../src/modes/daemon/rlm-ledger.js";
@@ -74,6 +78,111 @@ function makeChildSession(root: string, dir: string, parentFile: string, depth: 
 }
 
 describe("rlm spawn ledger", () => {
+	it("AC-34 reduces each ledger by exact child path, including standalone legacy deletes", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-mesh-deleted-paths-")));
+		try {
+			const a = new RlmSpawnLedger(root, join(root, "a"));
+			const b = new RlmSpawnLedger(root, join(root, "b"));
+			const first = join(root, "first.jsonl");
+			const second = join(root, "second.jsonl");
+			const legacy = join(root, "legacy.jsonl");
+			for (const [parent, child] of [
+				["one", first],
+				["two", second],
+			])
+				await a.appendSpawn({
+					childId: "same",
+					parent: join(root, parent!),
+					child: child!,
+					depth: 1,
+					name: "child",
+				});
+			await a.appendDelete({ childId: "same", child: first, reason: "user" });
+			await a.appendDelete({ childId: "same", child: legacy, reason: "user" });
+			await b.appendDelete({ childId: "same", child: second, reason: "user" });
+			writeFileSync(`${a.ledgerPath}.seed-ignored`, "malformed\n");
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([first, second, legacy]));
+			await a.appendSpawn({ childId: "same", parent: join(root, "one"), child: first, depth: 1, name: "again" });
+			await a.appendRename({ childId: "same", child: legacy, name: "still deleted" });
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([second, legacy]));
+			await a.appendDelete({ childId: "same", child: first, reason: "user" });
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([first, second, legacy]));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("AC-34 opens every cached ledger without replay and invalidates after append or file-set change", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-mesh-ledger-cache-")));
+		const replay = vi.spyOn(EventLog.prototype, "replaySync");
+		const open = vi.spyOn(fs, "openSync");
+		const close = vi.spyOn(fs, "closeSync");
+		try {
+			const a = new RlmSpawnLedger(root, join(root, "a"));
+			const b = new RlmSpawnLedger(root, join(root, "b"));
+			const first = join(root, "first.jsonl");
+			const second = join(root, "second.jsonl");
+			await a.appendDelete({ childId: "same", child: first, reason: "user" });
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([first]));
+			replay.mockClear();
+			open.mockClear();
+			close.mockClear();
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([first]));
+			expect(replay).not.toHaveBeenCalled();
+			expect(open).toHaveBeenCalledExactlyOnceWith(a.ledgerPath, "r");
+			expect(close).toHaveBeenCalledTimes(1);
+			await a.appendDelete({ childId: "other", child: second, reason: "user" });
+			expect(readDeletedRlmChildPaths(root)).toEqual(new Set([first, second]));
+			expect(replay).toHaveBeenCalledTimes(1);
+			await b.appendDelete({ childId: "third", child: join(root, "third.jsonl"), reason: "user" });
+			replay.mockClear();
+			expect(readDeletedRlmChildPaths(root).size).toBe(3);
+			expect(replay).toHaveBeenCalledTimes(2);
+		} finally {
+			replay.mockRestore();
+			open.mockRestore();
+			close.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["unreadable", 0],
+		["unreadable", 1],
+		["malformed", 0],
+		["malformed", 1],
+	] as const)(
+		"AC-34 rejects the complete ledger set (%s, bad index %s), even with a matching cached tombstone",
+		async (failure, badIndex) => {
+			const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-mesh-ledger-refusal-")));
+			let bad = "";
+			try {
+				for (const folder of ["a", "b"])
+					await new RlmSpawnLedger(root, join(root, folder)).appendDelete({
+						childId: "same",
+						child: join(root, "deleted.jsonl"),
+						reason: "user",
+					});
+				const files = fs.readdirSync(join(root, "rlm-ledger")).sort();
+				bad = join(root, "rlm-ledger", files[badIndex]!);
+				expect(readDeletedRlmChildPaths(root)).toEqual(new Set([join(root, "deleted.jsonl")]));
+				const before = statSync(bad);
+				if (failure === "unreadable") {
+					chmodSync(bad, 0);
+					const after = statSync(bad);
+					expect([after.size, after.mtimeMs, after.ino]).toEqual([before.size, before.mtimeMs, before.ino]);
+				} else fs.appendFileSync(bad, "malformed\n");
+				expect(() => readDeletedRlmChildPaths(root)).toThrow(bad);
+				expect(() => readDeletedRlmChildPaths(root)).toThrow(
+					failure === "unreadable" ? "EACCES" : "Malformed RLM ledger line",
+				);
+			} finally {
+				if (bad) chmodSync(bad, 0o600);
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("replays spawn, rename, and delete records last-writer-wins", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-"));
 		try {

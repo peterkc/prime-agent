@@ -6,6 +6,7 @@ import {
 	linkSync,
 	mkdirSync,
 	openSync,
+	readdirSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -284,6 +285,60 @@ function parseLedgerLine(line: string, index: number): RlmLedgerRecord | RlmLedg
 			return record as unknown as RlmLedgerDeleteRecord;
 		default:
 			return undefined;
+	}
+}
+
+const deletedChildCache = new Map<string, { snapshot: string; paths: ReadonlySet<string> }>();
+
+/** Read committed deletion intent across all session folders, never joining records by childId. */
+export function readDeletedRlmChildPaths(agentDir: string): ReadonlySet<string> {
+	const directory = join(agentDir, RLM_LEDGER_DIR);
+	let files: string[];
+	try {
+		files = readdirSync(directory)
+			.filter((file) => file.endsWith(".jsonl"))
+			.sort();
+	} catch (error) {
+		deletedChildCache.delete(directory);
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+		throw new Error(`RLM ledger ${directory}: ${String(error)}`, { cause: error });
+	}
+	try {
+		const stats = files.map((file) => {
+			const path = join(directory, file);
+			try {
+				const current = statSync(path);
+				// Permissions can change without changing the content freshness tuple.
+				const fd = openSync(path, "r");
+				closeSync(fd);
+				return [file, current.size, current.mtimeMs, current.ino];
+			} catch (error) {
+				throw new Error(`RLM ledger ${path}: ${String(error)}`, { cause: error });
+			}
+		});
+		const snapshot = JSON.stringify(stats);
+		const cached = deletedChildCache.get(directory);
+		if (cached?.snapshot === snapshot) return new Set(cached.paths);
+		const paths = new Set<string>();
+		for (const file of files) {
+			const path = join(directory, file);
+			try {
+				const log = new EventLog(path, { maxBytes: RLM_LEDGER_MAX_BYTES, maxRecords: RLM_LEDGER_MAX_RECORDS });
+				const deleted = new Set<string>();
+				for (const record of log.replaySync(parseLedgerLine, { missingFileThrows: true })) {
+					if (record.op === "delete") deleted.add(canonicalSessionPath(record.child));
+					else if (record.op === "spawn") deleted.delete(canonicalSessionPath(record.child));
+				}
+				for (const child of deleted) paths.add(child);
+			} catch (error) {
+				throw new Error(`RLM ledger ${path}: ${String(error)}`, { cause: error });
+			}
+		}
+		deletedChildCache.set(directory, { snapshot, paths });
+		return new Set(paths);
+	} catch (error) {
+		deletedChildCache.delete(directory);
+		throw error;
 	}
 }
 

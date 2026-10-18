@@ -89,19 +89,26 @@ This prevents daemon workers and one-shot clients from writing the same transcri
 ## Mesh Agent Messaging
 
 Set `"agentMessageTransport": "cotal"` in global settings for durable agent messages
-across daemons on this computer. Project settings cannot enable it. Restart the daemon
-after changing it. The default, `"native"`, keeps existing family messaging unchanged.
+across daemons on this computer. Project settings cannot enable it. Activation needs
+operator approval; after approval, run `prime-agent restart` after changing it.
+The default, `"native"`, keeps existing family messaging unchanged.
 
 On macOS, `prime-agent mesh install` creates `<agent dir>/mesh`, starts a launchd agent,
-waits for the broker, and creates the private signer. It requires `cotal` on `PATH`.
+waits for the broker, and creates the private signer. It requires Cotal CLI 0.79.0 on
+`PATH`. Install and doctor refuse any other version, malformed output or version-read
+failure before installation changes or doctor diagnostics. The CLI header decides
+compatibility, not adapter versions. Keep the resolved executable at 0.79.0; an external
+upgrade after installation is not prevented.
 The service runs `cotal up --space prime --server <URL> --no-manager` in the mesh home,
 with `COTAL_HOME=<mesh home>/home`. Options are `--mesh-home`, `--server nats://127.0.0.1:<port>`
-and `--label ai.prime.mesh.<name>`. Install refuses an occupied label or port.
+and `--label ai.prime.mesh.<name>`. `--mesh-home` is test-only.
+Install refuses an occupied label or port.
 If startup or signer creation fails, it removes the service and plist but keeps the home.
 
 - `prime-agent mesh start` and `stop` start or stop the installed service.
-- `prime-agent mesh status` reports service state, store bytes, service-log bytes,
-  enrolled-session count, and each session's stored, unacknowledged message count.
+- `prime-agent mesh status` reports the CLI version or its read failure, service state,
+  store bytes, service-log bytes, enrolled-session count, and each session's stored,
+  unacknowledged message count.
 - `prime-agent mesh doctor` also checks Cotal auth.
 - `prime-agent mesh uninstall` removes the service and plist, not the mesh home,
   signer, enrollment records or stored messages. Existing sessions need that auth.
@@ -123,6 +130,10 @@ before mesh support must be restarted; restarting only the supervisor can leave 
 running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
 clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.
 
+Switching to the current enrolled file also takes the replacement barrier: the
+endpoint closes before the open, and held messages return without an early acknowledgement.
+A foreign claim refuses before file or runtime changes with `claimed by another daemon`.
+The revision-35 begin fields `sessionFile` and `overwrite` remain accepted but unused.
 Same-ID import and switch refuse when another holder is live, the supervisor offers
 no replacement barrier (restart the daemon), or the worker predates the barrier
 (restart that session). After a post-copy failure, stop the failed session and reopen
@@ -149,7 +160,23 @@ frames settle nothing after close.
 
 When the mesh is on, deleting a session discards stored, unacknowledged messages, and
 restoring it from Trash does not restore them. Deleting while the transport is native
-leaves that session's directory entry, enrollment record and inbox unchanged.
+leaves that session's directory entry, enrollment record and inbox unchanged. A stale
+entry can still accept stored messages, but startup skips a missing file and those
+messages wait. If an active endpoint finds its file missing, each handoff refuses
+before waking a worker or recreating the file, leaves the message unacknowledged,
+and logs the session and missing-file reason. No automatic repair is added.
+
+Deliberately deleting an RLM child retains its transcript but removes its mesh entry,
+record and, when its claim is available, lifecycle inbox. Only a committed ledger
+delete for that exact canonical child path authorizes this exception to file absence.
+An ordinary roster removal, a session swap or an unbound queued child is not proof.
+The retained transcript cannot re-enroll even on explicit reopen, so that session
+cannot send or receive agent messages in Cotal mode. There is no clear-on-open rule.
+
+For an ordinary session still writing in another daemon, delete it in that daemon.
+Deleting it elsewhere while native can let the live writer recreate the transcript.
+After restart it can re-enroll with a new identity and lifecycle; the old inbox's
+messages do not follow it. The directory lock does not prevent that recreation.
 
 There is no per-daemon endpoint cap. NATS's default is 1000 consumers per stream, so the
 space supports about 1000 enrolled inboxes. Each uses one consumer in `DM_prime` and one
@@ -163,6 +190,26 @@ immediate cleanup.
 The broker store has no retention limit. `<mesh home>/service.log` is not rotated.
 Monitor the reported sizes; a full disk can make sends fail. Status queries pending counts
 once per enrollment and gets slower as the number of sessions grows.
+
+Deletion lookups run under the directory lock. Cache hits skip replay but still stat,
+open and close every ledger. An append invalidates the cache; replaying all ledgers
+lengthens the hold. Under load the lock can give up after about one second, leaving
+entry, record and inbox state behind. The failure is logged and is not retried.
+
+Any unreadable, malformed or over-bound committed `*.jsonl` ledger under
+`<agent dir>/rlm-ledger/` blocks new enrollment and directory publication for every
+session in that agent directory, including top-level sessions. Existing endpoints
+need not stop, but restarted sessions can be unavailable. The log names the file
+and cause. Failed reconciliation authorizes no removal of existing mesh state.
+
+**Warning:** Moving a ledger out of that directory removes its topology and deletion
+proof. Its deliberately deleted children can then re-enroll. Do not move it without
+accepting that loss of protection.
+
+To recover, back up the logged file first. Repair the reported read, format or size
+problem, or move the file outside the ledger directory after considering the warning.
+Then retry the session open or `prime-agent restart`. Prime does not repair or move
+ledgers automatically.
 
 A successful send returns `deliveryStatus: "stored"`, a stream sequence and a Cotal ID.
 This means the broker stored the message, not that the target wrote it. A delivery is
@@ -179,8 +226,9 @@ marks its text as possibly repeated. Already-held IDs are not added again.
 - Enrollment, wake and inbox-removal errors log the session ID and a redacted reason.
   Missing or invalid signers refuse enrollment and sends without printing their contents.
 
-To roll back after activation, set `"agentMessageTransport": "native"` and restart the
-daemon. Stored, undelivered messages stay on the broker until mesh mode is enabled again.
+To roll back after activation, set `"agentMessageTransport": "native"` and run
+`prime-agent restart`. Stored, undelivered messages stay on the broker until mesh mode
+is enabled again.
 They are neither lost nor sent natively. `prime-agent mesh status` reports how many remain.
 
 ## Scheduling

@@ -4442,6 +4442,126 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it.each([false, true])("AC-35 shares admission across supervisor sockets (reject: %s)", async (reject) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		const live = await createHarness({ persistSession: true });
+		const fence = createDeferred();
+		const entered = createDeferred();
+		const observed = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.sessionManager.flushNow();
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const accepting = originalAccept(text, options);
+			entered.resolve();
+			return accepting;
+		});
+		const onPersist = live.sessionManager.onPersist.bind(live.sessionManager);
+		let observers = 0;
+		const persist = vi.spyOn(live.sessionManager, "onPersist").mockImplementation((listener) => {
+			const off = onPersist(listener);
+			if (++observers === 2) observed.resolve();
+			return off;
+		});
+		const secondWrites: Buffer[] = [];
+		const persistedOnDisk: boolean[] = [];
+		const secondSocket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			end: vi.fn(),
+			write: (data: Buffer) => {
+				secondWrites.push(data);
+				if (decodeSecond().at(-1)?.type === "agent_message_persisted")
+					persistedOnDisk.push(readFileSync(live.session.sessionFile!, "utf8").includes("agentmsg_overlap"));
+				return true;
+			},
+		});
+		const secondClient = { ...h.client, authenticated: false, socket: secondSocket } as unknown as DaemonSocketClient;
+		const decodeSecond = () =>
+			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(secondWrites))
+				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+		const command = {
+			type: "worker_deliver_message",
+			targetActiveSessionId: "target",
+			message: "one entry",
+			sender: { sessionName: "sender" },
+			cotal: { id: "overlap", deliveryCount: 1, attemptToken: "S1" },
+		} as const;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		let second: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			expect(live.session.hasPendingAdmissionWaiters).toBe(true);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			await h.internals.handleLine(
+				secondClient,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "second",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "cotal",
+				}),
+			);
+			expect(decodeSecond().at(-1)).toMatchObject({ command: "worker_auth", success: true });
+			second = h.internals.receiveMeshMessage(secondClient, {
+				...command,
+				cotal: { ...command.cotal, deliveryCount: 2, attemptToken: "S2" },
+			});
+			void second.catch(() => undefined);
+			await observed.promise;
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(live.session.getSessionActionSnapshot().queuedCount).toBe(0);
+			expect(decodeSecond().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+			Object.assign(h.internals, { agentMessagesPaused: reject });
+			live.setResponses([fauxAssistantMessage("done")]);
+			fence.resolve();
+			if (reject) {
+				await expect(first).rejects.toThrow("Agent messaging is paused");
+				await expect(second).rejects.toThrow("Agent messaging is paused");
+				expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+				expect(persistedOnDisk).toEqual([]);
+				Object.assign(h.internals, { agentMessagesPaused: false });
+				await h.internals.receiveMeshMessage(secondClient, {
+					...command,
+					cotal: { ...command.cotal, attemptToken: "fresh" },
+				});
+			} else await Promise.all([first, second]);
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_overlap");
+			live.sessionManager.flushNow();
+			expect(accept).toHaveBeenCalledTimes(reject ? 2 : 1);
+			expect(
+				live.session.messages.filter(
+					(message) => message.role === "custom" && message.customType === "agent_message",
+				),
+			).toHaveLength(1);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+			).toHaveLength(1);
+			expect(readFileSync(live.session.sessionFile!, "utf8").split('"id":"agentmsg_overlap"')).toHaveLength(2);
+			expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+			expect(decodeSecond().filter((frame) => frame.type === "agent_message_persisted")).toEqual([
+				{ type: "agent_message_persisted", cotalId: "overlap", attemptToken: reject ? "fresh" : "S2" },
+			]);
+			expect(persistedOnDisk).toEqual([true]);
+		} finally {
+			fence.resolve();
+			await Promise.allSettled([first, second]);
+			accept.mockRestore();
+			persist.mockRestore();
+			live.cleanup();
+		}
+	});
+
 	it("drains a late started message before switching to the current enrolled file", async () => {
 		const messageStarted = createDeferred();
 		const releaseMessage = createDeferred();
