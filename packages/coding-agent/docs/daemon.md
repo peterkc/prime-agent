@@ -125,7 +125,9 @@ All daemons must use the same agent directory.
 
 A claim permits one supervisor to pull a session's inbox. A live claim held elsewhere
 prevents a second endpoint. The holder delivers to idle or saved sessions and wakes a
-worker when needed. Opening elsewhere does not transfer a live claim. Workers from
+worker when needed. Opening elsewhere does not transfer a live claim. A session opened
+in a daemon that does not hold its claim cannot send agent messages, including to its
+family. Open it in the claim holder, or close it there first. Workers from
 before mesh support must be restarted; restarting only the supervisor can leave them
 running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
 clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.

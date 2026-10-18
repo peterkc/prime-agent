@@ -880,7 +880,6 @@ export class DaemonSupervisor {
 					handoff: (record, message, count, bind, isOpen, attemptToken) =>
 						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
 				});
-				await this.mesh.reconcileDeletedChildren();
 			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
@@ -916,7 +915,8 @@ export class DaemonSupervisor {
 			setImmediate(() => {
 				if (!this.shuttingDown)
 					void this.mesh
-						?.start()
+						?.reconcileDeletedChildren()
+						.then(() => this.mesh?.start())
 						.catch((error: unknown) => this.log(`Mesh home enrollment failed: ${redactMeshError(error)}`));
 			});
 		} catch (error) {
@@ -3927,10 +3927,11 @@ export class DaemonSupervisor {
 			(root ? sessionSummaryFromRosterEntry(root) : undefined);
 		if (!summary || summary.sessionId !== record.sessionId)
 			throw new Error("Woken worker has no matching mesh session");
-		const sender = this.mesh?.directoryEntryForPrincipal(message.from.id);
-		const senderSessionId = sender?.sessionId;
+		let sender: ReturnType<MeshEndpoints["directoryEntryForPrincipal"]>;
 		let fromRelationship: ReturnType<typeof agentFamilyRelationship>;
 		try {
+			sender = this.mesh?.directoryEntryForPrincipal(message.from.id);
+			const senderSessionId = sender?.sessionId;
 			let family = [...this.roster().values()].map((entry) =>
 				this.familyCatalogEntry(sessionSummaryFromRosterEntry(entry)),
 			);
@@ -3952,7 +3953,7 @@ export class DaemonSupervisor {
 				message: text,
 				fromRelationship,
 				sender: {
-					sessionId: senderSessionId,
+					sessionId: sender?.sessionId,
 					sessionName: sender?.name ?? message.from.name,
 					clientId: message.from.id,
 				},

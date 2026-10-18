@@ -111,6 +111,8 @@ export class MeshEndpoints {
 	private readonly replacementBegins = new Map<string, ReplacementBegin>();
 	private closing = false;
 	private stopping?: Promise<void>;
+	private reconciling?: Promise<void>;
+	private reconcileAgain = false;
 
 	constructor(private readonly options: MeshEndpointOptions) {
 		try {
@@ -461,8 +463,24 @@ export class MeshEndpoints {
 		return session.close;
 	}
 
-	async reconcileDeletedChildren(): Promise<void> {
-		if (this.closing || this.refusal) return;
+	reconcileDeletedChildren(): Promise<void> {
+		if (this.closing || this.refusal) return Promise.resolve();
+		if (this.reconciling) {
+			this.reconcileAgain = true;
+			return this.reconciling;
+		}
+		this.reconciling = (async () => {
+			do {
+				this.reconcileAgain = false;
+				await this.reconcileDeletedChildrenOnce();
+			} while (this.reconcileAgain && !this.closing);
+		})().finally(() => {
+			this.reconciling = undefined;
+		});
+		return this.reconciling;
+	}
+
+	private async reconcileDeletedChildrenOnce(): Promise<void> {
 		let deleted: ReadonlySet<string>;
 		let files: string[];
 		try {
@@ -474,7 +492,9 @@ export class MeshEndpoints {
 			return;
 		}
 		for (const file of files) {
+			if (this.closing) break;
 			const sessionId = file.slice(0, -5);
+			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) continue;
 			try {
 				const record = readEnrollment(this.options.meshRoot, sessionId);
 				if (deleted.has(canonicalSessionPath(record.sessionFile)))
@@ -570,7 +590,14 @@ export class MeshEndpoints {
 
 	directoryEntryForPrincipal(principal: string): MeshDirectoryEntry | undefined {
 		const directory = join(this.options.meshRoot, "directory");
-		for (const file of readdirSync(directory)) {
+		let files: string[];
+		try {
+			files = readdirSync(directory);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			return undefined;
+		}
+		for (const file of files) {
 			if (!file.endsWith(".json")) continue;
 			try {
 				const entry = readDirectory(this.options.meshRoot, file.slice(0, -5));
@@ -891,6 +918,7 @@ export class MeshEndpoints {
 			await Promise.race([
 				Promise.allSettled([
 					...handoffs,
+					this.reconciling,
 					...this.enrolling.values(),
 					...[...this.replacementBegins.values()].map((beginning) => beginning.ready),
 				]),

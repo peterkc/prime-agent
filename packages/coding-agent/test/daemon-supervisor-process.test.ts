@@ -2159,7 +2159,7 @@ async function meshFixture() {
 }
 
 describe("mesh supervisor compatibility", () => {
-	it.each(["rename", "unknown", "missing", "saved"] as const)(
+	it.each(["rename", "unknown", "directory-error", "missing", "saved"] as const)(
 		"AC-36 AC-38 uses production handoff after %s",
 		async (mode) => {
 			const f = await meshFixture();
@@ -2180,7 +2180,8 @@ describe("mesh supervisor compatibility", () => {
 					await f.request(holder.client, { type: "kill", activeSessionId: target.activeSessionId! });
 				if (mode === "missing") rmSync(target.sessionFile!);
 				const workerCount = countWorkerDescriptors(f.agentDir);
-				if (mode === "unknown") writeFileSync(join(f.agentDir, `hold-pulls-${target.sessionId}`), "held");
+				if (mode === "unknown" || mode === "directory-error")
+					writeFileSync(join(f.agentDir, `hold-pulls-${target.sessionId}`), "held");
 				for (let n = 0; n < (mode === "missing" ? 2 : 1); n++) {
 					const stored = (await f.request(holder.client, {
 						type: "mesh_send",
@@ -2188,8 +2189,9 @@ describe("mesh supervisor compatibility", () => {
 						targetSessionId: target.sessionId,
 						message: "handoff",
 					})) as { cotalId: string };
-					if (mode === "unknown") {
-						rmSync(join(f.agentDir, "mesh", "directory", `${sender.sessionId}.json`));
+					if (mode === "unknown" || mode === "directory-error") {
+						if (mode === "unknown") rmSync(join(f.agentDir, "mesh", "directory", `${sender.sessionId}.json`));
+						else chmodSync(join(f.agentDir, "mesh", "directory"), 0o100);
 						rmSync(join(f.agentDir, `hold-pulls-${target.sessionId}`));
 						process.kill(holder.child.pid!, "SIGUSR2");
 					}
@@ -2203,7 +2205,14 @@ describe("mesh supervisor compatibility", () => {
 							`session file is missing: ${canonicalSessionPath(target.sessionFile!)}`,
 						);
 					} else {
-						await meshSignal(holder.child, "ack", stored.cotalId);
+						if (mode === "directory-error")
+							await Promise.race([
+								meshSignal(holder.child, "ack", stored.cotalId),
+								meshSignal(holder.child, "handoff-refused", stored.cotalId).then(() => {
+									throw new Error("Directory lookup prevented delivery");
+								}),
+							]);
+						else await meshSignal(holder.child, "ack", stored.cotalId);
 						const entries = readFileSync(target.sessionFile!, "utf8")
 							.trim()
 							.split("\n")
@@ -2214,9 +2223,10 @@ describe("mesh supervisor compatibility", () => {
 						expect(received).toHaveLength(1);
 						expect(received[0].details.from).toMatchObject({
 							sessionName: mode === "rename" ? "new-sender" : "old-sender",
-							...(mode === "unknown" ? {} : { sessionId: sender.sessionId }),
+							...(mode === "unknown" || mode === "directory-error" ? {} : { sessionId: sender.sessionId }),
 						});
-						if (mode === "unknown") expect(received[0].details.from.sessionId).toBeUndefined();
+						if (mode === "unknown" || mode === "directory-error")
+							expect(received[0].details.from.sessionId).toBeUndefined();
 						if (mode === "saved") expect(countWorkerDescriptors(f.agentDir)).toBe(workerCount + 1);
 					}
 				}
@@ -2226,6 +2236,7 @@ describe("mesh supervisor compatibility", () => {
 				const diagnostics = childDiagnostics.get(holder.child)?.stderr ?? "";
 				expect(diagnostics).not.toContain(before.identity.seed);
 			} finally {
+				chmodSync(join(f.agentDir, "mesh", "directory"), 0o700);
 				holder.client.close();
 			}
 		},
@@ -2399,27 +2410,63 @@ describe("mesh supervisor compatibility", () => {
 		},
 	);
 
-	it("AC-34 reconciles child roster removals but never a top-level removal", () => {
-		const root = tempDir();
-		const supervisor = new DaemonSupervisor(join(root, "roster.sock"), {
-			defaultSessionConfig: { agentDir: root, cwd: root },
+	it("AC-34 reconciles child roster removals but never a top-level removal", async () => {
+		const f = await meshFixture();
+		const folder = join(f.agentDir, "sessions");
+		const parent = SessionManager.create(f.root, folder);
+		parent.appendMessage({ role: "user", content: "parent", timestamp: 1 });
+		parent.flushNow();
+		const childDir = join(parent.getSessionArtifactDir()!, "child");
+		const child = SessionManager.create(f.root, childDir);
+		child.newSession({ parentSession: parent.getSessionFile()! });
+		child.appendSessionInfo("child");
+		child.appendMessage({ role: "user", content: "retained", timestamp: 2 });
+		child.flushNow();
+		writeFileSync(
+			join(parent.getSessionArtifactDir()!, "rlm-subagents.jsonl"),
+			`${JSON.stringify({ type: "rlm_subagent", childId: "child", sessionName: "child", sessionDir: childDir, sessionFile: child.getSessionFile(), parentSessionId: parent.getSessionId(), parentSessionFile: parent.getSessionFile(), rlmDepth: 1, status: "completed", createdAt: 1, updatedAt: "2026-01-01T00:00:00.000Z" })}\n`,
+		);
+		await new RlmSpawnLedger(f.agentDir, folder).appendSpawn({
+			childId: "child",
+			parent: parent.getSessionFile()!,
+			child: child.getSessionFile()!,
+			depth: 1,
+			name: "child",
 		});
-		const internals = supervisor as unknown as {
-			mesh: unknown;
-			isWorkerRosterApplyCurrent(): boolean;
-			applyWorkerRosterDelta(): void;
-			consumeWorkerRosterDelta(worker: object, payload: Buffer): void;
-		};
-		const reconcileDeletedChildren = vi.fn();
-		internals.mesh = { reconcileDeletedChildren };
-		internals.isWorkerRosterApplyCurrent = () => true;
-		internals.applyWorkerRosterDelta = () => undefined;
-		for (const id of ["top-level", `${root}/parent.jsonl#child`, `${root}/parent.jsonl#queued`]) {
-			internals.consumeWorkerRosterDelta(
-				{},
-				Buffer.from(JSON.stringify({ type: "roster_delta", entries: [], removedAgentIds: [id] })),
+		const holder = await f.start(join(f.root, "holder.sock"));
+		let unsubscribe = () => {};
+		try {
+			await meshSignal(holder.child, "log", "Mesh home enrollment:");
+			const opened = requireSummary(
+				await f.request(holder.client, { type: "create", sessionPath: parent.getSessionFile()! }),
 			);
-			expect(reconcileDeletedChildren).toHaveBeenCalledTimes(id === "top-level" ? 0 : id.endsWith("#child") ? 1 : 2);
+			if (opened.workerPid) workerPids.add(opened.workerPid);
+			await meshSignal(holder.child, "endpoint", child.getSessionId());
+			const top = await f.create(holder, "top-level");
+			await f.request(holder.client, { type: "roster_subscribe" });
+			const removed = new Promise<void>((resolveRemoved) => {
+				unsubscribe = holder.client.onMessage((event) => {
+					if (event.type === "roster_update" && event.removed?.includes(top.sessionId!)) resolveRemoved();
+				});
+			});
+			const bad = new RlmSpawnLedger(f.agentDir, join(f.agentDir, "broken"));
+			mkdirSync(dirname(bad.ledgerPath), { recursive: true });
+			writeFileSync(bad.ledgerPath, "malformed\n");
+			await f.request(holder.client, { type: "kill", activeSessionId: top.activeSessionId! });
+			await removed;
+			expect(childDiagnostics.get(holder.child)?.stderr).not.toContain("Mesh RLM deletion reconciliation failed");
+			expect(
+				await f.request(holder.client, {
+					type: "delete_rlm_subagent",
+					activeSessionId: opened.activeSessionId!,
+					childId: "child",
+				}),
+			).toEqual({ deleted: true });
+			await meshSignal(holder.child, "log", "Mesh RLM deletion reconciliation failed");
+			expect(childDiagnostics.get(holder.child)?.stderr).toContain(bad.ledgerPath);
+		} finally {
+			unsubscribe();
+			holder.client.close();
 		}
 	});
 
@@ -3164,6 +3211,7 @@ describe("mesh supervisor compatibility", () => {
 				return selector;
 			},
 			enroll,
+			reconcileDeletedChildren: async () => undefined,
 			start: async () => undefined,
 			stop: async () => undefined,
 			directoryEntryForPrincipal: () => ({ sessionId: "parent", name: "parent" }),
@@ -3296,17 +3344,6 @@ describe("mesh supervisor compatibility", () => {
 					resolver.mockImplementation(() => {
 						throw new Error("directory unavailable");
 					});
-					await expect(
-						internals.handoffMeshMessage(
-							{ sessionFile: targetFile, sessionId: "child" },
-							message,
-							2,
-							bind,
-							() => true,
-							"attempt",
-						),
-					).rejects.toThrow("directory unavailable");
-					continue;
 				}
 				await internals.handoffMeshMessage(
 					{ sessionFile: targetFile, sessionId: "child" },
@@ -3321,7 +3358,7 @@ describe("mesh supervisor compatibility", () => {
 					sender: { sessionId: undefined, sessionName: "parent" },
 				});
 			}
-			expect(requestWorker).toHaveBeenCalledTimes(3);
+			expect(requestWorker).toHaveBeenCalledTimes(4);
 			resolver.mockReturnValue(undefined);
 			await expect(
 				internals.handoffMeshMessage(
@@ -3333,7 +3370,7 @@ describe("mesh supervisor compatibility", () => {
 					"attempt",
 				),
 			).rejects.toThrow("closed before handoff");
-			expect(requestWorker).toHaveBeenCalledTimes(3);
+			expect(requestWorker).toHaveBeenCalledTimes(4);
 			resolver.mockRestore();
 			scan.mockRestore();
 			expect(enroll).toHaveBeenCalledTimes(5);

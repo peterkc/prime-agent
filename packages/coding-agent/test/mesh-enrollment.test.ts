@@ -7,6 +7,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
@@ -250,6 +251,102 @@ describe("mesh enrollment", () => {
 		const claim = claimEnrollment(meshRoot, sessionId, sessionFile);
 		claim.release();
 		await expect(mesh.resolveAddress(sessionId)).rejects.toThrow("Unknown mesh target");
+	});
+
+	it.each(["rerun", "stop", "removed"] as const)("AC-34 drains one reconciliation before %s", async (mode) => {
+		const { root, meshRoot, sessionId, sessionFile, mesh, log } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const other = SessionManager.create(root, join(root, "other-sessions"));
+		other.appendSessionInfo("other");
+		other.flushNow();
+		await mesh.enroll(other.getSessionId(), other.getSessionFile()!);
+		const [first, second] = readdirSync(join(meshRoot, "enrollments"))
+			.filter((file) => file.endsWith(".json"))
+			.map((file) => readEnrollment(meshRoot, file.slice(0, -5)));
+		if (!first || !second) throw new Error("Two enrollment records required");
+		const ledger = new RlmSpawnLedger(root, join(root, "sessions"));
+		await ledger.appendDelete({ childId: "first", child: first.sessionFile, reason: "user" });
+		if (mode === "stop") await ledger.appendDelete({ childId: "second", child: second.sessionFile, reason: "user" });
+		const entered = createDeferred();
+		const release = createDeferred();
+		const remove = vi.spyOn(core, "deprovisionAgent").mockImplementation(async (options) => {
+			if (options.targetId === first.identity.id) {
+				entered.resolve();
+				await release.promise;
+			}
+			return {} as core.DeprovisionResourceAccounting;
+		});
+		const lookup = vi.spyOn(rlmLedger, "readDeletedRlmChildPaths");
+		const pending = [mesh.reconcileDeletedChildren()];
+		let stopped = false;
+		let stopping: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			if (mode !== "stop")
+				await ledger.appendDelete({ childId: "second", child: second.sessionFile, reason: "user" });
+			if (mode === "removed")
+				await mesh.unenroll(second.sessionId, second.sessionFile, readDeletedRlmChildPaths(root));
+			else {
+				pending.push(mesh.reconcileDeletedChildren(), mesh.reconcileDeletedChildren());
+				expect(lookup).toHaveBeenCalledTimes(1);
+				if (mode === "stop") {
+					vi.useFakeTimers();
+					stopping = mesh.stop().then(() => {
+						stopped = true;
+					});
+					await vi.advanceTimersByTimeAsync(0);
+					expect(stopped).toBe(false);
+				}
+			}
+			release.resolve();
+			await Promise.all(pending);
+			await stopping;
+			expect(existsSync(enrollmentPath(meshRoot, first.sessionId))).toBe(false);
+			expect(existsSync(enrollmentPath(meshRoot, second.sessionId))).toBe(mode === "stop");
+			expect(remove).toHaveBeenCalledTimes(mode === "stop" ? 1 : 2);
+			if (mode !== "removed") expect(lookup).toHaveBeenCalledTimes(mode === "rerun" ? 2 : 1);
+			expect(log.mock.calls.some(([message]) => message.includes("unenrollment failed"))).toBe(false);
+			const claim = claimEnrollment(meshRoot, first.sessionId, first.sessionFile);
+			claim.release();
+		} finally {
+			release.resolve();
+			await Promise.allSettled(pending);
+			await stopping;
+		}
+	});
+
+	it("AC-34 keeps readiness independent of startup deprovisioning", async () => {
+		const { root, meshRoot, sessionId, sessionFile } = await fixture();
+		const socket = join(root, "daemon.sock");
+		writeFileSync(join(root, "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
+		const record = ensureEnrollmentRecord(meshRoot, sessionId, sessionFile);
+		await publishDirectory(meshRoot, record, socket);
+		await new RlmSpawnLedger(root, join(root, "sessions")).appendDelete({
+			childId: "deleted",
+			child: sessionFile,
+			reason: "user",
+		});
+		const entered = createDeferred();
+		const release = createDeferred();
+		vi.spyOn(core, "deprovisionAgent").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return {} as core.DeprovisionResourceAccounting;
+		});
+		const supervisor = new DaemonSupervisor(socket, { defaultSessionConfig: { cwd: root, agentDir: root } });
+		const order: string[] = [];
+		const starting = supervisor.start().then(() => {
+			order.push("ready");
+		});
+		try {
+			await entered.promise;
+			expect(order).toEqual(["ready"]);
+			expect(existsSync(enrollmentPath(meshRoot, sessionId))).toBe(false);
+		} finally {
+			release.resolve();
+			await starting;
+			await (supervisor as unknown as { cleanupSupervisorResources(): Promise<void> }).cleanupSupervisorResources();
+		}
 	});
 
 	it.each(["rebind", "cancelled", "failed"] as const)(

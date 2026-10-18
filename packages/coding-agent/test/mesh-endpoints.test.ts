@@ -543,6 +543,8 @@ describe("mesh endpoints", () => {
 		} finally {
 			corrupt.mockRestore();
 		}
+		rmSync(join(root, "directory"), { recursive: true });
+		expect(mesh.directoryEntryForPrincipal("local.a")).toBeUndefined();
 	});
 
 	it("broadcasts through the existing host expansion once per each of three family members", async () => {
