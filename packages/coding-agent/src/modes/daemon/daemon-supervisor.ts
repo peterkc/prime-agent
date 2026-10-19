@@ -2888,9 +2888,17 @@ export class DaemonSupervisor {
 					let deleteLease: SessionLease | undefined;
 					try {
 						deleteLease = acquireSessionLease(command.sessionPath, agentDir, {
-							...process.env,
 							[SESSION_LEASES_ENABLED_ENV]: "1",
 						});
+					} catch (error) {
+						if (error instanceof SessionAlreadyActiveError) {
+							throw new Error(
+								`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
+							);
+						}
+						throw error;
+					}
+					try {
 						await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
 						const result = await this.catalog.delete(command.sessionPath);
 						if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
@@ -2903,11 +2911,6 @@ export class DaemonSupervisor {
 							if (this.mesh) await this.unenrollMeshSession(deletedSession, deletedPath);
 						}
 						return success(command.id, command.type, result);
-					} catch (error) {
-						if (error instanceof SessionAlreadyActiveError) {
-							error.message = `Cannot delete session ${error.sessionPath}: it is open in another process. Close it there first.`;
-						}
-						throw error;
 					} finally {
 						deleteLease?.release();
 					}

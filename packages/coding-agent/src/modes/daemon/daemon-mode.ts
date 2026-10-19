@@ -4554,9 +4554,17 @@ export class AgentDaemon {
 				let deleteLease: SessionLease | undefined;
 				try {
 					deleteLease = acquireSessionLease(command.sessionPath, this.agentDir, {
-						...process.env,
 						[SESSION_LEASES_ENABLED_ENV]: "1",
 					});
+				} catch (error) {
+					if (error instanceof SessionAlreadyActiveError) {
+						throw new Error(
+							`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
+						);
+					}
+					throw error;
+				}
+				try {
 					const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
 						this.rlmSpawnLedger(),
 						command.sessionPath,
@@ -4582,11 +4590,6 @@ export class AgentDaemon {
 						}
 					}
 					return success(command.id, "delete_saved_session", result);
-				} catch (error) {
-					if (error instanceof SessionAlreadyActiveError) {
-						error.message = `Cannot delete session ${error.sessionPath}: it is open in another process. Close it there first.`;
-					}
-					throw error;
 				} finally {
 					deleteLease?.release();
 				}

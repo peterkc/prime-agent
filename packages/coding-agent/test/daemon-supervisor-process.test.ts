@@ -45,6 +45,7 @@ import {
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
+import { deleteDaemonSavedSession } from "../src/modes/daemon/saved-session-catalog.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
@@ -3027,10 +3028,10 @@ describe("mesh supervisor compatibility", () => {
 				const before = paths.map((path) => readFileSync(path));
 				const lease = acquireSessionLease(target.sessionFile!, f.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
 				try {
-					expect(await deleting.client.request(command)).toMatchObject({
-						success: false,
-						error: expect.stringContaining("Close it there first"),
-					});
+					const context = command.activeSessionId ? { activeSessionId: command.activeSessionId } : { cwd: f.root };
+					await expect(deleteDaemonSavedSession(deleting.client, context, deletedFile)).rejects.toThrow(
+						"open in another session or process. Close it there first",
+					);
 					expect(paths.map((path) => readFileSync(path))).toEqual(before);
 					for (const stream of ["dm", "dlv"])
 						expect(existsSync(join(f.agentDir, `${stream}-${target.sessionId}`))).toBe(true);

@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
+import {
+	acquireSessionLease,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -24,6 +28,7 @@ type RosterDelta = Extract<DaemonWorkerRosterOutbound, { type: "roster_delta" }>
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	vi.unstubAllEnvs();
 	vi.useRealTimers();
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -1474,6 +1479,7 @@ describe("saved-session delete paths", () => {
 	});
 
 	it("aborts a saved-child delete when the tombstone append fails", async () => {
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "unrelated-root");
 		const catalogDelete = vi.fn(async () => ({ ok: true, method: "unlink" }));
 		const { directory, sessionsDir, supervisor } = makeOfflineSupervisor("prime-roster-tombstone-fail-", {
 			catalog: { delete: catalogDelete, list: vi.fn(async () => []) },
@@ -1485,6 +1491,9 @@ describe("saved-session delete paths", () => {
 					{ childId: "child-1", child: childPath, parent: join(sessionsDir, "root.jsonl"), depth: 1, name: "c" },
 				]),
 				appendDelete: vi.fn(async () => {
+					expect(() =>
+						acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
+					).toThrowError(expect.objectContaining({ activeSessionId: undefined }));
 					throw new Error("ledger unwritable");
 				}),
 			}),
@@ -1924,7 +1933,11 @@ describe("worker delete tombstone durability", () => {
 
 		// (b) An unreadable ledger aborts the unknown target's deletion.
 		const withFailure = setup();
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "unrelated-root");
 		const daemonWithFailure = makeDeleteDaemon(withFailure.directory, async () => {
+			expect(() =>
+				acquireSessionLease(withFailure.garbled, withFailure.directory, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
+			).toThrowError(expect.objectContaining({ activeSessionId: undefined }));
 			throw new Error("ledger unreadable");
 		});
 		await expect(
