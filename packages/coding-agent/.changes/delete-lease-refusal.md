@@ -1,1 +1,1 @@
-- Fixed saved-session deletion to refuse while another live process holds the session-file lease, before changing files, artifacts, child tombstones or mesh state.
+- Fixed saved-session deletion to refuse when the session or a saved child or other session file under its artifact directory is open elsewhere, before changing files, child tombstones or mesh state.

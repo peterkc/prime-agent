@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -6,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { deleteSessionFile } from "../src/core/session-file-actions.js";
 import {
 	acquireSessionLease,
+	hasSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
@@ -1857,7 +1867,7 @@ describe("worker delete tombstone durability", () => {
 		};
 	}
 
-	it.each(["supervisor", "worker"])(
+	it.each(["supervisor", "worker", "artifact-filter", "symlink"])(
 		"refuses a saved-parent delete with a leased artifact child (%s)",
 		async (route) => {
 			vi.stubEnv("PATH", "");
@@ -1868,10 +1878,19 @@ describe("worker delete tombstone durability", () => {
 			const sessionPath = parent.getSessionFile()!;
 			const childPath = join(parent.getSessionArtifactDir()!, "nested", "child.jsonl");
 			mkdirSync(dirname(childPath), { recursive: true });
-			writeFileSync(childPath, `${JSON.stringify({ type: "session", id: "child" })}\n`);
-			const files = [sessionPath, childPath];
+			const target = route === "symlink" ? join(directory, "outside.jsonl") : childPath;
+			const header = `${JSON.stringify({ type: "session", id: "child" })}\n`;
+			writeFileSync(target, route === "artifact-filter" ? "not a header\n" : header);
+			if (route === "symlink") {
+				symlinkSync(target, childPath);
+				symlinkSync(sessionPath, join(dirname(childPath), "root-alias.jsonl"));
+			}
+			const plain = join(dirname(childPath), "notes.txt");
+			writeFileSync(plain, "scratch file\n");
+			const files = [sessionPath, childPath, plain];
 			const before = files.map((path) => readFileSync(path));
 			const remove = async (path: string) => {
+				if (route === "artifact-filter") expect(hasSessionLease(plain, directory)).toBe(false);
 				expect(() => acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" })).toThrow();
 				return deleteSessionFile(path);
 			};
@@ -1891,8 +1910,10 @@ describe("worker delete tombstone durability", () => {
 			} finally {
 				held?.release();
 			}
+			if (route === "artifact-filter") writeFileSync(childPath, header);
 			await handler.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath });
 			for (const path of files) expect(existsSync(path)).toBe(false);
+			if (route === "symlink") expect(readFileSync(target, "utf8")).toBe(header);
 		},
 	);
 

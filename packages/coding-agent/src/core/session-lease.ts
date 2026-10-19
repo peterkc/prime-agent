@@ -93,6 +93,11 @@ export function canonicalSessionPath(sessionPath: string): string {
 	}
 }
 
+/** Presence only; acquisition still decides whether an owner permits the operation. */
+export function hasSessionLease(sessionPath: string, agentDir: string): boolean {
+	return existsSync(leaseDirectory(agentDir, canonicalSessionPath(sessionPath)));
+}
+
 // An unreadable owner may hold a live lease. Only a missing owner is safely absent.
 function readLeaseOwner(directory: string): SessionLeaseOwner | "absent" | "unreadable" {
 	const ownerPath = join(directory, "owner.json");

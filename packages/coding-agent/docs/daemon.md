@@ -177,11 +177,14 @@ The retained transcript cannot re-enroll even on explicit reopen, so that sessio
 cannot send or receive agent messages in Cotal mode. There is no clear-on-open rule.
 
 Saved-session deletion in either transport acquires the canonical session-file lease
-before any removal or child tombstone. If another live process holds the lease,
-deletion refuses without changing the file, artifacts, child tombstones or mesh state.
-Close the session there first, then retry. An unreadable or corrupt lease owner also
-refuses deletion. Symlink aliases share the target's lease; same-ID copies at different
-canonical paths stay independent.
+before any removal or child tombstone. It also reserves saved child transcripts and
+other session files under that session's artifact directory. A live lease anywhere in
+that set refuses the whole delete and names the held path, without changing files,
+artifacts, child tombstones or mesh state. Close that session there first, then retry.
+An unreadable or corrupt lease owner also refuses deletion. File symlinks share their
+target's lease; symlinked directories are not traversed. Same-ID copies at different
+canonical paths stay independent. Other artifact files without a lease or a first-line
+session header are skipped, without creating lease records.
 
 After a successful forwarded delete, the worker releases its lease before the
 supervisor's unchanged mesh cleanup. That cleanup still checks the exact file's absence.

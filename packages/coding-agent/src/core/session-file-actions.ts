@@ -1,19 +1,31 @@
-import { type Dirent, existsSync, lstatSync, readdirSync } from "node:fs";
+import { type Dirent, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { spawnSyncHidden } from "../utils/child-process.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV, type SessionLease } from "./session-lease.js";
+import { readFirstLineSync } from "../utils/file-lines.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	hasSessionLease,
+	SESSION_LEASES_ENABLED_ENV,
+	type SessionLease,
+} from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 /** Reserve the target and artifact files before a recursive saved-session delete. */
 export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string): { release(): void } {
 	const leases: SessionLease[] = [];
+	const paths = new Set<string>();
 	const release = () => {
 		for (const lease of leases.reverse()) lease.release();
 	};
 	const acquire = (path: string) => {
+		if (paths.has(canonicalSessionPath(path))) return;
 		const lease = acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
-		if (lease) leases.push(lease);
+		if (lease) {
+			leases.push(lease);
+			paths.add(lease.sessionPath);
+		}
 	};
 	try {
 		acquire(sessionPath);
@@ -33,9 +45,22 @@ export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string
 			}
 			for (const entry of entries) {
 				const path = join(directory, entry.name);
-				if (entry.isDirectory()) directories.push(path);
-				// Explicit opens need not use .jsonl names; reserve regular files conservatively.
-				else if (entry.isFile()) acquire(path);
+				if (entry.isDirectory()) {
+					directories.push(path);
+					continue;
+				}
+				if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+				try {
+					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
+					if (!hasSessionLease(path, agentDir)) {
+						const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
+						if (header?.type !== "session") continue;
+					}
+				} catch (error) {
+					if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					throw error;
+				}
+				acquire(path);
 			}
 		}
 		return { release };
