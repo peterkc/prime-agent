@@ -400,7 +400,7 @@ function reportLedgerHealth(): boolean {
 	);
 	console.log("Recovery (offline): stop ALL writers, including workers that can outlive a supervisor restart.");
 	console.log("Back up each listed path before changing it. Do not hand-edit committed records.");
-	console.log("Prime never repairs ledgers automatically.");
+	console.log("This check does not repair, truncate, move or restore ledgers.");
 	console.log("For an uncommitted unterminated tail, remove only that tail.");
 	console.log("Warning: an older backup can lose deletion proof. Deleted children can re-enroll.");
 	console.log("For a bad committed record or a byte or record limit failure, restore a usable trusted backup.");
