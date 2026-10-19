@@ -108,9 +108,10 @@ If startup or signer creation fails, it removes the service and plist but keeps 
 
 - `prime-agent mesh start` and `stop` start or stop the installed service.
 - `prime-agent mesh status` first checks every RLM ledger locally, even without the
-  mesh home, broker or Cotal CLI. It then reports the CLI version or its read failure,
-  service state, store bytes, service-log bytes, enrolled-session count, and each
-  session's stored, unacknowledged message count.
+  mesh home, broker or Cotal CLI. If the mesh home or its `.cotal` directory is missing,
+  it stops after that check. Full status output includes the CLI version or its read
+  failure, service state, store bytes, service-log bytes, enrolled-session count, and
+  each session's stored, unacknowledged message count.
 - `prime-agent mesh doctor` checks the exact CLI version first, then ledger and status
   health, then Cotal auth. A failed version check still stops before ledger diagnosis;
   use `mesh status` for that offline check. An unhealthy check sets exit code 1.

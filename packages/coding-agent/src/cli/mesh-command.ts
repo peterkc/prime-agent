@@ -529,13 +529,13 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		}
 		let ledgerUnhealthy = false;
 		if (command === "status") ledgerUnhealthy = reportLedgerHealth();
+		if (command === "doctor") {
+			await requireCotalVersion(await executable("cotal"), options);
+			ledgerUnhealthy = reportLedgerHealth();
+		}
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = `gui/${process.getuid?.()}/${options.label}`;
 		if (command === "status" || command === "doctor") {
-			if (command === "doctor") {
-				await requireCotalVersion(await executable("cotal"), options);
-				ledgerUnhealthy = reportLedgerHealth();
-			}
 			await status(options, launchctl, target);
 			if (command === "doctor") {
 				const auth = await runTool(await executable("cotal"), ["doctor", "auth"], options);

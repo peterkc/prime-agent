@@ -364,6 +364,7 @@ describe("mesh command", () => {
 	it.each([
 		["status", "broker"],
 		["doctor", "broker"],
+		["doctor", "launchctl"],
 		["status", "cotal"],
 		["status", "home"],
 		["status", "serving"],
@@ -384,7 +385,7 @@ describe("mesh command", () => {
 		}
 		writeFileSync(join(root, "loaded"), "yes");
 		configure({ notReady: unavailable !== "serving" });
-		if (unavailable === "cotal") rmSync(join(root, "bin", unavailable));
+		if (unavailable === "cotal" || unavailable === "launchctl") rmSync(join(root, "bin", unavailable));
 		const before = readdirSync(agent, { recursive: true, encoding: "utf8" }).sort();
 		expect(existsSync(mesh)).toBe(unavailable !== "home");
 		await command(name);
