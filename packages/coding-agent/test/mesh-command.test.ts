@@ -365,6 +365,7 @@ describe("mesh command", () => {
 		["status", "broker"],
 		["doctor", "broker"],
 		["status", "cotal"],
+		["status", "home"],
 		["status", "serving"],
 		["doctor", "serving"],
 	])("reports all ledger failures in %s with %s unavailable or checked", async (name, unavailable) => {
@@ -376,7 +377,8 @@ describe("mesh command", () => {
 			["mesh/mesh.json", JSON.stringify({ space: "prime", server })],
 			["mesh/.cotal/nats/jetstream/preserved", "inbox"],
 		] as const;
-		for (const [file, bytes] of files) {
+		const fixtures = files.filter(([file]) => unavailable !== "home" || !file.startsWith("mesh/"));
+		for (const [file, bytes] of fixtures) {
 			mkdirSync(dirname(join(agent, file)), { recursive: true });
 			writeFileSync(join(agent, file), bytes);
 		}
@@ -384,13 +386,14 @@ describe("mesh command", () => {
 		configure({ notReady: unavailable !== "serving" });
 		if (unavailable === "cotal") rmSync(join(root, "bin", unavailable));
 		const before = readdirSync(agent, { recursive: true, encoding: "utf8" }).sort();
+		expect(existsSync(mesh)).toBe(unavailable !== "home");
 		await command(name);
 		expect(process.exitCode).toBe(1);
 		for (const file of ["bad-a.jsonl", "bad-b.jsonl"]) expect(output()).toContain(join(agent, RLM_LEDGER_DIR, file));
 		expect(output()).toMatch(/CHECKED.*FAILED/);
-		expect(output()).toMatch(/blocks new mesh enrollment agent-wide/);
+		expect(output()).toMatch(/blocks new mesh enrollment.*agent-wide/);
 		expect(readdirSync(agent, { recursive: true }).sort()).toEqual(before);
-		for (const [file, content] of files) expect(readFileSync(join(agent, file), "utf8")).toBe(content);
+		for (const [file, content] of fixtures) expect(readFileSync(join(agent, file), "utf8")).toBe(content);
 	});
 
 	it("reports store bytes and only unacknowledged counts, and diagnoses auth", async () => {

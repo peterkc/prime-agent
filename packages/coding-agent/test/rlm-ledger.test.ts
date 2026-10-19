@@ -87,22 +87,25 @@ describe("rlm spawn ledger", () => {
 			mkdirSync(directory);
 			const record = `${JSON.stringify({ v: 1, op: "future", at: "x" })}\n`;
 			const entries = [
-				["malformed.jsonl", `${record}broken\n`, /line 2/],
-				["bytes.jsonl", "x".repeat(RLM_LEDGER_MAX_BYTES + 1), /33554432 bytes/],
-				["unreadable.jsonl", record, /EACCES/],
-				["torn.jsonl", `${record}{broken`, undefined],
+				["malformed.jsonl", `${record}broken\n`, /line 2/, 2],
+				["bytes.jsonl", "x".repeat(RLM_LEDGER_MAX_BYTES + 1), /33554432 bytes/, undefined],
+				["unreadable.jsonl", record, /EACCES/, undefined],
+				["torn.jsonl", `${record}{broken`, undefined, undefined],
 			] as const;
 			for (const [name, bytes] of entries) writeFileSync(join(directory, name), bytes);
 			chmodSync(join(directory, "unreadable.jsonl"), 0);
 			const failures = readRlmLedgerHealth(root);
 			const bad = entries.slice(0, -1);
 			expect(failures).toHaveLength(bad.length);
-			for (const [name, , cause] of bad)
+			for (const [name, , cause, line] of bad)
 				expect(failures).toContainEqual(
-					expect.objectContaining({ path: join(directory, name), cause: expect.stringMatching(cause!) }),
+					expect.objectContaining({ path: join(directory, name), cause: expect.stringMatching(cause!), line }),
 				);
 			chmodSync(join(directory, "unreadable.jsonl"), 0o600);
 			for (const [name, bytes] of entries) expect(readFileSync(join(directory, name), "utf8")).toBe(bytes);
+			rmSync(directory, { recursive: true });
+			writeFileSync(directory, "not a directory");
+			expect(readRlmLedgerHealth(root)).toEqual([{ path: directory, cause: expect.stringMatching(/ENOTDIR/) }]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

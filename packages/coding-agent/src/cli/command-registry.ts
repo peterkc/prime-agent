@@ -113,9 +113,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	{
 		path: ["mesh", "status"],
 		usage: "mesh status [options]",
-		summary: "Show service state, store size and pending counts",
+		summary: "Show RLM ledger health, service state, store size and pending counts",
 	},
-	{ path: ["mesh", "doctor"], usage: "mesh doctor [options]", summary: "Check service state and Cotal auth" },
+	{
+		path: ["mesh", "doctor"],
+		usage: "mesh doctor [options]",
+		summary: "Check RLM ledger health, service state and Cotal auth",
+	},
 	{
 		path: ["incident"],
 		usage: "incident [--since <time>] [--until <time>] [--session <id>]",

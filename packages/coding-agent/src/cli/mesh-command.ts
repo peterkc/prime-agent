@@ -395,12 +395,20 @@ function reportLedgerHealth(): boolean {
 		console.log(`  ${failure.path}${line}: ${failure.cause}`);
 	}
 	if (failures.length === 0) return false;
-	console.log("Every listed failure blocks new mesh enrollment agent-wide.");
-	console.log("Recovery (offline): stop ALL writers, including workers that can outlive a supervisor restart.");
 	console.log(
-		"Back up each listed path. Restore committed data only from a trusted backup, or remove only an uncommitted unterminated tail.",
+		"Every listed failure blocks new mesh enrollment, directory publication and deletion reconciliation agent-wide.",
 	);
-	console.log("Do not hand-edit committed records. Restart writers after recovery.");
+	console.log("Recovery (offline): stop ALL writers, including workers that can outlive a supervisor restart.");
+	console.log("Back up each listed path before changing it. Do not hand-edit committed records.");
+	console.log("Prime never repairs ledgers automatically.");
+	console.log("For an uncommitted unterminated tail, remove only that tail.");
+	console.log("Warning: an older backup can lose deletion proof. Deleted children can re-enroll.");
+	console.log("For a bad committed record or a byte or record limit failure, restore a usable trusted backup.");
+	console.log("Warning: moving a ledger loses topology and deletion proof. Deleted children can re-enroll.");
+	console.log(
+		"If no usable backup exists, move the file outside the ledger directory only after accepting that loss.",
+	);
+	console.log("Correct file access if needed, then restart writers after recovery.");
 	return true;
 }
 
