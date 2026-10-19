@@ -674,6 +674,7 @@ function makeWorker(workerId: string, overrides: Partial<WorkerFixture> = {}): W
 }
 
 interface SupervisorFixture {
+	readonly defaultSessionConfig: { readonly agentDir: string };
 	workers: Map<string, WorkerFixture>;
 	flushRosterUpdates(): void;
 	consumeWorkerRosterDelta(worker: WorkerFixture, payload: Buffer): void;
@@ -1333,12 +1334,14 @@ describe("saved-session delete paths", () => {
 		const unreachable = makeWorker("w-down");
 		Object.assign(unreachable.descriptor, {
 			sessionFile: "/tmp/owned-down.jsonl",
+			pid: process.pid,
 			createCommand: { type: "create" },
 		});
 		unreachable.client = undefined;
 		const failed = makeWorker("w-failed");
 		Object.assign(failed.descriptor, {
 			sessionFile: "/tmp/owned-failed.jsonl",
+			pid: 0,
 			createCommand: { type: "create" },
 			lifecycle: "failed",
 		});
@@ -1354,6 +1357,7 @@ describe("saved-session delete paths", () => {
 		const supervisor = makeSupervisor([reachableRoster, unreachable, failed], {
 			catalog: { delete: catalogDelete, list: vi.fn(async () => []) },
 			mutationDrain: { begin: vi.fn(), end: vi.fn() },
+			processIdentity: (pid: number) => (pid === process.pid ? "current" : "gone"),
 			reclaimStaleWorkerRegistration,
 			rlmSpawnLedger: () => ({ edges: vi.fn(async () => []) }),
 		});
@@ -1381,9 +1385,16 @@ describe("saved-session delete paths", () => {
 		expect(catalogDelete).not.toHaveBeenCalled();
 
 		// A live-but-disconnected owner rejects instead of deleting underneath the worker.
-		await expect(
-			internals.handleCommand(client, { type: "delete_saved_session", sessionPath: "/tmp/owned-down.jsonl" }),
-		).rejects.toThrow(/retry the delete/);
+		const held = acquireSessionLease("/tmp/owned-down.jsonl", supervisor.defaultSessionConfig.agentDir, {
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+		});
+		try {
+			await expect(
+				internals.handleCommand(client, { type: "delete_saved_session", sessionPath: "/tmp/owned-down.jsonl" }),
+			).rejects.toThrow(/retry the delete/);
+		} finally {
+			held?.release();
+		}
 		expect(catalogDelete).not.toHaveBeenCalled();
 
 		// A dead failed registration is reclaimed, then the offline delete proceeds.

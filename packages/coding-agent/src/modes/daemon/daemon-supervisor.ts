@@ -2876,6 +2876,17 @@ export class DaemonSupervisor {
 								await this.unenrollMeshSession(deletedSession, deletedPath);
 							return response;
 						}
+						if (
+							owner.client !== undefined ||
+							owner.recovery !== undefined ||
+							!["gone", "replaced"].includes(
+								this.processIdentity(owner.descriptor.pid, owner.descriptor.processStartId),
+							)
+						) {
+							throw new Error(
+								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
+							);
+						}
 					}
 					const agentDir = this.defaultSessionConfig.agentDir;
 					if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
