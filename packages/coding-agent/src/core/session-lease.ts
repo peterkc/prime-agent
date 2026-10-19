@@ -7,6 +7,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -93,9 +94,14 @@ export function canonicalSessionPath(sessionPath: string): string {
 	}
 }
 
-/** Presence only; acquisition still decides whether an owner permits the operation. */
+/** Conservative presence; acquisition decides whether an owner permits the operation. */
 export function hasSessionLease(sessionPath: string, agentDir: string): boolean {
-	return existsSync(leaseDirectory(agentDir, canonicalSessionPath(sessionPath)));
+	try {
+		statSync(leaseDirectory(agentDir, canonicalSessionPath(sessionPath)));
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
 }
 
 // An unreadable owner may hold a live lease. Only a missing owner is safely absent.

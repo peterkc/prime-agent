@@ -2876,11 +2876,6 @@ export class DaemonSupervisor {
 								await this.unenrollMeshSession(deletedSession, deletedPath);
 							return response;
 						}
-						if (!(await this.reclaimStaleWorkerRegistration(owner))) {
-							throw new Error(
-								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
-							);
-						}
 					}
 					const agentDir = this.defaultSessionConfig.agentDir;
 					if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
@@ -2893,9 +2888,16 @@ export class DaemonSupervisor {
 								`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
 							);
 						}
-						throw error;
+						throw new Error(
+							`Cannot delete session ${command.sessionPath}: its session lease could not be checked (${error instanceof Error ? error.message : String(error)}). Nothing was removed.`,
+						);
 					}
 					try {
+						if (owner && !(await this.reclaimStaleWorkerRegistration(owner))) {
+							throw new Error(
+								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
+							);
+						}
 						await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
 						const result = await this.catalog.delete(command.sessionPath);
 						if (result.ok && entry && this.roster().get(entry.agentId) === entry) {

@@ -4564,7 +4564,9 @@ export class AgentDaemon {
 							`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
 						);
 					}
-					throw error;
+					throw new Error(
+						`Cannot delete session ${command.sessionPath}: its session lease could not be checked (${error instanceof Error ? error.message : String(error)}). Nothing was removed.`,
+					);
 				}
 				try {
 					const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(

@@ -185,6 +185,9 @@ An unreadable or corrupt lease owner also refuses deletion. File symlinks share 
 target's lease; symlinked directories are not traversed. Same-ID copies at different
 canonical paths stay independent. Other artifact files without a lease or a first-line
 session header are skipped, without creating lease records.
+The artifact scan is a point-in-time snapshot. Files created after the scan are not reserved.
+Deletes check leases only in the daemon's agent directory, so leases under a different
+agent directory are not seen.
 
 After a successful forwarded delete, the worker releases its lease before the
 supervisor's unchanged mesh cleanup. That cleanup still checks the exact file's absence.

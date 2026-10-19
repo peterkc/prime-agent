@@ -1867,7 +1867,7 @@ describe("worker delete tombstone durability", () => {
 		};
 	}
 
-	it.each(["supervisor", "worker", "artifact-filter", "symlink", "loop"])(
+	it.each(["supervisor", "worker", "artifact-filter", "symlink", "loop", "stale"])(
 		"refuses a saved-parent delete with a leased artifact child (%s)",
 		async (route) => {
 			vi.stubEnv("PATH", "");
@@ -1888,6 +1888,7 @@ describe("worker delete tombstone durability", () => {
 			if (route === "loop") symlinkSync("loop", join(dirname(childPath), "loop"));
 			const plain = join(dirname(childPath), "notes.txt");
 			writeFileSync(plain, "scratch file\n");
+			expect(hasSessionLease(sessionPath, plain)).toBe(true); // ENOTDIR cannot prove lease absence.
 			const files = [sessionPath, childPath, plain];
 			const before = files.map((path) => readFileSync(path));
 			const remove = async (path: string) => {
@@ -1898,7 +1899,24 @@ describe("worker delete tombstone durability", () => {
 			Object.assign(supervisor, { catalog: { delete: remove } });
 			const daemon = makeDeleteDaemon(directory, async () => []);
 			Object.assign(daemon, { deleteSavedSessionFile: remove });
-			const handler = route === "supervisor" ? supervisor : daemon;
+			if (route === "stale") {
+				const worker = makeWorker("stale", { client: undefined });
+				Object.assign(worker.descriptor, {
+					sessionFile: sessionPath,
+					createCommand: { type: "create" },
+					lifecycle: "failed",
+					recoveryJournalPath: join(directory, "stale-recovery.jsonl"),
+				});
+				Object.assign(worker, { descriptorPath: join(directory, "stale.json") });
+				supervisor.workers.set("stale", worker);
+				Object.assign(supervisor, {
+					processIdentity: () => "gone",
+					recoverUncertainWorkerOperations: async () => {
+						SessionManager.open(sessionPath).appendSessionInfo("interrupted");
+					},
+				});
+			}
+			const handler = route === "supervisor" || route === "stale" ? supervisor : daemon;
 			const held = acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
 			try {
 				await expect(
