@@ -498,19 +498,19 @@ export class MeshEndpoints {
 				if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) continue;
 				const record = readEnrollment(this.options.meshRoot, sessionId);
 				if (deleted.has(canonicalSessionPath(record.sessionFile)))
-					await this.unenroll(sessionId, record.sessionFile, deleted);
+					await this.unenroll(sessionId, record.sessionFile, true);
 			} catch (error) {
 				this.options.log(`Mesh session ${sessionId}: unenrollment failed: ${redactMeshError(error)}`);
 			}
 		}
 	}
 
-	async unenroll(sessionId: string, sessionFile: string, deletedChildren?: ReadonlySet<string>): Promise<void> {
+	async unenroll(sessionId: string, sessionFile: string, ledgerProof?: boolean): Promise<void> {
 		const record = await removeEnrollment(
 			this.options.meshRoot,
 			sessionId,
 			canonicalSessionPath(sessionFile),
-			deletedChildren,
+			ledgerProof,
 		);
 		if (record === "absent") return;
 		if (record === "mismatch") {

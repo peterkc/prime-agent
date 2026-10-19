@@ -259,7 +259,7 @@ export async function removeEnrollment(
 	meshRoot: string,
 	sessionId: string,
 	deletedPath: string,
-	deletedChildren?: ReadonlySet<string>,
+	ledgerProof?: boolean,
 ): Promise<"absent" | "mismatch" | EnrollmentRecord> {
 	return withDirectoryLock(meshRoot, sessionId, async () => {
 		const path = enrollmentPath(meshRoot, sessionId);
@@ -267,7 +267,8 @@ export async function removeEnrollment(
 		if (!record) return "absent";
 		if (
 			canonicalSessionPath(record.sessionFile) !== deletedPath ||
-			(!deletedChildren?.has(deletedPath) && lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined)
+			(!(ledgerProof && readDeletedRlmChildPaths(dirname(meshRoot)).has(deletedPath)) &&
+				lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined)
 		)
 			return "mismatch";
 		await rm(directoryPath(meshRoot, sessionId), { force: true });

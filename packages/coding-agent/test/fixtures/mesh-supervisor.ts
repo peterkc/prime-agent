@@ -120,14 +120,22 @@ const response: FauxResponseFactory = async (_context, options) => {
 	if (existsSync(path)) {
 		writeFileAtomicSync(join(agentDir, "turn-held"), "held");
 		await new Promise<void>((resolve) => {
+			let watcher: ReturnType<typeof watch> | undefined;
 			const finish = () => {
-				watcher.close();
+				watcher?.close();
 				options?.signal?.removeEventListener("abort", finish);
 				resolve();
 			};
-			const watcher = watch(agentDir, () => {
-				if (!existsSync(path)) finish();
-			});
+			try {
+				// macOS can deliver directory FSEvents late; a file watch reports its deletion.
+				watcher = watch(path, () => {
+					if (!existsSync(path)) finish();
+				});
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT" || existsSync(path)) throw error;
+				resolve();
+				return;
+			}
 			options?.signal?.addEventListener("abort", finish, { once: true });
 			if (options?.signal?.aborted || !existsSync(path)) finish();
 		});

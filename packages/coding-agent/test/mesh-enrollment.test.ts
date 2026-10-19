@@ -282,9 +282,9 @@ describe("mesh enrollment", () => {
 		});
 		const lookup = vi.spyOn(rlmLedger, "readDeletedRlmChildPaths");
 		await mesh.reconcileDeletedChildren();
-		expect(lookup).toHaveBeenCalledTimes(1);
-		await mesh.reconcileDeletedChildren();
 		expect(lookup).toHaveBeenCalledTimes(2);
+		await mesh.reconcileDeletedChildren();
+		expect(lookup).toHaveBeenCalledTimes(3);
 		expect(remove).toHaveBeenCalledTimes(1);
 		expect(remove.mock.calls[0]![0]).toMatchObject({
 			targetId: record.identity.id,
@@ -295,6 +295,29 @@ describe("mesh enrollment", () => {
 		const claim = claimEnrollment(meshRoot, sessionId, sessionFile);
 		claim.release();
 		await expect(mesh.resolveAddress(sessionId)).rejects.toThrow("Unknown mesh target");
+	});
+
+	it("AC-34 keeps a live child when a caller's deletion proof is stale", async () => {
+		const { root, meshRoot, sessionId, sessionFile, mesh } = await fixture();
+		await mesh.enroll(sessionId, sessionFile);
+		const record = readEnrollment(meshRoot, sessionId);
+		const directory = readDirectory(meshRoot, sessionId);
+		const endpoint = FakeEndpoint.instances.at(-1)!;
+		const ledger = new RlmSpawnLedger(root, join(root, "sessions"));
+		await ledger.appendDelete({ childId: "child", child: sessionFile, reason: "user" });
+		const deleted = readDeletedRlmChildPaths(root);
+		await ledger.appendSpawn({ childId: "child", parent: sessionFile, child: sessionFile, depth: 1, name: "child" });
+		const deletedPath = canonicalSessionPath(sessionFile);
+		expect(deleted.has(deletedPath)).toBe(true);
+		const remove = vi.spyOn(core, "deprovisionAgent").mockResolvedValue({} as core.DeprovisionResourceAccounting);
+		expect(await removeEnrollment(meshRoot, sessionId, deletedPath, true)).toBe("mismatch");
+		await mesh.unenroll(sessionId, sessionFile, true);
+		writeFileSync(ledger.ledgerPath, "malformed\n", { flag: "a" });
+		await expect(removeEnrollment(meshRoot, sessionId, deletedPath, true)).rejects.toThrow(ledger.ledgerPath);
+		expect(readEnrollment(meshRoot, sessionId)).toEqual(record);
+		expect(readDirectory(meshRoot, sessionId)).toEqual(directory);
+		expect(endpoint.stop).not.toHaveBeenCalled();
+		expect(remove).not.toHaveBeenCalled();
 	});
 
 	it("AC-34 skips a badly named enrollment and still removes a deleted child", async () => {
@@ -348,11 +371,10 @@ describe("mesh enrollment", () => {
 			await entered.promise;
 			if (mode !== "stop")
 				await ledger.appendDelete({ childId: "second", child: second.sessionFile, reason: "user" });
-			if (mode === "removed")
-				await mesh.unenroll(second.sessionId, second.sessionFile, readDeletedRlmChildPaths(root));
+			if (mode === "removed") await mesh.unenroll(second.sessionId, second.sessionFile, true);
 			else {
 				pending.push(mesh.reconcileDeletedChildren(), mesh.reconcileDeletedChildren());
-				expect(lookup).toHaveBeenCalledTimes(1);
+				expect(lookup).toHaveBeenCalledTimes(2);
 				if (mode === "stop") {
 					vi.useFakeTimers();
 					stopping = mesh.stop().then(() => {
@@ -368,7 +390,7 @@ describe("mesh enrollment", () => {
 			expect(existsSync(enrollmentPath(meshRoot, first.sessionId))).toBe(false);
 			expect(existsSync(enrollmentPath(meshRoot, second.sessionId))).toBe(mode === "stop");
 			expect(remove).toHaveBeenCalledTimes(mode === "stop" ? 1 : 2);
-			if (mode !== "removed") expect(lookup).toHaveBeenCalledTimes(mode === "rerun" ? 2 : 1);
+			if (mode !== "removed") expect(lookup).toHaveBeenCalledTimes(mode === "rerun" ? 4 : 2);
 			expect(log.mock.calls.some(([message]) => message.includes("unenrollment failed"))).toBe(false);
 			const claim = claimEnrollment(meshRoot, first.sessionId, first.sessionFile);
 			claim.release();
