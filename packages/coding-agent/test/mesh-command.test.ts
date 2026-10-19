@@ -55,6 +55,7 @@ if (tool === "launchctl") {
   if (args[0] === "bootout") { if (!existsSync(loaded)) process.exit(3); if (control.stalledBootout) process.exit(3); if (control.deferredBootout) writeFileSync(join(root, "removing"), "yes"); else unlinkSync(loaded); if (control.bootoutNonzero) process.exit(3); }
 } else {
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
+  if (args[0] === "--version") { console.log(control.versionOutput ?? "cotal-ai 0.79.0\n  adapter test 9.9.9"); process.exit(0); }
   if (args[0] === "up") writeFileSync("auth", "ready");
   if (args[0] === "status" && control.interruptedStatus && !existsSync(join(root, "interrupted"))) {
     writeFileSync(join(root, "interrupted"), "yes");
@@ -156,11 +157,53 @@ describe("mesh command", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it.each([
+		["matching", "cotal-ai 0.79.0\n  adapter test 9.9.9", undefined],
+		["mismatch", "cotal-ai 0.80.0\n  adapter test 0.79.0", undefined],
+		["malformed", "not a version\n  adapter test 0.79.0", undefined],
+		["failed", "cotal-ai 0.79.0", "--version"],
+	] as const)("AC-39 checks the CLI header before effects (%s)", async (kind, versionOutput, fail) => {
+		configure({ versionOutput, fail });
+		expect(existsSync(mesh)).toBe(false);
+		await command("install");
+		const matches = kind === "matching";
+		expect(process.exitCode).toBe(matches ? undefined : 1);
+		expect(existsSync(mesh)).toBe(matches);
+		expect(existsSync(plist)).toBe(matches);
+		expect(events().find((event) => event.args[0] === "--version")?.cwd).toBe(root);
+		if (!matches) {
+			expect(events().map((event) => event.args[0])).toEqual(["print", "--version"]);
+			expect(output()).toContain("required 0.79.0");
+			expect(output()).toContain(kind === "mismatch" ? "0.80.0" : kind === "failed" ? "exit 2" : "unrecognized");
+			mkdirSync(join(mesh, ".cotal"), { recursive: true });
+			writeFileSync(join(mesh, "mesh.json"), JSON.stringify({ space: "prime", server }));
+			writeFileSync(join(root, "loaded"), "yes");
+		}
+		rmSync(join(root, "events.jsonl"));
+		await command("doctor");
+		expect(process.exitCode).toBe(matches ? undefined : 1);
+		expect(events().some((event) => event.args[0] === "doctor")).toBe(matches);
+		if (!matches) expect(events().map((event) => event.args[0])).toEqual(["--version"]);
+		vi.mocked(console.log).mockClear();
+		vi.mocked(console.error).mockClear();
+		await command("status");
+		expect(process.exitCode).toBe(kind === "failed" || kind === "malformed" ? 1 : undefined);
+		expect(output()).toContain(
+			kind === "failed" || kind === "malformed"
+				? "Cannot read cotal CLI version"
+				: `Cotal CLI: ${kind === "mismatch" ? "0.80.0" : "0.79.0"}`,
+		);
+		expect(output()).not.toContain(seed);
+		const source = readFileSync(new URL("../src/cli/mesh-command.ts", import.meta.url), "utf8");
+		expect(source).not.toMatch(/from ["'](?:@cotal-ai|@nats-io|nats)/);
+	});
+
 	it("installs in order, accepts serving with exit 1, and preserves an existing signer", async () => {
 		await command("install", "--mesh-home", mesh);
 		expect(process.exitCode).toBeUndefined();
 		expect(events().map((event) => `${event.tool} ${event.args[0]}`)).toEqual([
 			"launchctl print",
+			"cotal --version",
 			"launchctl bootstrap",
 			"cotal up",
 			"cotal status",
@@ -195,7 +238,7 @@ describe("mesh command", () => {
 		await command("uninstall");
 		await command("install");
 		expect(events().filter((event) => event.args[0] === "mint")).toHaveLength(1);
-		for (const event of events().filter((event) => event.tool === "cotal"))
+		for (const event of events().filter((event) => event.tool === "cotal" && event.args[0] !== "--version"))
 			expect(event).toMatchObject({ cwd: mesh, cotalRoot: mesh, home: join(mesh, "home"), skipSeed: "1" });
 		expect(output()).not.toContain(seed);
 	});
@@ -443,7 +486,7 @@ describe("mesh command", () => {
 		mkdirSync(mesh, { recursive: true });
 		await command(name);
 		expect(process.exitCode).toBe(1);
-		expect(events()).toEqual([]);
+		expect(events().map((event) => event.args[0])).toEqual(name === "doctor" ? ["--version"] : []);
 		expect(output()).toContain("no .cotal directory");
 	});
 

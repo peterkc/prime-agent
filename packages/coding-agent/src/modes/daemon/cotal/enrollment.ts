@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	CotalEndpoint,
 	deprovisionAgent,
@@ -25,6 +25,7 @@ import {
 } from "../../../core/session-lease.js";
 import { readSessionInfo } from "../../../core/session-manager.js";
 import { writeFileAtomicSync } from "../../../utils/atomic-file.js";
+import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
 import { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
 
 export { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
@@ -258,6 +259,7 @@ export async function removeEnrollment(
 	meshRoot: string,
 	sessionId: string,
 	deletedPath: string,
+	ledgerProof?: boolean,
 ): Promise<"absent" | "mismatch" | EnrollmentRecord> {
 	return withDirectoryLock(meshRoot, sessionId, async () => {
 		const path = enrollmentPath(meshRoot, sessionId);
@@ -265,7 +267,8 @@ export async function removeEnrollment(
 		if (!record) return "absent";
 		if (
 			canonicalSessionPath(record.sessionFile) !== deletedPath ||
-			lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined
+			(!(ledgerProof && readDeletedRlmChildPaths(dirname(meshRoot)).has(deletedPath)) &&
+				lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined)
 		)
 			return "mismatch";
 		await rm(directoryPath(meshRoot, sessionId), { force: true });
@@ -361,6 +364,8 @@ export async function publishDirectory(
 		if (!existsSync(record.sessionFile) || !existsSync(path)) {
 			throw new Error(`Session ${record.sessionId}: session file or enrollment record is missing`);
 		}
+		if (readDeletedRlmChildPaths(dirname(meshRoot)).has(canonicalSessionPath(record.sessionFile)))
+			throw new Error(`Session ${record.sessionId}: RLM child was deliberately deleted`);
 		writeFileAtomicSync(directoryPath(meshRoot, record.sessionId), `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 		return entry;
 	});

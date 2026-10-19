@@ -69,6 +69,28 @@ supervisorPrototype.persistWorker = function (worker) {
 		);
 	}
 };
+// Expose the existing runtime-host legacy delete boundary without a new worker command.
+const daemonStartPrototype = AgentDaemon.prototype as unknown as {
+	start(): Promise<void>;
+	sessions: Map<string, { runtime: { session: { sessionId: string } } }>;
+	createSubagentRuntimeHost(parent: unknown): { deleteRlmSubagentRuntime(id: string): Promise<void> };
+};
+const daemonStart = daemonStartPrototype.start;
+daemonStartPrototype.start = async function () {
+	process.on("SIGUSR1", () => {
+		const input = JSON.parse(readFileSync(join(agentDir, "legacy-delete.json"), "utf8")) as {
+			parent: string;
+			child: string;
+		};
+		const parent = [...this.sessions.values()].find((state) => state.runtime.session.sessionId === input.parent);
+		if (!parent) throw new Error("Legacy delete parent missing");
+		void this.createSubagentRuntimeHost(parent)
+			.deleteRlmSubagentRuntime(input.child)
+			.then(() => signal("legacy-deleted"));
+	});
+	await daemonStart.call(this);
+};
+
 const mailbox = join(agentDir, "mailbox");
 let releaseDelivery!: () => void;
 const deliveryReady = new Promise<void>((resolveReady) => {
@@ -98,14 +120,22 @@ const response: FauxResponseFactory = async (_context, options) => {
 	if (existsSync(path)) {
 		writeFileAtomicSync(join(agentDir, "turn-held"), "held");
 		await new Promise<void>((resolve) => {
+			let watcher: ReturnType<typeof watch> | undefined;
 			const finish = () => {
-				watcher.close();
+				watcher?.close();
 				options?.signal?.removeEventListener("abort", finish);
 				resolve();
 			};
-			const watcher = watch(agentDir, () => {
-				if (!existsSync(path)) finish();
-			});
+			try {
+				// macOS can deliver directory FSEvents late; a file watch reports its deletion.
+				watcher = watch(path, () => {
+					if (!existsSync(path)) finish();
+				});
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT" || existsSync(path)) throw error;
+				resolve();
+				return;
+			}
 			options?.signal?.addEventListener("abort", finish, { once: true });
 			if (options?.signal?.aborted || !existsSync(path)) finish();
 		});
@@ -331,7 +361,7 @@ else {
 		defaultSessionConfig: {
 			agentDir,
 			cwd: process.argv[3],
-			sessionDir: join(agentDir, "sessions"),
+			sessionDir: process.env.PRIME_MESH_TEST_SESSION_DIR ?? join(agentDir, "sessions"),
 			provider: "faux",
 			model: "mesh-faux",
 			noTools: true,

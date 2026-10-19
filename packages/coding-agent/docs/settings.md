@@ -380,11 +380,20 @@ Normally the package manager's global modules location is queried using `root -g
 
 `agentMessageTransport` is a global-only, experimental setting. It defaults to
 `"native"`; set it to `"cotal"` to opt in to durable mesh agent messages.
-Project settings cannot enable it. Restart the daemon after changing it.
+Project settings cannot enable it. Activation needs operator approval; after approval,
+run `prime-agent restart` after changing it.
 Cotal mode requires `mesh/mesh.json` and the private `mesh/signer.json` in the
 agent home directory. Use `prime-agent mesh install` to set them up on macOS.
 Missing or invalid mesh files refuse mesh messages; they do not fall back to native delivery.
-See [Mesh agent messaging](daemon.md#mesh-agent-messaging) for limits and rollback.
+Install and doctor require Cotal CLI 0.79.0. `--mesh-home` is test-only.
+To roll back, set `"agentMessageTransport": "native"` and run `prime-agent restart`.
+Stored mesh messages wait on the broker; native mode does not deliver them.
+
+A deliberately deleted RLM child's retained transcript cannot re-enroll on reopen,
+so it cannot send or receive agent messages in Cotal mode. A bad committed ledger
+blocks new enrollment and publication agent-wide, including top-level sessions.
+See [Mesh agent messaging](daemon.md#mesh-agent-messaging) for claim restrictions,
+missing-file behavior, locked replay cost and safe ledger recovery.
 
 ### Daemon
 
@@ -392,7 +401,7 @@ See [Mesh agent messaging](daemon.md#mesh-agent-messaging) for limits and rollba
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
 | `autoReload` | `"off"` or `"idle"` | `"off"` | Reload changed runtime files when daemon sessions are idle. |
-| `agentMessageTransport` | `"native"` or `"cotal"` | `"native"` | Global-only agent message transport. Restart the daemon after changing it. |
+| `agentMessageTransport` | `"native"` or `"cotal"` | `"native"` | Global-only agent message transport. Run `prime-agent restart` after changing it. |
 
 `autoReload` reads only global settings; project settings and SDK overrides cannot enable it.
 The daemon reads the file every 15 seconds, so changing this setting needs no `/reload`.

@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { CotalEndpoint, createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +31,7 @@ import {
 	createAgentMessageHostHandlers,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
+import { AgentSession } from "../src/core/agent-session.js";
 import {
 	AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
@@ -39,6 +40,7 @@ import {
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { convertToLlm } from "../src/core/messages.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
@@ -70,6 +72,7 @@ import {
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
@@ -4442,6 +4445,374 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it.each([false, true])("AC-35 shares admission across supervisor sockets (reject: %s)", async (reject) => {
+		const h = harness();
+		await h.authenticate("cotal");
+		const live = await createHarness({ persistSession: true });
+		const fence = createDeferred();
+		const entered = createDeferred();
+		const observed = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.sessionManager.flushNow();
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const accepting = originalAccept(text, options);
+			entered.resolve();
+			return accepting;
+		});
+		const onPersist = live.sessionManager.onPersist.bind(live.sessionManager);
+		let observers = 0;
+		const persist = vi.spyOn(live.sessionManager, "onPersist").mockImplementation((listener) => {
+			const off = onPersist(listener);
+			if (++observers === 3) observed.resolve(); // Session custody plus both attempt observers.
+			return off;
+		});
+		const secondWrites: Buffer[] = [];
+		const persistedOnDisk: boolean[] = [];
+		const secondSocket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			end: vi.fn(),
+			write: (data: Buffer) => {
+				secondWrites.push(data);
+				if (decodeSecond().at(-1)?.type === "agent_message_persisted")
+					persistedOnDisk.push(readFileSync(live.session.sessionFile!, "utf8").includes("agentmsg_overlap"));
+				return true;
+			},
+		});
+		const secondClient = { ...h.client, authenticated: false, socket: secondSocket } as unknown as DaemonSocketClient;
+		const decodeSecond = () =>
+			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(secondWrites))
+				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+		const command = {
+			type: "worker_deliver_message",
+			targetActiveSessionId: "target",
+			message: "one entry",
+			sender: { sessionName: "sender" },
+			cotal: { id: "overlap", deliveryCount: 1, attemptToken: "S1" },
+		} as const;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		let second: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			expect(live.session.hasPendingAdmissionWaiters).toBe(true);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			await h.internals.handleLine(
+				secondClient,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "second",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "cotal",
+				}),
+			);
+			expect(decodeSecond().at(-1)).toMatchObject({ command: "worker_auth", success: true });
+			second = h.internals.receiveMeshMessage(secondClient, {
+				...command,
+				cotal: { ...command.cotal, deliveryCount: 2, attemptToken: "S2" },
+			});
+			void second.catch(() => undefined);
+			await observed.promise;
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(live.session.getSessionActionSnapshot().queuedCount).toBe(0);
+			expect(decodeSecond().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+			Object.assign(h.internals, { agentMessagesPaused: reject });
+			live.setResponses([fauxAssistantMessage("done")]);
+			fence.resolve();
+			if (reject) {
+				await expect(first).rejects.toThrow("Agent messaging is paused");
+				await expect(second).rejects.toThrow("Agent messaging is paused");
+				expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+				expect(persistedOnDisk).toEqual([]);
+				Object.assign(h.internals, { agentMessagesPaused: false });
+				await h.internals.receiveMeshMessage(secondClient, {
+					...command,
+					cotal: { ...command.cotal, attemptToken: "fresh" },
+				});
+			} else await Promise.all([first, second]);
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_overlap");
+			live.sessionManager.flushNow();
+			expect(accept).toHaveBeenCalledTimes(reject ? 2 : 1);
+			expect(
+				live.session.messages.filter(
+					(message) => message.role === "custom" && message.customType === "agent_message",
+				),
+			).toHaveLength(1);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+			).toHaveLength(1);
+			expect(readFileSync(live.session.sessionFile!, "utf8").split('"id":"agentmsg_overlap"')).toHaveLength(2);
+			expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+			expect(decodeSecond().filter((frame) => frame.type === "agent_message_persisted")).toEqual([
+				{ type: "agent_message_persisted", cotalId: "overlap", attemptToken: reject ? "fresh" : "S2" },
+			]);
+			expect(persistedOnDisk).toEqual([true]);
+		} finally {
+			fence.resolve();
+			await Promise.allSettled([first, second]);
+			accept.mockRestore();
+			persist.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["pending", "queued"] as const)(
+		"AC-35 keeps disconnected %s custody across a current-file replacement",
+		async (phase) => {
+			const workEntered = createDeferred();
+			const releaseWork = createDeferred();
+			const admissionEntered = createDeferred();
+			const shutdownStarted = createDeferred();
+			const releaseShutdown = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				extensionFactories: [
+					(pi) => {
+						pi.on("input", async (event) => {
+							if (event.text !== "hold-input") return;
+							workEntered.resolve();
+							await releaseWork.promise;
+							return { action: "handled" };
+						});
+						pi.on("session_shutdown", async (event) => {
+							if (event.reason !== "resume") return;
+							shutdownStarted.resolve();
+							await releaseShutdown.promise;
+						});
+					},
+				],
+				tools: [
+					{
+						name: "hold",
+						label: "Hold",
+						description: "Hold the current turn",
+						parameters: Type.Object({}),
+						execute: async () => {
+							workEntered.resolve();
+							await releaseWork.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			live.setResponses([fauxAssistantMessage("persisted")]);
+			await live.session.prompt("seed");
+			const factory: CreateAgentSessionRuntimeFactory = async (options) =>
+				({
+					session: new AgentSession({
+						agent: new Agent({
+							getApiKey: () => "faux-key",
+							initialState: {
+								model: live.getModel(),
+								systemPrompt: "Test",
+								messages: options.sessionManager.buildSessionContext().messages,
+							},
+							convertToLlm,
+						}),
+						sessionManager: options.sessionManager,
+						settingsManager: live.settingsManager,
+						cwd: live.tempDir,
+						modelRegistry: live.session.modelRegistry,
+						resourceLoader: live.session.resourceLoader,
+					}),
+					services: { cwd: live.tempDir, agentDir: live.tempDir },
+					diagnostics: [],
+				}) as never;
+			const h = harness(factory);
+			await h.authenticate("cotal");
+			const runtime = new AgentSessionRuntime(
+				live.session,
+				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				factory,
+			);
+			const state = await (
+				h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
+			).addRuntime(runtime);
+			const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+			let admissionCommitted: (() => void) | undefined;
+			const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+				admissionCommitted = options?.admissionCommitted;
+				const accepting = originalAccept(text, options);
+				admissionEntered.resolve();
+				return accepting;
+			});
+			const drain = vi.spyOn(live.session, "prepareAgentMessageReplacement");
+			const brokerMocks = (["start", "stop", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map(
+				(method) => vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			);
+			const secondWrites: Buffer[] = [];
+			const secondSocket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				end: vi.fn(),
+				write: (data: Buffer) => {
+					secondWrites.push(data);
+					return true;
+				},
+			});
+			const secondClient = {
+				...h.client,
+				authenticated: false,
+				socket: secondSocket,
+			} as unknown as DaemonSocketClient;
+			let mesh: MeshEndpoints | undefined;
+			let control: Promise<void> | undefined;
+			let receiving: Promise<void> | undefined;
+			let replacing: Promise<unknown> | undefined;
+			try {
+				const meshRoot = join(live.tempDir, "mesh");
+				mkdirSync(meshRoot);
+				writeFileSync(
+					join(meshRoot, "mesh.json"),
+					JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }),
+				);
+				writeFileSync(
+					join(meshRoot, "signer.json"),
+					JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))),
+					{ mode: 0o600 },
+				);
+				mesh = new MeshEndpoints({
+					meshRoot,
+					homeSocket: join(live.tempDir, "mesh.sock"),
+					handoff: vi.fn(),
+					log: vi.fn(),
+				});
+				await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+				Object.assign(h.internals, {
+					meshReplacementOffered: true,
+					supervisorLink: () => ({
+						request: async (command: Extract<DaemonCommand, { type: "mesh_replace" }>) => {
+							if (command.phase === "begin") {
+								const token = await mesh!.beginReplacement(command.sessionId, secondClient, command.token);
+								return { success: true, data: { required: token !== undefined, token } };
+							}
+							await mesh!.finishReplacement(
+								command.sessionId,
+								command.token,
+								command.phase,
+								command.sessionFile,
+							);
+							return { success: true, data: { outcome: command.phase } };
+						},
+					}),
+				});
+				live.setResponses([
+					fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+					fauxAssistantMessage("control done"),
+					fauxAssistantMessage("message done"),
+				]);
+				control = live.session.prompt(phase === "pending" ? "hold-input" : "hold-tool");
+				void control.catch(() => undefined);
+				await workEntered.promise;
+				const command = {
+					type: "worker_deliver_message",
+					targetActiveSessionId: state.activeSessionId,
+					message: "one entry",
+					sender: { sessionName: "sender" },
+					cotal: { id: "custody", deliveryCount: 1, attemptToken: "S1" },
+				} as const;
+				receiving = h.internals.receiveMeshMessage(h.client, command);
+				void receiving.catch(() => undefined);
+				await admissionEntered.promise;
+				if (phase === "queued") {
+					await receiving;
+					expect(live.session.hasQueuedAgentMessage("agentmsg_custody")).toBe(true);
+				} else expect(live.session.hasPendingAdmissionWaiters).toBe(true);
+				const completion = live.session
+					.waitForAgentMessagePromptCompletion("agentmsg_custody")
+					.catch(() => undefined);
+				h.socket.destroyed = true;
+				h.socket.emit("close");
+				await h.internals.handleLine(
+					secondClient,
+					JSON.stringify({
+						type: "worker_auth",
+						token: "token",
+						supervisorGeneration: "second",
+						supervisorPid: process.pid,
+						supervisorSocketPath: join(h.root, "supervisor.sock"),
+						agentMessageTransport: "cotal",
+						capabilities: [DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY],
+					}),
+				);
+				replacing = runtime.switchSession(live.session.sessionFile!);
+				await Promise.race([
+					shutdownStarted.promise, // The replacement manager already opened the current file.
+					replacing.then(() => {
+						throw new Error("Replacement completed before held shutdown");
+					}),
+				]);
+				expect(admissionCommitted).toBeTypeOf("function");
+				expect(() => admissionCommitted!()).toThrow("Mesh session is held for replacement");
+				releaseWork.resolve();
+				await Promise.allSettled([control, receiving]);
+				await completion;
+				releaseShutdown.resolve();
+				await replacing;
+				live.setResponses([fauxAssistantMessage("redelivery done")]);
+				await h.internals.receiveMeshMessage(secondClient, {
+					...command,
+					cotal: { ...command.cotal, deliveryCount: 2, attemptToken: "S2" },
+				});
+				await runtime.session.waitForAgentMessagePromptCompletion("agentmsg_custody");
+				runtime.session.sessionManager.flushNow();
+				const file = runtime.session.sessionFile!;
+				const diskEntries = readFileSync(file, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(
+					diskEntries.filter(
+						(entry) =>
+							entry.type === "custom_message" &&
+							entry.customType === "agent_message" &&
+							entry.details?.id === "agentmsg_custody",
+					),
+				).toHaveLength(1);
+				expect(
+					SessionManager.open(file)
+						.getEntries()
+						.filter(
+							(entry) =>
+								entry.type === "custom_message" &&
+								(entry.details as { id?: string })?.id === "agentmsg_custody",
+						),
+				).toHaveLength(1);
+				expect(drain.mock.calls[0]![0]).toContain("agentmsg_custody");
+				const release = await runtime.session.prepareAgentMessageReplacement(
+					["agentmsg_custody"],
+					new AbortController().signal,
+				);
+				release(); // An ID already on disk must not keep the drain waiting.
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+				const secondFrames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+					.push(Buffer.concat(secondWrites))
+					.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+				expect(secondFrames.filter((frame) => frame.type === "agent_message_persisted")).toEqual([
+					{ type: "agent_message_persisted", cotalId: "custody", attemptToken: "S2" },
+				]);
+			} finally {
+				releaseWork.resolve();
+				releaseShutdown.resolve();
+				await Promise.allSettled([control, receiving, replacing]);
+				await mesh?.stop();
+				await runtime.dispose();
+				accept.mockRestore();
+				drain.mockRestore();
+				live.cleanup();
+				for (const mock of brokerMocks) mock.mockRestore();
+			}
+		},
+	);
+
 	it("drains a late started message before switching to the current enrolled file", async () => {
 		const messageStarted = createDeferred();
 		const releaseMessage = createDeferred();
@@ -5651,9 +6022,10 @@ describe("mesh worker persistence", () => {
 		expect(() => manager.appendSessionInfo("holder-newer")).toThrow("name append failed");
 		if (mode !== "pending") writeFileSync(manager.getSessionFile()!, "null\nprivate-json-fragment");
 		const log = vi.spyOn(h.internals as unknown as { log(message: string): void }, "log");
+		const disposeCallbacks = new Set<() => void | Promise<void>>();
 		let accepted!: AgentSessionMessage;
 		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
-			expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
+			expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(2);
 			accepted = options.customMessage;
 		});
 		const state = makeState("target");
@@ -5666,7 +6038,10 @@ describe("mesh worker persistence", () => {
 				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
 				rejectAgentMessagePrompt: () => undefined,
 				hasQueuedAgentMessage: () => false,
-				registerDisposeCallback: () => () => undefined,
+				registerDisposeCallback: (callback: () => void | Promise<void>) => {
+					disposeCallbacks.add(callback);
+					return () => disposeCallbacks.delete(callback);
+				},
 			}),
 		} as unknown as ActiveSessionState["runtime"];
 		h.internals.sessions.set("target", state);
@@ -5713,7 +6088,7 @@ describe("mesh worker persistence", () => {
 		await h.internals.receiveMeshMessage(h.client, command);
 		expect(accept).toHaveBeenCalledTimes(1);
 		expect(h.frames()[3]).toEqual({ type: "agent_message_persisted", cotalId: "stable", attemptToken: "attempt" });
-		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
 		accept.mockRejectedValueOnce(new Error("accept failed"));
 		await expect(
 			h.internals.receiveMeshMessage(h.client, {
@@ -5721,15 +6096,17 @@ describe("mesh worker persistence", () => {
 				cotal: { id: "error", deliveryCount: 1, attemptToken: "attempt" },
 			}),
 		).rejects.toThrow("accept failed");
-		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
 		await h.internals.receiveMeshMessage(h.client, {
 			...command,
 			cotal: { id: "closed", deliveryCount: 1, attemptToken: "attempt" },
 		});
 		const count = h.frames().length;
 		h.socket.emit("close");
-		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(1);
 		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
 		expect(h.frames()).toHaveLength(count);
+		for (const dispose of disposeCallbacks) await dispose();
+		expect((manager as unknown as { persistListeners: Set<unknown> }).persistListeners.size).toBe(0);
 	});
 });

@@ -135,6 +135,31 @@ function requireSuccess(result: ToolResult, step: string): void {
 	if (result.code !== 0) throw new Error(`${step} failed (exit ${result.code})`);
 }
 
+const REQUIRED_COTAL_VERSION = "0.79.0";
+
+async function readCotalVersion(cotal: string, options: MeshOptions): Promise<string> {
+	try {
+		const result = await runTool(cotal, ["--version"], { ...options, meshHome: homedir() });
+		requireSuccess(result, "cotal --version");
+		const version = /^cotal-ai (\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?)$/.exec(
+			result.stdout.split(/\r?\n/, 1)[0] ?? "",
+		)?.[1];
+		if (!version) throw new Error("unrecognized cotal-ai version header");
+		return version;
+	} catch (error) {
+		throw new Error(
+			`Cannot read cotal CLI version: ${error instanceof Error ? error.message : String(error)}; required ${REQUIRED_COTAL_VERSION}`,
+			{ cause: error },
+		);
+	}
+}
+
+async function requireCotalVersion(cotal: string, options: MeshOptions): Promise<void> {
+	const version = await readCotalVersion(cotal, options);
+	if (version !== REQUIRED_COTAL_VERSION)
+		throw new Error(`cotal CLI version ${version}; required ${REQUIRED_COTAL_VERSION}`);
+}
+
 function xml(value: string): string {
 	return value
 		.replaceAll("&", "&amp;")
@@ -250,6 +275,7 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 	if (loaded.code !== 113) requireSuccess(loaded, "launchctl print");
 	await assertFreePort(options.port);
 	const cotal = await executable("cotal");
+	await requireCotalVersion(cotal, options);
 	const created = await mkdir(options.meshHome, { recursive: true, mode: 0o700 });
 	if (created) await chmod(options.meshHome, 0o700);
 	else {
@@ -364,6 +390,13 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	if (!existsSync(join(options.meshHome, ".cotal")))
 		throw new Error("Mesh home has no .cotal directory; install it first");
 	const cotal = await executable("cotal");
+	let versionUnavailable = false;
+	try {
+		console.log(`Cotal CLI: ${await readCotalVersion(cotal, options)}`);
+	} catch (error) {
+		console.log(error instanceof Error ? error.message : "Cannot read cotal CLI version");
+		versionUnavailable = true;
+	}
 	const config = await readJson(join(options.meshHome, "mesh.json"));
 	if (
 		!config ||
@@ -457,6 +490,7 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	}
 	if (job && job.code !== 0) throw new Error("Mesh launchd service is absent or inaccessible");
 	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
+	if (versionUnavailable) throw new Error("Mesh CLI version is unavailable");
 }
 
 export async function runMeshCommand(args: readonly string[], runtime: MeshRuntime = defaultRuntime): Promise<void> {
@@ -470,6 +504,7 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = `gui/${process.getuid?.()}/${options.label}`;
 		if (command === "status" || command === "doctor") {
+			if (command === "doctor") await requireCotalVersion(await executable("cotal"), options);
 			await status(options, launchctl, target);
 			if (command === "doctor") {
 				const auth = await runTool(await executable("cotal"), ["doctor", "auth"], options);
