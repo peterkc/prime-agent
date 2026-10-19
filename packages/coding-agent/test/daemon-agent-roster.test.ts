@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { deleteSessionFile } from "../src/core/session-file-actions.js";
 import {
 	acquireSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -1855,6 +1856,45 @@ describe("worker delete tombstone durability", () => {
 			rosterReporter: { removedAgentIds: Map<string, string | undefined> };
 		};
 	}
+
+	it.each(["supervisor", "worker"])(
+		"refuses a saved-parent delete with a leased artifact child (%s)",
+		async (route) => {
+			vi.stubEnv("PATH", "");
+			const { directory, sessionsDir, supervisor } = makeOfflineSupervisor("prime-parent-delete-lease-");
+			const parent = SessionManager.create(directory, sessionsDir);
+			parent.appendMessage({ role: "user", content: "parent", timestamp: 1 });
+			parent.flushNow();
+			const sessionPath = parent.getSessionFile()!;
+			const childPath = join(parent.getSessionArtifactDir()!, "nested", "child.jsonl");
+			mkdirSync(dirname(childPath), { recursive: true });
+			writeFileSync(childPath, `${JSON.stringify({ type: "session", id: "child" })}\n`);
+			const files = [sessionPath, childPath];
+			const before = files.map((path) => readFileSync(path));
+			const remove = async (path: string) => {
+				expect(() => acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" })).toThrow();
+				return deleteSessionFile(path);
+			};
+			Object.assign(supervisor, { catalog: { delete: remove } });
+			const daemon = makeDeleteDaemon(directory, async () => []);
+			Object.assign(daemon, { deleteSavedSessionFile: remove });
+			const handler = route === "supervisor" ? supervisor : daemon;
+			const held = acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+			try {
+				await expect(
+					handler.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath }),
+				).rejects.toThrow(
+					`Cannot delete session ${realpathSync(childPath)}: it is open in another session or process. Close it there first.`,
+				);
+				for (const [index, path] of files.entries()) expect(readFileSync(path)).toEqual(before[index]);
+				acquireSessionLease(sessionPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" })?.release();
+			} finally {
+				held?.release();
+			}
+			await handler.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath });
+			for (const path of files) expect(existsSync(path)).toBe(false);
+		},
+	);
 
 	it("deletes a top-level saved session without touching the spawn ledger", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-toplevel-delete-"));

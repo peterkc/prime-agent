@@ -107,7 +107,11 @@ import {
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
-import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
+import {
+	acquireSessionDeleteLeases,
+	deleteSessionArtifacts,
+	deleteSessionFile,
+} from "../../core/session-file-actions.js";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
@@ -4551,11 +4555,9 @@ export class AgentDaemon {
 					throw new Error("Cannot delete the currently active session");
 				}
 				const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
-				let deleteLease: SessionLease | undefined;
+				let deleteLease: ReturnType<typeof acquireSessionDeleteLeases> | undefined;
 				try {
-					deleteLease = acquireSessionLease(command.sessionPath, this.agentDir, {
-						[SESSION_LEASES_ENABLED_ENV]: "1",
-					});
+					deleteLease = acquireSessionDeleteLeases(command.sessionPath, this.agentDir);
 				} catch (error) {
 					if (error instanceof SessionAlreadyActiveError) {
 						throw new Error(

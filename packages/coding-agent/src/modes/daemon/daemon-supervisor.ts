@@ -51,13 +51,12 @@ import {
 	type IdleEvictionMinutes,
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
+import { acquireSessionDeleteLeases } from "../../core/session-file-actions.js";
 import {
-	acquireSessionLease,
 	canonicalSessionPath,
 	findLiveSessionCopy,
 	getProcessStartId,
 	SessionAlreadyActiveError,
-	type SessionLease,
 } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
@@ -2885,11 +2884,9 @@ export class DaemonSupervisor {
 					}
 					const agentDir = this.defaultSessionConfig.agentDir;
 					if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
-					let deleteLease: SessionLease | undefined;
+					let deleteLease: ReturnType<typeof acquireSessionDeleteLeases> | undefined;
 					try {
-						deleteLease = acquireSessionLease(command.sessionPath, agentDir, {
-							[SESSION_LEASES_ENABLED_ENV]: "1",
-						});
+						deleteLease = acquireSessionDeleteLeases(command.sessionPath, agentDir);
 					} catch (error) {
 						if (error instanceof SessionAlreadyActiveError) {
 							throw new Error(
