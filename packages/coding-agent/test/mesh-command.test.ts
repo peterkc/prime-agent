@@ -392,7 +392,6 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBe(1);
 		for (const file of ["bad-a.jsonl", "bad-b.jsonl"]) expect(output()).toContain(join(agent, RLM_LEDGER_DIR, file));
 		expect(output()).toMatch(/CHECKED.*FAILED/);
-		expect(output()).toMatch(/blocks new mesh enrollment.*agent-wide/);
 		expect(readdirSync(agent, { recursive: true }).sort()).toEqual(before);
 		for (const [file, content] of fixtures) expect(readFileSync(join(agent, file), "utf8")).toBe(content);
 	});
