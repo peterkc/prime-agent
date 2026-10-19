@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { execFileSyncHidden, isProcessAlive } from "../utils/child-process.js";
+import { readFirstLineSync } from "../utils/file-lines.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 export const SESSION_LEASE_OWNER_ID_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
@@ -293,6 +303,59 @@ function reclaimStaleLease(directory: string): boolean {
 		// The quarantined directory no longer owns the lease path.
 	}
 	return true;
+}
+
+function readPersistedSessionId(sessionPath: string): string {
+	const header = JSON.parse(readFirstLineSync(sessionPath) ?? "null") as { type?: unknown; id?: unknown } | null;
+	if (header?.type !== "session" || typeof header.id !== "string" || header.id.length === 0) {
+		throw new Error(`Invalid session header: ${sessionPath}`);
+	}
+	return header.id;
+}
+
+/** A snapshot check, not a reservation: another owner can start after this returns. */
+export function findLiveSessionCopy(
+	sessionPath: string,
+	agentDir: string,
+	onSkippedLease: (path: string) => void,
+): string | undefined {
+	const targetPath = canonicalSessionPath(sessionPath);
+	let sessionId: string;
+	try {
+		sessionId = readPersistedSessionId(targetPath);
+	} catch {
+		onSkippedLease(targetPath);
+		return undefined;
+	}
+
+	const root = join(agentDir, "session-leases");
+	let entries: string[];
+	try {
+		entries = readdirSync(root);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") onSkippedLease(root);
+		return undefined;
+	}
+
+	for (const entry of entries) {
+		if (!entry.endsWith(".lock")) continue;
+		const directory = join(root, entry);
+		try {
+			const owner = readLeaseOwner(directory);
+			if (owner === "absent") continue;
+			if (owner === "unreadable") {
+				onSkippedLease(directory);
+				continue;
+			}
+			const ownerPath = canonicalSessionPath(owner.sessionPath);
+			if (ownerPath === targetPath || !isLeaseOwnerAlive(owner)) continue;
+			if (readPersistedSessionId(ownerPath) === sessionId) return ownerPath;
+		} catch {
+			// Unattributable records must not block unrelated saved-session wakes or be reclaimed.
+			onSkippedLease(directory);
+		}
+	}
+	return undefined;
 }
 
 export function acquireSessionLease(

@@ -85,6 +85,7 @@ Every persisted session is protected by a process-safe lease keyed by canonical 
 - Concurrent creates for the same path converge on one worker launch.
 
 This prevents daemon workers and one-shot clients from writing the same transcript concurrently.
+Native agent-message wakes also refuse a saved copy when a lease snapshot finds the same session ID live at another canonical path.
 
 ## Mesh Agent Messaging
 
