@@ -13,10 +13,15 @@ import {
 import { tmpdir } from "node:os";
 
 const linkFailure = vi.hoisted(() => ({ code: undefined as string | undefined }));
+const openFailure = vi.hoisted(() => ({ path: undefined as string | undefined }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
 		...actual,
+		openSync: (...args: Parameters<typeof actual.openSync>) => {
+			if (args[0] === openFailure.path) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			return actual.openSync(...args);
+		},
 		linkSync: (
 			existingPath: Parameters<typeof actual.linkSync>[0],
 			newPath: Parameters<typeof actual.linkSync>[1],
@@ -93,7 +98,7 @@ describe("rlm spawn ledger", () => {
 				["torn.jsonl", `${record}{broken`, undefined, undefined],
 			] as const;
 			for (const [name, bytes] of entries) writeFileSync(join(directory, name), bytes);
-			chmodSync(join(directory, "unreadable.jsonl"), 0);
+			openFailure.path = join(directory, "unreadable.jsonl");
 			const failures = readRlmLedgerHealth(root);
 			const bad = entries.slice(0, -1);
 			expect(failures).toHaveLength(bad.length);
@@ -101,12 +106,13 @@ describe("rlm spawn ledger", () => {
 				expect(failures).toContainEqual(
 					expect.objectContaining({ path: join(directory, name), cause: expect.stringMatching(cause!), line }),
 				);
-			chmodSync(join(directory, "unreadable.jsonl"), 0o600);
+			openFailure.path = undefined;
 			for (const [name, bytes] of entries) expect(readFileSync(join(directory, name), "utf8")).toBe(bytes);
 			rmSync(directory, { recursive: true });
 			writeFileSync(directory, "not a directory");
 			expect(readRlmLedgerHealth(root)).toEqual([{ path: directory, cause: expect.stringMatching(/ENOTDIR/) }]);
 		} finally {
+			openFailure.path = undefined;
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
