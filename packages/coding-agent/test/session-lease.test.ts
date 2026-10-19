@@ -41,6 +41,7 @@ describe("session leases", () => {
 		["live", process.pid, false, "valid", true],
 		["dead", 2_147_483_647, false, "valid", false],
 		["same path", process.pid, true, "valid", false],
+		["unwritten file", process.pid, false, "unwritten", false],
 		["unreadable owner", process.pid, false, "owner", false],
 		["unreadable header", process.pid, false, "header", false],
 		["different ID", process.pid, false, "different", false],
@@ -55,6 +56,7 @@ describe("session leases", () => {
 				? "unreadable"
 				: `${JSON.stringify({ type: "session", id: kind === "different" ? "U" : "T" })}\n`,
 		);
+		if (kind === "unwritten") rmSync(other);
 		const key = createHash("sha256").update(canonicalSessionPath(other)).digest("hex");
 		const directory = join(agentDir, "session-leases", `${key}.lock`);
 		mkdirSync(directory, { recursive: true });

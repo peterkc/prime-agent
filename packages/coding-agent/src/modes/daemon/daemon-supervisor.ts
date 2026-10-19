@@ -2996,6 +2996,14 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
+				if (source && command.agentOrigin === true) {
+					const targetInfo = await readSessionInfo(sessionPath);
+					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+					assertAgentFamilyReach(
+						this.familyCatalogEntry(source.summary),
+						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+					);
+				}
 				if (command.agentOrigin === true) {
 					const liveCopy = findLiveSessionCopy(sessionPath, this.defaultSessionConfig.agentDir!, (path) =>
 						this.log(`Native message ownership check skipped unreadable lease: ${path}`),
@@ -3005,14 +3013,6 @@ export class DaemonSupervisor {
 							`Message was not stored: target is live in another daemon at ${liveCopy}; open it there or use mesh messaging`,
 						);
 					}
-				}
-				if (source && command.agentOrigin === true) {
-					const targetInfo = await readSessionInfo(sessionPath);
-					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
-					assertAgentFamilyReach(
-						this.familyCatalogEntry(source.summary),
-						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
-					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
 					type: "create",

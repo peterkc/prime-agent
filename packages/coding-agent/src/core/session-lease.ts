@@ -348,9 +348,11 @@ export function findLiveSessionCopy(
 				continue;
 			}
 			const ownerPath = canonicalSessionPath(owner.sessionPath);
-			if (ownerPath === targetPath || !isLeaseOwnerAlive(owner)) continue;
-			if (readPersistedSessionId(ownerPath) === sessionId) return ownerPath;
-		} catch {
+			if (ownerPath === targetPath) continue;
+			if (readPersistedSessionId(ownerPath) !== sessionId) continue;
+			if (isLeaseOwnerAlive(owner)) return ownerPath;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 			// Unattributable records must not block unrelated saved-session wakes or be reclaimed.
 			onSkippedLease(directory);
 		}
