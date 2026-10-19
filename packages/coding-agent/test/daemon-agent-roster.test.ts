@@ -1867,7 +1867,7 @@ describe("worker delete tombstone durability", () => {
 		};
 	}
 
-	it.each(["supervisor", "worker", "artifact-filter", "symlink"])(
+	it.each(["supervisor", "worker", "artifact-filter", "symlink", "loop"])(
 		"refuses a saved-parent delete with a leased artifact child (%s)",
 		async (route) => {
 			vi.stubEnv("PATH", "");
@@ -1885,6 +1885,7 @@ describe("worker delete tombstone durability", () => {
 				symlinkSync(target, childPath);
 				symlinkSync(sessionPath, join(dirname(childPath), "root-alias.jsonl"));
 			}
+			if (route === "loop") symlinkSync("loop", join(dirname(childPath), "loop"));
 			const plain = join(dirname(childPath), "notes.txt");
 			writeFileSync(plain, "scratch file\n");
 			const files = [sessionPath, childPath, plain];

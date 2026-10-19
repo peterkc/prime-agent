@@ -49,16 +49,16 @@ export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string
 					directories.push(path);
 					continue;
 				}
-				if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-				try {
-					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
-					if (!hasSessionLease(path, agentDir)) {
+				if (!hasSessionLease(path, agentDir)) {
+					if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+					try {
+						if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
 						const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
 						if (header?.type !== "session") continue;
+					} catch {
+						// No existing lease: a failed probe identifies no owner to protect.
+						continue;
 					}
-				} catch (error) {
-					if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") continue;
-					throw error;
 				}
 				acquire(path);
 			}
