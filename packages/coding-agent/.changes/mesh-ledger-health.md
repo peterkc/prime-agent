@@ -1,0 +1,1 @@
+- Added read-only RLM ledger health checks to mesh status and doctor, with all damaged paths and offline recovery guidance.

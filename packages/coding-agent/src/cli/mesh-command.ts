@@ -7,6 +7,7 @@ import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir } from "../config.js";
+import { readRlmLedgerHealth } from "../modes/daemon/rlm-ledger.js";
 
 type MeshCommand = "install" | "uninstall" | "start" | "stop" | "status" | "doctor";
 interface MeshOptions {
@@ -386,6 +387,23 @@ async function inboxConsumerCounts(meshHome: string, space: string): Promise<rea
 	return [0, 0];
 }
 
+function reportLedgerHealth(): boolean {
+	const failures = readRlmLedgerHealth(getAgentDir());
+	console.log(`RLM ledger health: CHECKED (${failures.length === 0 ? "healthy" : "FAILED"})`);
+	for (const failure of failures) {
+		const line = failure.line === undefined ? "" : ` (line ${failure.line})`;
+		console.log(`  ${failure.path}${line}: ${failure.cause}`);
+	}
+	if (failures.length === 0) return false;
+	console.log("Every listed failure blocks new mesh enrollment agent-wide.");
+	console.log("Recovery (offline): stop ALL writers, including workers that can outlive a supervisor restart.");
+	console.log(
+		"Back up each listed path. Restore committed data only from a trusted backup, or remove only an uncommitted unterminated tail.",
+	);
+	console.log("Do not hand-edit committed records. Restart writers after recovery.");
+	return true;
+}
+
 async function status(options: MeshOptions, launchctl: string | undefined, target: string): Promise<void> {
 	if (!existsSync(join(options.meshHome, ".cotal")))
 		throw new Error("Mesh home has no .cotal directory; install it first");
@@ -501,16 +519,22 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		if (runtime.platform !== "darwin" && command !== "status" && command !== "doctor") {
 			throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);
 		}
+		let ledgerUnhealthy = false;
+		if (command === "status") ledgerUnhealthy = reportLedgerHealth();
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = `gui/${process.getuid?.()}/${options.label}`;
 		if (command === "status" || command === "doctor") {
-			if (command === "doctor") await requireCotalVersion(await executable("cotal"), options);
+			if (command === "doctor") {
+				await requireCotalVersion(await executable("cotal"), options);
+				ledgerUnhealthy = reportLedgerHealth();
+			}
 			await status(options, launchctl, target);
 			if (command === "doctor") {
 				const auth = await runTool(await executable("cotal"), ["doctor", "auth"], options);
 				requireSuccess(auth, "cotal doctor auth");
 				console.log("Auth: healthy");
 			}
+			if (ledgerUnhealthy) throw new Error("RLM ledger check failed; new mesh enrollment is blocked");
 			return;
 		}
 		if (!launchctl) throw new Error(`mesh ${command} is not supported on ${runtime.platform}`);

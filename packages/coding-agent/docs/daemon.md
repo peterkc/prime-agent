@@ -107,10 +107,13 @@ Install refuses an occupied label or port.
 If startup or signer creation fails, it removes the service and plist but keeps the home.
 
 - `prime-agent mesh start` and `stop` start or stop the installed service.
-- `prime-agent mesh status` reports the CLI version or its read failure, service state,
-  store bytes, service-log bytes, enrolled-session count, and each session's stored,
-  unacknowledged message count.
-- `prime-agent mesh doctor` also checks Cotal auth.
+- `prime-agent mesh status` first checks every RLM ledger locally, even without the
+  mesh home, broker or Cotal CLI. It then reports the CLI version or its read failure,
+  service state, store bytes, service-log bytes, enrolled-session count, and each
+  session's stored, unacknowledged message count.
+- `prime-agent mesh doctor` checks the exact CLI version first, then ledger and status
+  health, then Cotal auth. A failed version check still stops before ledger diagnosis;
+  use `mesh status` for that offline check. An unhealthy check sets exit code 1.
 - `prime-agent mesh uninstall` removes the service and plist, not the mesh home,
   signer, enrollment records or stored messages. Existing sessions need that auth.
 - Install, uninstall, start and stop refuse platforms other than macOS without changes.
@@ -205,14 +208,24 @@ session in that agent directory, including top-level sessions. Existing endpoint
 need not stop, but restarted sessions can be unavailable. The log names the file
 and cause. Failed reconciliation authorizes no removal of existing mesh state.
 
+`mesh status` and `mesh doctor` report every independently failing ledger, with its
+path, cause and parse line or read limit. `CHECKED` is a point-in-time read, not a
+promise that a later append stays healthy. The check uses the same committed-line
+parser and bounds as enrollment. An unterminated final line remains uncommitted and
+is ignored unless the file already exceeds the byte limit. Diagnosis changes no
+ledger, directory entry, enrollment record or inbox.
+
 **Warning:** Moving a ledger out of that directory removes its topology and deletion
 proof. Its deliberately deleted children can then re-enroll. Do not move it without
 accepting that loss of protection.
 
-To recover, back up the logged file first. Repair the reported read, format or size
-problem, or move the file outside the ledger directory after considering the warning.
-Then retry the session open or `prime-agent restart`. Prime does not repair or move
-ledgers automatically.
+To recover, stop all writers for that agent directory, including workers that can
+outlive a supervisor restart. Back up each exact reported file before changing it.
+Restore committed data only from a trusted backup, or remove only an uncommitted,
+unterminated tail. Do not hand-edit committed records. An older backup can omit later
+deletion records; check that loss of protection before restoring it. Correct file
+access if needed, then restart the writers and retry the session open. Prime does
+not repair, truncate, move or restore ledgers during diagnosis.
 
 A successful send returns `deliveryStatus: "stored"`, a stream sequence and a Cotal ID.
 This means the broker stored the message, not that the target wrote it. A delivery is

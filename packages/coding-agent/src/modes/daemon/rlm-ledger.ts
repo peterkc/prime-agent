@@ -288,6 +288,46 @@ function parseLedgerLine(line: string, index: number): RlmLedgerRecord | RlmLedg
 	}
 }
 
+export interface RlmLedgerFailure {
+	readonly path: string;
+	readonly cause: string;
+	readonly line?: number;
+}
+
+/** Point-in-time full reads, without seeding, repair, or deletion-cache changes. */
+export function readRlmLedgerHealth(agentDir: string): RlmLedgerFailure[] {
+	const directory = join(agentDir, RLM_LEDGER_DIR);
+	let files: string[];
+	try {
+		files = readdirSync(directory)
+			.filter((file) => file.endsWith(".jsonl"))
+			.sort();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		return [{ path: directory, cause: error instanceof Error ? error.message : String(error) }];
+	}
+	const failures: RlmLedgerFailure[] = [];
+	for (const file of files) {
+		const path = join(directory, file);
+		let line: number | undefined;
+		try {
+			const log = new EventLog(path, { maxBytes: RLM_LEDGER_MAX_BYTES, maxRecords: RLM_LEDGER_MAX_RECORDS });
+			log.replaySync(
+				(text, index) => {
+					line = index + 1;
+					const record = parseLedgerLine(text, index);
+					line = undefined;
+					return record;
+				},
+				{ missingFileThrows: true },
+			);
+		} catch (error) {
+			failures.push({ path, cause: error instanceof Error ? error.message : String(error), line });
+		}
+	}
+	return failures;
+}
+
 const deletedChildCache = new Map<string, { snapshot: string; paths: ReadonlySet<string> }>();
 
 /** Read committed deletion intent across all session folders, never joining records by childId. */
