@@ -108,7 +108,12 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	SessionAlreadyActiveError,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	loadEntriesFromFileAsync,
@@ -4546,29 +4551,45 @@ export class AgentDaemon {
 					throw new Error("Cannot delete the currently active session");
 				}
 				const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
-				const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
-					this.rlmSpawnLedger(),
-					command.sessionPath,
-					composedEntry?.summary,
-				);
-				const result = await this.deleteSavedSessionFile(command.sessionPath, {
-					afterFileRemoved: async () => {
-						await this.cancelScheduledJobsForSessionFile(command.sessionPath);
-					},
-				});
-				if (result.ok && this.options.worker) {
-					const removedAgentId =
-						composedEntry?.agentId ??
-						(ledgerEdge ? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent) : deletedInfo?.id);
-					if (removedAgentId) {
-						this.rosterReporter.removedAgentIds.set(
-							removedAgentId,
-							composedEntry?.summary.sessionId ?? deletedInfo?.id,
-						);
-						this.scheduleRosterFlush();
+				let deleteLease: SessionLease | undefined;
+				try {
+					deleteLease = acquireSessionLease(command.sessionPath, this.agentDir, {
+						...process.env,
+						[SESSION_LEASES_ENABLED_ENV]: "1",
+					});
+					const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
+						this.rlmSpawnLedger(),
+						command.sessionPath,
+						composedEntry?.summary,
+					);
+					const result = await this.deleteSavedSessionFile(command.sessionPath, {
+						afterFileRemoved: async () => {
+							await this.cancelScheduledJobsForSessionFile(command.sessionPath);
+						},
+					});
+					if (result.ok && this.options.worker) {
+						const removedAgentId =
+							composedEntry?.agentId ??
+							(ledgerEdge
+								? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent)
+								: deletedInfo?.id);
+						if (removedAgentId) {
+							this.rosterReporter.removedAgentIds.set(
+								removedAgentId,
+								composedEntry?.summary.sessionId ?? deletedInfo?.id,
+							);
+							this.scheduleRosterFlush();
+						}
 					}
+					return success(command.id, "delete_saved_session", result);
+				} catch (error) {
+					if (error instanceof SessionAlreadyActiveError) {
+						error.message = `Cannot delete session ${error.sessionPath}: it is open in another process. Close it there first.`;
+					}
+					throw error;
+				} finally {
+					deleteLease?.release();
 				}
-				return success(command.id, "delete_saved_session", result);
 			}
 
 			case "cancel_prompt_admission": {

@@ -1,0 +1,1 @@
+- Fixed saved-session deletion to refuse while another live process holds the session-file lease, before changing files, artifacts, child tombstones or mesh state.

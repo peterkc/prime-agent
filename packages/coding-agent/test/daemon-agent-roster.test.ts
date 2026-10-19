@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -680,10 +681,12 @@ interface SupervisorFixture {
 }
 
 function makeSupervisor(workers: WorkerFixture[], extra: Record<string, unknown> = {}): SupervisorFixture {
+	const agentDir = mkdtempSync(join(tmpdir(), "prime-roster-supervisor-"));
+	tempDirs.push(agentDir);
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
 		workers: new Map(workers.map((worker) => [worker.descriptor.workerId, worker])),
 		clients: new Set(),
-		defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+		defaultSessionConfig: { agentDir, cwd: "/tmp" },
 		catalog: { list: vi.fn(async () => []) },
 		pendingRosterChanged: new Set(),
 		publishedRosterIds: new Set(),
@@ -1199,6 +1202,8 @@ describe("supervisor roster ledger", () => {
 		});
 		const parentPath = join(sessionsDir, "root.jsonl");
 		const childPath = join(directory, "artifacts", "child.jsonl");
+		mkdirSync(dirname(childPath), { recursive: true });
+		writeFileSync(childPath, "child transcript\n");
 		await supervisor
 			.rlmSpawnLedger()
 			.appendSpawn({ childId: "child-1", parent: parentPath, child: childPath, depth: 1, name: "child" });
@@ -1225,6 +1230,18 @@ describe("supervisor roster ledger", () => {
 			}),
 		);
 		supervisor.writeRosterEntry(childEntry);
+		const edges = await supervisor.rlmSpawnLedger().edges();
+		const lease = acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		try {
+			await expect(
+				supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath }),
+			).rejects.toThrow("Close it there first");
+			expect(readFileSync(childPath, "utf8")).toBe("child transcript\n");
+			await expect(supervisor.rlmSpawnLedger().edges()).resolves.toEqual(edges);
+			expect(supervisor.roster().has(childEntry.agentId)).toBe(true);
+		} finally {
+			lease?.release();
+		}
 
 		await supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath });
 
@@ -1881,6 +1898,21 @@ describe("worker delete tombstone durability", () => {
 			depth: 1,
 			name: "garbled",
 		});
+		const edges = await daemonWithEdge.rlmSpawnLedger().edges();
+		const lease = acquireSessionLease(withEdge.garbled, withEdge.directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		try {
+			await expect(
+				daemonWithEdge.handleCommand(offlineClient(), {
+					type: "delete_saved_session",
+					sessionPath: withEdge.garbled,
+				}),
+			).rejects.toThrow("Close it there first");
+			expect(readFileSync(withEdge.garbled, "utf8")).toBe("not a session header\n");
+			await expect(daemonWithEdge.rlmSpawnLedger().edges()).resolves.toEqual(edges);
+			expect(daemonWithEdge.rosterReporter.removedAgentIds.size).toBe(0);
+		} finally {
+			lease?.release();
+		}
 		await daemonWithEdge.handleCommand(
 			{ id: "client", attachedActiveSessionIds: new Set<string>() },
 			{ type: "delete_saved_session", sessionPath: withEdge.garbled },

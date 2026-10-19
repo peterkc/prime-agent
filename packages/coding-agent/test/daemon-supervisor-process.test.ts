@@ -30,7 +30,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
-import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
+import { getSessionArtifactPathForFile, readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { AgentRoster } from "../src/modes/daemon/agent-roster.js";
@@ -3012,15 +3012,33 @@ describe("mesh supervisor compatibility", () => {
 				const isSymlink = mode === "symlink-standalone" || mode === "symlink-forwarded";
 				const deletedFile = isSymlink ? join(dirname(target.sessionFile!), "alias.jsonl") : target.sessionFile!;
 				if (isSymlink) symlinkSync(target.sessionFile!, deletedFile);
-				expect(
-					await f.request(deleting.client, {
-						type: "delete_saved_session",
-						sessionPath: deletedFile,
-						...(mode === "other" || mode === "symlink-forwarded"
-							? { activeSessionId: sender.activeSessionId! }
-							: {}),
-					}),
-				).toMatchObject({ ok: true });
+				const command = {
+					type: "delete_saved_session" as const,
+					sessionPath: deletedFile,
+					...(mode === "other" || mode === "symlink-forwarded"
+						? { activeSessionId: sender.activeSessionId! }
+						: {}),
+				};
+				const artifact = join(getSessionArtifactPathForFile(target.sessionFile!), "delete-proof");
+				mkdirSync(dirname(artifact), { recursive: true });
+				writeFileSync(artifact, "keep until delete");
+				const paths = [deletedFile, target.sessionFile!, artifact];
+				for (const dir of ["directory", "enrollments"]) paths.push(join(meshRoot, dir, `${target.sessionId}.json`));
+				const before = paths.map((path) => readFileSync(path));
+				const lease = acquireSessionLease(target.sessionFile!, f.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+				try {
+					expect(await deleting.client.request(command)).toMatchObject({
+						success: false,
+						error: expect.stringContaining("Close it there first"),
+					});
+					expect(paths.map((path) => readFileSync(path))).toEqual(before);
+					for (const stream of ["dm", "dlv"])
+						expect(existsSync(join(f.agentDir, `${stream}-${target.sessionId}`))).toBe(true);
+				} finally {
+					lease?.release();
+				}
+				expect(await f.request(deleting.client, command)).toMatchObject({ ok: true });
+				acquireSessionLease(target.sessionFile!, f.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" })?.release();
 				if (isSymlink) {
 					expect(existsSync(deletedFile)).toBe(false);
 					expect(existsSync(target.sessionFile!)).toBe(true);
