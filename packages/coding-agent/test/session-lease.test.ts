@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
+	findLiveSessionCopy,
 	getWindowsProcessStartId,
 	isRenameTargetContention,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -36,6 +37,44 @@ function enabledEnvironment(owner: string): NodeJS.ProcessEnv {
 }
 
 describe("session leases", () => {
+	it.each([
+		["live", process.pid, false, "valid", true],
+		["dead", 2_147_483_647, false, "valid", false],
+		["same path", process.pid, true, "valid", false],
+		["unwritten file", process.pid, false, "unwritten", false],
+		["unreadable owner", process.pid, false, "owner", false],
+		["unreadable header", process.pid, false, "header", false],
+		["different ID", process.pid, false, "different", false],
+	] as const)("checks %s copy leases without reclaiming them", (_name, pid, samePath, kind, conflict) => {
+		const agentDir = createTempDir();
+		const target = join(agentDir, "saved.jsonl");
+		const other = samePath ? target : join(agentDir, "live.jsonl");
+		writeFileSync(target, `${JSON.stringify({ type: "session", id: "T" })}\n`);
+		writeFileSync(
+			other,
+			kind === "header"
+				? "unreadable"
+				: `${JSON.stringify({ type: "session", id: kind === "different" ? "U" : "T" })}\n`,
+		);
+		if (kind === "unwritten") rmSync(other);
+		const key = createHash("sha256").update(canonicalSessionPath(other)).digest("hex");
+		const directory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(directory, { recursive: true });
+		const ownerPath = join(directory, "owner.json");
+		if (kind === "owner") mkdirSync(ownerPath);
+		else
+			writeFileSync(
+				ownerPath,
+				JSON.stringify({ version: 1, token: "owner", pid, sessionPath: other, createdAt: "" }),
+			);
+		const skipped: string[] = [];
+		expect(findLiveSessionCopy(target, agentDir, (path) => skipped.push(path))).toBe(
+			conflict ? canonicalSessionPath(other) : undefined,
+		);
+		expect(skipped).toEqual(kind === "owner" || kind === "header" ? [directory] : []);
+		expect(existsSync(directory)).toBe(true);
+	});
+
 	it("reads an invariant process start identity on Windows", () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		const processStartId = getWindowsProcessStartId(42, (command, args) => {

@@ -1,0 +1,1 @@
+- Fixed native agent messages waking a copied saved session when its original is already live in another daemon.

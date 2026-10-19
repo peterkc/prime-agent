@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
@@ -917,7 +917,7 @@ export default function(pi) {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
-	it("delivers agent-origin messages between root siblings on separate workers", async () => {
+	it("delivers native sibling messages but refuses a copy held by another live owner", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
@@ -928,7 +928,14 @@ export default function(pi) {
 		);
 		mkdirSync(projectDir, { recursive: true });
 
-		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const supervisor = spawnSupervisor(
+			agentDir,
+			socketPath,
+			projectDir,
+			[],
+			{},
+			resolve(__dirname, "fixtures/mesh-supervisor.ts"),
+		);
 		const client = await connectEventually(socketPath, supervisor);
 		const createRoot = async (name: string) => {
 			const response = await client.request({
@@ -961,11 +968,43 @@ export default function(pi) {
 				deliveryStatus: "queued",
 			},
 		});
+		const manager = SessionManager.create(projectDir, join(root, "G"));
+		manager.appendSessionInfo("copied-target");
+		manager.appendMessage({ role: "user", content: "saved", timestamp: 1 });
+		manager.flushNow();
+		const livePath = manager.getSessionFile()!;
+		const savedPath = join(sessionDir, basename(livePath));
+		copyFileSync(livePath, savedPath);
+		const before = readFileSync(livePath, "utf8");
+		const lease = acquireSessionLease(livePath, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		const workerCount = countWorkerDescriptors(agentDir);
+		const send = (targetActiveSessionId: string) =>
+			client.request({
+				type: "send_message",
+				fromActiveSessionId: source.activeSessionId!,
+				targetActiveSessionId,
+				message: "native hello",
+				agentOrigin: true,
+			});
+		try {
+			const refusal = { success: false, error: expect.stringContaining(canonicalSessionPath(livePath)) };
+			expect(await send("copied-target")).toMatchObject(refusal);
+			expect(await send(manager.getSessionId())).toMatchObject(refusal);
+			expect(countWorkerDescriptors(agentDir)).toBe(workerCount);
+			expect(readFileSync(savedPath, "utf8")).toBe(before);
+			expect(readFileSync(livePath, "utf8")).toBe(before);
+			lease!.release();
+			const delivered = await send(manager.getSessionId());
+			expect(delivered.success).toBe(true);
+			expect(delivered).toHaveProperty("data.message", "native hello");
+		} finally {
+			lease!.release();
+		}
 		const shutdown = await client.request({ type: "shutdown" }, 10_000);
 		expect(shutdown.success).toBe(true);
 		client.close();
 		await waitForSocketGone(socketPath);
-	}, 30_000);
+	});
 
 	it("cancels an archived session heartbeat without spawning a worker", { tags: ["process-stress"] }, async () => {
 		const root = tempDir();

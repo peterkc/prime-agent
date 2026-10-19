@@ -51,7 +51,12 @@ import {
 	type IdleEvictionMinutes,
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
-import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
+import {
+	canonicalSessionPath,
+	findLiveSessionCopy,
+	getProcessStartId,
+	SessionAlreadyActiveError,
+} from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
@@ -2998,6 +3003,16 @@ export class DaemonSupervisor {
 						this.familyCatalogEntry(source.summary),
 						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
 					);
+				}
+				if (command.agentOrigin === true) {
+					const liveCopy = findLiveSessionCopy(sessionPath, this.defaultSessionConfig.agentDir!, (path) =>
+						this.log(`Native message ownership check skipped unreadable lease: ${path}`),
+					);
+					if (liveCopy) {
+						throw new Error(
+							`Message was not stored: target is live in another daemon at ${liveCopy}; open it there or use mesh messaging`,
+						);
+					}
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
 					type: "create",
