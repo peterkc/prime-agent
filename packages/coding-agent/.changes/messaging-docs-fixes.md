@@ -1,0 +1,5 @@
+- Fixed mesh claim guidance to explain that closing a worker or session does not release its claim.
+- Added the mesh's same-user signer and power-loss limits.
+- Fixed the Python messaging example and documented steering delivery and Cotal stored receipts.
+- Clarified that agent observation stays family-only while Cotal name sends can reach beyond the family.
+- Documented that CLI send and RPC send_message have no mesh path in Cotal mode.

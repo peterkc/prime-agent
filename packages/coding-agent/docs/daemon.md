@@ -128,11 +128,15 @@ entry, and starts an endpoint. The identity stays the same across restarts. Chil
 enroll only after they have a session file. Fileless sessions cannot send or receive.
 All daemons must use the same agent directory.
 
+Any process running as the same OS user that can read the mesh files can act as the
+mesh signer. The mesh is not a security boundary between those processes.
+
 A claim permits one supervisor to pull a session's inbox. A live claim held elsewhere
 prevents a second endpoint. The holder delivers to idle or saved sessions and wakes a
 worker when needed. Opening elsewhere does not transfer a live claim. A session opened
 in a daemon that does not hold its claim cannot send agent messages, including to its
-family. Open it in the claim holder, or close it there first. Workers from
+family. Closing a worker or its session does not release the session's mesh claim.
+Open the session in the daemon that holds its claim. Workers from
 before mesh support must be restarted; restarting only the supervisor can leave them
 running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
 clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.
@@ -258,6 +262,9 @@ This means the broker stored the message, not that the target wrote it. A delive
 acknowledged only after its own entry is written, or after an explicit cleared/closed drop.
 Crashes and other drops leave it unacknowledged for redelivery. A delivery above the first
 marks its text as possibly repeated. Already-held IDs are not added again.
+
+The broker can lose recently stored messages on a power loss or OS crash before
+it syncs them to disk.
 
 - `Message was not stored: ...` names a failure before publish: mesh unavailable,
   missing enrollment or directory, unknown/ambiguous target, or a reconnect deadline.

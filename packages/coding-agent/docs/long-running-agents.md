@@ -84,7 +84,6 @@ receipt = await agent_message.send(
     "Recheck the endpoint after the latest edit",
     receiver_role="sibling",
     receiver_name="api-reviewer",
-    mode="auto",
 )
 print(receipt["deliveryStatus"])
 ```
@@ -101,13 +100,11 @@ await agent_message.send(
 )
 ```
 
-Delivery modes are:
+Messages always use steering delivery, so a busy target sees them during its active run.
 
-- `auto`: steer a busy target and deliver immediately to an idle target;
-- `steer`: intentionally inject the message into active work; and
-- `follow_up`: wait until the target's current work finishes.
-
-A receipt is `delivered` when it reached an idle target's context or `queued` when accepted for later delivery. `agent_message.send("all", message)` broadcasts only within the family roster. The daemon derives sender identity and enforces message-size, rate, and pending-queue limits.
+With native messaging, a receipt is `delivered` when the message reached an idle target's context, or `queued` when accepted for later steering delivery.
+With Cotal, a successful send returns `stored`, a stream sequence and a Cotal ID. This proves broker storage, not delivery to the target.
+`agent_message.send("all", message)` broadcasts only within the family roster. The daemon derives sender identity and enforces message-size, rate, and pending-queue limits.
 
 ## Heartbeats and Scheduled Prompts
 
