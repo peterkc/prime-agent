@@ -102,7 +102,7 @@ await agent_message.send(
 )
 ```
 
-Messages always use steering delivery, so a busy target sees them during its active run.
+Messages always use steering delivery. A busy target receives a message when its current work allows.
 
 With native messaging, a receipt is `delivered` when the message reached an idle target's context, or `queued` when accepted for later steering delivery.
 With Cotal, a successful send returns `stored`, a stream sequence and a Cotal ID. This proves broker storage, not delivery to the target.
