@@ -13,13 +13,14 @@ import {
 } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { dmDurable } from "@cotal-ai/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatCommandHelp } from "../src/cli/command-registry.js";
 import { runMeshCommand } from "../src/cli/mesh-command.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { RLM_LEDGER_DIR } from "../src/modes/daemon/rlm-ledger.js";
 
 vi.mock("node:child_process", async (original) => {
 	const tools = await original<typeof subprocessTools>();
@@ -184,6 +185,7 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBe(matches ? undefined : 1);
 		expect(events().some((event) => event.args[0] === "doctor")).toBe(matches);
 		if (!matches) expect(events().map((event) => event.args[0])).toEqual(["--version"]);
+		if (!matches) expect(output()).not.toContain("RLM ledger health");
 		vi.mocked(console.log).mockClear();
 		vi.mocked(console.error).mockClear();
 		await command("status");
@@ -357,6 +359,41 @@ describe("mesh command", () => {
 				.slice(-3)
 				.map((event) => event.args[0]),
 		).toEqual(["bootout", "print", "print"]);
+	});
+
+	it.each([
+		["status", "broker"],
+		["doctor", "broker"],
+		["doctor", "launchctl"],
+		["status", "cotal"],
+		["status", "home"],
+		["status", "serving"],
+		["doctor", "serving"],
+	])("reports all ledger failures in %s with %s unavailable or checked", async (name, unavailable) => {
+		const agent = join(root, "agent");
+		const files = [
+			[`${RLM_LEDGER_DIR}/bad-a.jsonl`, "broken\n"],
+			[`${RLM_LEDGER_DIR}/bad-b.jsonl`, "{}\n"],
+			[`${RLM_LEDGER_DIR}/torn.jsonl`, "{torn"],
+			["mesh/mesh.json", JSON.stringify({ space: "prime", server })],
+			["mesh/.cotal/nats/jetstream/preserved", "inbox"],
+		] as const;
+		const fixtures = files.filter(([file]) => unavailable !== "home" || !file.startsWith("mesh/"));
+		for (const [file, bytes] of fixtures) {
+			mkdirSync(dirname(join(agent, file)), { recursive: true });
+			writeFileSync(join(agent, file), bytes);
+		}
+		writeFileSync(join(root, "loaded"), "yes");
+		configure({ notReady: unavailable !== "serving" });
+		if (unavailable === "cotal" || unavailable === "launchctl") rmSync(join(root, "bin", unavailable));
+		const before = readdirSync(agent, { recursive: true, encoding: "utf8" }).sort();
+		expect(existsSync(mesh)).toBe(unavailable !== "home");
+		await command(name);
+		expect(process.exitCode).toBe(1);
+		for (const file of ["bad-a.jsonl", "bad-b.jsonl"]) expect(output()).toContain(join(agent, RLM_LEDGER_DIR, file));
+		expect(output()).toMatch(/CHECKED.*FAILED/);
+		expect(readdirSync(agent, { recursive: true }).sort()).toEqual(before);
+		for (const [file, content] of fixtures) expect(readFileSync(join(agent, file), "utf8")).toBe(content);
 	});
 
 	it("reports store bytes and only unacknowledged counts, and diagnoses auth", async () => {

@@ -13,10 +13,15 @@ import {
 import { tmpdir } from "node:os";
 
 const linkFailure = vi.hoisted(() => ({ code: undefined as string | undefined }));
+const openFailure = vi.hoisted(() => ({ path: undefined as string | undefined }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
 		...actual,
+		openSync: (...args: Parameters<typeof actual.openSync>) => {
+			if (args[0] === openFailure.path) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			return actual.openSync(...args);
+		},
 		linkSync: (
 			existingPath: Parameters<typeof actual.linkSync>[0],
 			newPath: Parameters<typeof actual.linkSync>[1],
@@ -45,12 +50,14 @@ import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand, DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	RLM_LEDGER_DIR,
 	RLM_LEDGER_MAX_BYTES,
 	RLM_LEDGER_MAX_RECORDS,
 	type RlmLedgerDeleteReason,
 	RlmSpawnLedger,
 	readDeletedRlmChildPaths,
 	readLegacyRlmSubagentRegistry,
+	readRlmLedgerHealth,
 	rlmLedgerPath,
 } from "../src/modes/daemon/rlm-ledger.js";
 
@@ -78,6 +85,38 @@ function makeChildSession(root: string, dir: string, parentFile: string, depth: 
 }
 
 describe("rlm spawn ledger", () => {
+	it("checks every damaged ledger independently without changing committed bytes or a torn tail", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-ledger-health-"));
+		const directory = join(root, RLM_LEDGER_DIR);
+		try {
+			mkdirSync(directory);
+			const record = `${JSON.stringify({ v: 1, op: "future", at: "x" })}\n`;
+			const entries = [
+				["malformed.jsonl", `${record}broken\n`, /line 2/, 2],
+				["bytes.jsonl", "x".repeat(RLM_LEDGER_MAX_BYTES + 1), /33554432 bytes/, undefined],
+				["unreadable.jsonl", record, /EACCES/, undefined],
+				["torn.jsonl", `${record}{broken`, undefined, undefined],
+			] as const;
+			for (const [name, bytes] of entries) writeFileSync(join(directory, name), bytes);
+			openFailure.path = join(directory, "unreadable.jsonl");
+			const failures = readRlmLedgerHealth(root);
+			const bad = entries.slice(0, -1);
+			expect(failures).toHaveLength(bad.length);
+			for (const [name, , cause, line] of bad)
+				expect(failures).toContainEqual(
+					expect.objectContaining({ path: join(directory, name), cause: expect.stringMatching(cause!), line }),
+				);
+			openFailure.path = undefined;
+			for (const [name, bytes] of entries) expect(readFileSync(join(directory, name), "utf8")).toBe(bytes);
+			rmSync(directory, { recursive: true });
+			writeFileSync(directory, "not a directory");
+			expect(readRlmLedgerHealth(root)).toEqual([{ path: directory, cause: expect.stringMatching(/ENOTDIR/) }]);
+		} finally {
+			openFailure.path = undefined;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("AC-34 reduces each ledger by exact child path, including standalone legacy deletes", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-mesh-deleted-paths-")));
 		try {
