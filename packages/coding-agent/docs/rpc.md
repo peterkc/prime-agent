@@ -222,7 +222,7 @@ RPC clients can use the same daemon-owned coordination features as the interacti
 
 | Command | Fields | Successful response data |
 |---------|--------|--------------------------|
-| `send_message` | `targetActiveSessionId`, `message`, optional `deliveryMode` (`auto`, `steer`, `follow_up`) | Agent-message delivery receipt; [no mesh path in Cotal mode](daemon.md#mesh-agent-messaging) |
+| `send_message` | `targetActiveSessionId`, `message` | Agent-message delivery receipt |
 | `agent_messages_status` | none | Messaging safety status |
 | `agent_messages_pause` | none | Updated messaging safety status |
 | `agent_messages_resume` | none | Updated messaging safety status |
@@ -235,6 +235,8 @@ RPC clients can use the same daemon-owned coordination features as the interacti
 | `set_heartbeat` | `schedule`, `prompt`, optional `deliveryMode` (`steer`, `follow_up`) | `{ "heartbeat": {...} }` |
 | `update_heartbeat` | `action` (`pause`, `resume`, `clear`) | `{ "heartbeat": {...} }` or `null` |
 | `manage_heartbeat` | `activeSessionId`, `jobId`, `action` (`pause`, `resume`, `stop`) | `{ "heartbeat": {...} }` |
+
+`send_message` is refused in Cotal mode and has no mesh path. See [Mesh Agent Messaging](daemon.md#mesh-agent-messaging).
 
 Adding a schedule or heartbeat promotes an invocation-local RPC session to a resident daemon session so the scheduled work remains available after RPC stdin closes.
 

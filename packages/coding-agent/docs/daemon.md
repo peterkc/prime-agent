@@ -136,10 +136,12 @@ prevents a second endpoint. The holder delivers to idle or saved sessions and wa
 worker when needed. Opening elsewhere does not transfer a live claim. A session opened
 in a daemon that does not hold its claim cannot send agent messages, including to its
 family. Closing a worker or its session does not release the session's mesh claim.
-Open the session in the daemon that holds its claim. Workers from
+Open the session in the daemon that holds its claim.
+Stopping that daemon releases its claims. Workers from
 before mesh support must be restarted; restarting only the supervisor can leave them
-running. Mesh sends and handoffs refuse old workers with a restart message. Daemon
-clients that are not sessions (`daemon send` and RPC `send_message`) have no mesh path.
+running. Mesh sends and handoffs refuse old workers with a restart message. Sends from daemon
+clients that are not sessions (`prime-agent send` and RPC `send_message`) are refused in
+Cotal mode and have no mesh path.
 
 Switching to the current enrolled file also takes the replacement barrier: the
 endpoint closes before the open, and held messages return without an early acknowledgement.
@@ -165,7 +167,7 @@ and logs the session ID.
 The holder removes the inbox when it next finds the entry gone, before a handoff or at an
 endpoint start. An idle holder keeps the inbox until one of those checks runs. A partial
 removal is logged and not retried; consumers left still count toward the limit.
-A failed per-session close keeps the claim and prevents a second endpoint.
+A failed endpoint close during session deletion keeps the claim and prevents a second endpoint.
 Whole-mesh shutdown releases claims before exit. Queued deliveries and late persistence
 frames settle nothing after close.
 

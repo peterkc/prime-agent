@@ -76,6 +76,8 @@ The daemon routes direct messages between active sessions and retained daemon-ba
 prime-agent send <agent> "Please verify the latest migration"
 ```
 
+`prime-agent send` is refused in Cotal mode and has no mesh path. See [Mesh Agent Messaging](daemon.md#mesh-agent-messaging).
+
 From the Python kernel, use the preloaded `agent_observe` and `agent_message` Python skills:
 
 ```python

@@ -532,7 +532,7 @@ prime-agent doctor [--fix]                 # Inspect or safely clean up backgrou
 prime-agent shutdown [--force]             # Stop every agent, worker, and background service
 ```
 
-`send` has no mesh path in Cotal mode. See [Mesh Agent Messaging](docs/daemon.md#mesh-agent-messaging).
+`prime-agent send` is refused in Cotal mode and has no mesh path. See [Mesh Agent Messaging](docs/daemon.md#mesh-agent-messaging).
 
 `shutdown` asks for confirmation. `shutdown --force` skips confirmation and kills unresponsive workers and their tracked child processes.
 
