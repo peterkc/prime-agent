@@ -1,8 +1,24 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { deleteSessionFile } from "../src/core/session-file-actions.js";
+import {
+	acquireSessionLease,
+	hasSessionLease,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -23,6 +39,7 @@ type RosterDelta = Extract<DaemonWorkerRosterOutbound, { type: "roster_delta" }>
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	vi.unstubAllEnvs();
 	vi.useRealTimers();
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -657,6 +674,7 @@ function makeWorker(workerId: string, overrides: Partial<WorkerFixture> = {}): W
 }
 
 interface SupervisorFixture {
+	readonly defaultSessionConfig: { readonly agentDir: string };
 	workers: Map<string, WorkerFixture>;
 	flushRosterUpdates(): void;
 	consumeWorkerRosterDelta(worker: WorkerFixture, payload: Buffer): void;
@@ -680,10 +698,12 @@ interface SupervisorFixture {
 }
 
 function makeSupervisor(workers: WorkerFixture[], extra: Record<string, unknown> = {}): SupervisorFixture {
+	const agentDir = mkdtempSync(join(tmpdir(), "prime-roster-supervisor-"));
+	tempDirs.push(agentDir);
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
 		workers: new Map(workers.map((worker) => [worker.descriptor.workerId, worker])),
 		clients: new Set(),
-		defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+		defaultSessionConfig: { agentDir, cwd: "/tmp" },
 		catalog: { list: vi.fn(async () => []) },
 		pendingRosterChanged: new Set(),
 		publishedRosterIds: new Set(),
@@ -1199,6 +1219,8 @@ describe("supervisor roster ledger", () => {
 		});
 		const parentPath = join(sessionsDir, "root.jsonl");
 		const childPath = join(directory, "artifacts", "child.jsonl");
+		mkdirSync(dirname(childPath), { recursive: true });
+		writeFileSync(childPath, "child transcript\n");
 		await supervisor
 			.rlmSpawnLedger()
 			.appendSpawn({ childId: "child-1", parent: parentPath, child: childPath, depth: 1, name: "child" });
@@ -1225,6 +1247,18 @@ describe("supervisor roster ledger", () => {
 			}),
 		);
 		supervisor.writeRosterEntry(childEntry);
+		const edges = await supervisor.rlmSpawnLedger().edges();
+		const lease = acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		try {
+			await expect(
+				supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath }),
+			).rejects.toThrow("Close it there first");
+			expect(readFileSync(childPath, "utf8")).toBe("child transcript\n");
+			await expect(supervisor.rlmSpawnLedger().edges()).resolves.toEqual(edges);
+			expect(supervisor.roster().has(childEntry.agentId)).toBe(true);
+		} finally {
+			lease?.release();
+		}
 
 		await supervisor.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath: childPath });
 
@@ -1300,12 +1334,14 @@ describe("saved-session delete paths", () => {
 		const unreachable = makeWorker("w-down");
 		Object.assign(unreachable.descriptor, {
 			sessionFile: "/tmp/owned-down.jsonl",
+			pid: process.pid,
 			createCommand: { type: "create" },
 		});
 		unreachable.client = undefined;
 		const failed = makeWorker("w-failed");
 		Object.assign(failed.descriptor, {
 			sessionFile: "/tmp/owned-failed.jsonl",
+			pid: 0,
 			createCommand: { type: "create" },
 			lifecycle: "failed",
 		});
@@ -1321,6 +1357,7 @@ describe("saved-session delete paths", () => {
 		const supervisor = makeSupervisor([reachableRoster, unreachable, failed], {
 			catalog: { delete: catalogDelete, list: vi.fn(async () => []) },
 			mutationDrain: { begin: vi.fn(), end: vi.fn() },
+			processIdentity: (pid: number) => (pid === process.pid ? "current" : "gone"),
 			reclaimStaleWorkerRegistration,
 			rlmSpawnLedger: () => ({ edges: vi.fn(async () => []) }),
 		});
@@ -1348,9 +1385,16 @@ describe("saved-session delete paths", () => {
 		expect(catalogDelete).not.toHaveBeenCalled();
 
 		// A live-but-disconnected owner rejects instead of deleting underneath the worker.
-		await expect(
-			internals.handleCommand(client, { type: "delete_saved_session", sessionPath: "/tmp/owned-down.jsonl" }),
-		).rejects.toThrow(/retry the delete/);
+		const held = acquireSessionLease("/tmp/owned-down.jsonl", supervisor.defaultSessionConfig.agentDir, {
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+		});
+		try {
+			await expect(
+				internals.handleCommand(client, { type: "delete_saved_session", sessionPath: "/tmp/owned-down.jsonl" }),
+			).rejects.toThrow(/retry the delete/);
+		} finally {
+			held?.release();
+		}
 		expect(catalogDelete).not.toHaveBeenCalled();
 
 		// A dead failed registration is reclaimed, then the offline delete proceeds.
@@ -1457,6 +1501,7 @@ describe("saved-session delete paths", () => {
 	});
 
 	it("aborts a saved-child delete when the tombstone append fails", async () => {
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "unrelated-root");
 		const catalogDelete = vi.fn(async () => ({ ok: true, method: "unlink" }));
 		const { directory, sessionsDir, supervisor } = makeOfflineSupervisor("prime-roster-tombstone-fail-", {
 			catalog: { delete: catalogDelete, list: vi.fn(async () => []) },
@@ -1468,6 +1513,9 @@ describe("saved-session delete paths", () => {
 					{ childId: "child-1", child: childPath, parent: join(sessionsDir, "root.jsonl"), depth: 1, name: "c" },
 				]),
 				appendDelete: vi.fn(async () => {
+					expect(() =>
+						acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
+					).toThrowError(expect.objectContaining({ activeSessionId: undefined }));
 					throw new Error("ledger unwritable");
 				}),
 			}),
@@ -1830,6 +1878,75 @@ describe("worker delete tombstone durability", () => {
 		};
 	}
 
+	it.each(["supervisor", "worker", "artifact-filter", "symlink", "loop", "stale"])(
+		"refuses a saved-parent delete with a leased artifact child (%s)",
+		async (route) => {
+			vi.stubEnv("PATH", "");
+			const { directory, sessionsDir, supervisor } = makeOfflineSupervisor("prime-parent-delete-lease-");
+			const parent = SessionManager.create(directory, sessionsDir);
+			parent.appendMessage({ role: "user", content: "parent", timestamp: 1 });
+			parent.flushNow();
+			const sessionPath = parent.getSessionFile()!;
+			const childPath = join(parent.getSessionArtifactDir()!, "nested", "child.jsonl");
+			mkdirSync(dirname(childPath), { recursive: true });
+			const target = route === "symlink" ? join(directory, "outside.jsonl") : childPath;
+			const header = `${JSON.stringify({ type: "session", id: "child" })}\n`;
+			writeFileSync(target, route === "artifact-filter" ? "not a header\n" : header);
+			if (route === "symlink") {
+				symlinkSync(target, childPath);
+				symlinkSync(sessionPath, join(dirname(childPath), "root-alias.jsonl"));
+			}
+			if (route === "loop") symlinkSync("loop", join(dirname(childPath), "loop"));
+			const plain = join(dirname(childPath), "notes.txt");
+			writeFileSync(plain, "scratch file\n");
+			expect(hasSessionLease(sessionPath, plain)).toBe(true); // ENOTDIR cannot prove lease absence.
+			const files = [sessionPath, childPath, plain];
+			const before = files.map((path) => readFileSync(path));
+			const remove = async (path: string) => {
+				if (route === "artifact-filter") expect(hasSessionLease(plain, directory)).toBe(false);
+				expect(() => acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" })).toThrow();
+				return deleteSessionFile(path);
+			};
+			Object.assign(supervisor, { catalog: { delete: remove } });
+			const daemon = makeDeleteDaemon(directory, async () => []);
+			Object.assign(daemon, { deleteSavedSessionFile: remove });
+			if (route === "stale") {
+				const worker = makeWorker("stale", { client: undefined });
+				Object.assign(worker.descriptor, {
+					sessionFile: sessionPath,
+					createCommand: { type: "create" },
+					lifecycle: "failed",
+					recoveryJournalPath: join(directory, "stale-recovery.jsonl"),
+				});
+				Object.assign(worker, { descriptorPath: join(directory, "stale.json") });
+				supervisor.workers.set("stale", worker);
+				Object.assign(supervisor, {
+					processIdentity: () => "gone",
+					recoverUncertainWorkerOperations: async () => {
+						SessionManager.open(sessionPath).appendSessionInfo("interrupted");
+					},
+				});
+			}
+			const handler = route === "supervisor" || route === "stale" ? supervisor : daemon;
+			const held = acquireSessionLease(childPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+			try {
+				await expect(
+					handler.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath }),
+				).rejects.toThrow(
+					`Cannot delete session ${realpathSync(childPath)}: it is open in another session or process. Close it there first.`,
+				);
+				for (const [index, path] of files.entries()) expect(readFileSync(path)).toEqual(before[index]);
+				acquireSessionLease(sessionPath, directory, { [SESSION_LEASES_ENABLED_ENV]: "1" })?.release();
+			} finally {
+				held?.release();
+			}
+			if (route === "artifact-filter") writeFileSync(childPath, header);
+			await handler.handleCommand(offlineClient(), { type: "delete_saved_session", sessionPath });
+			for (const path of files) expect(existsSync(path)).toBe(false);
+			if (route === "symlink") expect(readFileSync(target, "utf8")).toBe(header);
+		},
+	);
+
 	it("deletes a top-level saved session without touching the spawn ledger", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-toplevel-delete-"));
 		tempDirs.push(directory);
@@ -1881,6 +1998,21 @@ describe("worker delete tombstone durability", () => {
 			depth: 1,
 			name: "garbled",
 		});
+		const edges = await daemonWithEdge.rlmSpawnLedger().edges();
+		const lease = acquireSessionLease(withEdge.garbled, withEdge.directory, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		try {
+			await expect(
+				daemonWithEdge.handleCommand(offlineClient(), {
+					type: "delete_saved_session",
+					sessionPath: withEdge.garbled,
+				}),
+			).rejects.toThrow("Close it there first");
+			expect(readFileSync(withEdge.garbled, "utf8")).toBe("not a session header\n");
+			await expect(daemonWithEdge.rlmSpawnLedger().edges()).resolves.toEqual(edges);
+			expect(daemonWithEdge.rosterReporter.removedAgentIds.size).toBe(0);
+		} finally {
+			lease?.release();
+		}
 		await daemonWithEdge.handleCommand(
 			{ id: "client", attachedActiveSessionIds: new Set<string>() },
 			{ type: "delete_saved_session", sessionPath: withEdge.garbled },
@@ -1892,7 +2024,11 @@ describe("worker delete tombstone durability", () => {
 
 		// (b) An unreadable ledger aborts the unknown target's deletion.
 		const withFailure = setup();
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "unrelated-root");
 		const daemonWithFailure = makeDeleteDaemon(withFailure.directory, async () => {
+			expect(() =>
+				acquireSessionLease(withFailure.garbled, withFailure.directory, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
+			).toThrowError(expect.objectContaining({ activeSessionId: undefined }));
 			throw new Error("ledger unreadable");
 		});
 		await expect(

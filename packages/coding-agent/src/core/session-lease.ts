@@ -7,6 +7,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -90,6 +91,16 @@ export function canonicalSessionPath(sessionPath: string): string {
 		} catch {
 			return resolvedPath;
 		}
+	}
+}
+
+/** Conservative presence; acquisition decides whether an owner permits the operation. */
+export function hasSessionLease(sessionPath: string, agentDir: string): boolean {
+	try {
+		statSync(leaseDirectory(agentDir, canonicalSessionPath(sessionPath)));
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
 	}
 }
 

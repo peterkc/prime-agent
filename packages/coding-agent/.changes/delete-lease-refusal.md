@@ -1,0 +1,1 @@
+- Fixed saved-session deletion to refuse while the session or a session file under its artifact directory is held by a live session-file lease. Sessions with leases disabled are not covered.
