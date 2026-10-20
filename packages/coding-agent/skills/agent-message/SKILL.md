@@ -71,6 +71,6 @@ if child is not None:
   send by family role.
 - The `agent_message` API derives sender identity in the daemon. With Cotal, any
   same-OS-user process that can read the mesh files can act as the mesh signer.
-  See [Mesh Agent Messaging](../../docs/daemon.md#mesh-agent-messaging).
+  See "Mesh Agent Messaging" in the Prime Agent docs (`docs/daemon.md`).
 - The daemon enforces message size, rate, and pending-queue limits before
   accepting delivery.
