@@ -1,13 +1,14 @@
 ---
 name: agent-observe
-description: Read-only roster and observation of an agent's parent, siblings, and direct children. Use to discover reachable agents and to inspect family status and bounded recent-message previews without mutating sessions.
+description: Read-only roster and observation of an agent's parent, siblings, and direct children. Use to discover family agents and to inspect family status and bounded recent-message previews without mutating sessions.
 ---
 
 # Agent Observe
 
 Observe the current agent's nuclear family through the local daemon: parent,
-siblings, direct children, and self. `list_agents` is the one family roster and
-covers every member `agent_message.send` can reach. `get_agent` and
+siblings, direct children, and self. Its roster and reads are family-only.
+With Cotal enabled, `agent_message.send` can reach sessions outside this roster
+by name or session ID when `receiver_role` is omitted. `get_agent` and
 `recent_messages` hydrate an inactive child before reading it. They cannot read
 a root sibling that has no live session in this worker.
 This skill is read-only: it can list family sessions, inspect one session, and fetch
@@ -49,8 +50,8 @@ if child is not None:
 ## Safety
 
 - This skill is read-only and exposes no mutation commands.
-- Targets outside the nuclear family are rejected; transcript reads follow the
-  same family rule as messaging.
+- Targets outside the nuclear family are rejected, even when Cotal name sends
+  can reach them.
 - Message access is bounded by count and per-message character limit.
 - Prefer status and recent previews for orchestration. Ask the user before
   using observed context to steer or message another session.

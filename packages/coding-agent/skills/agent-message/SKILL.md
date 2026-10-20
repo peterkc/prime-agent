@@ -69,6 +69,8 @@ if child is not None:
   children. Name-only addressing reaches any local-space session on Cotal.
   Name-only sends require `agentMessageTransport: "cotal"`. With native messaging,
   send by family role.
-- Sender identity is daemon-derived and cannot be spoofed from Python.
+- The `agent_message` API derives sender identity in the daemon. With Cotal, any
+  same-OS-user process that can read the mesh files can act as the mesh signer.
+  See "Mesh Agent Messaging" in the Prime Agent docs (`docs/daemon.md`).
 - The daemon enforces message size, rate, and pending-queue limits before
   accepting delivery.

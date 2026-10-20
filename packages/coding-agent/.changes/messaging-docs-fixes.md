@@ -1,0 +1,6 @@
+- Fixed mesh claim guidance to distinguish worker or session close from endpoint close during deletion and to explain that stopping the holding daemon releases its claims.
+- Added the mesh's same-user signer and power-loss limits and qualified the agent-message sender identity note.
+- Fixed the Python messaging example and documented steering delivery and Cotal stored receipts.
+- Removed the unsupported deliveryMode field from the RPC send_message docs.
+- Changed agent-observe guidance to state that its roster and reads stay family-only while Cotal name sends can reach beyond the family.
+- Fixed CLI send and RPC send_message docs to state that these commands are refused in Cotal mode and have no mesh path.
