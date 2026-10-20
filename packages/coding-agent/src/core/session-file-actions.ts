@@ -1,8 +1,74 @@
-import { existsSync } from "node:fs";
+import { type Dirent, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import { spawnSyncHidden } from "../utils/child-process.js";
+import { readFirstLineSync } from "../utils/file-lines.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	hasSessionLease,
+	SESSION_LEASES_ENABLED_ENV,
+	type SessionLease,
+} from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
+
+/** Reserve the target and artifact files before a recursive saved-session delete. */
+export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string): { release(): void } {
+	const leases: SessionLease[] = [];
+	const paths = new Set<string>();
+	const release = () => {
+		for (const lease of leases.reverse()) lease.release();
+	};
+	const acquire = (path: string) => {
+		if (paths.has(canonicalSessionPath(path))) return;
+		const lease = acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		if (lease) {
+			leases.push(lease);
+			paths.add(lease.sessionPath);
+		}
+	};
+	try {
+		acquire(sessionPath);
+		const directories = basename(sessionPath).replace(/\.jsonl$/, "")
+			? [getSessionArtifactPathForFile(sessionPath)]
+			: [];
+		while (directories.length > 0) {
+			const directory = directories.pop()!;
+			let entries: Dirent[];
+			try {
+				// rm removes directory symlinks themselves, not the trees they point at.
+				if (!lstatSync(directory).isDirectory()) continue;
+				entries = readdirSync(directory, { withFileTypes: true });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw error;
+			}
+			for (const entry of entries) {
+				const path = join(directory, entry.name);
+				if (entry.isDirectory()) {
+					directories.push(path);
+					continue;
+				}
+				if (!hasSessionLease(path, agentDir)) {
+					if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+					try {
+						if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
+						const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
+						if (header?.type !== "session") continue;
+					} catch {
+						// No existing lease: a failed probe identifies no owner to protect.
+						continue;
+					}
+				}
+				acquire(path);
+			}
+		}
+		return { release };
+	} catch (error) {
+		release();
+		throw error;
+	}
+}
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 

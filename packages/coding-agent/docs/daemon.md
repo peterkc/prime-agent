@@ -180,10 +180,26 @@ An ordinary roster removal, a session swap or an unbound queued child is not pro
 The retained transcript cannot re-enroll even on explicit reopen, so that session
 cannot send or receive agent messages in Cotal mode. There is no clear-on-open rule.
 
-For an ordinary session still writing in another daemon, delete it in that daemon.
-Deleting it elsewhere can let the live writer recreate the transcript.
-With the mesh on, it can re-enroll after restart with a new identity and lifecycle,
-but the old inbox's messages are lost. The directory lock does not prevent that recreation.
+Saved-session deletion in either transport acquires the canonical session-file lease
+before any removal or child tombstone. It also reserves saved child transcripts and
+other session files under that session's artifact directory. A live lease anywhere in
+that set refuses the whole delete and names the held path, without changing files,
+artifacts, child tombstones or mesh state. Close that session there first, then retry.
+An unreadable or corrupt lease owner also refuses deletion. File symlinks share their
+target's lease; symlinked directories are not traversed. Same-ID copies at different
+canonical paths stay independent. Other artifact files without a lease or a first-line
+session header are skipped, without creating lease records.
+The artifact scan is a point-in-time snapshot. Files created after the scan are not reserved.
+Deletes check leases only in the daemon's agent directory, so leases under a different
+agent directory are not seen.
+
+After a successful forwarded delete, the worker releases its lease before the
+supervisor's unchanged mesh cleanup. That cleanup still checks the exact file's absence.
+
+Direct SDK runtimes participate only when session leases are enabled. Other writers can
+still recreate a deleted transcript. With the mesh on, it can re-enroll after restart
+with a new identity and lifecycle, but the old inbox's messages are lost.
+The directory lock alone does not prevent that recreation.
 
 There is no per-daemon endpoint cap. NATS's default is 1000 consumers per stream, so the
 space supports about 1000 enrolled inboxes. Each uses one consumer in `DM_prime` and one

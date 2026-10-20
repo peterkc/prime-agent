@@ -51,6 +51,7 @@ import {
 	type IdleEvictionMinutes,
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
+import { acquireSessionDeleteLeases } from "../../core/session-file-actions.js";
 import {
 	canonicalSessionPath,
 	findLiveSessionCopy,
@@ -2875,24 +2876,54 @@ export class DaemonSupervisor {
 								await this.unenrollMeshSession(deletedSession, deletedPath);
 							return response;
 						}
-						if (!(await this.reclaimStaleWorkerRegistration(owner))) {
+						if (
+							owner.client !== undefined ||
+							owner.recovery !== undefined ||
+							!["gone", "replaced"].includes(
+								this.processIdentity(owner.descriptor.pid, owner.descriptor.processStartId),
+							)
+						) {
 							throw new Error(
 								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
 							);
 						}
 					}
-					await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
-					const result = await this.catalog.delete(command.sessionPath);
-					if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
-						this.roster().delete(entry.agentId);
+					const agentDir = this.defaultSessionConfig.agentDir;
+					if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
+					let deleteLease: ReturnType<typeof acquireSessionDeleteLeases> | undefined;
+					try {
+						deleteLease = acquireSessionDeleteLeases(command.sessionPath, agentDir);
+					} catch (error) {
+						if (error instanceof SessionAlreadyActiveError) {
+							throw new Error(
+								`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
+							);
+						}
+						throw new Error(
+							`Cannot delete session ${command.sessionPath}: its session lease could not be checked (${error instanceof Error ? error.message : String(error)}). Nothing was removed.`,
+						);
 					}
-					// The deleted session's armed heartbeats must leave the catalog
-					// snapshot too; their rows would otherwise linger until the TTL.
-					if (result.ok) {
-						this.invalidatePassiveScheduledJobs();
-						if (this.mesh) await this.unenrollMeshSession(deletedSession, deletedPath);
+					try {
+						if (owner && !(await this.reclaimStaleWorkerRegistration(owner))) {
+							throw new Error(
+								`Session worker is ${this.effectiveWorkerState(owner)}; retry the delete once it is reachable`,
+							);
+						}
+						await tombstoneSavedSessionDelete(this.rlmSpawnLedger(), command.sessionPath, entry?.summary);
+						const result = await this.catalog.delete(command.sessionPath);
+						if (result.ok && entry && this.roster().get(entry.agentId) === entry) {
+							this.roster().delete(entry.agentId);
+						}
+						// The deleted session's armed heartbeats must leave the catalog
+						// snapshot too; their rows would otherwise linger until the TTL.
+						if (result.ok) {
+							this.invalidatePassiveScheduledJobs();
+							if (this.mesh) await this.unenrollMeshSession(deletedSession, deletedPath);
+						}
+						return success(command.id, command.type, result);
+					} finally {
+						deleteLease?.release();
 					}
-					return success(command.id, command.type, result);
 				}
 				break;
 			}

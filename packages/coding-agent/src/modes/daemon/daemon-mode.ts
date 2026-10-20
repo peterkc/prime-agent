@@ -107,8 +107,17 @@ import {
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
-import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionDeleteLeases,
+	deleteSessionArtifacts,
+	deleteSessionFile,
+} from "../../core/session-file-actions.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	SessionAlreadyActiveError,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	loadEntriesFromFileAsync,
@@ -4546,29 +4555,48 @@ export class AgentDaemon {
 					throw new Error("Cannot delete the currently active session");
 				}
 				const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
-				const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
-					this.rlmSpawnLedger(),
-					command.sessionPath,
-					composedEntry?.summary,
-				);
-				const result = await this.deleteSavedSessionFile(command.sessionPath, {
-					afterFileRemoved: async () => {
-						await this.cancelScheduledJobsForSessionFile(command.sessionPath);
-					},
-				});
-				if (result.ok && this.options.worker) {
-					const removedAgentId =
-						composedEntry?.agentId ??
-						(ledgerEdge ? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent) : deletedInfo?.id);
-					if (removedAgentId) {
-						this.rosterReporter.removedAgentIds.set(
-							removedAgentId,
-							composedEntry?.summary.sessionId ?? deletedInfo?.id,
+				let deleteLease: ReturnType<typeof acquireSessionDeleteLeases> | undefined;
+				try {
+					deleteLease = acquireSessionDeleteLeases(command.sessionPath, this.agentDir);
+				} catch (error) {
+					if (error instanceof SessionAlreadyActiveError) {
+						throw new Error(
+							`Cannot delete session ${error.sessionPath}: it is open in another session or process. Close it there first.`,
 						);
-						this.scheduleRosterFlush();
 					}
+					throw new Error(
+						`Cannot delete session ${command.sessionPath}: its session lease could not be checked (${error instanceof Error ? error.message : String(error)}). Nothing was removed.`,
+					);
 				}
-				return success(command.id, "delete_saved_session", result);
+				try {
+					const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
+						this.rlmSpawnLedger(),
+						command.sessionPath,
+						composedEntry?.summary,
+					);
+					const result = await this.deleteSavedSessionFile(command.sessionPath, {
+						afterFileRemoved: async () => {
+							await this.cancelScheduledJobsForSessionFile(command.sessionPath);
+						},
+					});
+					if (result.ok && this.options.worker) {
+						const removedAgentId =
+							composedEntry?.agentId ??
+							(ledgerEdge
+								? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent)
+								: deletedInfo?.id);
+						if (removedAgentId) {
+							this.rosterReporter.removedAgentIds.set(
+								removedAgentId,
+								composedEntry?.summary.sessionId ?? deletedInfo?.id,
+							);
+							this.scheduleRosterFlush();
+						}
+					}
+					return success(command.id, "delete_saved_session", result);
+				} finally {
+					deleteLease?.release();
+				}
 			}
 
 			case "cancel_prompt_admission": {
