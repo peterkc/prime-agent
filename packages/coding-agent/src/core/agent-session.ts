@@ -1694,6 +1694,8 @@ export class AgentSession {
 	private _extensionRunner!: ExtensionRunner;
 	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
 	private _turnIndex = 0;
+	/** True from agent.continue() until the next agent.prompt(), so agent_start can report a continuation. */
+	private _agentStartContinues = false;
 	private _modelSelectEmitQueue: Promise<void> = Promise.resolve();
 	private _modelSelectEmitQueueIdle = true;
 	private _modelSelectEmitContext = new AsyncLocalStorage<boolean>();
@@ -4926,7 +4928,7 @@ export class AgentSession {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
 			this.sessionManager.recordGitStateIfChanged();
-			await this._extensionRunner.emit({ type: "agent_start" });
+			await this._extensionRunner.emit({ type: "agent_start", continuation: this._agentStartContinues });
 		} else if (event.type === "agent_end") {
 			// Also capture at end of turn so commits made during the run (e.g. via a bash tool) land.
 			this.sessionManager.recordGitStateIfChanged();
@@ -7453,6 +7455,7 @@ export class AgentSession {
 					// before_agent_start injections land after the earlier per-turn
 					// decision and may carry images the session model cannot serve.
 					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
+					this._agentStartContinues = false;
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -9484,6 +9487,7 @@ export class AgentSession {
 					waitForSessionInput = true;
 				} else {
 					this._postCompactionContinuationScheduled = false;
+					this._agentStartContinues = true;
 					continuation = this.agent.continue();
 				}
 			} finally {
@@ -13888,6 +13892,7 @@ export class AgentSession {
 			// A retry aborted between the sleep and this scheduled start must not
 			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
 			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+			this._agentStartContinues = true;
 			this.agent.continue().catch((error: unknown) => {
 				// A continue that never starts must still resolve the retry (else isRetrying
 				// sticks forever) — unless a newer retry owns the state by now.

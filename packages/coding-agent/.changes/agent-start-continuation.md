@@ -1,0 +1,1 @@
+- Added `continuation` to the `agent_start` extension event, so an extension can tell an automatic retry or post-compaction continue from a new run.

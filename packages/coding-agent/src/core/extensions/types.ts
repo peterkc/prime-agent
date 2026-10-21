@@ -675,6 +675,8 @@ export interface BeforeAgentStartInput {
 /** Fired when an agent loop starts */
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** True when an automatic retry or a post-compaction continue resumes the previous run; false for a new run. */
+	continuation: boolean;
 }
 
 /** Fired when an agent loop ends */
