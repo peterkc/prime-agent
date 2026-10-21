@@ -7357,7 +7357,8 @@ export class AgentSession {
 						if (this._isSessionInputHandoffDeferred(epoch)) {
 							throw new DeferredSessionInputError("Session input paused before preparation");
 						}
-						const preparationAction = activeTurns().at(-1);
+						const batch = activeTurns();
+						const preparationAction = batch.at(-1);
 						if (!preparationAction) return undefined;
 						const basePromptSnapshot = this._baseSystemPrompt;
 						const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -7365,11 +7366,12 @@ export class AgentSession {
 							preparationAction.payload.images,
 							basePromptSnapshot,
 							this._baseSystemPromptOptions,
-							activeTurns().map(({ source, payload }) =>
+							batch.map(({ source, payload }) =>
 								payload.inputId === undefined ? { source } : { source, inputId: payload.inputId },
 							),
 						);
-						if (activeTurns().at(-1) !== preparationAction) continue;
+						// inputs must describe the delivered batch, so any cancellation re-runs the hooks.
+						if (activeTurns().length !== batch.length) continue;
 						const prepared = { result, basePromptSnapshot };
 						for (const action of activeTurns()) action.payload.prepared = prepared;
 					}

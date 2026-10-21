@@ -711,10 +711,12 @@ describe("AgentSession queue characterization", () => {
 	it("delivers next-turn context when the first preparing turn is cancelled", async () => {
 		const firstPrompt = agentPromptText("agentmsg_cancel_first", "cancelled");
 		let cancelFirst: (() => void) | undefined;
+		const batchSizes: number[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
-					pi.on("before_agent_start", () => {
+					pi.on("before_agent_start", (event) => {
+						batchSizes.push(event.inputs.length);
 						cancelFirst?.();
 					});
 				},
@@ -724,7 +726,7 @@ describe("AgentSession queue characterization", () => {
 		harness.session.setFollowUpMode("all");
 		let cleared: { steering: string[]; followUp: string[] } | undefined;
 		cancelFirst = () => {
-			cleared = harness.session.clearQueuedUserMessagesMatching((text) => text === firstPrompt);
+			cleared ??= harness.session.clearQueuedUserMessagesMatching((text) => text === firstPrompt);
 		};
 		let sawNextTurnContext = false;
 		harness.setResponses([
@@ -745,6 +747,8 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.waitForIdle();
 
 		expect(cleared).toEqual({ steering: [], followUp: [firstPrompt] });
+		// The hooks rerun after the cancellation so inputs lists only the delivered turn.
+		expect(batchSizes).toEqual([2, 1]);
 		expect(sawNextTurnContext).toBe(true);
 		expect(getUserTexts(harness)).toEqual(["surviving"]);
 	});

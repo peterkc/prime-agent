@@ -562,7 +562,7 @@ The `systemPromptOptions` field gives extensions access to the same structured d
 
 Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again.
 
-One run can deliver several queued turns, and `event.prompt` is the last turn's text. Use `event.inputs` to tell which turns the run includes. Each entry has the turn's `source` (`"interactive"`, `"rpc"`, `"extension"` or `"internal"`) and, when the turn passed the `input` handlers, the `inputId` from its `input` event. Agent messages, heartbeats and other turns that skip `input` handlers have no `inputId`. An input that a handler marks `handled`, or that fails before it is queued, never appears in a later run's `inputs`.
+One run can deliver several queued turns, and `event.prompt` is the last turn's text. Use `event.inputs` to tell which turns the run includes. Each entry has the turn's `source` (`"interactive"`, `"rpc"`, `"extension"` or `"internal"`) and, when the turn passed the `input` handlers, the `inputId` from its `input` event. Agent messages, heartbeats and other turns that skip `input` handlers have no `inputId`, and neither does a queued turn restored after an update restart. An input that a handler marks `handled`, or that fails before it is queued, never appears in a later run's `inputs`. If a batched turn is cancelled while `before_agent_start` handlers run, the handlers run again with the remaining turns. A turn cancelled after the handlers finish can still be listed.
 
 #### agent_start / agent_end
 

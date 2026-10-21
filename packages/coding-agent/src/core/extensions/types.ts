@@ -665,7 +665,7 @@ export interface BeforeAgentStartEvent {
 export interface BeforeAgentStartInput {
 	/** Where the turn came from; "internal" covers machine-generated turns. */
 	source: InputSource | "internal";
-	/** The InputEvent.inputId of this turn's input. Absent when the turn skipped input handlers. */
+	/** The InputEvent.inputId of this turn's input. Absent when the turn skipped input handlers or was restored after a restart. */
 	inputId?: string;
 }
 
