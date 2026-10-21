@@ -1,0 +1,1 @@
+- Added `inputs` to the `before_agent_start` event and `inputId` to the `input` event, so an extension can tell which turns a run delivers and match them to their input.

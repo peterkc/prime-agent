@@ -6,6 +6,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { BashResult } from "../../src/core/bash-executor.js";
+import type { BeforeAgentStartInput } from "../../src/core/extensions/index.js";
 import {
 	convertToLlm,
 	HARNESS_DIGEST_CUSTOM_TYPE,
@@ -119,6 +120,41 @@ describe("AgentSession prompt characterization", () => {
 		await Promise.all([first, second]);
 		expect(inputOrder).toEqual(["first", "second"]);
 		expect(getUserTexts(harness)).toEqual(["first", "second"]);
+	});
+
+	it("lists each run's turns in before_agent_start inputs with the matching input ID (pi-f6kj0)", async () => {
+		const inputIds = new Map<string, string>();
+		const runs: BeforeAgentStartInput[][] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => {
+						inputIds.set(event.text, event.inputId);
+						return event.text === "handled" ? { action: "handled" } : undefined;
+					});
+					pi.on("before_agent_start", (event) => void runs.push(event.inputs));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("batch done")]);
+
+		await harness.session.prompt("handled");
+		const gate = gateNextAgentStart(harness);
+		const first = harness.session.prompt("first");
+		await gate.reached;
+		await harness.session.queueAgentMessagePrompt("agent message", "followUp");
+		await harness.session.prompt("typed", { streamingBehavior: "followUp" });
+		gate.release();
+		await first;
+		await harness.session.waitForIdle();
+
+		expect(new Set(inputIds.values()).size).toBe(3);
+		expect(runs).toEqual([
+			[{ source: "interactive", inputId: inputIds.get("first") }],
+			[{ source: "interactive", inputId: inputIds.get("typed") }, { source: "internal" }],
+		]);
 	});
 
 	it("admits reentrant hook prompts without deadlocking the active action", async () => {

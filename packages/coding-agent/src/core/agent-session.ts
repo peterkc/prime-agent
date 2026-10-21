@@ -657,8 +657,15 @@ interface SubmissionNormalizationPolicy {
 	expandPromptTemplates: boolean;
 }
 
+interface NormalizedPrompt {
+	kind: "prompt";
+	text: string;
+	images?: ImageContent[];
+	inputId?: string;
+}
+
 type NormalizedSubmission =
-	| { kind: "prompt"; text: string; images?: ImageContent[] }
+	| NormalizedPrompt
 	| {
 			kind: "sessionCommand";
 			text: string;
@@ -718,6 +725,7 @@ interface PreparedTurnPayload extends SessionTurnPayload {
 	images?: ImageContent[];
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
+	inputId?: string;
 	prepared?: PreparedPromptPreparation;
 	executionPolicy: TurnExecutionPolicy;
 	queueVisible: boolean;
@@ -5621,14 +5629,15 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		policy: SubmissionNormalizationPolicy,
-	): NormalizedSubmission {
+		inputId?: string,
+	): NormalizedPrompt {
 		if (policy.expandPromptTemplates) this._throwIfUnknownSlashCommand(text);
 		let expandedText = text;
 		if (policy.expandSkills) expandedText = this._expandSkillCommand(expandedText);
 		if (policy.expandPromptTemplates) {
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
-		return { kind: "prompt", text: expandedText, images };
+		return { kind: "prompt", text: expandedText, images, inputId };
 	}
 
 	/**
@@ -5685,12 +5694,13 @@ export class AgentSession {
 		}
 
 		if (policy.inputSource !== undefined && this._extensionRunner.hasHandlers("input")) {
-			return this._extensionRunner.emitInput(text, images, policy.inputSource).then((result) => {
+			const inputId = randomUUID();
+			return this._extensionRunner.emitInput(text, images, policy.inputSource, inputId).then((result) => {
 				if (result.action === "handled") return { kind: "handled" };
 				if (result.action === "transform") {
-					return this._finishSubmissionNormalization(result.text, result.images ?? images, policy);
+					return this._finishSubmissionNormalization(result.text, result.images ?? images, policy, inputId);
 				}
-				return this._finishSubmissionNormalization(text, images, policy);
+				return this._finishSubmissionNormalization(text, images, policy, inputId);
 			});
 		}
 
@@ -6261,6 +6271,7 @@ export class AgentSession {
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
 					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+					inputId: normalized.inputId,
 					priority: options?.priority,
 					executionPolicy: visibleQueued
 						? this._turnExecutionPolicy("queued")
@@ -6773,6 +6784,7 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			inputId?: string;
 			priority?: SessionActionPriority;
 			executionPolicy?: TurnExecutionPolicy;
 			queueVisible?: boolean;
@@ -6802,6 +6814,7 @@ export class AgentSession {
 			images: images?.map((image) => ({ ...image })),
 			content: content.map((block) => ({ ...block })),
 			customMessage: options.message?.role === "custom" ? cloneCustomMessage(options.message) : undefined,
+			inputId: options.inputId,
 			executionPolicy: options.executionPolicy ?? this._turnExecutionPolicy("queued"),
 			queueVisible: options.queueVisible ?? true,
 			acceptedAgentMessage: options.acceptedAgentMessage ?? false,
@@ -7344,7 +7357,8 @@ export class AgentSession {
 						if (this._isSessionInputHandoffDeferred(epoch)) {
 							throw new DeferredSessionInputError("Session input paused before preparation");
 						}
-						const preparationAction = activeTurns().at(-1);
+						const batch = activeTurns();
+						const preparationAction = batch.at(-1);
 						if (!preparationAction) return undefined;
 						const basePromptSnapshot = this._baseSystemPrompt;
 						const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -7352,8 +7366,12 @@ export class AgentSession {
 							preparationAction.payload.images,
 							basePromptSnapshot,
 							this._baseSystemPromptOptions,
+							batch.map(({ source, payload }) =>
+								payload.inputId === undefined ? { source } : { source, inputId: payload.inputId },
+							),
 						);
-						if (activeTurns().at(-1) !== preparationAction) continue;
+						// inputs must describe the delivered batch, so any cancellation re-runs the hooks.
+						if (activeTurns().length !== batch.length) continue;
 						const prepared = { result, basePromptSnapshot };
 						for (const action of activeTurns()) action.payload.prepared = prepared;
 					}
