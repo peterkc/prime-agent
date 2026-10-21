@@ -1060,6 +1060,7 @@ export class AgentCronScheduler {
 				await this.store.recordDispatchResult(dispatchId, result);
 				this.unrecordedResults.delete(dispatchId);
 			}
+			if (this.stopped && this.hasStarted) return 0;
 			claimedDispatches = await this.store.claimDue(now, this.now());
 			for (const dispatch of claimedDispatches) {
 				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
