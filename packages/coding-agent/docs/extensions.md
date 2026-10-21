@@ -566,10 +566,12 @@ One run can deliver several queued turns, and `event.prompt` is the last turn's 
 
 #### agent_start / agent_end
 
-Fired once per user prompt.
+Fired once per agent loop. An automatic retry or a continue after compaction starts another loop for the same run.
 
 ```typescript
-pi.on("agent_start", async (_event, ctx) => {});
+pi.on("agent_start", async (event, ctx) => {
+  // event.continuation - true when a retry or post-compaction continue resumes the previous run
+});
 
 pi.on("agent_end", async (event, ctx) => {
   // event.messages - messages from this prompt
