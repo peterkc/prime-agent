@@ -1013,6 +1013,8 @@ export class AgentCronScheduler {
 	private readonly dispatchLanes = new Map<string, Promise<void>>();
 	/** Set once startup recovery landed; a failed recovery is retried by the next claim instead of being skipped. */
 	private recovered = false;
+	/** Results whose write failed; a dispatch record left behind would make every later claim skip its job. */
+	private readonly unrecordedResults = new Map<string, Parameters<AgentCronJobStore["recordDispatchResult"]>[1]>();
 
 	constructor(
 		private readonly store: AgentCronJobStore,
@@ -1054,6 +1056,10 @@ export class AgentCronScheduler {
 				this.recovered = true;
 				if (this.stopped) return 0;
 			}
+			for (const [dispatchId, result] of this.unrecordedResults) {
+				await this.store.recordDispatchResult(dispatchId, result);
+				this.unrecordedResults.delete(dispatchId);
+			}
 			claimedDispatches = await this.store.claimDue(now, this.now());
 			for (const dispatch of claimedDispatches) {
 				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
@@ -1091,7 +1097,7 @@ export class AgentCronScheduler {
 				try {
 					const job = this.store.getClaimedJob(dispatch.job.id);
 					if (!job) {
-						await this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
+						await this.recordResult(dispatch.id, { now: this.now(), outcome: "skipped" });
 						return "skipped";
 					}
 					let runResult: AgentCronJobRunResult | undefined;
@@ -1102,7 +1108,7 @@ export class AgentCronScheduler {
 						error = runError;
 						this.hooks.onError?.(job, runError);
 					}
-					await this.store.recordDispatchResult(dispatch.id, {
+					await this.recordResult(dispatch.id, {
 						now: this.now(),
 						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
 						error,
@@ -1123,6 +1129,18 @@ export class AgentCronScheduler {
 			}
 		});
 		return task;
+	}
+
+	private async recordResult(
+		dispatchId: string,
+		result: Parameters<AgentCronJobStore["recordDispatchResult"]>[1],
+	): Promise<void> {
+		try {
+			await this.store.recordDispatchResult(dispatchId, result);
+		} catch (error) {
+			this.unrecordedResults.set(dispatchId, result);
+			throw error;
+		}
 	}
 
 	private scheduleNext(delayMs?: number): void {
