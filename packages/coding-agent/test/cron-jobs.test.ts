@@ -894,6 +894,7 @@ describe("AgentCronScheduler", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -1350,6 +1351,40 @@ describe("AgentCronScheduler", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("reports a timer-run store error and retries in 30s instead of rejecting unhandled (pi-wdod5)", async () => {
+		vi.useFakeTimers();
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		vi.spyOn(store, "recoverInterruptedDispatches").mockRejectedValue(new Error("EEXIST"));
+		const onRunDueError = vi.fn();
+		new AgentCronScheduler(store, { runJob: vi.fn(), onRunDueError }).start();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(onRunDueError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: "EEXIST" }));
+		await vi.advanceTimersByTimeAsync(29_999);
+		expect(onRunDueError).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(onRunDueError).toHaveBeenCalledTimes(2);
+	});
+
+	it("rewrites a failed run result before the next claim instead of skipping the job (pi-wdod5)", async () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		await store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 1m",
+			prompt: "check progress",
+			now: start,
+		});
+		vi.spyOn(store, "recordDispatchResult").mockRejectedValueOnce(new Error("EEXIST"));
+		let clock = new Date("2026-01-01T12:35:00.000Z");
+		const scheduler = new AgentCronScheduler(store, { now: () => clock, runJob: vi.fn(async () => undefined) });
+		await expect(scheduler.runDue()).rejects.toThrow("EEXIST");
+		clock = new Date("2026-01-01T12:36:00.000Z");
+		expect(await scheduler.runDue()).toBe(1);
+		expect(store.list()[0]).toMatchObject({ runCount: 2 });
 	});
 });
 

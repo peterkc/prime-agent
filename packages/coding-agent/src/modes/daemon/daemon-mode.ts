@@ -90,6 +90,7 @@ import {
 	isHeartbeatCronJob,
 	normalizeHeartbeatDeliveryMode,
 	normalizeHeartbeatSchedule,
+	RUN_DUE_RETRY_MS,
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
@@ -661,6 +662,11 @@ export class AgentDaemon {
 			},
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+			},
+			onRunDueError: (error) => {
+				this.log(
+					`Scheduled job check failed; retrying in ${RUN_DUE_RETRY_MS / 1000}s: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			},
 		});
 		this.cronStore.onHeartbeatChange(() => {

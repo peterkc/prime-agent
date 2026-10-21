@@ -1,0 +1,1 @@
+- Fixed a daemon session worker crashing when a scheduled-job store error occurred during a timed check; the error is now logged and the check retries after 30 seconds.
