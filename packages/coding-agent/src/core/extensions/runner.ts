@@ -15,6 +15,7 @@ import type { SecretValue } from "../tool-output-redaction.js";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeAgentStartInput,
 	BeforeProviderRequestEvent,
 	CompactOptions,
 	ContextEvent,
@@ -1057,6 +1058,7 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPrompt: string,
 		systemPromptOptions: BuildSystemPromptOptions,
+		inputs: BeforeAgentStartInput[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		let currentSystemPrompt = systemPrompt;
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
@@ -1082,6 +1084,7 @@ export class ExtensionRunner {
 						images,
 						systemPrompt: currentSystemPrompt,
 						systemPromptOptions,
+						inputs,
 					};
 					const handlerResult = await handler(event, ctx);
 
@@ -1167,7 +1170,12 @@ export class ExtensionRunner {
 	}
 
 	/** Emit input event. Transforms chain, "handled" short-circuits. */
-	async emitInput(text: string, images: ImageContent[] | undefined, source: InputSource): Promise<InputEventResult> {
+	async emitInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+		inputId: string,
+	): Promise<InputEventResult> {
 		let currentText = text;
 		let currentImages = images;
 
@@ -1175,7 +1183,7 @@ export class ExtensionRunner {
 			const ctx = this.createContext(ext.path);
 			for (const handler of ext.handlers.get("input") ?? []) {
 				try {
-					const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+					const event: InputEvent = { type: "input", text: currentText, images: currentImages, source, inputId };
 					const result = (await handler(event, ctx)) as InputEventResult | undefined;
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {

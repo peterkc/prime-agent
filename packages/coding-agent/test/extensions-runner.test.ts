@@ -474,7 +474,7 @@ describe("ExtensionRunner", () => {
 		])("emitInput resolves $name", async ({ exts, expected }) => {
 			const runner = await runnerWith(...exts);
 
-			expect(await runner.emitInput("hi", origImages, "interactive")).toMatchObject(expected);
+			expect(await runner.emitInput("hi", origImages, "interactive", "input-1")).toMatchObject(expected);
 			expect(runner.hasHandlers("input")).toBe(exts.length > 0);
 		});
 
@@ -492,14 +492,14 @@ describe("ExtensionRunner", () => {
 			const errors: string[] = [];
 			runner.onError((error) => errors.push(error.error));
 
-			expect(await runner.emitInput("stop", undefined, "interactive")).toEqual({ action: "handled" });
+			expect(await runner.emitInput("stop", undefined, "interactive", "input-1")).toEqual({ action: "handled" });
 			expect(globals.__inputReachedSecond).toBeUndefined();
 
-			expect((await runner.emitInput("boom", undefined, "rpc")).action).toBe("continue");
+			expect((await runner.emitInput("boom", undefined, "rpc", "input-2")).action).toBe("continue");
 			expect(errors).toContain("boom");
 			expect(globals.__inputReachedSecond).toBe(true);
 
-			await runner.emitInput("plain", undefined, "extension");
+			await runner.emitInput("plain", undefined, "extension", "input-3");
 			expect(globals.__inputSources).toEqual(["interactive", "rpc", "extension"]);
 		});
 	});
@@ -518,7 +518,7 @@ describe("ExtensionRunner", () => {
 		runner.onError((error) => errors.push(error.error));
 		runner.bindCore(extensionActions, extensionContextActions);
 
-		const chained = await runner.emitBeforeAgentStart("hello", undefined, "base", { cwd: tempDir });
+		const chained = await runner.emitBeforeAgentStart("hello", undefined, "base", { cwd: tempDir }, []);
 
 		expect(errors).toEqual([]);
 		expect(chained).toEqual({ messages: undefined, systemPrompt: "base\nfirst\nsecond" });

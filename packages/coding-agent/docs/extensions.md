@@ -542,6 +542,8 @@ pi.on("before_agent_start", async (event, ctx) => {
   //   .cwd - working directory
   //   .contextFiles - AGENTS.md files and other loaded context files
   //   .skills - loaded skills
+  // event.inputs - every turn this run delivers, in delivery order:
+  //   { source, inputId? }; inputId matches the input event of that turn
 
   return {
     // Inject a persistent message (stored in session, sent to LLM)
@@ -559,6 +561,8 @@ pi.on("before_agent_start", async (event, ctx) => {
 The `systemPromptOptions` field gives extensions access to the same structured data Prime Agent uses to build the system prompt. This lets you inspect what Prime Agent has loaded — custom prompts, guidelines, tool snippets, context files, skills — without re-discovering resources or re-parsing flags. Use it when your extension needs to make deep, informed changes to the system prompt while respecting user-provided configuration.
 
 Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again.
+
+One run can deliver several queued turns, and `event.prompt` is the last turn's text. Use `event.inputs` to tell which turns the run includes. Each entry has the turn's `source` (`"interactive"`, `"rpc"`, `"extension"` or `"internal"`) and, when the turn passed the `input` handlers, the `inputId` from its `input` event. Agent messages, heartbeats and other turns that skip `input` handlers have no `inputId`. An input that a handler marks `handled`, or that fails before it is queued, never appears in a later run's `inputs`.
 
 #### agent_start / agent_end
 
@@ -898,6 +902,7 @@ pi.on("input", async (event, ctx) => {
   // event.text - raw input (before skill/template expansion)
   // event.images - attached images, if any
   // event.source - "interactive" (typed), "rpc" (API), or "extension" (via sendUserMessage)
+  // event.inputId - opaque ID, unique within the session; see before_agent_start's event.inputs
 
   // Transform: rewrite input before expansion
   if (event.text.startsWith("?quick "))
