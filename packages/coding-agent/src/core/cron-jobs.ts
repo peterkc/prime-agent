@@ -73,7 +73,11 @@ export interface AgentCronSchedulerHooks {
 	beginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
 	now?: () => Date;
 	onError?: (job: AgentCronJob, error: unknown) => void;
+	/** A timer-started run failed before dispatch; the scheduler retries after RUN_DUE_RETRY_MS. */
+	onRunDueError?: (error: unknown) => void;
 }
+
+export const RUN_DUE_RETRY_MS = 30_000;
 
 export interface HeartbeatCronSessionActivity {
 	isStreaming: boolean;
@@ -1141,7 +1145,11 @@ export class AgentCronScheduler {
 		}
 		this.timer = setTimeout(
 			() => {
-				void this.runDue();
+				// A store error must not become an unhandled rejection, which ends a daemon worker.
+				this.runDue().catch((error: unknown) => {
+					this.hooks.onRunDueError?.(error);
+					if (!this.stopped) this.scheduleNext(RUN_DUE_RETRY_MS);
+				});
 			},
 			Math.min(nextDelay, MAX_TIMEOUT_MS),
 		);

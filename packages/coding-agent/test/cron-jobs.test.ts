@@ -894,6 +894,7 @@ describe("AgentCronScheduler", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -1350,6 +1351,20 @@ describe("AgentCronScheduler", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("reports a timer-run store error and retries in 30s instead of rejecting unhandled (pi-wdod5)", async () => {
+		vi.useFakeTimers();
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		vi.spyOn(store, "recoverInterruptedDispatches").mockRejectedValue(new Error("EEXIST"));
+		const onRunDueError = vi.fn();
+		new AgentCronScheduler(store, { runJob: vi.fn(), onRunDueError }).start();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(onRunDueError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: "EEXIST" }));
+		await vi.advanceTimersByTimeAsync(29_999);
+		expect(onRunDueError).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(onRunDueError).toHaveBeenCalledTimes(2);
 	});
 });
 
