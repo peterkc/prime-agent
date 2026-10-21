@@ -657,7 +657,10 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string;
 	/** Structured options used to build the system prompt. Extensions can inspect this to understand what Pi loaded without re-discovering resources. */
 	systemPromptOptions: BuildSystemPromptOptions;
-	/** Every turn this run delivers, in delivery order. `prompt` is the last turn's text. */
+	/**
+	 * The turns this run delivers, in delivery order, as of when the handlers ran. A turn cancelled
+	 * after the handlers finish can still be listed. `prompt` is the last turn's text.
+	 */
 	inputs: BeforeAgentStartInput[];
 }
 
@@ -797,7 +800,10 @@ export interface InputEvent {
 	images?: ImageContent[];
 	/** Where the input came from */
 	source: InputSource;
-	/** Opaque ID, unique within the session. A run started by this input lists it in BeforeAgentStartEvent.inputs. */
+	/**
+	 * Opaque ID, unique within the session. A run started by this input lists it in
+	 * BeforeAgentStartEvent.inputs, unless the turn was restored after a restart.
+	 */
 	inputId: string;
 }
 
