@@ -1166,8 +1166,12 @@ export class AgentCronScheduler {
 			() => {
 				// A store error must not become an unhandled rejection, which ends a daemon worker.
 				this.runDue().catch((error: unknown) => {
-					this.hooks.onRunDueError?.(error);
 					if (!this.stopped) this.scheduleNext(RUN_DUE_RETRY_MS);
+					try {
+						this.hooks.onRunDueError?.(error);
+					} catch {
+						// A throwing report hook must not end the worker either; the retry is already set.
+					}
 				});
 			},
 			Math.min(nextDelay, MAX_TIMEOUT_MS),
