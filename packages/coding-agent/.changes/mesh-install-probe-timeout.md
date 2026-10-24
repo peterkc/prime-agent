@@ -1,0 +1,1 @@
+- Fixed `prime-agent mesh install` rolling back a healthy broker because each readiness probe timed out before `cotal status --components` finished, which takes about 5 seconds without a manager; each probe may now take up to 10 seconds within the 30-second wait.

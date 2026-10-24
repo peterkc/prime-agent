@@ -61,7 +61,7 @@ if (tool === "launchctl") {
   if (args[0] === "status" && control.interruptedStatus && !existsSync(join(root, "interrupted"))) {
     writeFileSync(join(root, "interrupted"), "yes");
     // Keep the process alive until execFile's failure timeout; this timer never signals readiness.
-    if (control.interruptedStatus === "timeout") { setInterval(() => {}, 1000); return; }
+    if (control.interruptedStatus === "timeout") { setInterval(() => {}, 1000); return; } if (control.interruptedStatus === "slow") { setTimeout(() => { console.log("  broker  serving · registered"); process.exit(1); }, 5_500); return; }
     process.stdout.write("x".repeat(2 * 1024 * 1024)); return;
   }
   if (args[0] === "status") { console.log(control.notReady ? "  broker  registered" : "  broker  serving · registered"); console.log(control.seed); process.exit(1); }
@@ -290,11 +290,11 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["timeout", "overflow"])("waits through an interrupted %s status probe", async (interruptedStatus) => {
+	it.each(["timeout", "overflow", "slow"])("waits through the %s status probe", async (interruptedStatus) => {
 		configure({ interruptedStatus });
 		await command("install");
 		expect(process.exitCode).toBeUndefined();
-		expect(events().filter((event) => event.args[0] === "status")).toHaveLength(2);
+		expect(events().filter((e) => e.args[0] === "status")).toHaveLength(interruptedStatus === "slow" ? 1 : 2);
 		expect(existsSync(join(mesh, "signer.json"))).toBe(true);
 	});
 
