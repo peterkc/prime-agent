@@ -232,12 +232,8 @@ async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshR
 	const deadline = runtime.now() + 30_000;
 	while (runtime.now() < deadline) {
 		try {
-			const status = await runTool(
-				cotal,
-				["status", "--components"],
-				options,
-				Math.min(5000, deadline - runtime.now()),
-			);
+			// `cotal status --components` takes about 5 s without a manager, and longer under load.
+			const status = await runTool(cotal, ["status", "--components"], options, deadline - runtime.now());
 			if (brokerServing(status.stdout)) return;
 		} catch {
 			// A failed probe is not readiness; keep checking within the same deadline.
