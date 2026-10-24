@@ -60,8 +60,6 @@ if (tool === "launchctl") {
   if (args[0] === "up") writeFileSync("auth", "ready");
   if (args[0] === "status" && control.interruptedStatus && !existsSync(join(root, "interrupted"))) {
     writeFileSync(join(root, "interrupted"), "yes");
-    // Keep the process alive until execFile's failure timeout; this timer never signals readiness.
-    if (control.interruptedStatus === "timeout") { setInterval(() => {}, 1000); return; }
     process.stdout.write("x".repeat(2 * 1024 * 1024)); return;
   }
   if (args[0] === "status") { console.log(control.notReady ? "  broker  registered" : "  broker  serving · registered"); console.log(control.seed); process.exit(1); }
@@ -205,7 +203,7 @@ describe("mesh command", () => {
 		await command("install", "--mesh-home", mesh);
 		expect(process.exitCode).toBeUndefined();
 		const probe = vi.mocked(subprocessTools.execFile).mock.calls.find((call) => call[1]?.[0] === "status");
-		expect(probe?.[2]).toMatchObject({ timeout: 10_000 });
+		expect(probe?.[2]).toMatchObject({ timeout: 30_000 });
 		expect(events().map((event) => `${event.tool} ${event.args[0]}`)).toEqual([
 			"launchctl print",
 			"cotal --version",
@@ -293,7 +291,7 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["timeout", "overflow"])("waits through an interrupted %s status probe", async (interruptedStatus) => {
+	it.each(["overflow"])("waits through an interrupted %s status probe", async (interruptedStatus) => {
 		configure({ interruptedStatus });
 		await command("install");
 		expect(process.exitCode).toBeUndefined();

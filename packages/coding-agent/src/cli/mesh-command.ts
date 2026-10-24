@@ -137,8 +137,6 @@ function requireSuccess(result: ToolResult, step: string): void {
 }
 
 const REQUIRED_COTAL_VERSION = "0.79.0";
-/** `cotal status --components` takes about 5 s when the mesh runs without a manager. */
-const BROKER_PROBE_TIMEOUT_MS = 10_000;
 
 async function readCotalVersion(cotal: string, options: MeshOptions): Promise<string> {
 	try {
@@ -234,12 +232,8 @@ async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshR
 	const deadline = runtime.now() + 30_000;
 	while (runtime.now() < deadline) {
 		try {
-			const status = await runTool(
-				cotal,
-				["status", "--components"],
-				options,
-				Math.min(BROKER_PROBE_TIMEOUT_MS, deadline - runtime.now()),
-			);
+			// `cotal status --components` takes about 5 s without a manager, and longer under load.
+			const status = await runTool(cotal, ["status", "--components"], options, deadline - runtime.now());
 			if (brokerServing(status.stdout)) return;
 		} catch {
 			// A failed probe is not readiness; keep checking within the same deadline.
