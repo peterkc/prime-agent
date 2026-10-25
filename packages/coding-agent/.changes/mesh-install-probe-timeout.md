@@ -1,1 +1,2 @@
 - Fixed `prime-agent mesh install` rolling back a healthy broker because each readiness probe timed out after 5 seconds, before `cotal status --components` finished (about 5 seconds without a manager, longer under load); a probe may now use the rest of the 30-second wait.
+- Fixed `prime-agent mesh` install, rollback and uninstall possibly hanging with no time limit on a broker or launchd check started just as the 30-second wait ran out.

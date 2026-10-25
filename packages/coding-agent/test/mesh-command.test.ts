@@ -199,11 +199,8 @@ describe("mesh command", () => {
 	});
 
 	it("installs in order, accepts serving with exit 1, and preserves an existing signer", async () => {
-		vi.mocked(subprocessTools.execFile).mockClear();
 		await command("install", "--mesh-home", mesh);
 		expect(process.exitCode).toBeUndefined();
-		const probe = vi.mocked(subprocessTools.execFile).mock.calls.find((call) => call[1]?.[0] === "status");
-		expect(probe?.[2]).toMatchObject({ timeout: 30_000 });
 		expect(events().map((event) => `${event.tool} ${event.args[0]}`)).toEqual([
 			"launchctl print",
 			"cotal --version",
@@ -297,6 +294,19 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBeUndefined();
 		expect(events().filter((event) => event.args[0] === "status")).toHaveLength(2);
 		expect(existsSync(join(mesh, "signer.json"))).toBe(true);
+	});
+
+	it("never starts a status probe or bootout check with a zero timeout at the deadline", async () => {
+		configure({ notReady: true });
+		vi.mocked(subprocessTools.execFile).mockClear();
+		await runMeshCommand(["install", "--label", "ai.prime.mesh.test", "--server", server], {
+			...clock,
+			now: () => (now += 15_000),
+		});
+		const calls = vi.mocked(subprocessTools.execFile).mock.calls;
+		expect(calls.filter((call) => call[1]?.[0] === "status").map((call) => call[2]?.timeout)).toEqual([15_000]);
+		expect(calls.map((call) => call[2]?.timeout)).not.toContain(0);
+		expect(process.exitCode).toBe(1);
 	});
 
 	it.each(["uninstall", "rollback"])("retains the plist when %s cannot confirm bootout", async (step) => {
