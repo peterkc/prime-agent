@@ -291,6 +291,19 @@ async function removeJob(launchctl: string, options: MeshOptions, runtime: MeshR
 	await rm(options.plist, { force: true });
 }
 
+async function removeJobs(launchctl: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+	// Attempt both removals so a stuck renewal job cannot leave the service loaded.
+	const failures: string[] = [];
+	for (const job of [renewalOf(options), options]) {
+		try {
+			await removeJob(launchctl, job, runtime);
+		} catch (error) {
+			failures.push(`${job.label}: ${error instanceof Error ? error.message : "removal failed"}`);
+		}
+	}
+	if (failures.length > 0) throw new Error(failures.join("; "));
+}
+
 async function install(options: MeshOptions, launchctl: string, target: string, runtime: MeshRuntime): Promise<void> {
 	const renewal = renewalOf(options);
 	for (const job of [options, renewal]) {
@@ -340,8 +353,7 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 		);
 	} catch (error) {
 		try {
-			await removeJob(launchctl, renewal, runtime);
-			await removeJob(launchctl, options, runtime);
+			await removeJobs(launchctl, options, runtime);
 		} catch (rollbackError) {
 			const original = error instanceof Error ? error.message : "Mesh install failed";
 			const reason = rollbackError instanceof Error ? rollbackError.message : "cleanup failed";
@@ -592,8 +604,7 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		}
 		switch (command) {
 			case "uninstall":
-				await removeJob(launchctl, renewalOf(toolOptions), runtime);
-				await removeJob(launchctl, toolOptions, runtime);
+				await removeJobs(launchctl, toolOptions, runtime);
 				break;
 			case "start":
 				requireSuccess(await runTool(launchctl, ["kickstart", target], toolOptions), "launchctl kickstart");

@@ -41,10 +41,12 @@ while (!existsSync(join(cotalRoot, ".cotal")) && dirname(cotalRoot) !== cotalRoo
 appendFileSync(join(root, "events.jsonl"), JSON.stringify({ tool, args, cotalRoot, cwd: process.cwd(), home: process.env.COTAL_HOME, skipSeed: process.env.COTAL_SKIP_CONNECTOR_SEED }) + "\n");
 const job = args[0] === "bootstrap" ? /<key>Label<\/key><string>(.*?)<\/string>/.exec(readFileSync(args[2], "utf8"))[1] : String(args.at(-1));
 const loaded = join(root, job.endsWith(".renew") ? "loaded-renew" : "loaded");
+const stalled = control.stalledBootout === true || (control.stalledBootout === "renew" && job.endsWith(".renew"));
 if (tool === "launchctl") {
-  if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (control.stalledBootout || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
+  if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
   if (args[0] === "bootstrap") {
+    if (control.failRenewBootstrap && job.endsWith(".renew")) process.exit(5);
     const plist = readFileSync(args[2], "utf8");
     const decode = x => x.replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"').replaceAll("&apos;", "'");
     const cwd = decode(/<key>WorkingDirectory<\/key><string>(.*?)<\/string>/.exec(plist)[1]);
@@ -54,7 +56,7 @@ if (tool === "launchctl") {
     execFileSync(argv[0], argv.slice(1), { cwd, env: { ...process.env, COTAL_HOME: home } });
     writeFileSync(loaded, "yes");
   }
-  if (args[0] === "bootout") { if (!existsSync(loaded)) process.exit(3); if (control.stalledBootout) process.exit(3); if (control.deferredBootout) writeFileSync(join(root, "removing"), "yes"); else unlinkSync(loaded); if (control.bootoutNonzero) process.exit(3); }
+  if (args[0] === "bootout") { if (!existsSync(loaded)) process.exit(3); if (stalled) process.exit(3); if (control.deferredBootout) writeFileSync(join(root, "removing"), "yes"); else unlinkSync(loaded); if (control.bootoutNonzero) process.exit(3); }
 } else {
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
   if (args[0] === "--version") { console.log(control.versionOutput ?? "cotal-ai 0.79.0\n  adapter test 9.9.9"); process.exit(0); }
@@ -269,9 +271,11 @@ describe("mesh command", () => {
 	});
 
 	it("removes both launchd jobs when the renewal job fails to load", async () => {
-		configure({ fail: "doctor" });
+		configure({ failRenewBootstrap: true });
 		await command("install");
 		expect(process.exitCode).toBe(1);
+		expect(output()).toContain("launchctl bootstrap failed (exit 5)");
+		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(2);
 		expect(readdirSync(dirname(plist))).toEqual([]);
 		expect(existsSync(join(root, "loaded"))).toBe(false);
 	});
@@ -325,15 +329,22 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBe(1);
 	});
 
-	it.each(["uninstall", "rollback"])("retains the plist when %s cannot confirm bootout", async (step) => {
+	it.each([
+		["uninstall", true],
+		["rollback", true],
+		["uninstall", "renew"],
+	] as const)("retains only the unconfirmed plist when %s cannot confirm bootout (%s)", async (step, stalled) => {
 		if (step === "uninstall") await command("install");
-		configure({ stalledBootout: true, fail: step === "rollback" ? "mint" : "" });
+		configure({ stalledBootout: stalled, fail: step === "rollback" ? "mint" : "" });
 		await command(step === "rollback" ? "install" : "uninstall");
 		expect(process.exitCode).toBe(1);
-		expect(existsSync(plist)).toBe(true);
-		expect(existsSync(join(root, "loaded"))).toBe(true);
-		expect(now).toBe(30_000);
-		expect(output()).toContain("still loaded after bootout");
+		expect(existsSync(plist)).toBe(stalled === true);
+		expect(existsSync(join(root, "loaded"))).toBe(stalled === true);
+		// Rollback after a failed mint has no renewal job to stall.
+		expect(existsSync(plist.replace(".plist", ".renew.plist"))).toBe(step === "uninstall");
+		expect(now).toBe(step === "uninstall" && stalled === true ? 60_000 : 30_000);
+		const label = stalled === true ? "ai.prime.mesh.test" : "ai.prime.mesh.test.renew";
+		expect(output()).toContain(`${label}: Mesh launchd service is still loaded after bootout`);
 		if (step === "rollback") expect(output()).toContain("cotal mint --signer failed (exit 2); rollback incomplete:");
 	});
 
@@ -346,6 +357,16 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBeUndefined();
 		expect(readdirSync(dirname(plist))).toEqual([]);
 		expect(readdirSync(root)).not.toContain("loaded-renew");
+		expect(existsSync(join(root, "loaded"))).toBe(false);
+	});
+
+	it("uninstalls an install from before the renewal agent", async () => {
+		await command("install");
+		rmSync(join(root, "loaded-renew"));
+		rmSync(plist.replace(".plist", ".renew.plist"));
+		await command("uninstall");
+		expect(process.exitCode).toBeUndefined();
+		expect(readdirSync(dirname(plist))).toEqual([]);
 		expect(existsSync(join(root, "loaded"))).toBe(false);
 	});
 
