@@ -230,14 +230,13 @@ function brokerServing(stdout: string): boolean {
 
 async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
 	const deadline = runtime.now() + 30_000;
-	while (runtime.now() < deadline) {
+	for (;;) {
+		// Read the clock once: a zero timeout would let execFile wait forever.
+		const timeout = deadline - runtime.now();
+		if (timeout <= 0) break;
 		try {
-			const status = await runTool(
-				cotal,
-				["status", "--components"],
-				options,
-				Math.min(5000, deadline - runtime.now()),
-			);
+			// `cotal status --components` takes about 5 s without a manager, and longer under load.
+			const status = await runTool(cotal, ["status", "--components"], options, timeout);
 			if (brokerServing(status.stdout)) return;
 		} catch {
 			// A failed probe is not readiness; keep checking within the same deadline.
@@ -257,8 +256,10 @@ async function waitForBootout(
 	runtime: MeshRuntime,
 ): Promise<void> {
 	const deadline = runtime.now() + 30_000;
-	while (runtime.now() < deadline) {
-		const job = await runTool(launchctl, ["print", target], options, Math.min(5000, deadline - runtime.now()));
+	for (;;) {
+		const timeout = deadline - runtime.now();
+		if (timeout <= 0) break;
+		const job = await runTool(launchctl, ["print", target], options, Math.min(5000, timeout));
 		if (job.code === 113) return;
 		requireSuccess(job, "launchctl print after bootout");
 		const remaining = deadline - runtime.now();

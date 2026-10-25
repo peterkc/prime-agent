@@ -60,8 +60,6 @@ if (tool === "launchctl") {
   if (args[0] === "up") writeFileSync("auth", "ready");
   if (args[0] === "status" && control.interruptedStatus && !existsSync(join(root, "interrupted"))) {
     writeFileSync(join(root, "interrupted"), "yes");
-    // Keep the process alive until execFile's failure timeout; this timer never signals readiness.
-    if (control.interruptedStatus === "timeout") { setInterval(() => {}, 1000); return; }
     process.stdout.write("x".repeat(2 * 1024 * 1024)); return;
   }
   if (args[0] === "status") { console.log(control.notReady ? "  broker  registered" : "  broker  serving · registered"); console.log(control.seed); process.exit(1); }
@@ -290,12 +288,25 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["timeout", "overflow"])("waits through an interrupted %s status probe", async (interruptedStatus) => {
+	it.each(["overflow"])("waits through an interrupted %s status probe", async (interruptedStatus) => {
 		configure({ interruptedStatus });
 		await command("install");
 		expect(process.exitCode).toBeUndefined();
 		expect(events().filter((event) => event.args[0] === "status")).toHaveLength(2);
 		expect(existsSync(join(mesh, "signer.json"))).toBe(true);
+	});
+
+	it("never starts a status probe or bootout check with a zero timeout at the deadline", async () => {
+		configure({ notReady: true });
+		vi.mocked(subprocessTools.execFile).mockClear();
+		await runMeshCommand(["install", "--label", "ai.prime.mesh.test", "--server", server], {
+			...clock,
+			now: () => (now += 15_000),
+		});
+		const calls = vi.mocked(subprocessTools.execFile).mock.calls;
+		expect(calls.filter((call) => call[1]?.[0] === "status").map((call) => call[2]?.timeout)).toEqual([15_000]);
+		expect(calls.map((call) => call[2]?.timeout)).not.toContain(0);
+		expect(process.exitCode).toBe(1);
 	});
 
 	it.each(["uninstall", "rollback"])("retains the plist when %s cannot confirm bootout", async (step) => {
