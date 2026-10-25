@@ -1,0 +1,1 @@
+- Fixed Cotal's 24-hour daemon credentials never renewing, because the mesh runs without Cotal's manager; `mesh doctor` then reported an auth failure. `prime-agent mesh install` now adds a launchd agent that runs Cotal's renewal repair every 10 minutes. Reinstall an existing mesh (`mesh uninstall`, then `mesh install`) to add it; the mesh home is kept.

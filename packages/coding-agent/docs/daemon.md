@@ -103,19 +103,27 @@ upgrade after installation is not prevented.
 The service runs `cotal up --space prime --server <URL> --no-manager` in the mesh home,
 with `COTAL_HOME=<mesh home>/home`. Options are `--mesh-home`, `--server nats://127.0.0.1:<port>`
 and `--label ai.prime.mesh.<name>`. `--mesh-home` is test-only.
+Cotal renews its 24-hour daemon credentials only from its manager, which `--no-manager`
+omits. Install therefore adds a second launchd agent, `<label>.renew`, that runs
+`cotal doctor auth --fix` in the mesh home at load and every 10 minutes. Cotal's repair
+re-signs only credentials past their renewal point, at 75% of their lifetime. It logs to
+`<mesh home>/renewal.log`, about 125 KB a day.
 Install refuses an occupied label or port.
-If startup or signer creation fails, it removes the service and plist but keeps the home.
+If startup, signer creation or loading the renewal agent fails, it removes both agents
+and plists but keeps the home. A failing renewal run shows in `renewal.log` and in
+`mesh doctor`, not at install.
 
 - `prime-agent mesh start` and `stop` start or stop the installed service.
 - `prime-agent mesh status` first checks every RLM ledger locally, even without the
   mesh home, broker or Cotal CLI. If the mesh home or its `.cotal` directory is missing,
   it stops after that check. Full status output includes the CLI version or its read
-  failure, service state, store bytes, service-log bytes, enrolled-session count, and
-  each session's stored, unacknowledged message count.
+  failure, service state, renewal-agent state, store bytes, service-log and renewal-log
+  bytes, enrolled-session count, and each session's stored, unacknowledged message count.
+  A missing renewal agent fails status; reinstall the mesh to add it.
 - `prime-agent mesh doctor` checks the exact CLI version first, then ledger and status
   health, then Cotal auth. A failed version check still stops before ledger diagnosis;
   use `mesh status` for that offline check. An unhealthy check sets exit code 1.
-- `prime-agent mesh uninstall` removes the service and plist, not the mesh home,
+- `prime-agent mesh uninstall` removes both agents and plists, not the mesh home,
   signer, enrollment records or stored messages. Existing sessions need that auth.
 - Install, uninstall, start and stop refuse platforms other than macOS without changes.
 
@@ -216,7 +224,7 @@ These lines count durable consumer directories on disk. Cotal's pending-count in
 can leave temporary memory-only DM consumers. They also use the limit but are not in
 these disk counts. The client sets a five-minute inactivity threshold and attempts
 immediate cleanup.
-The broker store has no retention limit. `<mesh home>/service.log` is not rotated.
+The broker store has no retention limit. `service.log` and `renewal.log` are not rotated.
 Monitor the reported sizes; a full disk can make sends fail. Status queries pending counts
 once per enrollment and gets slower as the number of sessions grows.
 

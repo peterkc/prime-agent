@@ -3,7 +3,7 @@ import { constants, existsSync } from "node:fs";
 import { access, chmod, lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir } from "../config.js";
@@ -63,7 +63,8 @@ function parseOptions(args: readonly string[]): MeshOptions {
 				throw new Error("Unknown mesh option");
 		}
 	}
-	if (!/^ai\.prime\.mesh(?:\.[A-Za-z0-9.-]+)?$/.test(label)) throw new Error("Invalid mesh launchd label");
+	if (!/^ai\.prime\.mesh(?:\.[A-Za-z0-9.-]+)?$/.test(label) || label.endsWith(".renew"))
+		throw new Error("Invalid mesh launchd label");
 	let url: URL;
 	try {
 		url = new URL(server);
@@ -170,8 +171,23 @@ function xml(value: string): string {
 		.replaceAll("'", "&apos;");
 }
 
-function agentPlist(options: MeshOptions, cotal: string): string {
-	const args = [cotal, "up", "--space", "prime", "--server", options.server, "--no-manager"];
+// Cotal renews its 24-hour daemon creds only from its manager, which `--no-manager` omits. A second
+// job runs Cotal's documented repair every 10 minutes. It re-signs only creds past their renewal
+// point (75% of their lifetime), so a short interval keeps `cotal doctor auth` healthy.
+function renewalOf(options: MeshOptions): MeshOptions {
+	const label = `${options.label}.renew`;
+	return { ...options, label, plist: join(dirname(options.plist), `${label}.plist`) };
+}
+
+function targetOf(options: MeshOptions): string {
+	return `gui/${process.getuid?.()}/${options.label}`;
+}
+
+function agentPlist(options: MeshOptions, cotal: string, renewal = false): string {
+	const args = renewal
+		? [cotal, "doctor", "auth", "--fix"]
+		: [cotal, "up", "--space", "prime", "--server", options.server, "--no-manager"];
+	const log = xml(join(options.meshHome, renewal ? "renewal.log" : "service.log"));
 	const env = {
 		COTAL_HOME: join(options.meshHome, "home"),
 		PATH: absolutePathEntries().join(delimiter),
@@ -189,9 +205,9 @@ function agentPlist(options: MeshOptions, cotal: string): string {
 		.map(([key, value]) => `<key>${key}</key><string>${xml(value)}</string>`)
 		.join("")}</dict>
 <key>RunAtLoad</key><true/>
-<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-<key>StandardOutPath</key><string>${xml(join(options.meshHome, "service.log"))}</string>
-<key>StandardErrorPath</key><string>${xml(join(options.meshHome, "service.log"))}</string>
+${renewal ? "<key>StartInterval</key><integer>600</integer>" : "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"}
+<key>StandardOutPath</key><string>${log}</string>
+<key>StandardErrorPath</key><string>${log}</string>
 </dict></plist>
 `;
 }
@@ -268,13 +284,22 @@ async function waitForBootout(
 	throw new Error("Mesh launchd service is still loaded after bootout");
 }
 
+async function removeJob(launchctl: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+	// bootout can return nonzero for an absent job; confirm removal with print.
+	await runTool(launchctl, ["bootout", targetOf(options)], options);
+	await waitForBootout(launchctl, targetOf(options), options, runtime);
+	await rm(options.plist, { force: true });
+}
+
 async function install(options: MeshOptions, launchctl: string, target: string, runtime: MeshRuntime): Promise<void> {
-	// print must work before the mesh home exists; launchctl does not use Cotal's working directory.
-	const probeOptions = { ...options, meshHome: homedir() };
-	const loaded = await runTool(launchctl, ["print", target], probeOptions);
-	if (loaded.code === 0) throw new Error("Mesh launchd label is already loaded");
-	if (existsSync(options.plist)) throw new Error("Mesh launchd plist already exists; uninstall it first");
-	if (loaded.code !== 113) requireSuccess(loaded, "launchctl print");
+	const renewal = renewalOf(options);
+	for (const job of [options, renewal]) {
+		// print must work before the mesh home exists; launchctl does not use Cotal's working directory.
+		const loaded = await runTool(launchctl, ["print", targetOf(job)], { ...job, meshHome: homedir() });
+		if (loaded.code === 0) throw new Error(`Mesh launchd label ${job.label} is already loaded`);
+		if (existsSync(job.plist)) throw new Error("Mesh launchd plist already exists; uninstall it first");
+		if (loaded.code !== 113) requireSuccess(loaded, "launchctl print");
+	}
 	await assertFreePort(options.port);
 	const cotal = await executable("cotal");
 	await requireCotalVersion(cotal, options);
@@ -308,12 +333,15 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 			if (!existsSync(join(options.meshHome, "signer.json")))
 				throw new Error("cotal mint did not create signer.json");
 		}
+		await writeFile(renewal.plist, agentPlist(renewal, cotal, true), { flag: "wx", mode: 0o600 });
+		requireSuccess(
+			await runTool(launchctl, ["bootstrap", target.slice(0, target.lastIndexOf("/")), renewal.plist], options),
+			"launchctl bootstrap",
+		);
 	} catch (error) {
 		try {
-			// bootout can return nonzero for an absent job; confirm removal with print.
-			await runTool(launchctl, ["bootout", target], options);
-			await waitForBootout(launchctl, target, options, runtime);
-			await rm(options.plist, { force: true });
+			await removeJob(launchctl, renewal, runtime);
+			await removeJob(launchctl, options, runtime);
 		} catch (rollbackError) {
 			const original = error instanceof Error ? error.message : "Mesh install failed";
 			const reason = rollbackError instanceof Error ? rollbackError.message : "cleanup failed";
@@ -448,6 +476,8 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	const lastExitCode =
 		job?.code === 0 ? /^\s*last exit code = (-?\d+)(?:: [^\r\n]+)?\s*$/m.exec(job.stdout)?.[1] : undefined;
 	if (lastExitCode !== undefined) console.log(`Launchd last exit code: ${lastExitCode}`);
+	const renewal = launchctl ? await runTool(launchctl, ["print", targetOf(renewalOf(options))], options) : undefined;
+	if (renewal) console.log(`Credential renewal: ${renewal.code === 0 ? "scheduled" : "absent"}`);
 	const broker = await runTool(
 		cotal,
 		["status", "--components", "--space", config.space, "--server", config.server],
@@ -459,6 +489,8 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	console.log(`Store: ${await storeBytes(join(options.meshHome, ".cotal", "nats", "jetstream"))} bytes`);
 	const log = join(options.meshHome, "service.log");
 	console.log(`Service log: ${existsSync(log) ? (await lstat(log)).size : 0} bytes`);
+	const renewalLog = join(options.meshHome, "renewal.log");
+	console.log(`Renewal log: ${existsSync(renewalLog) ? (await lstat(renewalLog)).size : 0} bytes`);
 	if (!serving) throw new Error("Mesh broker is not serving");
 	let countUnavailable = false;
 	const enrollments = join(options.meshHome, "enrollments");
@@ -516,6 +548,7 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 		console.log(`Session ${sessionId}: ${pendingCount(pending.stdout)} unacknowledged`);
 	}
 	if (job && job.code !== 0) throw new Error("Mesh launchd service is absent or inaccessible");
+	if (renewal && renewal.code !== 0) throw new Error("Mesh credential renewal job is absent; reinstall the mesh");
 	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
 	if (versionUnavailable) throw new Error("Mesh CLI version is unavailable");
 }
@@ -535,7 +568,7 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 			ledgerUnhealthy = reportLedgerHealth();
 		}
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
-		const target = `gui/${process.getuid?.()}/${options.label}`;
+		const target = targetOf(options);
 		if (command === "status" || command === "doctor") {
 			await status(options, launchctl, target);
 			if (command === "doctor") {
@@ -553,14 +586,14 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		}
 		const toolOptions = { ...options, meshHome: homedir() };
 		const job = await runTool(launchctl, ["print", target], toolOptions);
-		if (!(command === "uninstall" && job.code === 113 && existsSync(options.plist))) {
+		const plists = [options.plist, renewalOf(options).plist];
+		if (!(command === "uninstall" && job.code === 113 && plists.some((plist) => existsSync(plist)))) {
 			requireSuccess(job, "Mesh launchd service lookup");
 		}
 		switch (command) {
 			case "uninstall":
-				await runTool(launchctl, ["bootout", target], toolOptions);
-				await waitForBootout(launchctl, target, toolOptions, runtime);
-				await rm(options.plist, { force: true });
+				await removeJob(launchctl, renewalOf(toolOptions), runtime);
+				await removeJob(launchctl, toolOptions, runtime);
 				break;
 			case "start":
 				requireSuccess(await runTool(launchctl, ["kickstart", target], toolOptions), "launchctl kickstart");
