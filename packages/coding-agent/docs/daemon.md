@@ -113,8 +113,11 @@ have a 30-day lifetime. The renewal agent cannot re-sign them. Install adds a th
 agent, `<label>.rotate`, that runs `prime-agent mesh rotate --if-due` daily at 04:00
 local time. It rotates when either credential reaches 75% of its lifetime, about
 every three weeks. Its command output goes to `<mesh home>/rotation.log`; broker
-boot output stays in `service.log`. The job uses the absolute `prime-agent` entry
-on `PATH`, not its resolved symlink target, so an upgrade can replace that target.
+boot output stays in `service.log`. The job uses the managed native installation's
+upgrade-stable launcher when available. Otherwise, install requires the absolute
+`prime-agent` entry on `PATH` to resolve to the running CLI. It keeps that entry,
+not its resolved symlink target, so an upgrade can replace the target. A shadowing
+installation on `PATH` is refused before mesh files are written.
 
 Install refuses an occupied service, renewal or rotation label, or broker port.
 Labels ending in `.renew` or `.rotate` are reserved. If startup, signer creation or
@@ -147,8 +150,12 @@ scheduled. The error names `rotation.log` and `rotation.lock` for investigation.
 - Install, uninstall, start, stop and rotate refuse platforms other than macOS
   without changes.
 
-Rotation normally causes an outage of up to about a minute. Failure and recovery
-can add the bounded waits to about three minutes. Sessions reconnect afterward.
+Rotation normally causes an outage of up to about a minute. The configured waits
+and tool timeouts allow up to 272 seconds (about 4.5 minutes) including failure
+and recovery. This excludes filesystem delays and process-scheduling overhead.
+Sessions reconnect afterward. If the service was stopped with `mesh stop`, rotation
+still renews the credentials, then sends SIGTERM to the restored service to keep
+it stopped, including after a failed rotation.
 It stops the renewal and service jobs, then waits for the broker port and recorded
 Cotal processes to stop. A temporary foreground launchd job boots the same service
 with `--rotate-sys` and no `KeepAlive`. After both $SYS issue times advance and their
@@ -156,18 +163,26 @@ with `--rotate-sys` and no `KeepAlive`. After both $SYS issue times advance and 
 exit, and restores the installed service and renewal jobs. The installed service
 plist never changes. Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon
 through `cotal down`; rotation uses launchd and waits for that daemon to exit itself.
-Each stop wait is bounded at 30 seconds. No failed step is hidden; recovery still
-attempts to restore both installed jobs, even when a job lookup fails or is killed.
-SIGINT and SIGTERM are deferred while jobs are stopped; recovery finishes before
-rotation exits nonzero naming the signal. The scheduled agent gives launchd's own
-stop 240 seconds (`ExitTimeOut`), longer than the bounded waits.
+Each stop wait has a 30-second deadline; its final port probe can take one second
+more. No failed step is hidden; recovery still attempts to restore both installed
+jobs, even when a job lookup fails or is killed.
+SIGINT, SIGTERM and SIGHUP are deferred while jobs are stopped; recovery finishes
+before rotation exits nonzero naming the signal. The 272-second bound includes
+three bootouts (5-second calls plus 30-second removal waits), two process/port
+stop waits (up to 31 seconds each, including the final 1-second port probe), two
+30-second readiness waits, and nine other 5-second calls (version, preflight
+lookups, temporary bootstrap, restore lookups and bootstraps, and a final stop).
+The scheduled agent sets `ExitTimeOut` to 330 seconds, leaving 58 seconds of margin.
 
 Rotation holds `<mesh home>/rotation.lock` exclusively and records its owner PID.
 A concurrent rotation refuses to run while that PID is live. A later rotation takes
 over a dead owner's lock and reports it. Unreadable owner content refuses rotation;
 confirm no rotation process is running before removing that lock. If
 `rotation-boot.plist` remains, status reports that recovery is needed. After
-confirming no rotation is running, uninstall and reinstall the mesh.
+confirming no rotation is running, uninstall and reinstall the mesh. If the jobs
+are unloaded but no temporary plist remains, restore the service first with
+`launchctl bootstrap gui/$UID ~/Library/LaunchAgents/<label>.plist`, then restore
+the renewal job with `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/<label>.renew.plist`.
 
 **Warning:** Rotation makes earlier full Cotal backups unrestorable against the new
 trust chain. Take a fresh full backup after rotation. The data account, agent

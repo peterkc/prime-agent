@@ -9,6 +9,7 @@ import {
 	readFileSync,
 	realpathSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
@@ -24,7 +25,18 @@ import { RLM_LEDGER_DIR } from "../src/modes/daemon/rlm-ledger.js";
 
 vi.mock("node:child_process", async (original) => {
 	const tools = await original<typeof subprocessTools>();
-	return { ...tools, execFile: vi.fn(tools.execFile) };
+	return {
+		...tools,
+		execFile: vi.fn((...params: Parameters<typeof tools.execFile>) =>
+			tools.execFile(params[0], params[1], params[2], (error, stdout, stderr) => {
+				if (control.timeoutBootout && params[1]?.[0] === "bootout" && existsSync(join(root, "rotated"))) {
+					expect(params[2]?.timeout).toBe(5000);
+					error = Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM" as const });
+				}
+				params[3]?.(error, stdout, stderr);
+			}),
+		),
+	};
 });
 
 const seed = `S${"A".repeat(57)}`;
@@ -44,8 +56,9 @@ const loaded = join(root, job.endsWith(".rotate") ? "loaded-rotate" : job.endsWi
 const stalled = (control.stalledBootout === true && !job.endsWith(".rotate")) || (control.stalledBootout === "renew" && job.endsWith(".renew")) || (control.stalledBootout === "service" && job.endsWith(".test")) || (control.stalledBootout === "temporary" && existsSync(join(root, "rotated")) && job.endsWith(".test"));
 if (tool === "launchctl") {
   if (args[0] === "print" && control.killRestartPrint && job.endsWith(".test") && existsSync(join(root, "rotated")) && !existsSync(join(root, "agent", "mesh", "rotation-boot.plist"))) process.kill(process.pid, "SIGKILL");
-  if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
+  if (args[0] === "print") { console.log("state = " + (existsSync(join(root, "stopped")) ? "not running" : "running") + "\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
+  if (args[0] === "kill") { writeFileSync(join(root, "stopped"), "yes"); if (existsSync(join(cotalRoot, ".cotal", "nats.pid"))) unlinkSync(join(cotalRoot, ".cotal", "nats.pid")); }
   if (args[0] === "bootstrap") {
     if ((control.failRenewBootstrap && job.endsWith(".renew")) || (control.failRotateBootstrap && job.endsWith(".rotate")) || (control.failRestart && existsSync(join(root, "rotated")) && !job.endsWith(".renew"))) process.exit(5);
     const plist = readFileSync(args[2], "utf8");
@@ -56,8 +69,9 @@ if (tool === "launchctl") {
     const argv = [.../<key>ProgramArguments<\/key><array>(.*?)<\/array>/.exec(plist)[1].matchAll(/<string>(.*?)<\/string>/g)].map(m => decode(m[1]));
     if (!existsSync(join(cwd, "mesh.json")) || !existsSync(join(cwd, ".cotal"))) process.exit(3);
     if (!job.endsWith(".rotate")) execFileSync(argv[0], argv.slice(1), { cwd, env: { ...process.env, COTAL_HOME: home } });
-    writeFileSync(loaded, "yes");
+    writeFileSync(loaded, "yes"); if (!job.endsWith(".renew") && !job.endsWith(".rotate") && existsSync(join(root, "stopped"))) unlinkSync(join(root, "stopped"));
   }
+  if (args[0] === "bootout" && control.killBootout && !existsSync(join(root, "rotated"))) { writeFileSync(join(root, "removing"), "yes"); process.kill(process.pid, "SIGKILL"); }
   if (args[0] === "bootout") { if (!existsSync(loaded)) process.exit(3); if (stalled) process.exit(3); if (control.deferredBootout) writeFileSync(join(root, "removing"), "yes"); else unlinkSync(loaded); if (control.bootoutNonzero) process.exit(3); }
 } else {
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
@@ -102,6 +116,7 @@ let plist: string;
 let server: string;
 let control: Record<string, unknown>;
 let now = 0;
+const originalArgv = [...process.argv];
 const clock = {
 	platform: "darwin" as const,
 	now: () => now,
@@ -179,8 +194,10 @@ describe("mesh command", () => {
 		plist = join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist");
 		mkdirSync(join(root, "bin"));
 		mkdirSync(join(root, ".cotal"));
-		for (const tool of ["launchctl", "cotal", "prime-agent"])
-			writeFileSync(join(root, "bin", tool), fakeTool, { mode: 0o700 });
+		for (const tool of ["launchctl", "cotal"]) writeFileSync(join(root, "bin", tool), fakeTool, { mode: 0o700 });
+		process.argv[1] = join(root, "running-cli");
+		writeFileSync(process.argv[1], fakeTool, { mode: 0o700 });
+		symlinkSync(process.argv[1], join(root, "bin", "prime-agent"));
 		vi.stubEnv(ENV_AGENT_DIR, join(root, "agent"));
 		vi.stubEnv("HOME", root);
 		vi.stubEnv("XDG_CONFIG_HOME", join(root, "config"));
@@ -195,6 +212,8 @@ describe("mesh command", () => {
 	});
 	afterEach(() => {
 		process.exitCode = undefined;
+		process.argv = [...originalArgv];
+		vi.mocked(subprocessTools.execFile).mockReset();
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 		rmSync(root, { recursive: true, force: true });
@@ -325,16 +344,17 @@ describe("mesh command", () => {
 		expect(existsSync(join(root, "loaded"))).toBe(false);
 	});
 
-	it.each(["label", "port", "wildcard", "plist"])(
+	it.each(["label", "port", "wildcard", "plist", "launcher"])(
 		"refuses an occupied %s before creating mesh files",
 		async (occupied) => {
 			const socket = createServer();
 			try {
-				if (occupied === "label") writeFileSync(join(root, "loaded"), "yes");
+				if (occupied === "launcher") process.argv[1] = process.execPath;
+				else if (occupied === "label") writeFileSync(join(root, "loaded"), "yes");
 				else if (occupied === "plist") {
 					mkdirSync(join(root, "Library", "LaunchAgents"), { recursive: true });
 					writeFileSync(plist, "retained");
-				} else {
+				} else if (occupied !== "launcher") {
 					await new Promise<void>((ready) =>
 						socket.listen(0, occupied === "wildcard" ? "0.0.0.0" : "127.0.0.1", ready),
 					);
@@ -345,7 +365,10 @@ describe("mesh command", () => {
 				await command("install");
 				expect(process.exitCode).toBe(1);
 				expect(existsSync(mesh)).toBe(false);
-				expect(events()).toHaveLength(occupied === "label" || occupied === "plist" ? 1 : 3);
+				expect(events()).toHaveLength(
+					occupied === "label" || occupied === "plist" ? 1 : occupied === "launcher" ? 4 : 3,
+				);
+				if (occupied === "launcher") expect(output()).toContain("PATH does not resolve to the running CLI");
 				if (occupied === "plist") expect(readFileSync(plist, "utf8")).toBe("retained");
 			} finally {
 				if (socket.listening) await new Promise<void>((closed) => socket.close(() => closed()));
@@ -700,18 +723,9 @@ describe("mesh command", () => {
 				const effects = events().filter((event) =>
 					["bootout", "bootstrap", "up", "down", "status"].includes(event.args[0]!),
 				);
-				expect(effects.map((event) => event.args[0])).toEqual([
-					"bootout",
-					"bootout",
-					"bootstrap",
-					"up",
-					"status",
-					"bootout",
-					"bootstrap",
-					"up",
-					"bootstrap",
-					"status",
-				]);
+				expect(effects.map((event) => event.args[0]).join(" ")).toBe(
+					"bootout bootout bootstrap up status bootout bootstrap up bootstrap status",
+				);
 				expect(effects.slice(0, 2).map((event) => event.args[1])).toEqual([
 					`gui/${process.getuid!()}/ai.prime.mesh.test.renew`,
 					`gui/${process.getuid!()}/ai.prime.mesh.test`,
@@ -740,55 +754,52 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["boot", "restart", "stale", "service", "renew", "temporary"])(
-		"restores jobs and reports a failed rotation step (%s)",
-		async (failure) => {
-			await command("install");
-			now = Date.UTC(2026, 10, 1);
-			configure({
-				failRotate: failure === "boot",
-				failRestart: failure === "restart",
-				staleRotation: failure === "stale",
-				stalledBootout: ["service", "renew", "temporary"].includes(failure) ? failure : undefined,
-			});
-			rmSync(join(root, "events.jsonl"));
-			await command("rotate");
-			expect(process.exitCode).toBe(1);
-			expect(output()).toContain(
-				failure === "boot"
-					? "start rotation broker"
-					: failure === "restart"
-						? "restart ai.prime.mesh.test"
-						: failure === "stale"
-							? "verify rotated $SYS credentials"
-							: failure === "temporary"
-								? "stop rotation broker"
-								: `stop ai.prime.mesh.test${failure === "renew" ? ".renew" : ""}`,
-			);
-			expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(
-				failure === "service" ? 1 : failure === "renew" ? 0 : 3,
-			);
-			if (failure === "temporary") {
-				await command("status");
-				expect(process.exitCode).toBe(1);
-				expect(output()).toContain("Temporary rotation plist remains");
-			}
-			expect(events().some((event) => event.args[0] === "down")).toBe(false);
-			expect(existsSync(join(root, "loaded-renew"))).toBe(true);
-			expect(existsSync(join(root, "loaded"))).toBe(failure !== "restart");
-			expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
-			expect(output()).not.toContain(seed);
-		},
-	);
-
-	it("restarts the service when its restart lookup is killed", async () => {
+	it.each([
+		["boot", "start rotation broker", 3],
+		["restart", "restart ai.prime.mesh.test", 3],
+		["stale", "verify rotated $SYS credentials", 3],
+		["service", "stop ai.prime.mesh.test", 1],
+		["renew", "stop ai.prime.mesh.test.renew", 0],
+		["temporary", "stop rotation broker", 3],
+	] as const)("restores jobs and reports a failed rotation step (%s)", async (failure, step, bootstraps) => {
 		await command("install");
 		now = Date.UTC(2026, 10, 1);
-		configure({ killRestartPrint: true });
+		configure({
+			failRotate: failure === "boot",
+			failRestart: failure === "restart",
+			staleRotation: failure === "stale",
+			stalledBootout: ["service", "renew", "temporary"].includes(failure) ? failure : undefined,
+		});
+		rmSync(join(root, "events.jsonl"));
+		await command("rotate");
+		expect(process.exitCode).toBe(1);
+		expect(output()).toContain(step);
+		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(bootstraps);
+		if (failure === "temporary") {
+			await command("status");
+			expect(process.exitCode).toBe(1);
+			expect(output()).toContain("Temporary rotation plist remains");
+		}
+		expect(events().some((event) => event.args[0] === "down")).toBe(false);
+		expect(existsSync(join(root, "loaded-renew"))).toBe(true);
+		expect(existsSync(join(root, "loaded"))).toBe(failure !== "restart");
+		expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
+		expect(output()).not.toContain(seed);
+	});
+
+	it.each(["lookup", "killed-stop", "timed-out-cleanup"])("PR 52 recovers after a rejected %s", async (failure) => {
+		await command("install");
+		configure({
+			killRestartPrint: failure === "lookup",
+			killBootout: failure === "killed-stop",
+			deferredBootout: failure === "timed-out-cleanup",
+			timeoutBootout: failure === "timed-out-cleanup",
+		});
 		rmSync(join(root, "events.jsonl"));
 		await command("rotate");
 		expect(process.exitCode).toBeUndefined();
-		expect(existsSync(join(root, "loaded"))).toBe(true);
+		for (const job of ["loaded", "loaded-renew"]) expect(existsSync(join(root, job))).toBe(true);
+		for (const file of ["rotation-boot.plist", "rotation.lock"]) expect(existsSync(join(mesh, file))).toBe(false);
 		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(3);
 	});
 
@@ -821,6 +832,7 @@ describe("mesh command", () => {
 			expect(output()).toContain("wait for Cotal processes to stop");
 			expect(events().some((event) => event.args.includes(join(mesh, "rotation-boot.plist")))).toBe(false);
 			expect(now).toBe(30_000);
+			if (held === "pid") expect(output()).toContain(`${join(mesh, ".cotal", "nats.pid")} (PID 42)`);
 		} finally {
 			if (socket.listening) await new Promise<void>((closed) => socket.close(() => closed()));
 		}
@@ -908,7 +920,7 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["SIGINT", "SIGTERM"] as const)("restores jobs before reporting %s", async (signal) => {
+	it.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)("restores jobs before reporting %s", async (signal) => {
 		await command("install");
 		const listeners = process.listeners(signal);
 		configure({ signal });
@@ -918,6 +930,19 @@ describe("mesh command", () => {
 		for (const job of ["loaded", "loaded-renew"]) expect(existsSync(join(root, job))).toBe(true);
 		expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
 		expect(process.listeners(signal)).toEqual(listeners);
+	});
+
+	it.each([false, true])("PR 52 keeps a stopped service stopped after rotation (failure=%s)", async (failRotate) => {
+		await command("install");
+		await command("stop");
+		now = Date.UTC(2026, 10, 1);
+		configure({ failRotate });
+		await command("rotate");
+		expect(process.exitCode).toBe(failRotate ? 1 : undefined);
+		await command("status");
+		expect(output()).toContain("Launchd: not running");
+
+		if (!failRotate) expect(output()).toContain("Mesh credentials rotated");
 	});
 
 	it("preserves the rotation error when lock cleanup also fails", async () => {
@@ -941,31 +966,54 @@ describe("mesh command", () => {
 		expect(output()).toContain("Mesh credentials rotated");
 	});
 
-	it.each(["missing", "garbled", "lock", "duplicate-jwt"])(
-		"refuses rotation before stopping anything (%s)",
-		async (failure) => {
-			await command("install");
-			const cred = join(mesh, ".cotal", "space.7072696d65", "connection-evictor.creds");
-			if (failure === "missing") rmSync(cred);
-			if (failure === "garbled")
-				writeFileSync(
-					cred,
-					`-----BEGIN NATS USER JWT-----
-e30.eyJleHAiOiJzZWNyZXQifQ.c2ln
-------END NATS USER JWT------
-${seed}`,
-				);
-			if (failure === "lock") mkdirSync(join(mesh, "rotation.lock"));
-			if (failure === "duplicate-jwt")
-				writeFileSync(cred, `${readFileSync(cred, "utf8")}\n${readFileSync(cred, "utf8")}`);
-			rmSync(join(root, "events.jsonl"));
-			await command("rotate");
-			expect(process.exitCode).toBe(1);
+	it.each([
+		"missing",
+		"garbled",
+		"lock",
+		"duplicate-jwt",
+		"server",
+		"unknown-plist",
+		"rotating-plist",
+		"leftover",
+		"service-plist",
+		"renewal-plist",
+		"service-unloaded",
+		"renewal-unloaded",
+	])("refuses rotation before stopping anything (%s)", async (failure) => {
+		await command("install");
+		const cred = join(mesh, ".cotal", "space.7072696d65", "connection-evictor.creds");
+		if (failure === "missing") rmSync(cred);
+		if (failure === "garbled")
+			writeFileSync(
+				cred,
+				`-----BEGIN NATS USER JWT-----\ne30.eyJleHAiOiJzZWNyZXQifQ.c2ln\n------END NATS USER JWT------\n${seed}`,
+			);
+		if (failure === "lock") mkdirSync(join(mesh, "rotation.lock"));
+		if (failure === "duplicate-jwt")
+			writeFileSync(cred, `${readFileSync(cred, "utf8")}\n${readFileSync(cred, "utf8")}`);
+		if (failure === "server")
+			writeFileSync(join(mesh, "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+		if (failure === "unknown-plist") writeFileSync(plist, "unrecognized");
+		if (failure === "rotating-plist")
+			writeFileSync(plist, readFileSync(plist, "utf8").replace("</array>", "<string>--rotate-sys</string></array>"));
+		if (failure === "leftover") writeFileSync(join(mesh, "rotation-boot.plist"), "leftover");
+		if (failure === "service-plist") rmSync(plist);
+		if (failure === "renewal-plist") {
+			const file = plist.replace(".plist", ".renew.plist");
+			rmSync(file);
+			mkdirSync(file);
+		}
+		if (failure.endsWith("-unloaded")) rmSync(join(root, failure === "service-unloaded" ? "loaded" : "loaded-renew"));
+		rmSync(join(root, "events.jsonl"));
+		await command("rotate");
+		expect(process.exitCode).toBe(1);
+		expect(events().filter((event) => ["bootout", "bootstrap"].includes(event.args[0]!))).toEqual([]);
+		if (["missing", "garbled", "duplicate-jwt", "lock"].includes(failure)) {
 			expect(events()).toEqual([]);
 			expect(output()).toContain(failure === "lock" ? "rotation lock" : "Cannot read $SYS credential lifetime");
-			expect(output()).not.toContain(seed);
-		},
-	);
+		}
+		expect(output()).not.toContain(seed);
+	});
 
 	it.each(["healthy", "bootstrap", "occupied", "absent-status", "older-install"])(
 		"owns the third rotation job (%s)",
@@ -993,7 +1041,7 @@ ${seed}`,
 				`<string>${join(root, "bin", "prime-agent")}</string><string>mesh</string><string>rotate</string><string>--if-due</string><string>--label</string><string>ai.prime.mesh.test</string><string>--server</string><string>${server}</string><string>--mesh-home</string><string>${mesh}</string>`,
 			);
 			expect(job).toContain(
-				"<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict><key>ExitTimeOut</key><integer>240</integer>",
+				"<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict><key>ExitTimeOut</key><integer>330</integer>",
 			);
 			expect(job).toContain(`<key>StandardErrorPath</key><string>${join(mesh, "rotation.log")}</string>`);
 			expect(job).not.toContain("<key>RunAtLoad</key>");
