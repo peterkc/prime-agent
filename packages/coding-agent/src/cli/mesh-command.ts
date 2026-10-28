@@ -350,7 +350,7 @@ function processAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if (["ESRCH", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
 		throw error;
 	}
 }
@@ -505,52 +505,87 @@ async function meshConfig(options: MeshOptions): Promise<{ readonly space: strin
 	return { space: config.space, server: config.server };
 }
 
-async function systemCredentials(options: MeshOptions, space: string): Promise<readonly SystemCredential[]> {
+const SYSTEM_CREDENTIAL_FILES = ["membership-observer.creds", "connection-evictor.creds"] as const;
+
+async function systemCredential(options: MeshOptions, space: string, file: string): Promise<SystemCredential> {
 	// Cotal 0.79.0 spaceSegment: lowercase hex of the space's UTF-8 bytes, under .cotal (not auth).
 	const directory = join(options.meshHome, ".cotal", `space.${Buffer.from(space, "utf8").toString("hex")}`);
-	const credentials: SystemCredential[] = [];
-	for (const file of ["membership-observer.creds", "connection-evictor.creds"]) {
-		try {
-			const text = await readFile(join(directory, file), "utf8");
-			const sections = [
-				...text.matchAll(
-					/^-----BEGIN NATS USER JWT-----\r?\n([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\r?\n------END NATS USER JWT------$/gm,
-				),
-			];
-			if (sections.length !== 1) throw new Error("expected one JWT section");
-			const jwt = sections[0]![1]!;
-			const claims: unknown = JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString("utf8"));
-			if (
-				!claims ||
-				typeof claims !== "object" ||
-				!("iat" in claims) ||
-				!("exp" in claims) ||
-				typeof claims.iat !== "number" ||
-				typeof claims.exp !== "number" ||
-				!Number.isSafeInteger(claims.iat) ||
-				!Number.isSafeInteger(claims.exp) ||
-				claims.iat < 0 ||
-				claims.exp <= claims.iat ||
-				claims.exp > 8_640_000_000_000
-			)
-				throw new Error("invalid lifetime");
-			credentials.push({ file, iat: claims.iat, exp: claims.exp });
-		} catch {
-			// Never include parser errors: they may quote a credential's JWT or secret seed.
-			throw new Error(`Cannot read $SYS credential lifetime: ${file}`);
-		}
+	try {
+		const text = await readFile(join(directory, file), "utf8");
+		const sections = [
+			...text.matchAll(
+				/^-----BEGIN NATS USER JWT-----\r?\n([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\r?\n------END NATS USER JWT------$/gm,
+			),
+		];
+		if (sections.length !== 1) throw new Error("expected one JWT section");
+		const jwt = sections[0]![1]!;
+		const claims: unknown = JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString("utf8"));
+		if (
+			!claims ||
+			typeof claims !== "object" ||
+			!("iat" in claims) ||
+			!("exp" in claims) ||
+			typeof claims.iat !== "number" ||
+			typeof claims.exp !== "number" ||
+			!Number.isSafeInteger(claims.iat) ||
+			!Number.isSafeInteger(claims.exp) ||
+			claims.iat < 0 ||
+			claims.exp <= claims.iat ||
+			claims.exp > 8_640_000_000_000
+		)
+			throw new Error("invalid lifetime");
+		return { file, iat: claims.iat, exp: claims.exp };
+	} catch {
+		// Never include parser errors: they may quote a credential's JWT or secret seed.
+		throw new Error(`Cannot read $SYS credential lifetime: ${file}`);
 	}
-	return credentials;
 }
 
-async function rotate(options: MeshOptions, launchctl: string, runtime: MeshRuntime): Promise<void> {
-	const lock = join(options.meshHome, "rotation.lock");
+async function systemCredentials(options: MeshOptions, space: string): Promise<readonly SystemCredential[]> {
+	return Promise.all(SYSTEM_CREDENTIAL_FILES.map((file) => systemCredential(options, space, file)));
+}
+
+async function acquireRotationLock(lock: string): Promise<string> {
 	try {
 		await mkdir(lock, { mode: 0o700 });
-	} catch {
-		throw new Error(
-			`Cannot acquire mesh rotation lock ${lock}; another rotation may be running. Remove a stale lock only after confirming no rotation is running.`,
-		);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") throw new Error(`Cannot acquire mesh rotation lock ${lock}; install the mesh first`);
+		if (code !== "EEXIST") throw new Error(`Cannot acquire mesh rotation lock ${lock}: ${code}`, { cause: error });
+		let owner: string;
+		try {
+			const entries = await readdir(lock);
+			owner = entries[0] ?? "";
+			if (
+				entries.length !== 1 ||
+				!/^[1-9]\d*$/.test(owner) ||
+				Number(owner) > 0x7fffffff ||
+				(await readFile(join(lock, owner), "utf8")).trim() !== owner
+			)
+				throw new Error("invalid owner");
+		} catch {
+			throw new Error(
+				`Mesh rotation lock ${lock} has unreadable owner content; confirm no rotation is running before removing it`,
+			);
+		}
+		if (processAlive(Number(owner)))
+			throw new Error(`Mesh rotation lock ${lock}: another rotation may be running (pid ${owner})`);
+		// Remove only the dead owner's record, never a new owner's record after a competing takeover.
+		await rm(join(lock, owner));
+		await rmdir(lock);
+		await mkdir(lock, { mode: 0o700 });
+		console.log(`Taking over stale mesh rotation lock ${lock} from dead pid ${owner}`);
+	}
+	const owner = join(lock, String(process.pid));
+	await writeFile(owner, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+	return owner;
+}
+
+async function rotateCredentials(options: MeshOptions, launchctl: string, runtime: MeshRuntime): Promise<void> {
+	const failures: string[] = [];
+	let interrupted: NodeJS.Signals | undefined;
+	function deferSignal(signal: NodeJS.Signals): void {
+		interrupted ??= signal;
 	}
 	try {
 		const config = await meshConfig(options);
@@ -574,15 +609,18 @@ async function rotate(options: MeshOptions, launchctl: string, runtime: MeshRunt
 			requireSuccess(await runTool(launchctl, ["print", targetOf(job)], options), `Mesh job lookup ${job.label}`);
 		}
 		const domain = targetOf(options).slice(0, targetOf(options).lastIndexOf("/"));
-		const failures: string[] = [];
-		let step = "stop renewal job";
+		process.on("SIGINT", deferSignal);
+		process.on("SIGTERM", deferSignal);
+		let step: string | undefined;
 		try {
 			for (const job of [...jobs].reverse()) {
 				step = `stop ${job.label}`;
 				await bootout(launchctl, job, runtime);
 			}
+			if (interrupted) throw new Error(`interrupted by ${interrupted}`);
 			step = "wait for Cotal processes to stop";
 			await waitForStopped(options, runtime);
+			if (interrupted) throw new Error(`interrupted by ${interrupted}`);
 			// Reuse the service label: only one broker job can be loaded, including during recovery.
 			// The installed plist is never changed; the temporary boot cannot be relaunched by KeepAlive.
 			step = "start rotation broker";
@@ -636,13 +674,34 @@ async function rotate(options: MeshOptions, launchctl: string, runtime: MeshRunt
 		} catch (error) {
 			failures.push(`wait for restarted broker: ${error instanceof Error ? error.message : "failed"}`);
 		}
+		if (interrupted) failures.push(`Rotation interrupted by ${interrupted}; recovery attempted`);
 		if (failures.length) throw new Error(failures.join("; "));
 		console.log(
 			`Mesh credentials rotated: ${options.label}. Earlier full Cotal backups are no longer restorable; take a fresh backup.`,
 		);
 	} finally {
-		await rmdir(lock);
+		process.off("SIGINT", deferSignal);
+		process.off("SIGTERM", deferSignal);
 	}
+}
+
+async function rotate(options: MeshOptions, launchctl: string, runtime: MeshRuntime): Promise<void> {
+	const lock = join(options.meshHome, "rotation.lock");
+	const owner = await acquireRotationLock(lock);
+	const failures: string[] = [];
+	try {
+		await rotateCredentials(options, launchctl, runtime);
+	} catch (error) {
+		failures.push(error instanceof Error ? error.message : "Mesh rotation failed");
+	} finally {
+		try {
+			await rm(owner);
+			await rmdir(lock);
+		} catch (error) {
+			failures.push(`Release mesh rotation lock ${lock}: ${error instanceof Error ? error.message : "failed"}`);
+		}
+	}
+	if (failures.length) throw new Error(failures.join("; "));
 }
 
 async function storeBytes(path: string): Promise<number> {
@@ -734,7 +793,12 @@ function reportLedgerHealth(): boolean {
 	return true;
 }
 
-async function status(options: MeshOptions, launchctl: string | undefined, target: string): Promise<void> {
+async function status(
+	options: MeshOptions,
+	launchctl: string | undefined,
+	target: string,
+	runtime: MeshRuntime,
+): Promise<void> {
 	if (!existsSync(join(options.meshHome, ".cotal")))
 		throw new Error("Mesh home has no .cotal directory; install it first");
 	const cotal = await executable("cotal");
@@ -761,8 +825,23 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	if (renewal) console.log(`Credential renewal: ${renewal.code === 0 ? "scheduled" : "absent"}`);
 	const rotation = launchctl ? await runTool(launchctl, ["print", targetOf(rotationOf(options))], options) : undefined;
 	if (rotation) console.log(`Credential rotation: ${rotation.code === 0 ? "scheduled" : "absent"}`);
-	for (const cred of await systemCredentials(options, config.space))
-		console.log(`$SYS ${cred.file} expires: ${new Date(cred.exp * 1000).toString()}`);
+	const rotationExit =
+		rotation?.code === 0 ? /^\s*last exit code = (-?\d+)(?:: [^\r\n]+)?\s*$/m.exec(rotation.stdout)?.[1] : undefined;
+	if (rotationExit !== undefined) console.log(`Credential rotation last exit code: ${rotationExit}`);
+	let credentialsUnavailable = false;
+	let rotationOverdue = false;
+	for (const file of SYSTEM_CREDENTIAL_FILES) {
+		try {
+			const cred = await systemCredential(options, config.space, file);
+			console.log(`$SYS ${file} last rotation: ${new Date(cred.iat * 1000).toString()}`);
+			console.log(`$SYS ${file} expires: ${new Date(cred.exp * 1000).toString()}`);
+			const due = cred.iat + 0.75 * (cred.exp - cred.iat);
+			if (runtime.now() / 1000 > due + 26 * 60 * 60) rotationOverdue = true;
+		} catch {
+			console.log(`$SYS ${file}: unreadable`);
+			credentialsUnavailable = true;
+		}
+	}
 	const broker = await runTool(
 		cotal,
 		["status", "--components", "--space", config.space, "--server", config.server],
@@ -839,6 +918,11 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 		throw new Error(
 			"Temporary rotation plist remains; a rotation is in progress or needs recovery. Uninstall and reinstall the mesh only after confirming no rotation is running.",
 		);
+	if (rotationOverdue)
+		throw new Error(
+			`Mesh $SYS credential rotation is over 26 hours overdue; inspect ${join(options.meshHome, "rotation.log")} and ${join(options.meshHome, "rotation.lock")}`,
+		);
+	if (credentialsUnavailable) throw new Error("Mesh $SYS credential lifetimes are unavailable");
 	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
 	if (versionUnavailable) throw new Error("Mesh CLI version is unavailable");
 }
@@ -860,7 +944,7 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = targetOf(options);
 		if (command === "status" || command === "doctor") {
-			await status(options, launchctl, target);
+			await status(options, launchctl, target, runtime);
 			if (command === "doctor") {
 				const auth = await runTool(await executable("cotal"), ["doctor", "auth"], options);
 				requireSuccess(auth, "cotal doctor auth");

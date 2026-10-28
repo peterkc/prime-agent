@@ -41,7 +41,7 @@ while (!existsSync(join(cotalRoot, ".cotal")) && dirname(cotalRoot) !== cotalRoo
 appendFileSync(join(root, "events.jsonl"), JSON.stringify({ tool, args, cotalRoot, cwd: process.cwd(), home: process.env.COTAL_HOME, skipSeed: process.env.COTAL_SKIP_CONNECTOR_SEED }) + "\n");
 const job = args[0] === "bootstrap" ? /<key>Label<\/key><string>(.*?)<\/string>/.exec(readFileSync(args[2], "utf8"))[1] : String(args.at(-1));
 const loaded = join(root, job.endsWith(".rotate") ? "loaded-rotate" : job.endsWith(".renew") ? "loaded-renew" : "loaded");
-const stalled = (control.stalledBootout === true && !job.endsWith(".rotate")) || (control.stalledBootout === "renew" && job.endsWith(".renew"));
+const stalled = (control.stalledBootout === true && !job.endsWith(".rotate")) || (control.stalledBootout === "renew" && job.endsWith(".renew")) || (control.stalledBootout === "service" && job.endsWith(".test")) || (control.stalledBootout === "temporary" && existsSync(join(root, "rotated")) && job.endsWith(".test"));
 if (tool === "launchctl") {
   if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
@@ -137,7 +137,12 @@ async function command(name: string, ...options: string[]): Promise<void> {
 					: name === "rotate"
 						? 1000
 						: ms;
+			if (control.signal && name === "rotate") {
+				process.emit(control.signal as NodeJS.Signals, control.signal as NodeJS.Signals);
+				configure({ signal: undefined });
+			}
 			if (name === "rotate" && !control.holdPid) rmSync(join(mesh, ".cotal", "nats.pid"), { force: true });
+			if (control.cleanupFailure) writeFileSync(join(mesh, "rotation.lock", "leftover"), "retained");
 			configure({ credentialNow: now });
 		},
 	});
@@ -734,31 +739,46 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["boot", "restart", "stale"])("restores jobs and reports a failed rotation step (%s)", async (failure) => {
-		await command("install");
-		now = Date.UTC(2026, 10, 1);
-		configure({
-			failRotate: failure === "boot",
-			failRestart: failure === "restart",
-			staleRotation: failure === "stale",
-		});
-		rmSync(join(root, "events.jsonl"));
-		await command("rotate");
-		expect(process.exitCode).toBe(1);
-		expect(output()).toContain(
-			failure === "boot"
-				? "start rotation broker"
-				: failure === "restart"
-					? "restart ai.prime.mesh.test"
-					: "verify rotated $SYS credentials",
-		);
-		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(3);
-		expect(events().some((event) => event.args[0] === "down")).toBe(false);
-		expect(existsSync(join(root, "loaded-renew"))).toBe(true);
-		expect(existsSync(join(root, "loaded"))).toBe(failure !== "restart");
-		expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
-		expect(output()).not.toContain(seed);
-	});
+	it.each(["boot", "restart", "stale", "service", "renew", "temporary"])(
+		"restores jobs and reports a failed rotation step (%s)",
+		async (failure) => {
+			await command("install");
+			now = Date.UTC(2026, 10, 1);
+			configure({
+				failRotate: failure === "boot",
+				failRestart: failure === "restart",
+				staleRotation: failure === "stale",
+				stalledBootout: ["service", "renew", "temporary"].includes(failure) ? failure : undefined,
+			});
+			rmSync(join(root, "events.jsonl"));
+			await command("rotate");
+			expect(process.exitCode).toBe(1);
+			expect(output()).toContain(
+				failure === "boot"
+					? "start rotation broker"
+					: failure === "restart"
+						? "restart ai.prime.mesh.test"
+						: failure === "stale"
+							? "verify rotated $SYS credentials"
+							: failure === "temporary"
+								? "stop rotation broker"
+								: `stop ai.prime.mesh.test${failure === "renew" ? ".renew" : ""}`,
+			);
+			expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(
+				failure === "service" ? 1 : failure === "renew" ? 0 : 3,
+			);
+			if (failure === "temporary") {
+				await command("status");
+				expect(process.exitCode).toBe(1);
+				expect(output()).toContain("Temporary rotation plist remains");
+			}
+			expect(events().some((event) => event.args[0] === "down")).toBe(false);
+			expect(existsSync(join(root, "loaded-renew"))).toBe(true);
+			expect(existsSync(join(root, "loaded"))).toBe(failure !== "restart");
+			expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
+			expect(output()).not.toContain(seed);
+		},
+	);
 
 	it.each(["server", "space"])(
 		"does not accept a different %s's serving broker during install",
@@ -776,15 +796,22 @@ describe("mesh command", () => {
 		},
 	);
 
-	it("waits for root process death and refuses a second boot while a Cotal pid stays live", async () => {
+	it.each(["pid", "port"])("refuses a second boot while the broker %s stays live", async (held) => {
 		await command("install");
-		configure({ holdPid: true });
-		rmSync(join(root, "events.jsonl"));
-		await command("rotate");
-		expect(process.exitCode).toBe(1);
-		expect(output()).toContain("wait for Cotal processes to stop");
-		expect(events().some((event) => event.args.includes(join(mesh, "rotation-boot.plist")))).toBe(false);
-		expect(now).toBe(30_000);
+		const socket = createServer();
+		try {
+			if (held === "port")
+				await new Promise<void>((ready) => socket.listen(Number(new URL(server).port), "127.0.0.1", ready));
+			configure({ holdPid: held === "pid" });
+			rmSync(join(root, "events.jsonl"));
+			await command("rotate");
+			expect(process.exitCode).toBe(1);
+			expect(output()).toContain("wait for Cotal processes to stop");
+			expect(events().some((event) => event.args.includes(join(mesh, "rotation-boot.plist")))).toBe(false);
+			expect(now).toBe(30_000);
+		} finally {
+			if (socket.listening) await new Promise<void>((closed) => socket.close(() => closed()));
+		}
 	});
 
 	it("reports and uninstalls a leftover temporary rotation job", async () => {
@@ -796,6 +823,110 @@ describe("mesh command", () => {
 		await command("uninstall");
 		expect(process.exitCode).toBeUndefined();
 		expect(existsSync(join(mesh, "rotation-boot.plist"))).toBe(false);
+	});
+
+	it.each(["fresh", "boundary", "late-observer", "late-evictor", "unreadable", "garbled"])(
+		"finishes credential status diagnostics (%s)",
+		async (scenario) => {
+			await command("install");
+			now = Date.UTC(2026, 10, 1);
+			const file = scenario === "late-evictor" ? "connection-evictor.creds" : "membership-observer.creds";
+			for (const name of ["membership-observer.creds", "connection-evictor.creds"]) credentials(0, name);
+			if (scenario === "boundary" || scenario.startsWith("late"))
+				credentials(scenario === "boundary" ? 22.5 + 26 / 24 : 24, file);
+			if (scenario === "unreadable") rmSync(join(mesh, ".cotal", "space.7072696d65", file));
+			if (scenario === "garbled") writeFileSync(join(mesh, ".cotal", "space.7072696d65", file), "broken");
+			mkdirSync(join(mesh, "rotation.lock"));
+			writeFileSync(join(mesh, "rotation.lock", "2147483647"), "2147483647\n");
+			for (const name of ["status", "doctor"]) {
+				await command(name);
+				expect(process.exitCode).toBe(
+					scenario.startsWith("late") || scenario === "unreadable" || scenario === "garbled" ? 1 : undefined,
+				);
+				for (const line of [
+					"Broker: serving",
+					"Store: 0 bytes",
+					"Enrolled sessions: 0",
+					"Credential rotation last exit code: 78",
+				])
+					expect(output()).toContain(line);
+				if (scenario.startsWith("late"))
+					for (const part of ["over 26 hours overdue", "rotation.log", "rotation.lock"])
+						expect(output()).toContain(part);
+				else if (scenario === "unreadable" || scenario === "garbled")
+					expect(output()).toContain(`$SYS ${file}: unreadable`);
+				else
+					expect(output()).toContain(
+						`$SYS ${file} last rotation: ${new Date((now / 1000 - (scenario === "boundary" ? 22.5 + 26 / 24 : 0) * 86400) * 1000).toString()}`,
+					);
+			}
+		},
+	);
+
+	it.each(["dead", "live", "unreadable", "missing-home", "ENOTDIR"])(
+		"handles rotation lock ownership (%s)",
+		async (owner) => {
+			await command("install");
+			const lock = join(mesh, "rotation.lock");
+			if (owner === "missing-home") rmSync(mesh, { recursive: true });
+			else if (owner === "ENOTDIR") {
+				rmSync(mesh, { recursive: true });
+				writeFileSync(mesh, "not a directory");
+			} else {
+				mkdirSync(lock);
+				const pid = owner === "live" ? process.pid : 2147483647;
+				writeFileSync(join(lock, String(pid)), owner === "unreadable" ? "broken" : `${pid}\n`);
+			}
+			rmSync(join(root, "events.jsonl"));
+			await command("rotate");
+			expect(process.exitCode).toBe(owner === "dead" ? undefined : 1);
+			if (owner !== "dead") expect(events()).toEqual([]);
+			expect(output()).toContain(
+				owner === "dead"
+					? "Taking over stale"
+					: owner === "live"
+						? "another rotation may be running"
+						: owner === "unreadable"
+							? "unreadable owner content"
+							: owner === "missing-home"
+								? "install the mesh first"
+								: "ENOTDIR",
+			);
+			if (owner === "dead") expect(existsSync(lock)).toBe(false);
+		},
+	);
+
+	it.each(["SIGINT", "SIGTERM"] as const)("restores jobs before reporting %s", async (signal) => {
+		await command("install");
+		const listeners = process.listeners(signal);
+		configure({ signal });
+		await command("rotate");
+		expect(process.exitCode).toBe(1);
+		expect(output()).toContain(`interrupted by ${signal}`);
+		for (const job of ["loaded", "loaded-renew"]) expect(existsSync(join(root, job))).toBe(true);
+		expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
+		expect(process.listeners(signal)).toEqual(listeners);
+	});
+
+	it("preserves the rotation error when lock cleanup also fails", async () => {
+		await command("install");
+		configure({ failRotate: true, cleanupFailure: true });
+		await command("rotate");
+		expect(process.exitCode).toBe(1);
+		expect(output()).toContain("start rotation broker: launchctl bootstrap rotation boot failed");
+		expect(output()).toContain("Release mesh rotation lock");
+	});
+
+	it("treats EPERM pid probes as foreign processes", async () => {
+		await command("install");
+		vi.spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error("foreign"), { code: "EPERM" });
+		});
+		now = 1000;
+		configure({ credentialNow: now });
+		await runMeshCommand(["rotate", "--label", "ai.prime.mesh.test", "--server", server, "--mesh-home", mesh], clock);
+		expect(process.exitCode).toBeUndefined();
+		expect(output()).toContain("Mesh credentials rotated");
 	});
 
 	it.each(["missing", "garbled", "lock", "duplicate-jwt"])(
@@ -895,6 +1026,7 @@ ${seed}`,
 	});
 
 	it("routes public mesh help and status without starting an agent", async () => {
+		now = Date.now();
 		await command("install");
 		const result = await handlePublicCommand(["mesh", "status", "--label", "ai.prime.mesh.test"]);
 		expect(result.handled).toBe(true);

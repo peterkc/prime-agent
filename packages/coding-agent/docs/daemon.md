@@ -119,18 +119,22 @@ on `PATH`, not its resolved symlink target, so an upgrade can replace that targe
 Install refuses an occupied service, renewal or rotation label, or broker port.
 Labels ending in `.renew` or `.rotate` are reserved. If startup, signer creation or
 loading either scheduled agent fails, install attempts to remove all three agents
-and plists but keeps the home. A failing scheduled run shows in its log and in
-`mesh doctor`, not at install.
+and plists but keeps the home. Scheduled failures appear in `rotation.log`. Status
+and doctor report the rotation job's last exit code and fail once either $SYS
+credential is more than 26 hours past its 75% renewal point, even if the job remains
+scheduled. The error names `rotation.log` and `rotation.lock` for investigation.
 
 - `prime-agent mesh start` and `stop` start or stop the installed service.
 - `prime-agent mesh status` first checks every RLM ledger locally, even without the
   mesh home, broker or Cotal CLI. If the mesh home or its `.cotal` directory is missing,
   it stops after that check. Full status output includes the CLI version or its read
-  failure, service state, renewal-agent and rotation-agent states, $SYS expiry times,
-  store bytes, service-log and renewal-log bytes, enrolled-session count, and each
+  failure, service state, renewal-agent and rotation-agent states, the rotation job's
+  last exit code, $SYS last-rotation and expiry times, store bytes, service-log and
+  renewal-log bytes, enrolled-session count, and each
   session's stored, unacknowledged message count. A missing renewal or rotation
   agent fails status; reinstall the mesh to add it. A leftover temporary rotation
-  plist also fails status.
+  plist also fails status. An unreadable $SYS credential is reported by filename;
+  status finishes broker, store and session diagnostics before failing.
 - `prime-agent mesh doctor` checks the exact CLI version first, then ledger and status
   health, then Cotal auth. A failed version check still stops before ledger diagnosis;
   use `mesh status` for that offline check. An unhealthy check sets exit code 1.
@@ -143,7 +147,8 @@ and plists but keeps the home. A failing scheduled run shows in its log and in
 - Install, uninstall, start, stop and rotate refuse platforms other than macOS
   without changes.
 
-Rotation causes an outage of up to about a minute. Sessions reconnect afterward.
+Rotation normally causes an outage of up to about a minute. Failure and recovery
+can add the bounded waits to about three minutes. Sessions reconnect afterward.
 It stops the renewal and service jobs, then waits for the broker port and recorded
 Cotal processes to stop. A temporary foreground launchd job boots the same service
 with `--rotate-sys` and no `KeepAlive`. After both $SYS issue times advance and their
@@ -152,12 +157,14 @@ exit, and restores the installed service and renewal jobs. The installed service
 plist never changes. Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon
 through `cotal down`; rotation uses launchd and waits for that daemon to exit itself.
 Each stop wait is bounded at 30 seconds. No failed step is hidden; recovery still
-attempts to restore both installed jobs.
+attempts to restore both installed jobs. SIGINT and SIGTERM are deferred while jobs
+are stopped; recovery finishes before rotation exits nonzero naming the signal.
 
-Rotation holds `<mesh home>/rotation.lock` exclusively. A concurrent rotation refuses
-to run. After a crash, first confirm no rotation process is running before removing
-a stale lock. If `rotation-boot.plist` remains, status reports that recovery is
-needed. After confirming no rotation is running, uninstall and reinstall the mesh.
+Rotation holds `<mesh home>/rotation.lock` exclusively and records its owner PID.
+A concurrent rotation refuses to run while that PID is live. A later rotation takes
+over a dead owner's lock and reports it. Unreadable owner content refuses rotation;
+confirm no rotation process is running before removing that lock. If
+`rotation-boot.plist` remains, status reports that recovery is needed. After confirming no rotation is running, uninstall and reinstall the mesh.
 
 **Warning:** Rotation makes earlier full Cotal backups unrestorable against the new
 trust chain. Take a fresh full backup after rotation. The data account, agent
