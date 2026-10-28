@@ -243,7 +243,7 @@ function agentPlist(
 		.join("")}</dict>
 ${
 	kind === "rotation"
-		? "<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>"
+		? "<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict><key>ExitTimeOut</key><integer>240</integer>"
 		: `<key>RunAtLoad</key><true/>
 ${kind === "renewal" ? "<key>StartInterval</key><integer>600</integer>" : "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"}`
 }
@@ -657,14 +657,14 @@ async function rotateCredentials(options: MeshOptions, launchctl: string, runtim
 		}
 		for (const job of jobs) {
 			try {
-				const loaded = await runTool(launchctl, ["print", targetOf(job)], options);
-				if (loaded.code !== 0 || existsSync(temporary)) {
-					if (loaded.code !== 0 && loaded.code !== 113) requireSuccess(loaded, "launchctl print before restart");
+				// A lookup that fails or is killed (for example by a terminal Ctrl-C) proves nothing,
+				// so restart unless the job is confirmed loaded from its installed plist.
+				const loaded = await runTool(launchctl, ["print", targetOf(job)], options).catch(() => undefined);
+				if (loaded?.code !== 0 || existsSync(temporary))
 					requireSuccess(
 						await runTool(launchctl, ["bootstrap", domain, job.plist], options),
 						"launchctl bootstrap",
 					);
-				}
 			} catch (error) {
 				failures.push(`restart ${job.label}: ${error instanceof Error ? error.message : "failed"}`);
 			}

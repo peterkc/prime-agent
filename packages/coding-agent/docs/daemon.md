@@ -157,14 +157,17 @@ exit, and restores the installed service and renewal jobs. The installed service
 plist never changes. Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon
 through `cotal down`; rotation uses launchd and waits for that daemon to exit itself.
 Each stop wait is bounded at 30 seconds. No failed step is hidden; recovery still
-attempts to restore both installed jobs. SIGINT and SIGTERM are deferred while jobs
-are stopped; recovery finishes before rotation exits nonzero naming the signal.
+attempts to restore both installed jobs, even when a job lookup fails or is killed.
+SIGINT and SIGTERM are deferred while jobs are stopped; recovery finishes before
+rotation exits nonzero naming the signal. The scheduled agent gives launchd's own
+stop 240 seconds (`ExitTimeOut`), longer than the bounded waits.
 
 Rotation holds `<mesh home>/rotation.lock` exclusively and records its owner PID.
 A concurrent rotation refuses to run while that PID is live. A later rotation takes
 over a dead owner's lock and reports it. Unreadable owner content refuses rotation;
 confirm no rotation process is running before removing that lock. If
-`rotation-boot.plist` remains, status reports that recovery is needed. After confirming no rotation is running, uninstall and reinstall the mesh.
+`rotation-boot.plist` remains, status reports that recovery is needed. After
+confirming no rotation is running, uninstall and reinstall the mesh.
 
 **Warning:** Rotation makes earlier full Cotal backups unrestorable against the new
 trust chain. Take a fresh full backup after rotation. The data account, agent

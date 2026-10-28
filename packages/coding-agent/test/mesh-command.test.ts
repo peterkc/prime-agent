@@ -43,6 +43,7 @@ const job = args[0] === "bootstrap" ? /<key>Label<\/key><string>(.*?)<\/string>/
 const loaded = join(root, job.endsWith(".rotate") ? "loaded-rotate" : job.endsWith(".renew") ? "loaded-renew" : "loaded");
 const stalled = (control.stalledBootout === true && !job.endsWith(".rotate")) || (control.stalledBootout === "renew" && job.endsWith(".renew")) || (control.stalledBootout === "service" && job.endsWith(".test")) || (control.stalledBootout === "temporary" && existsSync(join(root, "rotated")) && job.endsWith(".test"));
 if (tool === "launchctl") {
+  if (args[0] === "print" && control.killRestartPrint && job.endsWith(".test") && existsSync(join(root, "rotated")) && !existsSync(join(root, "agent", "mesh", "rotation-boot.plist"))) process.kill(process.pid, "SIGKILL");
   if (args[0] === "print") { console.log("state = running\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
   if (args[0] === "bootstrap") {
@@ -780,6 +781,17 @@ describe("mesh command", () => {
 		},
 	);
 
+	it("restarts the service when its restart lookup is killed", async () => {
+		await command("install");
+		now = Date.UTC(2026, 10, 1);
+		configure({ killRestartPrint: true });
+		rmSync(join(root, "events.jsonl"));
+		await command("rotate");
+		expect(process.exitCode).toBeUndefined();
+		expect(existsSync(join(root, "loaded"))).toBe(true);
+		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(3);
+	});
+
 	it.each(["server", "space"])(
 		"does not accept a different %s's serving broker during install",
 		async (foreignBroker) => {
@@ -981,7 +993,7 @@ ${seed}`,
 				`<string>${join(root, "bin", "prime-agent")}</string><string>mesh</string><string>rotate</string><string>--if-due</string><string>--label</string><string>ai.prime.mesh.test</string><string>--server</string><string>${server}</string><string>--mesh-home</string><string>${mesh}</string>`,
 			);
 			expect(job).toContain(
-				"<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>",
+				"<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict><key>ExitTimeOut</key><integer>240</integer>",
 			);
 			expect(job).toContain(`<key>StandardErrorPath</key><string>${join(mesh, "rotation.log")}</string>`);
 			expect(job).not.toContain("<key>RunAtLoad</key>");
