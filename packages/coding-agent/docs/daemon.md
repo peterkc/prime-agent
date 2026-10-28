@@ -114,10 +114,13 @@ agent, `<label>.rotate`, that runs `prime-agent mesh rotate --if-due` daily at 0
 local time. It rotates when either credential reaches 75% of its lifetime, about
 every three weeks. Its command output goes to `<mesh home>/rotation.log`; broker
 boot output stays in `service.log`. The job uses the managed native installation's
-upgrade-stable launcher when available. Otherwise, install requires the absolute
-`prime-agent` entry on `PATH` to resolve to the running CLI. It keeps that entry,
-not its resolved symlink target, so an upgrade can replace the target. A shadowing
-installation on `PATH` is refused before mesh files are written.
+upgrade-stable launcher when available, else the launcher named by
+`PRIME_AGENT_LAUNCHER_PATH`, which `prime-agent.sh` sets for a source checkout.
+Otherwise, install requires the absolute `prime-agent` entry on `PATH` to resolve
+to the running CLI. It keeps that entry, not its resolved symlink target, so an
+upgrade can replace the target. A shadowing installation on `PATH` is refused
+before mesh files are written. For another wrapper, such as a package-manager
+shim, set `PRIME_AGENT_LAUNCHER_PATH` to its absolute path before installing.
 
 Install refuses an occupied service, renewal or rotation label, or broker port.
 Labels ending in `.renew` or `.rotate` are reserved. If startup, signer creation or
@@ -155,7 +158,8 @@ and tool timeouts allow up to 272 seconds (about 4.5 minutes) including failure
 and recovery. This excludes filesystem delays and process-scheduling overhead.
 Sessions reconnect afterward. If the service was stopped with `mesh stop`, rotation
 still renews the credentials, then sends SIGTERM to the restored service to keep
-it stopped, including after a failed rotation.
+it stopped, including after a failed rotation. Rotation refuses, before stopping
+anything, a service in any other launchd state, such as a pending respawn.
 It stops the renewal and service jobs, then waits for the broker port and recorded
 Cotal processes to stop. A temporary foreground launchd job boots the same service
 with `--rotate-sys` and no `KeepAlive`. After both $SYS issue times advance and their

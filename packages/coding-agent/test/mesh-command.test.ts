@@ -21,6 +21,7 @@ import { formatCommandHelp } from "../src/cli/command-registry.js";
 import { runMeshCommand } from "../src/cli/mesh-command.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { PRIME_AGENT_LAUNCHER_PATH_ENV } from "../src/modes/daemon/daemon-runtime-identity.js";
 import { RLM_LEDGER_DIR } from "../src/modes/daemon/rlm-ledger.js";
 
 vi.mock("node:child_process", async (original) => {
@@ -56,7 +57,7 @@ const loaded = join(root, job.endsWith(".rotate") ? "loaded-rotate" : job.endsWi
 const stalled = (control.stalledBootout === true && !job.endsWith(".rotate")) || (control.stalledBootout === "renew" && job.endsWith(".renew")) || (control.stalledBootout === "service" && job.endsWith(".test")) || (control.stalledBootout === "temporary" && existsSync(join(root, "rotated")) && job.endsWith(".test"));
 if (tool === "launchctl") {
   if (args[0] === "print" && control.killRestartPrint && job.endsWith(".test") && existsSync(join(root, "rotated")) && !existsSync(join(root, "agent", "mesh", "rotation-boot.plist"))) process.kill(process.pid, "SIGKILL");
-  if (args[0] === "print") { console.log("state = " + (existsSync(join(root, "stopped")) ? "not running" : "running") + "\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
+  if (args[0] === "print") { console.log("state = " + (control.serviceState ?? (existsSync(join(root, "stopped")) ? "not running" : "running")) + "\nlast exit code = 78" + (control.symbolicExit ? ": EX_CONFIG" : "")); if (existsSync(loaded) && (stalled || existsSync(join(root, "removing"))) && !existsSync(join(root, "Library", "LaunchAgents", "ai.prime.mesh.test.plist"))) process.exit(2); if (existsSync(join(root, "removing"))) { unlinkSync(join(root, "removing")); unlinkSync(loaded); process.exit(0); } process.exit(existsSync(loaded) ? 0 : 113); }
   if (control.fail === args[0]) { console.error(control.seed); process.exit(2); }
   if (args[0] === "kill") { writeFileSync(join(root, "stopped"), "yes"); if (existsSync(join(cotalRoot, ".cotal", "nats.pid"))) unlinkSync(join(cotalRoot, ".cotal", "nats.pid")); }
   if (args[0] === "bootstrap") {
@@ -203,6 +204,7 @@ describe("mesh command", () => {
 		vi.stubEnv("XDG_CONFIG_HOME", join(root, "config"));
 		vi.stubEnv("PATH", join(root, "bin"));
 		vi.stubEnv("MESH_FIXTURE_ROOT", root);
+		vi.stubEnv(PRIME_AGENT_LAUNCHER_PATH_ENV, "");
 		vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		control = {};
@@ -941,8 +943,17 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBe(failRotate ? 1 : undefined);
 		await command("status");
 		expect(output()).toContain("Launchd: not running");
-
 		if (!failRotate) expect(output()).toContain("Mesh credentials rotated");
+	});
+
+	it.each([0o700, 0o600])("PR 52 pins an executable declared launcher (mode %o)", async (mode) => {
+		const launcher = join(root, "prime-agent.sh");
+		writeFileSync(launcher, fakeTool, { mode });
+		process.argv[1] = process.execPath;
+		vi.stubEnv(PRIME_AGENT_LAUNCHER_PATH_ENV, launcher);
+		await command("install");
+		const job = mode === 0o700 ? readFileSync(plist.replace(".plist", ".rotate.plist"), "utf8") : output();
+		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : "is not executable");
 	});
 
 	it("preserves the rotation error when lock cleanup also fails", async () => {
@@ -979,8 +990,10 @@ describe("mesh command", () => {
 		"renewal-plist",
 		"service-unloaded",
 		"renewal-unloaded",
+		"respawning",
 	])("refuses rotation before stopping anything (%s)", async (failure) => {
 		await command("install");
+		if (failure === "respawning") configure({ serviceState: "spawn scheduled" });
 		const cred = join(mesh, ".cotal", "space.7072696d65", "connection-evictor.creds");
 		if (failure === "missing") rmSync(cred);
 		if (failure === "garbled")

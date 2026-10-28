@@ -7,6 +7,7 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, isBunBinary } from "../config.js";
+import { PRIME_AGENT_LAUNCHER_PATH_ENV } from "../modes/daemon/daemon-runtime-identity.js";
 import { readRlmLedgerHealth } from "../modes/daemon/rlm-ledger.js";
 import { getNativeInstallation } from "../utils/native-installation.js";
 
@@ -436,16 +437,23 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 	await assertFreePort(options.port);
 	const cotal = await executable("cotal");
 	await requireCotalVersion(cotal, options);
-	const native = isBunBinary ? getNativeInstallation() : undefined;
-	const primeAgent = native?.launcher ?? (await executable(APP_NAME));
-	if (!native) {
+	// A managed native install or a wrapper such as prime-agent.sh names its own upgrade-stable launcher.
+	const declared = process.env[PRIME_AGENT_LAUNCHER_PATH_ENV];
+	const launcher =
+		(isBunBinary ? getNativeInstallation() : undefined)?.launcher ?? (declared ? resolve(declared) : undefined);
+	const primeAgent = launcher ?? (await executable(APP_NAME));
+	if (launcher) {
+		await access(launcher, constants.X_OK).catch((error: unknown) => {
+			throw new Error(`${APP_NAME} launcher ${launcher} is not executable`, { cause: error });
+		});
+	} else {
 		try {
 			const current = isBunBinary ? process.execPath : process.argv[1];
 			if (!current || (await realpath(primeAgent)) !== (await realpath(current)))
 				throw new Error("CLI identity differs");
 		} catch (error) {
 			throw new Error(
-				`${APP_NAME} on PATH does not resolve to the running CLI; install using its upgrade-stable launcher`,
+				`${APP_NAME} on PATH does not resolve to the running CLI; install through its launcher or set ${PRIME_AGENT_LAUNCHER_PATH_ENV}`,
 				{ cause: error },
 			);
 		}
@@ -630,7 +638,12 @@ async function rotateCredentials(options: MeshOptions, launchctl: string, runtim
 			await readFile(job.plist, "utf8");
 			const loaded = await runTool(launchctl, ["print", targetOf(job)], options);
 			requireSuccess(loaded, `Mesh job lookup ${job.label}`);
-			if (job === options) serviceWasRunning = /^\s*state = running$/m.test(loaded.stdout);
+			if (job !== options) continue;
+			// Only a running service or one stopped by `mesh stop` is safe to restore; a pending respawn is neither.
+			const state = /^\s*state = (.+)$/m.exec(loaded.stdout)?.[1];
+			if (state !== "running" && state !== "not running")
+				throw new Error(`Mesh service state is ${state ?? "unknown"}; rotate when it is running or stopped`);
+			serviceWasRunning = state === "running";
 		}
 		const domain = targetOf(options).slice(0, targetOf(options).lastIndexOf("/"));
 		process.on("SIGINT", deferSignal);
