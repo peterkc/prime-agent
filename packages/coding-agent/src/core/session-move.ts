@@ -85,6 +85,7 @@ export interface SessionMoveReport {
 	readonly sourceFile: string;
 	readonly targetFile?: string;
 	readonly journalPath: string;
+	readonly committed?: true;
 	readonly messages: readonly string[];
 	readonly backups: readonly SessionMoveBackup[];
 }
@@ -104,6 +105,7 @@ export interface SessionMoveCallbacks {
 }
 
 export interface SessionMoveRecoveryCallbacks {
+	readonly resume?: SessionMoveCallbacks["resume"];
 	readonly acquireLeases: (journal: SessionMoveJournal) => { release(): void };
 	readonly readEnrollmentPath: (journal: SessionMoveJournal) => string | undefined | Promise<string | undefined>;
 	readonly readDirectorySocket: (journal: SessionMoveJournal) => string | undefined | Promise<string | undefined>;
@@ -635,7 +637,10 @@ export async function relocateSession(options: {
 	} catch (error) {
 		if (journal && present(journal.journalPath)) {
 			if (committed)
-				return report(journal, "pending", ["Session published; recovery is pending", errorMessage(error)]);
+				return {
+					...report(journal, "pending", ["Session published; recovery is pending", errorMessage(error)]),
+					committed: true,
+				};
 			const rolledBack = await rollbackSessionMove(journal, callbacks.resume);
 			return { ...rolledBack, messages: [errorMessage(error), ...rolledBack.messages] };
 		}
@@ -782,7 +787,7 @@ export async function recoverSessionMove(options: {
 			throw error;
 		}
 		try {
-			return await rollbackSessionMove(journal);
+			return await rollbackSessionMove(journal, callbacks.resume);
 		} finally {
 			leases.release();
 		}

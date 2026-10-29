@@ -27,6 +27,15 @@ export function redactMeshError(error: unknown, includeMessage = true): string {
 	return `${name}${code}${includeMessage && typeof message === "string" ? `: ${redact(message)}` : ""}`;
 }
 
+export class MeshTransferRecordError extends Error {
+	constructor(
+		readonly step: "enrollment" | "directory",
+		cause: unknown,
+	) {
+		super(`Mesh ${step} transfer failed: ${redactMeshError(cause)}`, { cause });
+	}
+}
+
 /** Only payload-validation failures are permanent; residency and I/O failures may recover. */
 export class InvalidMeshPayloadError extends Error {}
 

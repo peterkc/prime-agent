@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, type MessageMeta } from "@cotal-ai/core";
 import {
@@ -9,12 +9,14 @@ import {
 	type AgentSessionMessageSender,
 } from "../../../core/agent-messages.js";
 import { canonicalSessionPath, SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
+import type { SessionMoveMeshWrites } from "../../../core/session-move.js";
 import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
 import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
 	credentialSource,
 	deprovisionEnrollment,
+	directoryPath,
 	type EnrollmentRecord,
 	enrollmentPath,
 	ensureEnrollmentRecord,
@@ -32,7 +34,9 @@ import {
 	updateEnrollmentPath,
 	withDirectoryLock,
 } from "./enrollment.js";
-import { InvalidMeshPayloadError, meshMessageText, redactMeshError } from "./mesh-shared.js";
+import { InvalidMeshPayloadError, MeshTransferRecordError, meshMessageText, redactMeshError } from "./mesh-shared.js";
+
+export { MeshTransferRecordError } from "./mesh-shared.js";
 
 export interface MeshEndpointOptions {
 	readonly meshRoot: string;
@@ -98,6 +102,17 @@ interface SessionReplacement {
 	state: "active" | "failed";
 }
 
+function syncTransferRecord(path: string): void {
+	for (const file of [path, dirname(path)]) {
+		const descriptor = openSync(file, "r");
+		try {
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+	}
+}
+
 export class MeshEndpoints {
 	private readonly config?: MeshConfiguration;
 	private readonly refusal?: string;
@@ -107,6 +122,16 @@ export class MeshEndpoints {
 	private readonly enrolling = new Map<string, Promise<void>>();
 	private enrollmentQueue = Promise.resolve();
 	private readonly pending = new Map<string, PendingPersistence>();
+	private readonly moving = new Set<string>();
+	private readonly transfers = new Map<
+		string,
+		{
+			readonly record: EnrollmentRecord;
+			readonly claim: SessionLease;
+			readonly endpoint?: SessionEndpoint;
+			stopped: boolean;
+		}
+	>();
 	private readonly replacements = new Map<string, SessionReplacement>();
 	private readonly replacementBegins = new Map<string, ReplacementBegin>();
 	private closing = false;
@@ -170,6 +195,7 @@ export class MeshEndpoints {
 			this.recordEnrollmentFailure(sessionId, error);
 			return Promise.reject(error);
 		}
+		if (this.moving.has(sessionId)) return Promise.reject(new Error(`Session ${sessionId}: move is pending`));
 		const existing = this.enrolling.get(sessionId);
 		if (existing) return existing;
 		if (this.replacements.has(sessionId) || this.replacementBegins.has(sessionId)) return Promise.resolve();
@@ -329,8 +355,87 @@ export class MeshEndpoints {
 		}
 	}
 
+	async suspendSession(sessionId: string): Promise<boolean> {
+		if (this.closing) throw new Error("Mesh is shutting down");
+		if (this.moving.has(sessionId) || this.replacements.has(sessionId) || this.replacementBegins.has(sessionId))
+			throw new Error(`Session ${sessionId}: a move or replacement is pending`);
+		this.moving.add(sessionId);
+		try {
+			await this.enrolling.get(sessionId);
+			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) {
+				this.moving.delete(sessionId);
+				return false;
+			}
+			if (this.refusal) throw new Error(this.refusal);
+			const record = readEnrollment(this.options.meshRoot, sessionId);
+			const session = this.sessions.get(sessionId);
+			const claim = session?.claim ?? claimEnrollment(this.options.meshRoot, sessionId, record.sessionFile);
+			const transfer = { record, claim, endpoint: session, stopped: false };
+			this.transfers.set(sessionId, transfer);
+			try {
+				await this.closeSession(sessionId);
+				transfer.stopped = true;
+			} finally {
+				await session?.handoff;
+			}
+			return true;
+		} catch (error) {
+			if (!this.transfers.has(sessionId)) this.moving.delete(sessionId);
+			if (error instanceof SessionAlreadyActiveError)
+				throw new Error(`Session ${sessionId}: claimed by another daemon`, { cause: error });
+			throw error;
+		}
+	}
+
+	async resumeSession(sessionId: string): Promise<void> {
+		const transfer = this.transfers.get(sessionId);
+		if (!transfer) {
+			if (this.sessions.get(sessionId)?.state === "closed") await this.closeSession(sessionId);
+			return;
+		}
+		await this.closeSession(sessionId);
+		this.sessions.delete(sessionId);
+		await this.startSession(sessionId, transfer.record.sessionFile, transfer.claim);
+		this.transfers.delete(sessionId);
+		this.moving.delete(sessionId);
+	}
+
+	async writeTransferRecords(
+		sessionId: string,
+		sessionFile: string,
+		homeSocket: string,
+		writes: SessionMoveMeshWrites = { enrollment: true, directory: true },
+	): Promise<void> {
+		if (!this.transfers.has(sessionId))
+			throw new MeshTransferRecordError("enrollment", new Error(`Session ${sessionId}: transfer claim is not held`));
+		let step: "enrollment" | "directory" = "enrollment";
+		try {
+			const record = writes.enrollment
+				? await updateEnrollmentPath(this.options.meshRoot, sessionId, sessionFile)
+				: readEnrollment(this.options.meshRoot, sessionId);
+			if (writes.enrollment) syncTransferRecord(enrollmentPath(this.options.meshRoot, sessionId));
+			step = "directory";
+			if (writes.directory) {
+				await publishDirectory(this.options.meshRoot, record, homeSocket);
+				syncTransferRecord(directoryPath(this.options.meshRoot, sessionId));
+			}
+		} catch (error) {
+			throw new MeshTransferRecordError(step, error);
+		}
+	}
+
+	releaseClaim(sessionId: string): void {
+		const transfer = this.transfers.get(sessionId);
+		if (!transfer) return;
+		transfer.claim.release();
+		this.transfers.delete(sessionId);
+		this.moving.delete(sessionId);
+		if (transfer.stopped && this.sessions.get(sessionId) === transfer.endpoint) this.sessions.delete(sessionId);
+	}
+
 	async beginReplacement(sessionId: string, requester: object, token: string): Promise<string | undefined> {
 		if (this.closing || this.refusal) throw new Error(this.refusal ?? "Mesh is shutting down");
+		if (this.moving.has(sessionId)) throw new Error(`Session ${sessionId}: move is pending`);
 		if (typeof token !== "string" || !token) throw new Error("Mesh replacement refused: invalid replacement token");
 		if (this.replacements.get(sessionId)?.token === token || this.replacementBegins.get(sessionId)?.token === token)
 			throw new Error(`Session ${sessionId}: stale replacement token`);
@@ -949,6 +1054,9 @@ export class MeshEndpoints {
 				session.queue.length = 0;
 				session.claim.release();
 			}
+			for (const transfer of this.transfers.values()) transfer.claim.release();
+			this.transfers.clear();
+			this.moving.clear();
 			for (const replacement of this.replacements.values()) replacement.claim.release();
 			this.replacements.clear();
 			this.replacementBegins.clear();
