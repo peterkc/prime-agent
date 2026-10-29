@@ -48,7 +48,7 @@ let mesh: "updated" | "not_enrolled" | "failed";
 let method: "trash" | "unlink";
 let meshReason: string;
 let recovered: object[];
-let moveFailure: boolean;
+let moveFailure: boolean | "before-send";
 let blockingJobId: string | undefined;
 let targetRunning: boolean;
 let holdMove: boolean;
@@ -140,6 +140,7 @@ class WireSocket extends Duplex {
 				heldReply = reply;
 				moveReceived();
 			} else reply();
+			if (command.type === "list" && moveFailure === "before-send") this.destroy();
 		}
 		done();
 	}
@@ -428,29 +429,35 @@ describe("session move command", () => {
 		},
 	);
 
-	it.each(["delayed", "disconnect", "timeout"])(
-		"F2 move reply %s waits or reports an unknown result",
+	it.each(["delayed", "disconnect", "timeout", "before-send"])(
+		"F2 move reply %s distinguishes sent and unsent requests",
 		async (mode) => {
 			holdMove = true;
+			if (mode === "before-send") moveFailure = mode;
 			const received = new Promise<void>((resolve) => {
 				moveReceived = resolve;
 			});
 			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 			const moving = run(["--yes"]);
 			try {
-				await received;
+				if (mode !== "before-send") await received;
 				if (mode === "disconnect") for (const socket of sockets) socket.destroy();
-				else await vi.advanceTimersByTimeAsync(mode === "timeout" ? 24 * 60 * 60 * 1000 : 30_001);
+				else if (mode !== "before-send")
+					await vi.advanceTimersByTimeAsync(mode === "timeout" ? 24 * 60 * 60 * 1000 : 30_001);
 				if (mode === "delayed") heldReply();
 				await moving;
 				expect(process.exitCode).toBe(mode === "delayed" ? undefined : 1);
-				expect(errors()).toContain(mode === "delayed" ? "Moved" : "Move result is unknown");
-				if (mode !== "delayed") {
+				expect(errors()).toContain(
+					mode === "delayed" ? "Moved" : mode === "before-send" ? "Nothing moved" : "Move result is unknown",
+				);
+				if (mode === "before-send")
+					expect(requests.some(({ command }) => command.type === "move_saved_session")).toBe(false);
+				if (mode !== "delayed" && mode !== "before-send") {
 					for (const text of [f.target, "--dry-run again"]) expect(errors()).toContain(text);
 					expect(errors()).not.toMatch(/nothing moved/i);
 				}
 			} finally {
-				heldReply();
+				if (mode !== "before-send") heldReply();
 				await moving;
 				vi.useRealTimers();
 			}

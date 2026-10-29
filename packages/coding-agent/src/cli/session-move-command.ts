@@ -332,6 +332,10 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			client = await readSourceDaemon(sourceSocket);
 			if (!client) throw new Error("Source daemon did not start");
 		}
+		// No await before request: readSourceDaemon already cached the hello.
+		if (!client.isConnected) {
+			throw new Error("Move failed: source daemon disconnected before the move request was sent. Nothing moved.");
+		}
 		let response: DaemonResponse;
 		try {
 			response = await client.request(

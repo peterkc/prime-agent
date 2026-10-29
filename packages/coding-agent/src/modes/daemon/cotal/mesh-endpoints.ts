@@ -128,6 +128,7 @@ export class MeshEndpoints {
 	private enrollmentQueue = Promise.resolve();
 	private readonly pending = new Map<string, PendingPersistence>();
 	private readonly moving = new Set<string>();
+	private readonly interruptedResumes = new Set<string>();
 	private readonly transfers = new Map<
 		string,
 		{
@@ -396,6 +397,7 @@ export class MeshEndpoints {
 		await this.enrolling.get(sessionId);
 		const transfer = this.transfers.get(sessionId);
 		if (!transfer) {
+			if (!this.interruptedResumes.has(sessionId)) return;
 			const session = this.sessions.get(sessionId);
 			if (session && session.state !== "closed") return;
 			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) return;
@@ -409,6 +411,7 @@ export class MeshEndpoints {
 				await session?.handoff;
 				this.sessions.delete(sessionId);
 				await this.startSession(sessionId, record.sessionFile, claim);
+				this.interruptedResumes.delete(sessionId);
 			} catch (error) {
 				claim.release();
 				throw error;
@@ -417,9 +420,12 @@ export class MeshEndpoints {
 			}
 			return;
 		}
+		// Only an interrupted transfer resume can reopen an endpoint after its claim is released.
+		this.interruptedResumes.add(sessionId);
 		await this.closeSession(sessionId);
 		this.sessions.delete(sessionId);
 		await this.startSession(sessionId, transfer.record.sessionFile, transfer.claim);
+		this.interruptedResumes.delete(sessionId);
 		this.transfers.delete(sessionId);
 		this.moving.delete(sessionId);
 	}
@@ -1081,6 +1087,7 @@ export class MeshEndpoints {
 			for (const transfer of this.transfers.values()) transfer.claim.release();
 			this.transfers.clear();
 			this.moving.clear();
+			this.interruptedResumes.clear();
 			for (const replacement of this.replacements.values()) replacement.claim.release();
 			this.replacements.clear();
 			this.replacementBegins.clear();

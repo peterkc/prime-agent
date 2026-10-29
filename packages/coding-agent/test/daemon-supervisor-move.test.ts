@@ -344,15 +344,17 @@ describe("supervisor session move", () => {
 		["paused", "active or paused scheduled job"],
 		["foreign", "claimed by another daemon"],
 		["replacement", "replacement is pending"],
+		["refused", "space and server are required"],
 		["target-id", "already holds session"],
 		["target-name", "named moving"],
 	])("AC-14 refuses %s without changing session or mesh records", async (state, reason) => {
-		const f = await fixture(state !== "foreign");
+		const f = await fixture(state !== "foreign" && state !== "refused");
 		const before = fs.readFileSync(f.paths.sourceFile);
 		let claim: ReturnType<typeof enrollment.claimEnrollment> | undefined;
 		let jobId: string | undefined;
-		if (state === "foreign") {
-			claim = enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile);
+		if (state === "foreign" || state === "refused") {
+			if (state === "foreign") claim = enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile);
+			else fs.writeFileSync(join(f.meshRoot, "mesh.json"), "{}");
 			f.supervisor = await start(f.root, f.sourceDir, f.socket);
 		}
 		const sup = harness(f.supervisor!);
@@ -426,6 +428,7 @@ describe("supervisor session move", () => {
 			expect(fs.readFileSync(enrollment.enrollmentPath(f.meshRoot, f.id))).toEqual(record);
 			expect(fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id))).toEqual(directory);
 			expect(fs.existsSync(f.paths.targetFile)).toBe(false);
+			expect(fs.existsSync(f.paths.journalPath)).toBe(false);
 		} finally {
 			claim?.release();
 			sup.workers.clear();
