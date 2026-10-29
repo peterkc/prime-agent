@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants, existsSync } from "node:fs";
-import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -352,7 +352,9 @@ function processAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		if (["ESRCH", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+		// EPERM means the PID exists under another user; only ESRCH proves the process is gone.
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
 		throw error;
 	}
 }
@@ -443,9 +445,13 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 		(isBunBinary ? getNativeInstallation() : undefined)?.launcher ?? (declared ? resolve(declared) : undefined);
 	const primeAgent = launcher ?? (await executable(APP_NAME));
 	if (launcher) {
-		await access(launcher, constants.X_OK).catch((error: unknown) => {
-			throw new Error(`${APP_NAME} launcher ${launcher} is not executable`, { cause: error });
-		});
+		// launchd cannot run a directory, which passes the X_OK check; stat follows symlinks.
+		try {
+			if (!(await stat(launcher)).isFile()) throw new Error("not a regular file");
+			await access(launcher, constants.X_OK);
+		} catch (error) {
+			throw new Error(`${APP_NAME} launcher ${launcher} is not an executable file`, { cause: error });
+		}
 	} else {
 		try {
 			const current = isBunBinary ? process.execPath : process.argv[1];

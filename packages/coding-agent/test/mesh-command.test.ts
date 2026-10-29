@@ -889,7 +889,7 @@ describe("mesh command", () => {
 		},
 	);
 
-	it.each(["dead", "live", "unreadable", "missing-home", "ENOTDIR"])(
+	it.each(["dead", "live", "foreign-user", "unreadable", "missing-home", "ENOTDIR"])(
 		"handles rotation lock ownership (%s)",
 		async (owner) => {
 			await command("install");
@@ -901,6 +901,10 @@ describe("mesh command", () => {
 			} else {
 				mkdirSync(lock);
 				const pid = owner === "live" ? process.pid : 2147483647;
+				if (owner === "foreign-user")
+					vi.spyOn(process, "kill").mockImplementation(() => {
+						throw Object.assign(new Error("foreign"), { code: "EPERM" });
+					});
 				writeFileSync(join(lock, String(pid)), owner === "unreadable" ? "broken" : `${pid}\n`);
 			}
 			rmSync(join(root, "events.jsonl"));
@@ -910,7 +914,7 @@ describe("mesh command", () => {
 			expect(output()).toContain(
 				owner === "dead"
 					? "Taking over stale"
-					: owner === "live"
+					: owner === "live" || owner === "foreign-user"
 						? "another rotation may be running"
 						: owner === "unreadable"
 							? "unreadable owner content"
@@ -946,14 +950,15 @@ describe("mesh command", () => {
 		if (!failRotate) expect(output()).toContain("Mesh credentials rotated");
 	});
 
-	it.each([0o700, 0o600])("PR 52 pins an executable declared launcher (mode %o)", async (mode) => {
+	it.each([0o700, 0o600, "directory"] as const)("PR 52 pins an executable declared launcher (%s)", async (mode) => {
 		const launcher = join(root, "prime-agent.sh");
-		writeFileSync(launcher, fakeTool, { mode });
+		if (mode === "directory") mkdirSync(launcher);
+		else writeFileSync(launcher, fakeTool, { mode });
 		process.argv[1] = process.execPath;
 		vi.stubEnv(PRIME_AGENT_LAUNCHER_PATH_ENV, launcher);
 		await command("install");
 		const job = mode === 0o700 ? readFileSync(plist.replace(".plist", ".rotate.plist"), "utf8") : output();
-		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : "is not executable");
+		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : "is not an executable file");
 	});
 
 	it("preserves the rotation error when lock cleanup also fails", async () => {
@@ -963,18 +968,6 @@ describe("mesh command", () => {
 		expect(process.exitCode).toBe(1);
 		expect(output()).toContain("start rotation broker: launchctl bootstrap rotation boot failed");
 		expect(output()).toContain("Release mesh rotation lock");
-	});
-
-	it("treats EPERM pid probes as foreign processes", async () => {
-		await command("install");
-		vi.spyOn(process, "kill").mockImplementation(() => {
-			throw Object.assign(new Error("foreign"), { code: "EPERM" });
-		});
-		now = 1000;
-		configure({ credentialNow: now });
-		await runMeshCommand(["rotate", "--label", "ai.prime.mesh.test", "--server", server, "--mesh-home", mesh], clock);
-		expect(process.exitCode).toBeUndefined();
-		expect(output()).toContain("Mesh credentials rotated");
 	});
 
 	it.each([

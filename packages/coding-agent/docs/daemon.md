@@ -125,7 +125,8 @@ shim, set `PRIME_AGENT_LAUNCHER_PATH` to its absolute path before installing.
 Install refuses an occupied service, renewal or rotation label, or broker port.
 Labels ending in `.renew` or `.rotate` are reserved. If startup, signer creation or
 loading either scheduled agent fails, install attempts to remove all three agents
-and plists but keeps the home. Scheduled failures appear in `rotation.log`. Status
+and plists but keeps the home. Rotation-job failures appear in `rotation.log` and
+renewal failures in `renewal.log`. Status
 and doctor report the rotation job's last exit code and fail once either $SYS
 credential is more than 26 hours past its 75% renewal point, even if the job remains
 scheduled. The error names `rotation.log` and `rotation.lock` for investigation.
