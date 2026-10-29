@@ -252,9 +252,9 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		const targetRepository = resolveRepositoryDaemon(targetCwd);
 		const targetSocket = targetRepository?.socketPath ?? defaultDaemonSocketPath();
 		const targetSessionDir =
-			targetRepository?.sessionDir ??
 			readPersistedDaemonFolders(agentDir, targetSocket)?.sessionDir ??
-			join(agentDir, "sessions");
+			targetRepository?.sessionDir ??
+			getSessionsDir(agentDir);
 		client = await readSourceDaemon(sourceSocket);
 		const roster = await readRoster(client);
 		const sessionPath = await resolveSource(options.selector, sourceSessionDir, roster);
@@ -311,8 +311,6 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			if (!(await promptYesNo(`Move ${info.name ?? info.id} (${info.id}) to ${targetCwd}?`)))
 				throw new Error("Session move declined");
 		}
-		if (targetRepository) prepareRepositoryDaemon(targetRepository);
-		else mkdirSync(targetSessionDir, { recursive: true });
 		if (!client) {
 			await runStart(
 				{
@@ -336,6 +334,9 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		if (!client.isConnected) {
 			throw new Error("Move failed: source daemon disconnected before the move request was sent. Nothing moved.");
 		}
+		if (targetRepository && targetSessionDir === targetRepository.sessionDir)
+			prepareRepositoryDaemon(targetRepository);
+		else mkdirSync(targetSessionDir, { recursive: true });
 		let response: DaemonResponse;
 		try {
 			response = await client.request(

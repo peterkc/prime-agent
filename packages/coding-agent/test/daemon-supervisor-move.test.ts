@@ -98,7 +98,7 @@ async function start(
 	recovery.mockRestore();
 	return supervisor;
 }
-async function fixture(startNow = true) {
+async function fixture(startNow = true, id: string = randomUUID()) {
 	const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "prime-move-")));
 	roots.push(root);
 	vi.stubEnv(ENV_AGENT_DIR, root);
@@ -110,7 +110,6 @@ async function fixture(startNow = true) {
 	const targetDir = join(root, "target", "sessions");
 	fs.mkdirSync(sourceDir, { recursive: true });
 	fs.mkdirSync(targetDir, { recursive: true });
-	const id = randomUUID();
 	const sourceFile = join(sourceDir, `${id}.jsonl`);
 	fs.writeFileSync(
 		sourceFile,
@@ -187,6 +186,8 @@ function writeJournal(f: Awaited<ReturnType<typeof fixture>>, phase: SessionMove
 		fs.copyFileSync(f.paths.sourceFile, f.paths.fileTemporary);
 		fs.mkdirSync(f.paths.targetArtifactRoot, { recursive: true });
 		fs.cpSync(f.paths.sourceArtifacts, f.paths.artifactTemporary, { recursive: true });
+		const { dev, ino } = fs.lstatSync(f.paths.artifactTemporary, { bigint: true });
+		Object.assign(journal, { artifactIdentity: `${dev}:${ino}` });
 		if (phase === "committing" || phase === "committed") {
 			fs.renameSync(f.paths.sourceFile, f.paths.sourceBackup);
 			fs.renameSync(f.paths.artifactTemporary, f.paths.targetArtifacts);
@@ -290,8 +291,8 @@ describe("supervisor session move", () => {
 		freeClaim(f);
 		freeLeases(f.paths);
 	});
-	it("AC-13 dispatch moves enrolled files, deletes originals and releases custody", async () => {
-		const f = await fixture();
+	it.each([randomUUID(), "session.1"])("AC-13/#55 dispatch moves enrolled ID %s and releases custody", async (id) => {
+		const f = await fixture(true, id);
 		const response = await dispatch(f);
 		expect(response).toMatchObject({
 			success: true,
@@ -437,7 +438,7 @@ describe("supervisor session move", () => {
 			freeLeases(f.paths);
 		}
 	});
-	it.each([false, true])("AC-16/F7/H1 restart=%s move-time recovery resumes the endpoint", async (restart) => {
+	it.each([false, true])("AC-16/#55 restart=%s preserves mesh custody", async (restart) => {
 		const f = await fixture(!restart);
 		if (restart) {
 			writeJournal(f, "committing");
@@ -451,25 +452,29 @@ describe("supervisor session move", () => {
 			}
 		} else {
 			const endpoint = Endpoint.instances.find((instance) => instance.options.card?.kind === "agent")!;
-			endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
+			endpoint.stop.mockRejectedValue(new Error("stop failed"));
 			const failed = await dispatch(f);
 			expect(failed).toMatchObject({ success: false, error: expect.stringContaining("recovery is pending") });
+			expect(() => enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile)).toThrow();
 		}
 		expect(fs.existsSync(f.paths.sourceFile)).toBe(!restart);
 		expect(fs.existsSync(f.paths.journalPath)).toBe(true);
 		expect(fs.existsSync(f.paths.targetFile)).toBe(false);
 		freeLeases(f.paths);
 		const later = await dispatch(f, { ...f.command, targetSessionDir: f.sourceDir });
-		expect(later).toMatchObject({ success: false, data: { recovered: [{ status: "rolled_back" }] } });
-		expect(fs.existsSync(f.paths.journalPath)).toBe(false);
+		const status = restart ? "rolled_back" : "pending";
+		expect(later).toMatchObject({ success: false, data: { recovered: [{ status }] } });
+		expect(fs.existsSync(f.paths.journalPath)).toBe(!restart);
 		const resumed = Endpoint.instances.filter((instance) => instance.options.card?.kind === "agent");
-		expect(resumed).toHaveLength(restart ? 1 : 2);
+		expect(resumed).toHaveLength(1);
+		if (!restart) expect(() => enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile)).toThrow();
 		expect(resumed.at(-1)!.start).toHaveBeenCalledOnce();
 	});
-	it.each(["enrollment", "directory", "journal"])(
+	it.each(["enrollment", "directory", "journal", "enrollment-only"])(
 		"AC-17 %s failure after publication keeps committed journal and originals",
 		async (step) => {
 			const f = await fixture();
+			const failedStep = step === "enrollment-only" ? "enrollment" : step;
 			if (step === "journal") {
 				const write = atomic.writeFileAtomicSync;
 				vi.spyOn(atomic, "writeFileAtomicSync").mockImplementation((path, data, options) => {
@@ -480,7 +485,7 @@ describe("supervisor session move", () => {
 			} else
 				vi.spyOn(
 					enrollment,
-					step === "enrollment" ? "updateEnrollmentPath" : "publishDirectory",
+					failedStep === "enrollment" ? "updateEnrollmentPath" : "publishDirectory",
 				).mockRejectedValueOnce(new Error("record refused"));
 			expect(await dispatch(f)).toMatchObject({
 				success: true,
@@ -488,7 +493,7 @@ describe("supervisor session move", () => {
 					moved: true,
 					mesh: {
 						status: "failed",
-						step: step === "journal" ? "enrollment" : step,
+						step: failedStep === "journal" ? "enrollment" : failedStep,
 						reason: expect.stringContaining("record refused"),
 					},
 				},
@@ -500,12 +505,23 @@ describe("supervisor session move", () => {
 			expect(fs.existsSync(f.paths.sourceArtifacts)).toBe(true);
 			freeLeases(f.paths);
 			freeClaim(f);
+			if (step === "enrollment-only")
+				await enrollment.publishDirectory(
+					f.meshRoot,
+					{ ...enrollment.readEnrollment(f.meshRoot, f.id), sessionFile: f.paths.targetFile },
+					f.targetSocket,
+				);
+			const correctPath =
+				step === "directory"
+					? enrollment.enrollmentPath(f.meshRoot, f.id)
+					: enrollment.directoryPath(f.meshRoot, f.id);
+			const before = fs.readFileSync(correctPath);
 			expect(await harness(f.supervisor!).recoverSessionMoves()).toMatchObject([
 				{ status: "moved", backups: [{ path: f.paths.sourceBackup }, { path: f.paths.sourceArtifacts }] },
 			]);
+			expect(enrollment.readEnrollment(f.meshRoot, f.id).sessionFile).toBe(f.paths.targetFile);
+			if (step === "directory" || step === "enrollment-only") expect(fs.readFileSync(correctPath)).toEqual(before);
 			expect(enrollment.readDirectory(f.meshRoot, f.id)?.homeSocket).toBe(f.targetSocket);
-			expect(fs.existsSync(f.paths.sourceBackup)).toBe(true);
-			expect(await harness(f.supervisor!).recoverSessionMoves()).toEqual([]);
 		},
 	);
 	it("AC-17 journal cleanup failure is not reported as a mesh failure", async () => {

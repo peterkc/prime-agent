@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { normalizeAgentSessionMessage } from "../../../core/agent-messages.js";
 
 function sessionKey(sessionId: string): string {
-	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
+	if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(sessionId)) throw new Error("Invalid mesh session ID");
 	return sessionId;
 }
 

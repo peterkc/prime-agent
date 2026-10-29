@@ -76,6 +76,8 @@ export interface SessionMoveJournal extends SessionMovePaths {
 	readonly endpointSuspended: boolean;
 	readonly phase: SessionMovePhase;
 	readonly artifactsPresent: boolean;
+	readonly artifactSha256?: string;
+	readonly artifactIdentity?: string;
 	readonly createdDirectories: readonly string[];
 	readonly fileBytes?: number;
 	readonly fileSha256?: string;
@@ -203,6 +205,20 @@ export function sessionMovePaths(input: SessionMoveInput): SessionMoveResult<Ses
 	}
 }
 
+function assertSessionMoveArtifacts(paths: SessionMovePaths): void {
+	if (!sessionArtifactFiles(paths.sourceArtifacts).next().done) {
+		throw new Error("Cannot move a session with RLM children in its artifact tree");
+	}
+	const jobs = AgentCronJobStore.forSessionArtifacts();
+	jobs.registerSessionArtifact(paths.sessionId, paths.sourceArtifacts);
+	const blockingJobs = jobs.list().filter((job) => job.status === "active" || job.status === "paused");
+	if (blockingJobs.length > 0) {
+		throw new Error(
+			`Cannot move a session with an active or paused scheduled job; cancel these jobs first: ${blockingJobs.map((job) => job.id).join(", ")}`,
+		);
+	}
+}
+
 /** Side-effect-free saved-session checks shared by the CLI and supervisor. */
 export async function preflightSessionMove(
 	input: Omit<SessionMoveInput, "sessionId">,
@@ -244,17 +260,7 @@ export async function preflightSessionMove(
 			throw new Error("Cannot move a session with RLM children");
 		}
 	}
-	if (!sessionArtifactFiles(paths.sourceArtifacts).next().done) {
-		throw new Error("Cannot move a session with RLM children in its artifact tree");
-	}
-	const jobs = AgentCronJobStore.forSessionArtifacts();
-	jobs.registerSessionArtifact(info.id, paths.sourceArtifacts);
-	const blockingJobs = jobs.list().filter((job) => job.status === "active" || job.status === "paused");
-	if (blockingJobs.length > 0) {
-		throw new Error(
-			`Cannot move a session with an active or paused scheduled job; cancel these jobs first: ${blockingJobs.map((job) => job.id).join(", ")}`,
-		);
-	}
+	assertSessionMoveArtifacts(paths);
 	if (present(paths.journalPath))
 		throw new Error(
 			`An earlier move of this session is waiting for recovery (${paths.journalPath}). Fix the error it reported, or restart the source daemon to finish the recovery, then try again`,
@@ -398,6 +404,16 @@ function artifactFiles(root: string, relative = ""): Map<string, string> {
 	return files;
 }
 
+/** The session-file lease does not fence artifact writers. */
+function artifactDigest(path: string): string | undefined {
+	return present(path) ? digest(Buffer.from(JSON.stringify([...artifactFiles(path)]))) : undefined;
+}
+
+function artifactIdentity(path: string): string {
+	const { dev, ino } = lstatSync(path, { bigint: true });
+	return `${dev}:${ino}`;
+}
+
 function copyArtifacts(source: string, target: string): void {
 	const metadata = lstatSync(source);
 	if (metadata.isDirectory()) {
@@ -507,10 +523,16 @@ export async function rollbackSessionMove(
 	const errors: string[] = [];
 	for (const path of [journal.targetArtifacts, journal.fileTemporary, journal.artifactTemporary]) {
 		try {
+			if (path !== journal.fileTemporary && !journal.artifactsPresent) continue;
 			// Promotion is only attempted after the committing journal is durable.
 			if (path === journal.targetArtifacts && journal.phase !== "committing" && journal.phase !== "committed")
 				continue;
 			if (present(path)) {
+				if (path === journal.targetArtifacts && artifactIdentity(path) !== journal.artifactIdentity) {
+					if (!journal.artifactIdentity)
+						throw new Error("Artifact ownership is unknown; keep the journal for recovery");
+					continue;
+				}
 				rmSync(path, { recursive: true });
 				fsyncPath(dirname(path));
 			}
@@ -583,10 +605,16 @@ export async function deleteSessionMoveOriginal(
 				}
 			}
 		}
+		if (!reason && artifactDigest(journal.sourceArtifacts) !== journal.artifactSha256) {
+			reason = "Source artifacts changed during the move; original kept";
+		}
 		if (!reason && present(journal.sourceBackup)) {
 			const removed = await removeMovedSessionFile(journal.sourceBackup);
 			if (!removed.ok) reason = removed.error;
 			else method = removed.method;
+		}
+		if (!reason && artifactDigest(journal.sourceArtifacts) !== journal.artifactSha256) {
+			reason = "Source artifacts changed during original-file removal; artifacts kept";
 		}
 		if (!reason && present(journal.sourceArtifacts)) rmSync(journal.sourceArtifacts, { recursive: true });
 	} catch (error) {
@@ -669,6 +697,7 @@ export async function relocateSession(options: {
 			throw new Error("Open the session once in its own repository first to upgrade it");
 		}
 		if ((header.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
+		assertSessionMoveArtifacts(paths);
 		const artifactsPresent = present(paths.sourceArtifacts);
 		if (artifactsPresent && !lstatSync(paths.sourceArtifacts).isDirectory()) {
 			throw new Error(`Source artifact folder is not a directory: ${paths.sourceArtifacts}`);
@@ -684,12 +713,16 @@ export async function relocateSession(options: {
 			targetSocket: options.targetSocket,
 			endpointSuspended: false,
 			artifactsPresent,
+			artifactSha256: artifactDigest(paths.sourceArtifacts),
 			createdDirectories,
 		};
 		mkdirSync(dirname(paths.journalPath), { recursive: true });
 		if (createdDirectories.includes(dirname(paths.journalPath))) fsyncPath(paths.agentDir);
 		writeJournal(journal);
 		const endpointSuspended = await callbacks.suspend(journal);
+		if (artifactDigest(paths.sourceArtifacts) !== journal.artifactSha256) {
+			throw new Error("Source artifacts changed while suspending the endpoint; try the move again");
+		}
 		journal = { ...journal, endpointSuspended, phase: "copying" };
 		writeJournal(journal);
 		const git = captureGitContext(targetCwd) ?? undefined;
@@ -702,9 +735,14 @@ export async function relocateSession(options: {
 			mkdirSync(paths.targetArtifactRoot, { recursive: true });
 			if (createdDirectories.includes(paths.targetArtifactRoot)) fsyncPath(dirname(paths.targetArtifactRoot));
 			copyArtifacts(paths.sourceArtifacts, paths.artifactTemporary);
+			journal = { ...journal, artifactIdentity: artifactIdentity(paths.artifactTemporary) };
+			writeJournal(journal);
 		}
 		const verified = verifySessionMoveCopy(journal, sourceEntries, git);
 		if (!verified.ok) throw new Error(verified.reason);
+		if (artifactDigest(paths.sourceArtifacts) !== journal.artifactSha256) {
+			throw new Error("Source artifacts changed while copying; try the move again");
+		}
 		journal = { ...journal, phase: "committing" };
 		writeJournal(journal);
 		renameAbsent(paths.sourceFile, paths.sourceBackup);
@@ -807,9 +845,17 @@ function parseJournal(path: string): SessionMoveJournal {
 	if (
 		("fileBytes" in raw &&
 			(typeof raw.fileBytes !== "number" || !Number.isSafeInteger(raw.fileBytes) || raw.fileBytes < 0)) ||
-		("fileSha256" in raw && (typeof raw.fileSha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.fileSha256)))
+		("fileSha256" in raw && (typeof raw.fileSha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.fileSha256))) ||
+		("artifactSha256" in raw &&
+			(typeof raw.artifactSha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.artifactSha256)))
 	) {
 		throw new Error("Invalid verified file length or SHA-256");
+	}
+	if (
+		"artifactIdentity" in raw &&
+		(typeof raw.artifactIdentity !== "string" || !/^\d+:\d+$/.test(raw.artifactIdentity))
+	) {
+		throw new Error("Invalid artifact directory identity");
 	}
 	return raw as SessionMoveJournal;
 }

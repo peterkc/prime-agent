@@ -466,7 +466,8 @@ export class MeshEndpoints {
 
 	releaseClaim(sessionId: string): void {
 		const transfer = this.transfers.get(sessionId);
-		if (!transfer) return;
+		// A rejected stop leaves local consumer custody unproven.
+		if (!transfer || !transfer.stopped) return;
 		transfer.claim.release();
 		this.transfers.delete(sessionId);
 		this.moving.delete(sessionId);

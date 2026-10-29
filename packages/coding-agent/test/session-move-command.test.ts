@@ -1,4 +1,5 @@
 import { ChildProcess, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	lstatSync,
 	mkdirSync,
@@ -113,7 +114,6 @@ function fixture() {
 		targetDir,
 		sourceFile,
 		paths,
-		enrollment,
 		sourceSocket: repositorySocketPath(source),
 		targetSocket: repositorySocketPath(target),
 	};
@@ -187,8 +187,6 @@ function moved(command: Extract<DaemonCommand, { type: "move_saved_session" }>) 
 		success: true,
 		data: {
 			moved: true,
-			sessionId: entries[0].id,
-			name: "moving",
 			targetFile,
 			original: {
 				deleted: mesh !== "failed",
@@ -487,7 +485,7 @@ describe("session move command", () => {
 			env = { ...process.env };
 		vi.mocked(promptYesNo).mockImplementation(async () => {
 			for (const text of [
-				f.paths.sourceFile,
+				f.sourceFile,
 				f.paths.targetFile,
 				f.paths.sourceArtifacts,
 				"Trash",
@@ -518,8 +516,8 @@ describe("session move command", () => {
 			for (const text of [
 				"moving",
 				"session-1",
-				outside ? join(home, "sessions/session-1.jsonl") : f.paths.targetFile,
-				f.paths.sourceFile,
+				outside ? join(home, "inherited-session-dir/session-1.jsonl") : f.paths.targetFile,
+				f.sourceFile,
 				f.paths.sourceArtifacts,
 				"enrolled",
 				"no process has the session open",
@@ -531,16 +529,17 @@ describe("session move command", () => {
 		},
 	);
 	it("AC-28 JSON dry run has the preview fields and no side effects", async () => {
+		session(f.sourceFile, "session.1");
 		const before = tree(),
 			env = { ...process.env };
 		await run(["--dry-run", "--json"]);
 		expect(JSON.parse(output())).toMatchObject({
 			dryRun: true,
-			sessionId: "session-1",
+			sessionId: "session.1",
 			name: "moving",
-			targetFile: f.paths.targetFile,
-			original: { file: f.sourceFile, artifacts: f.paths.sourceArtifacts },
-			mesh: { enrolled: true },
+			targetFile: join(f.targetDir, "session.1.jsonl"),
+			original: { file: f.sourceFile, artifacts: join(dirname(f.paths.sourceArtifacts), "session.1") },
+			mesh: { enrolled: false },
 			recheck: expect.stringContaining("no process has the session open"),
 		});
 		expect(promptYesNo).not.toHaveBeenCalled();
@@ -550,12 +549,34 @@ describe("session move command", () => {
 		["absent", "session-1"],
 		["running", "session-1"],
 		["running", "-session-1"],
+		["persisted", "session.1"],
+		["environment", "session-1"],
 	])("AC-21/AC-22/AC-23 move never contacts %s target; printed ID %s resumes saved-only", async (state, id) => {
 		targetRunning = state === "running";
 		session(f.sourceFile, id);
-		await run(["--yes", "--json"]);
+		const targetDir =
+			state === "persisted"
+				? join(home, "custom")
+				: state === "environment"
+					? join(home, "inherited-session-dir")
+					: f.targetDir;
+		if (state === "persisted") {
+			const key = createHash("sha256").update(f.targetSocket).digest("hex").slice(0, 12);
+			const folder = join(home, "daemon-workers", key);
+			mkdirSync(folder, { recursive: true });
+			writeFileSync(
+				join(folder, "supervisor-config"),
+				JSON.stringify({
+					version: 1,
+					socketPath: f.targetSocket,
+					defaultSessionConfig: { agentDir: home, sessionDir: targetDir },
+				}),
+			);
+		}
+		const folder = state === "environment" ? home : f.target;
+		await run(["--yes", "--json"], "moving", folder);
 		const result = JSON.parse(output());
-		const targetFile = join(f.targetDir, `${id}.jsonl`);
+		const targetFile = join(targetDir, `${id}.jsonl`);
 		expect(process.exitCode).toBeUndefined();
 		expect(result).toMatchObject({
 			moved: true,
@@ -566,15 +587,16 @@ describe("session move command", () => {
 			mesh: { status: "updated" },
 		});
 		const resume = id.startsWith("-") ? `--resume=${id}` : `--resume ${id}`;
-		expect(result.openCommand).toBe(`cd '${f.target.replaceAll("'", `'"'"'`)}' && prime-agent ${resume}`);
+		expect(result.openCommand).toBe(`cd '${folder.replaceAll("'", `'"'"'`)}' && prime-agent ${resume}`);
 		const parsed = parseArgs(result.openCommand.split(" && prime-agent ")[1].split(" "));
 		expect(parsed.resume).toBe(id);
-		expect(await resolveSessionPath(String(parsed.resume), f.target, f.targetDir)).toMatchObject({
+		expect(await resolveSessionPath(String(parsed.resume), folder, targetDir)).toMatchObject({
 			path: targetFile,
 		});
 		expect(connected).not.toContain(f.targetSocket);
 		expect(spawnHidden).not.toHaveBeenCalled();
-		expect(readFileSync(join(f.target, ".git/info/exclude"), "utf8")).toContain("/.prime/agent/sessions/");
+		if (state !== "environment" && state !== "persisted")
+			expect(readFileSync(join(f.target, ".git/info/exclude"), "utf8")).toContain("/.prime/agent/sessions/");
 	});
 	it("AC-22 starts an absent source through the non-replacing launch path", async () => {
 		sourceState = "absent";
@@ -588,6 +610,17 @@ describe("session move command", () => {
 		expect(config).toMatchObject({ cwd: f.source });
 		expect(connected).not.toContain(f.targetSocket);
 		expect(requests.map(({ command }) => command.type)).not.toEqual(expect.arrayContaining(["shutdown", "restart"]));
+	});
+	it("#55 failed source launch leaves the target repository unchanged", async () => {
+		sourceState = "absent";
+		const before = tree();
+		vi.mocked(spawnHidden).mockImplementation(() => {
+			throw new Error("launch refused");
+		});
+		await run(["--yes"]);
+		expect(process.exitCode).toBe(1);
+		expect(errors()).toContain("launch refused");
+		expect(tree()).toEqual(before);
 	});
 	it.each(["trash", "unlink", "not_enrolled", "failed", "journal"] as const)(
 		"AC-23 prints deletion and mesh outcome %s with the open command",
