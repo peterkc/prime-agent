@@ -293,6 +293,7 @@ describe("session relocation", () => {
 			const result = await move(f);
 			expect(result.status).toBe("moved");
 			const kept = mode === "failure" || mode === "broken-interpreter";
+			expect(result.originalMethod).toBe(kept ? undefined : mode === "success" ? "trash" : "unlink");
 			expect(existsSync(f.paths.sourceBackup)).toBe(kept);
 			expect(existsSync(f.paths.sourceArtifacts)).toBe(kept);
 			expect(result.backups.map((backup) => backup.path)).toEqual(

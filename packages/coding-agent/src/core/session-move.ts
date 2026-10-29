@@ -86,6 +86,7 @@ export interface SessionMoveReport {
 	readonly targetFile?: string;
 	readonly journalPath: string;
 	readonly committed?: true;
+	readonly originalMethod?: "trash" | "unlink";
 	readonly messages: readonly string[];
 	readonly backups: readonly SessionMoveBackup[];
 }
@@ -457,8 +458,9 @@ export async function rollbackSessionMove(
 export async function deleteSessionMoveOriginal(
 	journal: SessionMoveJournal,
 	paths: SessionMovePaths,
-): Promise<SessionMoveBackup[]> {
+): Promise<{ readonly backups: SessionMoveBackup[]; readonly method?: "trash" | "unlink" }> {
 	const backups: SessionMoveBackup[] = [];
+	let method: "trash" | "unlink" | undefined;
 	let reason: string | undefined;
 	const valid = validateSessionMoveJournal(journal, paths.agentDir, paths.sourceSessionDir, paths.journalPath);
 	if (!valid.ok) reason = valid.reason;
@@ -498,6 +500,7 @@ export async function deleteSessionMoveOriginal(
 		if (!reason && present(journal.sourceBackup)) {
 			const removed = await removeMovedSessionFile(journal.sourceBackup);
 			if (!removed.ok) reason = removed.error;
+			else method = removed.method;
 		}
 		if (!reason && present(journal.sourceArtifacts)) rmSync(journal.sourceArtifacts, { recursive: true });
 	} catch (error) {
@@ -508,7 +511,7 @@ export async function deleteSessionMoveOriginal(
 			if (present(path)) backups.push({ path, reason });
 		}
 	}
-	return backups;
+	return { backups, method };
 }
 
 /** Canonical ordering matches other session file actions; all four leases are enabled. */
@@ -549,6 +552,7 @@ export async function relocateSession(options: {
 	const { paths, callbacks } = options;
 	let journal: SessionMoveJournal | undefined;
 	let committed = false;
+	let originalMethod: "trash" | "unlink" | undefined;
 	try {
 		const checked = sessionMovePaths(paths);
 		if (!checked.ok) throw new Error(checked.reason);
@@ -626,20 +630,25 @@ export async function relocateSession(options: {
 		writeJournal(journal);
 		const cleanupJournal = { ...journal };
 		await callbacks.writeMeshRecords(journal, { enrollment: true, directory: true });
-		const backups = await deleteSessionMoveOriginal(journal, paths);
+		const deletion = await deleteSessionMoveOriginal(journal, paths);
+		originalMethod = deletion.method;
 		deleteJournal(cleanupJournal);
-		return report(
-			cleanupJournal,
-			"moved",
-			["Session moved", ...backups.map((backup) => `Kept ${backup.path}: ${backup.reason}`)],
-			backups,
-		);
+		return {
+			...report(
+				cleanupJournal,
+				"moved",
+				["Session moved", ...deletion.backups.map((backup) => `Kept ${backup.path}: ${backup.reason}`)],
+				deletion.backups,
+			),
+			originalMethod,
+		};
 	} catch (error) {
 		if (journal && present(journal.journalPath)) {
 			if (committed)
 				return {
 					...report(journal, "pending", ["Session published; recovery is pending", errorMessage(error)]),
 					committed: true,
+					originalMethod,
 				};
 			const rolledBack = await rollbackSessionMove(journal, callbacks.resume);
 			return { ...rolledBack, messages: [errorMessage(error), ...rolledBack.messages] };

@@ -4,13 +4,43 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 
 interface RepositoryDaemon {
-	root: string;
-	socketPath: string;
-	sessionDir: string;
+	readonly root: string;
+	readonly socketPath: string;
+	readonly sessionDir: string;
+}
+
+interface ResolvedRepositoryDaemon extends RepositoryDaemon {
+	readonly excludeFile: string;
 }
 
 const repositories = new Map<string, RepositoryDaemon | undefined>();
 const roots = new Map<string, string>();
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	delete env.GIT_DIR;
+	delete env.GIT_WORK_TREE;
+	return env;
+}
+
+/** Resolve repository storage without preparing folders or changing the environment. */
+export function resolveRepositoryDaemon(folder: string): ResolvedRepositoryDaemon | undefined {
+	const result = spawnSync(
+		"git",
+		["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--git-path", "info/exclude"],
+		{ cwd: resolve(folder), env: gitEnvironment(), encoding: "utf8" },
+	);
+	if (result.status !== 0) return undefined;
+	const [toplevel, commonDir, excludeFile] = result.stdout.trimEnd().split("\n");
+	if (!toplevel || !commonDir || !excludeFile) return undefined;
+	const root = basename(commonDir) === ".git" ? dirname(commonDir) : toplevel;
+	const sessionDir = join(root, basename(root) === ".prime" ? "agent" : ".prime/agent", "sessions");
+	return { root, sessionDir, socketPath: repositorySocketPath(root), excludeFile };
+}
+
+export function prepareRepositoryDaemon(daemon: ResolvedRepositoryDaemon): void {
+	prepareSessionFolders(daemon.root, daemon.sessionDir, daemon.excludeFile, gitEnvironment());
+}
 
 /** Choose repository storage and socket once per caller folder. */
 export function repositoryDaemon(folder: string): RepositoryDaemon | undefined {
@@ -20,29 +50,12 @@ export function repositoryDaemon(folder: string): RepositoryDaemon | undefined {
 		if (cached) process.env.PRIME_AGENT_SESSION_DIR = cached.sessionDir;
 		return cached;
 	}
-	const env = { ...process.env };
-	delete env.GIT_DIR;
-	delete env.GIT_WORK_TREE;
-	const result = spawnSync(
-		"git",
-		["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--git-path", "info/exclude"],
-		{ cwd, env, encoding: "utf8" },
-	);
-	if (result.status !== 0) {
-		repositories.set(cwd, undefined);
-		return undefined;
+	const daemon = resolveRepositoryDaemon(cwd);
+	if (daemon) {
+		prepareRepositoryDaemon(daemon);
+		process.env.PRIME_AGENT_SESSION_DIR = daemon.sessionDir;
+		roots.set(daemon.socketPath, daemon.root);
 	}
-	const [toplevel, commonDir, excludeFile] = result.stdout.trimEnd().split("\n");
-	if (!toplevel || !commonDir || !excludeFile) {
-		repositories.set(cwd, undefined);
-		return undefined;
-	}
-	const root = basename(commonDir) === ".git" ? dirname(commonDir) : toplevel;
-	const sessionDir = join(root, basename(root) === ".prime" ? "agent" : ".prime/agent", "sessions");
-	const daemon = { root, sessionDir, socketPath: repositorySocketPath(root) };
-	prepareSessionFolders(root, sessionDir, excludeFile, env);
-	process.env.PRIME_AGENT_SESSION_DIR = sessionDir;
-	roots.set(daemon.socketPath, root);
 	repositories.set(cwd, daemon);
 	return daemon;
 }

@@ -3361,6 +3361,7 @@ export class DaemonSupervisor {
 					targetFile: paths.targetFile,
 					moved,
 					original: {
+						method: report.originalMethod,
 						deleted: !existsSync(paths.sourceBackup) && !existsSync(paths.sourceArtifacts),
 						backups: report.backups,
 					},

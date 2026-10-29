@@ -240,7 +240,7 @@ describe("supervisor session move", () => {
 				moved: true,
 				sessionId: f.id,
 				targetFile: f.paths.targetFile,
-				original: { deleted: true },
+				original: { deleted: true, method: "unlink" },
 				mesh: { status: "updated" },
 			},
 		});
