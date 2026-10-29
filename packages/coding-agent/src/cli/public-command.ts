@@ -122,6 +122,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return HANDLED;
 		case "send":
 			return runInternalAgentCommand("send", args.slice(1));
+		case "notify":
+			return runInternalAgentCommand("notify", args.slice(1));
 		case "schedule":
 			return runNestedAgentCommand("schedule", "cron", args.slice(1));
 		case "status":

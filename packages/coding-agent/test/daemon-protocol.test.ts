@@ -29,6 +29,7 @@ import {
 	type DaemonOutbound,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
+	isDaemonMutatingCommand,
 	isSessionPlaneDaemonCommand,
 	isSessionSummary,
 	salvageDaemonCommandId,
@@ -85,12 +86,17 @@ describe("daemon protocol helpers", () => {
 		}
 	});
 
-	it.each(["mesh_send", "mesh_replace"] as const)(
+	it.each(["mesh_send", "mesh_replace", "mesh_notify"] as const)(
 		"checks new-client/old-supervisor capability for %s",
 		checkMeshCapability,
 	);
 
-	async function checkMeshCapability(type: "mesh_send" | "mesh_replace") {
+	async function checkMeshCapability(type: "mesh_send" | "mesh_replace" | "mesh_notify") {
+		if (type === "mesh_notify") {
+			expect(WORKER_DAEMON_COMMAND_TYPES.has(type)).toBe(false);
+			expect(DAEMON_COMMAND_PLANE[type]).toBe("control");
+			expect(isDaemonMutatingCommand({ type })).toBe(true);
+		}
 		const client = new DaemonClient("unused");
 		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
 		const state = client as unknown as {
@@ -103,22 +109,28 @@ describe("daemon protocol helpers", () => {
 			requestWire: typeof wire;
 		};
 		state.socket = { destroyed: false };
-		state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 33, serverCapabilities: ["mesh_send"] };
+		state.helloMessage = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: type === "mesh_notify" ? 36 : 33,
+			serverCapabilities: ["mesh_send", "session_move", "mesh_notify"],
+		};
 		state.requestWire = wire;
-		const capability = type === "mesh_send" ? "mesh_send" : "mesh_replacement";
-		const revision = type === "mesh_send" ? 34 : 35;
+		const capability = type === "mesh_replace" ? "mesh_replacement" : type;
+		const revision = type === "mesh_notify" ? 37 : type === "mesh_send" ? 34 : 35;
 		const command: DaemonCommand =
 			type === "mesh_send"
 				? { type, fromActiveSessionId: "a", targetSessionId: "b", message: "hello" }
-				: {
-						type,
-						fromActiveSessionId: "a",
-						phase: "begin",
-						token: "replacement",
-						sessionId: "b",
-						sessionFile: "b.jsonl",
-						overwrite: true,
-					};
+				: type === "mesh_notify"
+					? { type, target: "b", message: "hello" }
+					: {
+							type,
+							fromActiveSessionId: "a",
+							phase: "begin",
+							token: "replacement",
+							sessionId: "b",
+							sessionFile: "b.jsonl",
+							overwrite: true,
+						};
 		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
 		expect(wire).not.toHaveBeenCalled();
 		await expect(client.request({ type: "list" })).resolves.toMatchObject({ command: "list", success: true });
@@ -267,8 +279,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(36);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-36-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(37);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-37-mesh-notify");
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -325,6 +337,7 @@ describe("daemon protocol helpers", () => {
 	// capability name, and whether a default server advertises that capability.
 	it.each([
 		["mesh_send", { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" }, false],
+		["mesh_notify", { minProtocol: 7, minSchemaRevision: 37, capability: "mesh_notify" }, false],
 		["mesh_replace", { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" }, false],
 		["move_saved_session", { minProtocol: 7, minSchemaRevision: 36, capability: "session_move" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
@@ -510,6 +523,7 @@ describe("daemon protocol helpers", () => {
 			"get_direct_worker_transport",
 			"list_agent_peers",
 			"mesh_send",
+			"mesh_notify",
 			"mesh_replace",
 			"move_saved_session",
 			"promote_owned_session",

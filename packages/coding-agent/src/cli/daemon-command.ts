@@ -4,12 +4,24 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { expandTildePath } from "../config.js";
+import {
+	type AgentSessionMessageReceipt,
+	assertDirectAgentMessageTarget,
+	normalizeAgentSessionMessage,
+} from "../core/agent-messages.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
+import { redactMeshError } from "../modes/daemon/cotal/mesh-shared.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
-import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_COMMAND_COMPATIBILITY,
+	type DaemonOutbound,
+	type DaemonResponse,
+	type MeshNotifyResult,
+	meetsDaemonCommandCompatibility,
+} from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -59,6 +71,11 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 		return false;
 	}
 
+	if (args[1] === "notify") {
+		await runNotify(args.slice(2));
+		return true;
+	}
+
 	try {
 		const parsed = parseDaemonClientCommand(args.slice(1));
 		await runDaemonClientCommand(parsed);
@@ -68,6 +85,144 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 		console.error(chalk.red(`Error: ${message}`));
 		process.exitCode = 1;
 		return true;
+	}
+}
+
+interface NotifyArgs {
+	readonly socketPath?: string;
+	readonly target: string;
+	readonly message: string;
+}
+
+function parseNotifyArgs(args: string[]): NotifyArgs {
+	const separator = args.indexOf("--");
+	if (separator === -1)
+		throw new Error("Usage: prime-agent notify [--daemon-socket <path>] [--json] <session> -- <message>");
+	let socketPath: string | undefined;
+	let target: string | undefined;
+	const seen = new Set<string>();
+	for (let index = 0; index < separator; index++) {
+		const arg = args[index]!;
+		if (arg === "--json" || arg === "--daemon-socket") {
+			if (seen.has(arg)) throw new Error(`Duplicate notify option: ${arg}`);
+			seen.add(arg);
+			if (arg === "--daemon-socket") {
+				const value = args[++index];
+				if (index >= separator || !value || value.startsWith("-"))
+					throw new Error("--daemon-socket requires a path");
+				socketPath = normalizeSocketPath(value);
+			}
+		} else if (arg.startsWith("-")) throw new Error(`Unknown notify option: ${arg}`);
+		else {
+			if (target !== undefined) throw new Error("notify accepts exactly one target");
+			target = arg;
+		}
+	}
+	if (target === undefined) throw new Error("notify requires a target session");
+	return {
+		socketPath,
+		target: assertDirectAgentMessageTarget(target),
+		message: normalizeAgentSessionMessage(args.slice(separator + 1).join(" ")),
+	};
+}
+
+function isStoredMeshReceipt(value: unknown): value is AgentSessionMessageReceipt {
+	if (!value || typeof value !== "object") return false;
+	const receipt = value as Partial<AgentSessionMessageReceipt>;
+	return (
+		typeof receipt.cotalId === "string" &&
+		receipt.cotalId.length > 0 &&
+		receipt.id === `agentmsg_${receipt.cotalId}` &&
+		receipt.source === "agent_message" &&
+		typeof receipt.message === "string" &&
+		receipt.message.length > 0 &&
+		receipt.deliveryStatus === "stored" &&
+		Number.isSafeInteger(receipt.sequence) &&
+		(receipt.sequence ?? 0) > 0 &&
+		!!receipt.target &&
+		typeof receipt.target === "object" &&
+		typeof receipt.target.sessionId === "string" &&
+		receipt.target.sessionId.length > 0 &&
+		typeof receipt.target.activeSessionId === "string" &&
+		receipt.target.activeSessionId.length > 0 &&
+		(receipt.target.sessionName === undefined || typeof receipt.target.sessionName === "string") &&
+		!!receipt.from &&
+		typeof receipt.from === "object" &&
+		receipt.from.sessionName === "gate-watcher" &&
+		typeof receipt.from.clientId === "string"
+	);
+}
+
+function parseNotifyResult(value: unknown): MeshNotifyResult {
+	if (value && typeof value === "object") {
+		const result = value as Record<string, unknown>;
+		if (result.outcome === "stored" && isStoredMeshReceipt(result.receipt))
+			return { outcome: "stored", receipt: result.receipt };
+		if (
+			(result.outcome === "failed" || result.outcome === "unknown") &&
+			typeof result.error === "string" &&
+			result.error
+		)
+			return { outcome: result.outcome, error: result.error };
+	}
+	throw new Error("Daemon returned an invalid mesh_notify result");
+}
+
+async function runNotify(args: string[]): Promise<void> {
+	const separator = args.indexOf("--");
+	const json = args.slice(0, separator === -1 ? args.length : separator).includes("--json");
+	let client: DaemonClient | undefined;
+	let requested = false;
+	let result: MeshNotifyResult;
+	try {
+		const parsed = parseNotifyArgs(args);
+		const socketPath = parsed.socketPath ?? repositoryDaemon(process.cwd())?.socketPath ?? defaultDaemonSocketPath();
+		client = new DaemonClient(socketPath);
+		await client.connect();
+		const hello = await client.waitForHello();
+		if (!meetsDaemonCommandCompatibility(hello, DAEMON_COMMAND_COMPATIBILITY.mesh_notify))
+			throw new Error("The running Prime Agent daemon does not support mesh_notify; restart the daemon");
+		requested = true;
+		const response = await client.request(
+			{ type: "mesh_notify", target: parsed.target, message: parsed.message },
+			35_000,
+			{ recoverable: false },
+		);
+		if (!response.success) throw new Error(response.error);
+		if (response.command !== "mesh_notify") throw new Error("Daemon returned a different command result");
+		result = parseNotifyResult(response.data);
+	} catch (error) {
+		result = requested
+			? {
+					outcome: "unknown",
+					error: `Message storage outcome is unknown: ${redactMeshError(error)}; a resend can show the message twice`,
+				}
+			: { outcome: "failed", error: `Message was not stored: ${redactMeshError(error)}` };
+	} finally {
+		client?.close();
+	}
+	switch (result.outcome) {
+		case "stored":
+			process.exitCode = 0;
+			if (json) printJson(result);
+			else
+				console.log(
+					`Stored for ${result.receipt.target.sessionName ?? result.receipt.target.sessionId}`.replace(
+						/[\r\n]+/g,
+						" ",
+					),
+				);
+			return;
+		case "failed":
+		case "unknown":
+			process.exitCode = result.outcome === "failed" ? 1 : 2;
+			if (json) printJson(result);
+			else console.log(result.error.replace(/[\r\n]+/g, " "));
+			return;
+		default: {
+			const unhandled: never = result;
+			return unhandled;
+		}
 	}
 }
 

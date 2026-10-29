@@ -66,6 +66,20 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		],
 	},
 	{
+		path: ["notify"],
+		usage: "notify [--daemon-socket <path>] [--json] <session> -- <message>",
+		summary: "Send a one-way mesh notification as gate-watcher",
+		description:
+			"Requires a running Cotal-enabled daemon. gate-watcher is not a reply address; a real session with that name receives replies addressed by name. Exit codes: 0 stored, 1 failed before publish, 2 storage outcome unknown. Do not automatically resend an unknown outcome.",
+		options: [
+			"--daemon-socket <path>  Choose the sender-host daemon (pass explicitly from launchd)",
+			"--json  Print one result object, including on failure",
+		],
+		examples: [
+			'notify --daemon-socket /tmp/prime-agent.sock --json reviewer -- "Gate check finished. No reply expected."',
+		],
+	},
+	{
 		path: ["schedule"],
 		usage: "schedule <list|add|cancel>",
 		summary: "Manage prompts that run later or on a recurring schedule",

@@ -95,6 +95,8 @@ import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./
 import type { MeshEndpoints } from "./cotal/mesh-endpoints.js";
 import {
 	type EnrollmentRecord,
+	MeshNotStoredError,
+	MeshStorageUnknownError,
 	MeshTransferRecordError,
 	meshMessageText,
 	redactMeshError,
@@ -132,6 +134,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	isSessionSummary,
+	type MeshNotifyResult,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -226,6 +229,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	"agent_roster",
 	"direct_peer_transport",
 	"mesh_send",
+	"mesh_notify",
 	"mesh_replacement",
 	"session_move",
 ];
@@ -3001,6 +3005,24 @@ export class DaemonSupervisor {
 				command.sessionFile,
 			);
 			return success(command.id, command.type, { outcome });
+		}
+
+		if (command.type === "mesh_notify") {
+			let result: MeshNotifyResult;
+			try {
+				if (!this.mesh) throw new MeshNotStoredError("Message was not stored: Cotal transport is not enabled");
+				const receipt = await this.mesh.sendService(command.target, command.message);
+				result = { outcome: "stored", receipt };
+			} catch (error) {
+				result = {
+					outcome: error instanceof MeshNotStoredError ? "failed" : "unknown",
+					error:
+						error instanceof MeshNotStoredError || error instanceof MeshStorageUnknownError
+							? error.message
+							: `Message storage outcome is unknown: ${redactMeshError(error)}; a resend can show the message twice`,
+				};
+			}
+			return success(command.id, command.type, result);
 		}
 
 		if (command.type === "mesh_send") {

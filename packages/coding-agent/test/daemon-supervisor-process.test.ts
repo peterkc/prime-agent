@@ -2199,6 +2199,50 @@ async function meshFixture() {
 }
 
 describe("mesh supervisor compatibility", () => {
+	it("mesh-notify stores once across daemons, renders gate-watcher without a role and refuses a second live host", async () => {
+		const f = await meshFixture();
+		const sender = await f.start(join(f.root, "sender.sock"));
+		const receiver = await f.start(join(f.root, "receiver.sock"));
+		try {
+			const target = await f.create(receiver, "reviewer");
+			expect(sender.client.supportsServerCapability("mesh_notify")).toBe(true);
+			const result = (await f.request(sender.client, {
+				type: "mesh_notify",
+				target: "ReViEwEr",
+				message: "No reply expected.",
+			})) as { outcome: string; receipt: { sequence: number; cotalId: string } };
+			expect(result).toMatchObject({ outcome: "stored", receipt: { sequence: 1, cotalId: expect.any(String) } });
+			await meshSignal(receiver.child, "ack", result.receipt.cotalId);
+			const entries = readFileSync(target.sessionFile!, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			const received = entries.filter(
+				(entry) => entry.type === "custom_message" && entry.details?.id === `agentmsg_${result.receipt.cotalId}`,
+			);
+			expect(received).toHaveLength(1);
+			expect(received[0]).toMatchObject({
+				content: "[agent-message from gate-watcher]\n\nPossibly repeated agent message.\n\nNo reply expected.",
+				details: { from: { sessionName: "gate-watcher", clientId: expect.stringMatching(/^local\.U/) } },
+			});
+			expect(received[0].details.fromRelationship).toBeUndefined();
+			expect(received[0].details.from.sessionId).toBeUndefined();
+			expect(countWorkerDescriptors(f.agentDir)).toBe(1);
+			expect(
+				(childDiagnostics.get(sender.child)?.stdout ?? "")
+					.split("\n")
+					.filter((line) => line.includes('"type":"notification-published"')),
+			).toHaveLength(1);
+			expect(
+				await f.request(receiver.client, { type: "mesh_notify", target: target.sessionId, message: "blocked" }),
+			).toMatchObject({ outcome: "failed", error: expect.stringContaining("already active") });
+			expect(childDiagnostics.get(receiver.child)?.stdout).not.toContain('"type":"notification-published"');
+		} finally {
+			sender.client.close();
+			receiver.client.close();
+		}
+	});
+
 	it.each(["rename", "unknown", "directory-error", "missing", "saved"] as const)(
 		"AC-36 AC-38 uses production handoff after %s",
 		async (mode) => {

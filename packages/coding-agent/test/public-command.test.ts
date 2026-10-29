@@ -158,6 +158,10 @@ describe("public command routing", () => {
 			["rename", "worker", "reviewer", "--daemon-socket", "/tmp/custom-daemon.sock"],
 			["daemon", "rename", "worker", "reviewer", "--daemon-socket", "/tmp/custom-daemon.sock"],
 		],
+		[
+			["notify", "--daemon-socket", "/tmp/notify.sock", "--json", "worker", "--", "--help"],
+			["daemon", "notify", "--daemon-socket", "/tmp/notify.sock", "--json", "worker", "--", "--help"],
+		],
 		// Help-like message text after the separator stays literal payload.
 		[
 			["send", "worker", "--", "--help"],
