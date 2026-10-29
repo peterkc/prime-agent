@@ -30,6 +30,7 @@ import {
 	createCustomMessage,
 	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "./messages.js";
+import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV, SessionAlreadyActiveError } from "./session-lease.js";
 import {
 	addAssistantUsage,
 	cloneUsage,
@@ -919,6 +920,36 @@ function readTailLeafId(filePath: string, fileSize: number): string | null | und
 	return windowBytes === fileSize ? null : undefined;
 }
 
+function requireNormalSessionPath(path: string): void {
+	const name = basename(resolve(path));
+	if (name.endsWith(".moved") || name.endsWith(".moving")) {
+		throw new Error(`Cannot open move backup or temporary: ${path}`);
+	}
+}
+
+function appendEntryToExistingFile(
+	sessionFile: string,
+	buildEntry: (seed: AppendEntrySeed) => SessionEntry,
+	fallback: () => string,
+	agentDir: string,
+): string {
+	requireNormalSessionPath(sessionFile);
+	let lease: ReturnType<typeof acquireSessionLease>;
+	try {
+		lease = acquireSessionLease(sessionFile, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+	} catch (error) {
+		if (error instanceof SessionAlreadyActiveError) {
+			throw new Error(`Session is open or being moved: ${sessionFile}`, { cause: error });
+		}
+		throw error;
+	}
+	try {
+		return appendEntryWithoutLease(sessionFile, buildEntry) ?? fallback();
+	} finally {
+		lease?.release();
+	}
+}
+
 /**
  * Appends one metadata entry to an existing session file without parsing the
  * transcript. Repairs crash damage like a full open would, validates the
@@ -927,7 +958,7 @@ function readTailLeafId(filePath: string, fileSize: number): string | null | und
  * can place the entry (an older or newer version, a header beyond the window,
  * or a tail too large to resolve the leaf), so the caller can fall back.
  */
-function appendEntryToExistingFile(
+function appendEntryWithoutLease(
 	sessionFile: string,
 	buildEntry: (seed: AppendEntrySeed) => SessionEntry,
 ): string | undefined {
@@ -967,18 +998,34 @@ function appendEntryToExistingFile(
  * full transcript parse; falls back to opening a SessionManager when only a
  * full open can place the entry.
  */
-export function appendSessionInfoToExistingFile(sessionFile: string, name: string): string {
-	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionInfoEntry(name, seed));
-	return fastId ?? SessionManager.open(sessionFile).appendSessionInfo(name);
+export function appendSessionInfoToExistingFile(
+	sessionFile: string,
+	name: string,
+	agentDir: string = getDefaultAgentDir(),
+): string {
+	return appendEntryToExistingFile(
+		sessionFile,
+		(seed) => buildSessionInfoEntry(name, seed),
+		() => SessionManager.open(sessionFile).appendSessionInfo(name),
+		agentDir,
+	);
 }
 
 /**
  * Appends a lifecycle (session_state) entry to a closed session file without a
  * full transcript parse; falls back like appendSessionInfoToExistingFile.
  */
-export function appendSessionStateToExistingFile(sessionFile: string, state: SessionState): string {
-	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionStateEntry(state, seed));
-	return fastId ?? SessionManager.open(sessionFile).appendSessionState(state);
+export function appendSessionStateToExistingFile(
+	sessionFile: string,
+	state: SessionState,
+	agentDir: string = getDefaultAgentDir(),
+): string {
+	return appendEntryToExistingFile(
+		sessionFile,
+		(seed) => buildSessionStateEntry(state, seed),
+		() => SessionManager.open(sessionFile).appendSessionState(state),
+		agentDir,
+	);
 }
 
 /**
@@ -996,11 +1043,14 @@ export function appendCustomMessageToExistingFile<T = unknown>(
 	content: string | (TextContent | ImageContent)[],
 	display: boolean,
 	details?: T,
+	agentDir: string = getDefaultAgentDir(),
 ): string {
-	const fastId = appendEntryToExistingFile(sessionFile, (seed) =>
-		buildCustomMessageEntry(customType, content, display, details, seed),
+	return appendEntryToExistingFile(
+		sessionFile,
+		(seed) => buildCustomMessageEntry(customType, content, display, details, seed),
+		() => SessionManager.open(sessionFile).appendCustomMessageEntry(customType, content, display, details),
+		agentDir,
 	);
-	return fastId ?? SessionManager.open(sessionFile).appendCustomMessageEntry(customType, content, display, details);
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
@@ -1766,6 +1816,7 @@ export class SessionManager {
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+		requireNormalSessionPath(sessionFile);
 		this.persistedEntryIds.clear();
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
@@ -2660,6 +2711,7 @@ export class SessionManager {
 	}
 
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+		requireNormalSessionPath(path);
 		// Only the header's cwd is needed to construct the manager; the constructor
 		// (setSessionFile) performs the full parse. Read just the first line here
 		// instead of parsing the entire file a second time — that double parse is a
@@ -2687,6 +2739,7 @@ export class SessionManager {
 	}
 
 	static async openAsync(path: string, sessionDir?: string, cwdOverride?: string): Promise<SessionManager> {
+		requireNormalSessionPath(path);
 		if (!existsSync(path)) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
 		}

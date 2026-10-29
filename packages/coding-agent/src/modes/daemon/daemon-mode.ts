@@ -120,6 +120,7 @@ import {
 	type SessionLease,
 } from "../../core/session-lease.js";
 import {
+	appendSessionInfoToExistingFile,
 	getSessionArtifactPathForFile,
 	loadEntriesFromFileAsync,
 	readSessionInfo,
@@ -4539,7 +4540,7 @@ export class AgentDaemon {
 								undefined,
 								true,
 							);
-							SessionManager.open(command.sessionPath).appendSessionInfo(name);
+							appendSessionInfoToExistingFile(command.sessionPath, name, this.agentDir);
 							await this.rlmSpawnLedger()
 								.appendRenameByChildPath(command.sessionPath, name)
 								.catch((error) => {

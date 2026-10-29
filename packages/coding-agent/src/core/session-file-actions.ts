@@ -1,6 +1,6 @@
 import { type Dirent, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { spawnSyncHidden } from "../utils/child-process.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import {
@@ -118,6 +118,26 @@ async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFile
 		const trashErrorHint = getTrashErrorHint();
 		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
 		return { ok: false, error };
+	}
+}
+
+/** Unlike ordinary delete, a move backup is kept when an installed trash command fails. */
+export async function removeMovedSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
+	const args = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+	const result = spawnSyncHidden("trash", args, { encoding: "utf-8" });
+	if (!existsSync(sessionPath)) return { ok: true, method: "trash" };
+	const extensions = process.platform === "win32" ? ["", ".exe", ".com", ".cmd", ".bat"] : [""];
+	const installed = (process.env.PATH ?? "")
+		.split(delimiter)
+		.some((directory) => extensions.some((extension) => existsSync(join(directory, `trash${extension}`))));
+	if ((result.error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT" || installed) {
+		return { ok: false, error: `trash failed: ${result.error?.message ?? (result.stderr?.trim() || result.status)}` };
+	}
+	try {
+		await unlink(sessionPath);
+		return { ok: true, method: "unlink" };
+	} catch (error) {
+		return { ok: false, error: error instanceof Error ? error.message : String(error) };
 	}
 }
 
