@@ -1191,22 +1191,25 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         double = "ps:Mon Jan 12 00:00:00 2026"
         self.addCleanup(time.tzset)
         cases = [
-            ("darwin", 1767225600, 136, None, single),
-            ("darwin", 1768176000, 136, None, double),
-            ("darwin", 1767225600, 0, single[3:] + "\n", single),
-            ("darwin", 1767225600, 135, single[3:], single),
-            ("darwin", 1767225600, None, single[3:], single),
-            ("darwin", 1767225600, 0, None, None),
-            ("darwin", 0, 0, "", None),
-            ("linux", 0, 0, None, "proc:987"),
+            ("darwin", 1767225600, 136, None, single, None),
+            ("darwin", 1768176000, 136, None, double, None),
+            ("darwin", 1767225600, 0, single[3:] + "\n", single, None),
+            ("darwin", 1767225600, 135, single[3:], single, None),
+            ("darwin", 1767225600, None, single[3:], single, None),
+            ("darwin", 1767225600, 136, single[3:], single, 4321),
+            ("darwin", 0, 136, single[3:], single, None),
+            ("darwin", 1767225600, 0, None, None, None),
+            ("darwin", 0, 0, "", None, None),
+            ("linux", 0, 0, None, "proc:987", None),
         ]
-        for platform, seconds, copied, stdout, expected in cases:
+        for platform, seconds, copied, stdout, expected, reported in cases:
             with self.subTest(platform=platform, seconds=seconds,
-                              copied=copied, stdout=stdout):
+                              copied=copied, stdout=stdout, reported=reported):
                 def query(pid, flavor, arg, buffer, size):
                     if copied is None:
                         raise OSError("libproc unavailable")
-                    payload = struct.pack("=4I104xQ8x", 0, 0, 0, pid, seconds)
+                    payload = struct.pack("=4I104xQ8x", 0, 0, 0,
+                                          reported or pid, seconds)
                     ctypes.memmove(buffer, payload, len(payload))
                     return copied
 
@@ -1236,7 +1239,8 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     time.tzset()
                     actual = bash_module._process_start_id(1234)
                     self.assertEqual(actual, expected)
-                if copied == 136 or platform == "linux":
+                direct = copied == 136 and seconds and reported is None
+                if direct or platform == "linux":
                     run.assert_not_called()
                 else:
                     self.assertEqual(
@@ -1248,6 +1252,8 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                         [env[k] for k in ("LC_ALL", "LANG", "TZ")],
                         ["C", "C", "UTC"],
                     )
+        with mock.patch.dict(sys.modules, {"ctypes": None}):
+            self.assertIsNone(bash_module._darwin_process_start_id(1234))
 
     async def test_undelivered_kill_leaves_journal_record_active(self):
         if not bash_module._IS_POSIX:

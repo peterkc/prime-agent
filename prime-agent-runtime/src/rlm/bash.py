@@ -1103,7 +1103,10 @@ def _taskkill_tree(pid: int) -> bool:
 
 
 def _darwin_process_start_id(pid: int) -> str | None:
-    import ctypes
+    try:
+        import ctypes
+    except ImportError:
+        return None
 
     # Public libproc ABI: sys/proc_info.h, PROC_PIDTBSDINFO (3).
     class ProcBsdInfo(ctypes.Structure):
