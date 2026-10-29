@@ -1102,6 +1102,60 @@ def _taskkill_tree(pid: int) -> bool:
         return False
 
 
+def _darwin_process_start_id(pid: int) -> str | None:
+    try:
+        import ctypes
+    except ImportError:
+        return None
+
+    # Public libproc ABI: sys/proc_info.h, PROC_PIDTBSDINFO (3).
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        query = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        query.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        query.restype = ctypes.c_int
+        info = ProcBsdInfo()
+        size = ctypes.sizeof(info)
+        copied = query(pid, 3, 0, ctypes.byref(info), size)
+        if copied != size or info.pbi_pid != pid or not info.pbi_start_tvsec:
+            return None
+        # asctime is locale-independent; gmtime matches the host's TZ=UTC.
+        return f"ps:{time.asctime(time.gmtime(info.pbi_start_tvsec))}"
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return None
+
+
 def _process_start_id(pid: int) -> str | None:
     if os.name == "nt":
         # Mirrors getWindowsProcessStartId in session-lease.ts byte-for-byte so
@@ -1124,6 +1178,10 @@ def _process_start_id(pid: int) -> str | None:
             return f"win:{out}" if out.isdigit() else None
         except (OSError, subprocess.SubprocessError):
             return None
+    if sys.platform == "darwin":
+        start_id = _darwin_process_start_id(pid)
+        if start_id is not None:
+            return start_id
     try:
         with open(f"/proc/{pid}/stat", "r") as f:
             stat = f.read()
@@ -1133,11 +1191,17 @@ def _process_start_id(pid: int) -> str | None:
     except (OSError, ValueError):
         pass
     try:
-        # macOS has no /proc; /bin/ps is always present there, so use the
-        # absolute path (bare `ps` stays only as the exotic-POSIX last resort).
-        ps = "/bin/ps" if sys.platform == "darwin" else "ps"
+        # Sandboxes may block setuid /bin/ps; use it only if libproc fails.
+        darwin = sys.platform == "darwin"
+        ps = "/bin/ps" if darwin else "ps"
+        env = (
+            {**os.environ, "LC_ALL": "C", "LC_TIME": "C",
+             "LANG": "C", "TZ": "UTC"}
+            if darwin else None
+        )
         out = subprocess.run(
-            [ps, "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
+            [ps, "-p", str(pid), "-o", "lstart="],
+            capture_output=True, text=True, timeout=5, env=env,
         ).stdout.strip()
         return f"ps:{out}" if out else None
     except (OSError, subprocess.SubprocessError):

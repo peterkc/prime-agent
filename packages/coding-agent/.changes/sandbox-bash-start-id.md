@@ -1,0 +1,1 @@
+- Fixed agent `bash()` failing under macOS `sandbox-exec`, and fixed runtime orphan-process records on macOS that never matched the host's process identity, so the host can reap them.
