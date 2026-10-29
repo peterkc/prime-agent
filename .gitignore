@@ -11,7 +11,10 @@ packages/*/dist-firefox/
 
 # Environment
 .env
-.prime/
+**/.prime/*
+!/.prime/agent/
+/.prime/agent/*
+!/.prime/agent/agx.yaml
 
 # Editor files
 .vscode/
@@ -40,7 +43,6 @@ packages/coding-agent/binaries/
 packages/coding-agent/release/
 todo.md
 plans/
-.prime/agent/
 collect.sh
 .kernel-venv/
 .worktrees/
