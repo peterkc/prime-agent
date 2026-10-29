@@ -289,7 +289,7 @@ const refusals = [
 	["artifact-child", "RLM children"],
 	["active", "scheduled job"],
 	["paused", "scheduled job"],
-	["journal", "already exists"],
+	["journal", "waiting for recovery"],
 	["version", "upgrade"],
 	["parent", "upgrade"],
 	["unsafe", "Unsafe session ID"],

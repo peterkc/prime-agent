@@ -255,8 +255,11 @@ export async function preflightSessionMove(
 			`Cannot move a session with an active or paused scheduled job; cancel these jobs first: ${blockingJobs.map((job) => job.id).join(", ")}`,
 		);
 	}
+	if (present(paths.journalPath))
+		throw new Error(
+			`An earlier move of this session is waiting for recovery (${paths.journalPath}). Fix the error it reported, or restart the source daemon to finish the recovery, then try again`,
+		);
 	for (const path of [
-		paths.journalPath,
 		paths.sourceBackup,
 		paths.targetFile,
 		paths.fileTemporary,
