@@ -1,0 +1,1 @@
+- Added scheduled $SYS credential rotation and `mesh rotate` with bounded launchd shutdown and recovery.

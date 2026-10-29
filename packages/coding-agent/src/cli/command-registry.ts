@@ -94,7 +94,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["mesh"],
-		usage: "mesh <install|uninstall|start|stop|status|doctor>",
+		usage: "mesh <install|uninstall|start|stop|status|doctor|rotate>",
 		summary: "Manage the local Cotal broker service",
 		options: [
 			"--label <label>  Launchd label (default: ai.prime.mesh)",
@@ -107,6 +107,12 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		path: ["mesh", "uninstall"],
 		usage: "mesh uninstall [options]",
 		summary: "Remove the service and keep mesh enrollments",
+	},
+	{
+		path: ["mesh", "rotate"],
+		usage: "mesh rotate [--if-due] [options]",
+		summary: "Rotate the system credentials with a short broker outage",
+		options: ["--if-due  Rotate only at 75% of either $SYS credential's lifetime"],
 	},
 	{ path: ["mesh", "start"], usage: "mesh start [options]", summary: "Start the installed service" },
 	{ path: ["mesh", "stop"], usage: "mesh stop [options]", summary: "Stop the installed service" },

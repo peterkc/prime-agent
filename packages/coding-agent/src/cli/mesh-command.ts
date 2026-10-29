@@ -1,17 +1,20 @@
 import { execFile } from "node:child_process";
 import { constants, existsSync } from "node:fs";
-import { access, chmod, lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
-import { APP_NAME, getAgentDir } from "../config.js";
+import { APP_NAME, getAgentDir, isBunBinary } from "../config.js";
+import { PRIME_AGENT_LAUNCHER_PATH_ENV } from "../modes/daemon/daemon-runtime-identity.js";
 import { readRlmLedgerHealth } from "../modes/daemon/rlm-ledger.js";
+import { getNativeInstallation } from "../utils/native-installation.js";
 
-type MeshCommand = "install" | "uninstall" | "start" | "stop" | "status" | "doctor";
+type MeshCommand = "install" | "uninstall" | "start" | "stop" | "status" | "doctor" | "rotate";
 interface MeshOptions {
 	readonly command: MeshCommand;
+	readonly ifDue: boolean;
 	readonly label: string;
 	readonly meshHome: string;
 	readonly server: string;
@@ -22,6 +25,7 @@ interface MeshRuntime {
 	readonly platform: NodeJS.Platform;
 	readonly now: () => number;
 	readonly wait: (ms: number) => Promise<unknown>;
+	readonly processAlive?: (pid: number) => boolean;
 }
 interface ToolResult {
 	readonly code: number;
@@ -37,15 +41,23 @@ function parseOptions(args: readonly string[]): MeshOptions {
 		command !== "start" &&
 		command !== "stop" &&
 		command !== "status" &&
-		command !== "doctor"
+		command !== "doctor" &&
+		command !== "rotate"
 	)
-		throw new Error(`Use ${APP_NAME} mesh <install|uninstall|start|stop|status|doctor>`);
+		throw new Error(`Use ${APP_NAME} mesh <install|uninstall|start|stop|status|doctor|rotate>`);
 	let label = "ai.prime.mesh";
 	let meshHome = join(getAgentDir(), "mesh");
 	let server = "nats://127.0.0.1:4222";
+	let ifDue = false;
 	const seen = new Set<string>();
 	for (let index = 1; index < args.length; index += 2) {
 		const flag = args[index]!;
+		if (flag === "--if-due" && command === "rotate" && !seen.has(flag)) {
+			seen.add(flag);
+			ifDue = true;
+			index--;
+			continue;
+		}
 		const value = args[index + 1];
 		if (!value || value.startsWith("--") || seen.has(flag)) throw new Error("Mesh options need one value each");
 		seen.add(flag);
@@ -63,7 +75,7 @@ function parseOptions(args: readonly string[]): MeshOptions {
 				throw new Error("Unknown mesh option");
 		}
 	}
-	if (!/^ai\.prime\.mesh(?:\.[A-Za-z0-9.-]+)?$/.test(label) || label.endsWith(".renew"))
+	if (!/^ai\.prime\.mesh(?:\.[A-Za-z0-9.-]+)?$/.test(label) || label.endsWith(".renew") || label.endsWith(".rotate"))
 		throw new Error("Invalid mesh launchd label");
 	let url: URL;
 	try {
@@ -87,6 +99,7 @@ function parseOptions(args: readonly string[]): MeshOptions {
 		throw new Error("Mesh server must be a nats://127.0.0.1 URL with a valid port and no credentials");
 	return {
 		command,
+		ifDue,
 		label,
 		meshHome,
 		server,
@@ -179,15 +192,41 @@ function renewalOf(options: MeshOptions): MeshOptions {
 	return { ...options, label, plist: join(dirname(options.plist), `${label}.plist`) };
 }
 
+function rotationOf(options: MeshOptions): MeshOptions {
+	const label = `${options.label}.rotate`;
+	return { ...options, label, plist: join(dirname(options.plist), `${label}.plist`) };
+}
+
 function targetOf(options: MeshOptions): string {
 	return `gui/${process.getuid?.()}/${options.label}`;
 }
 
-function agentPlist(options: MeshOptions, cotal: string, renewal = false): string {
-	const args = renewal
-		? [cotal, "doctor", "auth", "--fix"]
-		: [cotal, "up", "--space", "prime", "--server", options.server, "--no-manager"];
-	const log = xml(join(options.meshHome, renewal ? "renewal.log" : "service.log"));
+function agentPlist(
+	options: MeshOptions,
+	program: string,
+	kind: "service" | "renewal" | "rotation" = "service",
+): string {
+	const job = kind === "renewal" ? renewalOf(options) : kind === "rotation" ? rotationOf(options) : options;
+	const args =
+		kind === "renewal"
+			? [program, "doctor", "auth", "--fix"]
+			: kind === "rotation"
+				? [
+						program,
+						"mesh",
+						"rotate",
+						"--if-due",
+						"--label",
+						options.label,
+						"--server",
+						options.server,
+						"--mesh-home",
+						options.meshHome,
+					]
+				: [program, "up", "--space", "prime", "--server", options.server, "--no-manager"];
+	const log = xml(
+		join(options.meshHome, kind === "renewal" ? "renewal.log" : kind === "rotation" ? "rotation.log" : "service.log"),
+	);
 	const env = {
 		COTAL_HOME: join(options.meshHome, "home"),
 		PATH: absolutePathEntries().join(delimiter),
@@ -198,14 +237,18 @@ function agentPlist(options: MeshOptions, cotal: string, renewal = false): strin
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>${xml(options.label)}</string>
+<key>Label</key><string>${xml(job.label)}</string>
 <key>ProgramArguments</key><array>${args.map((arg) => `<string>${xml(arg)}</string>`).join("")}</array>
 <key>WorkingDirectory</key><string>${xml(options.meshHome)}</string>
 <key>EnvironmentVariables</key><dict>${Object.entries(env)
 		.map(([key, value]) => `<key>${key}</key><string>${xml(value)}</string>`)
 		.join("")}</dict>
-<key>RunAtLoad</key><true/>
-${renewal ? "<key>StartInterval</key><integer>600</integer>" : "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"}
+${
+	kind === "rotation"
+		? "<key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict><key>ExitTimeOut</key><integer>330</integer>"
+		: `<key>RunAtLoad</key><true/>
+${kind === "renewal" ? "<key>StartInterval</key><integer>600</integer>" : "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"}`
+}
 <key>StandardOutPath</key><string>${log}</string>
 <key>StandardErrorPath</key><string>${log}</string>
 </dict></plist>
@@ -244,7 +287,7 @@ function brokerServing(stdout: string): boolean {
 	return /^\s*broker\s+serving(?:\s|$)/m.test(stdout);
 }
 
-async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshRuntime, space: string): Promise<void> {
 	const deadline = runtime.now() + 30_000;
 	for (;;) {
 		// Read the clock once: a zero timeout would let execFile wait forever.
@@ -252,7 +295,12 @@ async function waitForBroker(cotal: string, options: MeshOptions, runtime: MeshR
 		if (timeout <= 0) break;
 		try {
 			// `cotal status --components` takes about 5 s without a manager, and longer under load.
-			const status = await runTool(cotal, ["status", "--components"], options, timeout);
+			const status = await runTool(
+				cotal,
+				["status", "--components", "--space", space, "--server", options.server],
+				options,
+				timeout,
+			);
 			if (brokerServing(status.stdout)) return;
 		} catch {
 			// A failed probe is not readiness; keep checking within the same deadline.
@@ -284,19 +332,93 @@ async function waitForBootout(
 	throw new Error("Mesh launchd service is still loaded after bootout");
 }
 
+function rotationBootPath(options: MeshOptions): string {
+	return join(options.meshHome, "rotation-boot.plist");
+}
+
+function rotationBootPlist(service: string): string {
+	const keepAlive = "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>";
+	if (
+		!service.includes(keepAlive) ||
+		!service.includes("</array>") ||
+		service.includes("<string>--rotate-sys</string>")
+	)
+		throw new Error("Unrecognized mesh service plist; reinstall the mesh before rotating");
+	return service.replace("</array>", "<string>--rotate-sys</string></array>").replace(keepAlive, "");
+}
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means the PID exists under another user; only ESRCH proves the process is gone.
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+		throw error;
+	}
+}
+
+async function liveRootProcess(options: MeshOptions, runtime: MeshRuntime): Promise<string | undefined> {
+	const directory = join(options.meshHome, ".cotal");
+	for (const file of (await readdir(directory)).filter((name) => name.endsWith(".pid"))) {
+		let raw: string;
+		try {
+			raw = (await readFile(join(directory, file), "utf8")).trim();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw new Error(`Cannot read Cotal pid record ${file}`, { cause: error });
+		}
+		const pid = Number(raw);
+		if (!/^\d+$/.test(raw) || !Number.isInteger(pid) || pid < 1 || pid > 0x7fffffff)
+			throw new Error(`Invalid Cotal pid record ${file}; refusing to boot another broker`);
+		if ((runtime.processAlive ?? processAlive)(pid)) return `${join(directory, file)} (PID ${pid})`;
+	}
+	return undefined;
+}
+
+async function waitForStopped(options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+	const deadline = runtime.now() + 30_000;
+	let liveProcess: string | undefined;
+	for (;;) {
+		liveProcess = await liveRootProcess(options, runtime);
+		try {
+			await assertFreePort(options.port);
+			if (!liveProcess) return;
+		} catch {
+			// A closed port AND dead recorded processes are required, not elapsed time.
+		}
+		const remaining = deadline - runtime.now();
+		if (remaining <= 0) break;
+		await runtime.wait(Math.min(250, remaining));
+	}
+	throw new Error(
+		`Mesh broker or recorded Cotal processes did not stop within 30 seconds${liveProcess ? `; live Cotal pid record ${liveProcess}` : ""}`,
+	);
+}
+
+async function bootout(launchctl: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
+	try {
+		await runTool(launchctl, ["bootout", targetOf(options)], options);
+	} catch {
+		// A rejected bootout may still be tearing down the job. Only print confirms removal.
+	}
+	await waitForBootout(launchctl, targetOf(options), options, runtime);
+}
+
 async function removeJob(launchctl: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
 	// bootout can return nonzero for an absent job; confirm removal with print.
-	await runTool(launchctl, ["bootout", targetOf(options)], options);
-	await waitForBootout(launchctl, targetOf(options), options, runtime);
+	await bootout(launchctl, options, runtime);
 	await rm(options.plist, { force: true });
 }
 
 async function removeJobs(launchctl: string, options: MeshOptions, runtime: MeshRuntime): Promise<void> {
-	// Attempt both removals so a stuck renewal job cannot leave the service loaded.
+	// Attempt every removal so a stuck scheduled job cannot leave the service loaded.
 	const failures: string[] = [];
-	for (const job of [renewalOf(options), options]) {
+	for (const job of [rotationOf(options), renewalOf(options), options]) {
 		try {
-			await removeJob(launchctl, job, runtime);
+			await removeJob(launchctl, { ...job, meshHome: homedir() }, runtime);
+			if (job.label === options.label) await rm(rotationBootPath(options), { force: true });
 		} catch (error) {
 			failures.push(`${job.label}: ${error instanceof Error ? error.message : "removal failed"}`);
 		}
@@ -306,7 +428,8 @@ async function removeJobs(launchctl: string, options: MeshOptions, runtime: Mesh
 
 async function install(options: MeshOptions, launchctl: string, target: string, runtime: MeshRuntime): Promise<void> {
 	const renewal = renewalOf(options);
-	for (const job of [options, renewal]) {
+	const rotation = rotationOf(options);
+	for (const job of [options, renewal, rotation]) {
 		// print must work before the mesh home exists; launchctl does not use Cotal's working directory.
 		const loaded = await runTool(launchctl, ["print", targetOf(job)], { ...job, meshHome: homedir() });
 		if (loaded.code === 0) throw new Error(`Mesh launchd label ${job.label} is already loaded`);
@@ -316,6 +439,31 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 	await assertFreePort(options.port);
 	const cotal = await executable("cotal");
 	await requireCotalVersion(cotal, options);
+	// A managed native install or a wrapper such as prime-agent.sh names its own upgrade-stable launcher.
+	const declared = process.env[PRIME_AGENT_LAUNCHER_PATH_ENV];
+	const launcher =
+		(isBunBinary ? getNativeInstallation() : undefined)?.launcher ?? (declared ? resolve(declared) : undefined);
+	const primeAgent = launcher ?? (await executable(APP_NAME));
+	if (launcher) {
+		// launchd cannot run a directory, which passes the X_OK check; stat follows symlinks.
+		try {
+			if (!(await stat(launcher)).isFile()) throw new Error("not a regular file");
+			await access(launcher, constants.X_OK);
+		} catch (error) {
+			throw new Error(`${APP_NAME} launcher ${launcher} is not an executable file`, { cause: error });
+		}
+	} else {
+		try {
+			const current = isBunBinary ? process.execPath : process.argv[1];
+			if (!current || (await realpath(primeAgent)) !== (await realpath(current)))
+				throw new Error("CLI identity differs");
+		} catch (error) {
+			throw new Error(
+				`${APP_NAME} on PATH does not resolve to the running CLI; install through its launcher or set ${PRIME_AGENT_LAUNCHER_PATH_ENV}`,
+				{ cause: error },
+			);
+		}
+	}
 	const created = await mkdir(options.meshHome, { recursive: true, mode: 0o700 });
 	if (created) await chmod(options.meshHome, 0o700);
 	else {
@@ -337,7 +485,7 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 			await runTool(launchctl, ["bootstrap", target.slice(0, target.lastIndexOf("/")), options.plist], options),
 			"launchctl bootstrap",
 		);
-		await waitForBroker(cotal, options, runtime);
+		await waitForBroker(cotal, options, runtime, "prime");
 		if (!existsSync(join(options.meshHome, "signer.json"))) {
 			requireSuccess(
 				await runTool(cotal, ["mint", "--signer", "--out", "signer.json"], options),
@@ -346,10 +494,15 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 			if (!existsSync(join(options.meshHome, "signer.json")))
 				throw new Error("cotal mint did not create signer.json");
 		}
-		await writeFile(renewal.plist, agentPlist(renewal, cotal, true), { flag: "wx", mode: 0o600 });
+		await writeFile(renewal.plist, agentPlist(options, cotal, "renewal"), { flag: "wx", mode: 0o600 });
 		requireSuccess(
 			await runTool(launchctl, ["bootstrap", target.slice(0, target.lastIndexOf("/")), renewal.plist], options),
 			"launchctl bootstrap",
+		);
+		await writeFile(rotation.plist, agentPlist(options, primeAgent, "rotation"), { flag: "wx", mode: 0o600 });
+		requireSuccess(
+			await runTool(launchctl, ["bootstrap", target.slice(0, target.lastIndexOf("/")), rotation.plist], options),
+			"launchctl bootstrap rotation job",
 		);
 	} catch (error) {
 		try {
@@ -362,6 +515,248 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 		throw error;
 	}
 	console.log(`Mesh installed: ${options.label}`);
+}
+
+interface SystemCredential {
+	readonly file: string;
+	readonly iat: number;
+	readonly exp: number;
+}
+
+async function meshConfig(options: MeshOptions): Promise<{ readonly space: string; readonly server: string }> {
+	const config = await readJson(join(options.meshHome, "mesh.json"));
+	if (
+		!config ||
+		typeof config !== "object" ||
+		!("space" in config) ||
+		!("server" in config) ||
+		typeof config.space !== "string" ||
+		!config.space ||
+		typeof config.server !== "string" ||
+		!config.server
+	) {
+		throw new Error("Mesh configuration needs space and server strings");
+	}
+	return { space: config.space, server: config.server };
+}
+
+const SYSTEM_CREDENTIAL_FILES = ["membership-observer.creds", "connection-evictor.creds"] as const;
+
+async function systemCredential(options: MeshOptions, space: string, file: string): Promise<SystemCredential> {
+	// Cotal 0.79.0 spaceSegment: lowercase hex of the space's UTF-8 bytes, under .cotal (not auth).
+	const directory = join(options.meshHome, ".cotal", `space.${Buffer.from(space, "utf8").toString("hex")}`);
+	try {
+		const text = await readFile(join(directory, file), "utf8");
+		const sections = [
+			...text.matchAll(
+				/^-----BEGIN NATS USER JWT-----\r?\n([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\r?\n------END NATS USER JWT------$/gm,
+			),
+		];
+		if (sections.length !== 1) throw new Error("expected one JWT section");
+		const jwt = sections[0]![1]!;
+		const claims: unknown = JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString("utf8"));
+		if (
+			!claims ||
+			typeof claims !== "object" ||
+			!("iat" in claims) ||
+			!("exp" in claims) ||
+			typeof claims.iat !== "number" ||
+			typeof claims.exp !== "number" ||
+			!Number.isSafeInteger(claims.iat) ||
+			!Number.isSafeInteger(claims.exp) ||
+			claims.iat < 0 ||
+			claims.exp <= claims.iat ||
+			claims.exp > 8_640_000_000_000
+		)
+			throw new Error("invalid lifetime");
+		return { file, iat: claims.iat, exp: claims.exp };
+	} catch {
+		// Never include parser errors: they may quote a credential's JWT or secret seed.
+		throw new Error(`Cannot read $SYS credential lifetime: ${file}`);
+	}
+}
+
+async function systemCredentials(options: MeshOptions, space: string): Promise<readonly SystemCredential[]> {
+	return Promise.all(SYSTEM_CREDENTIAL_FILES.map((file) => systemCredential(options, space, file)));
+}
+
+async function acquireRotationLock(lock: string): Promise<string> {
+	try {
+		await mkdir(lock, { mode: 0o700 });
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") throw new Error(`Cannot acquire mesh rotation lock ${lock}; install the mesh first`);
+		if (code !== "EEXIST") throw new Error(`Cannot acquire mesh rotation lock ${lock}: ${code}`, { cause: error });
+		let owner: string;
+		try {
+			const entries = await readdir(lock);
+			owner = entries[0] ?? "";
+			if (
+				entries.length !== 1 ||
+				!/^[1-9]\d*$/.test(owner) ||
+				Number(owner) > 0x7fffffff ||
+				(await readFile(join(lock, owner), "utf8")).trim() !== owner
+			)
+				throw new Error("invalid owner");
+		} catch {
+			throw new Error(
+				`Mesh rotation lock ${lock} has unreadable owner content; confirm no rotation is running before removing it`,
+			);
+		}
+		if (processAlive(Number(owner)))
+			throw new Error(`Mesh rotation lock ${lock}: another rotation may be running (pid ${owner})`);
+		// Remove only the dead owner's record, never a new owner's record after a competing takeover.
+		await rm(join(lock, owner));
+		await rmdir(lock);
+		await mkdir(lock, { mode: 0o700 });
+		console.log(`Taking over stale mesh rotation lock ${lock} from dead pid ${owner}`);
+	}
+	const owner = join(lock, String(process.pid));
+	await writeFile(owner, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+	return owner;
+}
+
+async function rotateCredentials(options: MeshOptions, launchctl: string, runtime: MeshRuntime): Promise<void> {
+	const failures: string[] = [];
+	let interrupted: NodeJS.Signals | undefined;
+	function deferSignal(signal: NodeJS.Signals): void {
+		interrupted ??= signal;
+	}
+	try {
+		const config = await meshConfig(options);
+		const before = await systemCredentials(options, config.space);
+		const due = Math.min(...before.map((cred) => cred.iat + 0.75 * (cred.exp - cred.iat)));
+		if (options.ifDue && runtime.now() < due * 1000) {
+			console.log(`Credential rotation not due; next due: ${new Date(due * 1000).toString()}`);
+			return;
+		}
+		if (config.server !== options.server)
+			throw new Error("Mesh server differs from mesh.json; use the installed --server URL");
+		const cotal = await executable("cotal");
+		await requireCotalVersion(cotal, options);
+		const temporary = rotationBootPath(options);
+		if (existsSync(temporary))
+			throw new Error("Temporary rotation plist remains; uninstall and reinstall the mesh before rotating");
+		const bootPlist = rotationBootPlist(await readFile(options.plist, "utf8"));
+		const jobs = [options, renewalOf(options)];
+		let serviceWasRunning = false;
+		for (const job of jobs) {
+			await readFile(job.plist, "utf8");
+			const loaded = await runTool(launchctl, ["print", targetOf(job)], options);
+			requireSuccess(loaded, `Mesh job lookup ${job.label}`);
+			if (job !== options) continue;
+			// Only a running service or one stopped by `mesh stop` is safe to restore; a pending respawn is neither.
+			const state = /^\s*state = (.+)$/m.exec(loaded.stdout)?.[1];
+			if (state !== "running" && state !== "not running")
+				throw new Error(`Mesh service state is ${state ?? "unknown"}; rotate when it is running or stopped`);
+			serviceWasRunning = state === "running";
+		}
+		const domain = targetOf(options).slice(0, targetOf(options).lastIndexOf("/"));
+		process.on("SIGINT", deferSignal);
+		process.on("SIGTERM", deferSignal);
+		process.on("SIGHUP", deferSignal);
+		let step: string | undefined;
+		try {
+			for (const job of [...jobs].reverse()) {
+				step = `stop ${job.label}`;
+				await bootout(launchctl, job, runtime);
+			}
+			if (interrupted) throw new Error(`interrupted by ${interrupted}`);
+			step = "wait for Cotal processes to stop";
+			await waitForStopped(options, runtime);
+			if (interrupted) throw new Error(`interrupted by ${interrupted}`);
+			// Reuse the service label: only one broker job can be loaded, including during recovery.
+			// The installed plist is never changed; the temporary boot cannot be relaunched by KeepAlive.
+			step = "start rotation broker";
+			await writeFile(temporary, bootPlist, { flag: "wx", mode: 0o600 });
+			const started = Math.floor(runtime.now() / 1000);
+			requireSuccess(
+				await runTool(launchctl, ["bootstrap", domain, temporary], options),
+				"launchctl bootstrap rotation boot",
+			);
+			await waitForBroker(cotal, options, runtime, config.space);
+			step = "verify rotated $SYS credentials";
+			const after = await systemCredentials(options, config.space);
+			for (const [index, cred] of after.entries()) {
+				const remaining = cred.exp - runtime.now() / 1000;
+				if (
+					cred.iat < started ||
+					cred.iat <= before[index]!.iat ||
+					cred.iat > runtime.now() / 1000 ||
+					Math.abs(remaining - 30 * 24 * 60 * 60) > 60
+				)
+					throw new Error(`${cred.file} does not have an advanced iat and fresh 30-day lifetime`);
+			}
+		} catch (error) {
+			failures.push(`${step}: ${error instanceof Error ? error.message : "failed"}`);
+		}
+		if (existsSync(temporary)) {
+			try {
+				await bootout(launchctl, options, runtime);
+				await waitForStopped(options, runtime);
+				await rm(temporary);
+			} catch (error) {
+				failures.push(`stop rotation broker: ${error instanceof Error ? error.message : "failed"}`);
+			}
+		}
+		for (const job of jobs) {
+			try {
+				// A lookup that fails or is killed (for example by a terminal Ctrl-C) proves nothing,
+				// so restart unless the job is confirmed loaded from its installed plist.
+				const loaded = await runTool(launchctl, ["print", targetOf(job)], options).catch(() => undefined);
+				if (loaded?.code !== 0 || existsSync(temporary))
+					requireSuccess(
+						await runTool(launchctl, ["bootstrap", domain, job.plist], options),
+						"launchctl bootstrap",
+					);
+			} catch (error) {
+				failures.push(`restart ${job.label}: ${error instanceof Error ? error.message : "failed"}`);
+			}
+		}
+		try {
+			await waitForBroker(cotal, options, runtime, config.space);
+		} catch (error) {
+			failures.push(`wait for restarted broker: ${error instanceof Error ? error.message : "failed"}`);
+		}
+		if (!serviceWasRunning) {
+			try {
+				requireSuccess(
+					await runTool(launchctl, ["kill", "SIGTERM", targetOf(options)], options),
+					"launchctl kill restored service",
+				);
+			} catch (error) {
+				failures.push(`stop restored service: ${error instanceof Error ? error.message : "failed"}`);
+			}
+		}
+		if (interrupted) failures.push(`Rotation interrupted by ${interrupted}; recovery attempted`);
+		if (failures.length) throw new Error(failures.join("; "));
+		console.log(
+			`Mesh credentials rotated: ${options.label}. Earlier full Cotal backups are no longer restorable; take a fresh backup.`,
+		);
+	} finally {
+		process.off("SIGINT", deferSignal);
+		process.off("SIGTERM", deferSignal);
+		process.off("SIGHUP", deferSignal);
+	}
+}
+
+async function rotate(options: MeshOptions, launchctl: string, runtime: MeshRuntime): Promise<void> {
+	const lock = join(options.meshHome, "rotation.lock");
+	const owner = await acquireRotationLock(lock);
+	const failures: string[] = [];
+	try {
+		await rotateCredentials(options, launchctl, runtime);
+	} catch (error) {
+		failures.push(error instanceof Error ? error.message : "Mesh rotation failed");
+	} finally {
+		try {
+			await rm(owner);
+			await rmdir(lock);
+		} catch (error) {
+			failures.push(`Release mesh rotation lock ${lock}: ${error instanceof Error ? error.message : "failed"}`);
+		}
+	}
+	if (failures.length) throw new Error(failures.join("; "));
 }
 
 async function storeBytes(path: string): Promise<number> {
@@ -453,7 +848,12 @@ function reportLedgerHealth(): boolean {
 	return true;
 }
 
-async function status(options: MeshOptions, launchctl: string | undefined, target: string): Promise<void> {
+async function status(
+	options: MeshOptions,
+	launchctl: string | undefined,
+	target: string,
+	runtime: MeshRuntime,
+): Promise<void> {
 	if (!existsSync(join(options.meshHome, ".cotal")))
 		throw new Error("Mesh home has no .cotal directory; install it first");
 	const cotal = await executable("cotal");
@@ -464,19 +864,7 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 		console.log(error instanceof Error ? error.message : "Cannot read cotal CLI version");
 		versionUnavailable = true;
 	}
-	const config = await readJson(join(options.meshHome, "mesh.json"));
-	if (
-		!config ||
-		typeof config !== "object" ||
-		!("space" in config) ||
-		!("server" in config) ||
-		typeof config.space !== "string" ||
-		!config.space ||
-		typeof config.server !== "string" ||
-		!config.server
-	) {
-		throw new Error("Mesh configuration needs space and server strings");
-	}
+	const config = await meshConfig(options);
 	const job = launchctl ? await runTool(launchctl, ["print", target], options) : undefined;
 	const state =
 		job?.code === 0
@@ -490,6 +878,25 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	if (lastExitCode !== undefined) console.log(`Launchd last exit code: ${lastExitCode}`);
 	const renewal = launchctl ? await runTool(launchctl, ["print", targetOf(renewalOf(options))], options) : undefined;
 	if (renewal) console.log(`Credential renewal: ${renewal.code === 0 ? "scheduled" : "absent"}`);
+	const rotation = launchctl ? await runTool(launchctl, ["print", targetOf(rotationOf(options))], options) : undefined;
+	if (rotation) console.log(`Credential rotation: ${rotation.code === 0 ? "scheduled" : "absent"}`);
+	const rotationExit =
+		rotation?.code === 0 ? /^\s*last exit code = (-?\d+)(?:: [^\r\n]+)?\s*$/m.exec(rotation.stdout)?.[1] : undefined;
+	if (rotationExit !== undefined) console.log(`Credential rotation last exit code: ${rotationExit}`);
+	let credentialsUnavailable = false;
+	let rotationOverdue = false;
+	for (const file of SYSTEM_CREDENTIAL_FILES) {
+		try {
+			const cred = await systemCredential(options, config.space, file);
+			console.log(`$SYS ${file} last rotation: ${new Date(cred.iat * 1000).toString()}`);
+			console.log(`$SYS ${file} expires: ${new Date(cred.exp * 1000).toString()}`);
+			const due = cred.iat + 0.75 * (cred.exp - cred.iat);
+			if (runtime.now() / 1000 > due + 26 * 60 * 60) rotationOverdue = true;
+		} catch {
+			console.log(`$SYS ${file}: unreadable`);
+			credentialsUnavailable = true;
+		}
+	}
 	const broker = await runTool(
 		cotal,
 		["status", "--components", "--space", config.space, "--server", config.server],
@@ -561,6 +968,16 @@ async function status(options: MeshOptions, launchctl: string | undefined, targe
 	}
 	if (job && job.code !== 0) throw new Error("Mesh launchd service is absent or inaccessible");
 	if (renewal && renewal.code !== 0) throw new Error("Mesh credential renewal job is absent; reinstall the mesh");
+	if (rotation && rotation.code !== 0) throw new Error("Mesh credential rotation job is absent; reinstall the mesh");
+	if (existsSync(rotationBootPath(options)))
+		throw new Error(
+			"Temporary rotation plist remains; a rotation is in progress or needs recovery. Uninstall and reinstall the mesh only after confirming no rotation is running.",
+		);
+	if (rotationOverdue)
+		throw new Error(
+			`Mesh $SYS credential rotation is over 26 hours overdue; inspect ${join(options.meshHome, "rotation.log")} and ${join(options.meshHome, "rotation.lock")}`,
+		);
+	if (credentialsUnavailable) throw new Error("Mesh $SYS credential lifetimes are unavailable");
 	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
 	if (versionUnavailable) throw new Error("Mesh CLI version is unavailable");
 }
@@ -582,7 +999,7 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 		const launchctl = runtime.platform === "darwin" ? await executable("launchctl") : undefined;
 		const target = targetOf(options);
 		if (command === "status" || command === "doctor") {
-			await status(options, launchctl, target);
+			await status(options, launchctl, target, runtime);
 			if (command === "doctor") {
 				const auth = await runTool(await executable("cotal"), ["doctor", "auth"], options);
 				requireSuccess(auth, "cotal doctor auth");
@@ -596,15 +1013,19 @@ export async function runMeshCommand(args: readonly string[], runtime: MeshRunti
 			await install(options, launchctl, target, runtime);
 			return;
 		}
+		if (command === "rotate") {
+			await rotate(options, launchctl, runtime);
+			return;
+		}
 		const toolOptions = { ...options, meshHome: homedir() };
 		const job = await runTool(launchctl, ["print", target], toolOptions);
-		const plists = [options.plist, renewalOf(options).plist];
+		const plists = [options.plist, renewalOf(options).plist, rotationOf(options).plist];
 		if (!(command === "uninstall" && job.code === 113 && plists.some((plist) => existsSync(plist)))) {
 			requireSuccess(job, "Mesh launchd service lookup");
 		}
 		switch (command) {
 			case "uninstall":
-				await removeJobs(launchctl, toolOptions, runtime);
+				await removeJobs(launchctl, options, runtime);
 				break;
 			case "start":
 				requireSuccess(await runTool(launchctl, ["kickstart", target], toolOptions), "launchctl kickstart");
