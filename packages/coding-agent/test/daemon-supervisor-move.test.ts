@@ -291,8 +291,8 @@ describe("supervisor session move", () => {
 		freeClaim(f);
 		freeLeases(f.paths);
 	});
-	it.each([randomUUID(), "session.1"])("AC-13/#55 dispatch moves enrolled ID %s and releases custody", async (id) => {
-		const f = await fixture(true, id);
+	it("AC-13/#55 dispatch moves an enrolled ID and releases custody", async () => {
+		const f = await fixture();
 		const response = await dispatch(f);
 		expect(response).toMatchObject({
 			success: true,
@@ -339,6 +339,7 @@ describe("supervisor session move", () => {
 		["worker", "worker is recovering"],
 		["lease", "open or being written elsewhere"],
 		["child", "RLM child session"],
+		["dotted", "moves require mesh-compatible IDs"],
 		["children", "RLM children"],
 		["artifact-child", "RLM children"],
 		["active", "active or paused scheduled job"],
@@ -348,7 +349,7 @@ describe("supervisor session move", () => {
 		["refused", "space and server are required"],
 		["target-id", "already holds session"],
 		["target-name", "named moving"],
-	])("AC-14 refuses %s without changing session or mesh records", async (state, reason) => {
+	])("AC-14/#55 refuses %s without changing session or mesh records", async (state, reason) => {
 		const f = await fixture(state !== "foreign" && state !== "refused");
 		const before = fs.readFileSync(f.paths.sourceFile);
 		let claim: ReturnType<typeof enrollment.claimEnrollment> | undefined;
@@ -381,6 +382,7 @@ describe("supervisor session move", () => {
 					createCommand: {},
 				},
 			});
+		if (state === "dotted") fs.writeFileSync(f.paths.sourceFile, before.toString().replace(f.id, "session.1"));
 		if (state === "child")
 			fs.writeFileSync(f.paths.sourceFile, before.toString().replace('"version":', '"rlmDepth":1,"version":'));
 		if (state === "artifact-child") fs.copyFileSync(f.paths.sourceFile, join(f.paths.sourceArtifacts, "child.data"));
@@ -431,7 +433,7 @@ describe("supervisor session move", () => {
 			expect(fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id))).toEqual(directory);
 			expect(fs.existsSync(f.paths.targetFile)).toBe(false);
 			expect(fs.existsSync(f.paths.journalPath)).toBe(false);
-			if (state === "replacement") expect(claims).not.toHaveBeenCalled();
+			if (state === "replacement" || state === "dotted") expect(claims).not.toHaveBeenCalled();
 		} finally {
 			claim?.release();
 			sup.workers.clear();
@@ -522,6 +524,7 @@ describe("supervisor session move", () => {
 			expect(enrollment.readEnrollment(f.meshRoot, f.id).sessionFile).toBe(f.paths.targetFile);
 			if (step === "directory" || step === "enrollment-only") expect(fs.readFileSync(correctPath)).toEqual(before);
 			expect(enrollment.readDirectory(f.meshRoot, f.id)?.homeSocket).toBe(f.targetSocket);
+			freeClaim(f);
 		},
 	);
 	it("AC-17 journal cleanup failure is not reported as a mesh failure", async () => {

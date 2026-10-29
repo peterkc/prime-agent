@@ -158,8 +158,10 @@ function directChild(root: string, path: string): boolean {
 
 /** The single ID/path rule used before a move, recovery, and original deletion. */
 export function sessionMovePaths(input: SessionMoveInput): SessionMoveResult<SessionMovePaths> {
-	if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(input.sessionId)) {
-		return failure(`Unsafe session ID: ${input.sessionId}`);
+	if (!/^[A-Za-z0-9_-]+$/.test(input.sessionId)) {
+		return failure(
+			`Unsafe session ID: ${input.sessionId}; moves require mesh-compatible IDs (letters, digits, _ or -)`,
+		);
 	}
 	try {
 		const sourceSessionDir = physicalPath(input.sourceSessionDir);

@@ -471,7 +471,7 @@ export class MeshEndpoints {
 		transfer.claim.release();
 		this.transfers.delete(sessionId);
 		this.moving.delete(sessionId);
-		if (transfer.stopped && this.sessions.get(sessionId) === transfer.endpoint) this.sessions.delete(sessionId);
+		if (this.sessions.get(sessionId) === transfer.endpoint) this.sessions.delete(sessionId);
 	}
 
 	async beginReplacement(sessionId: string, requester: object, token: string): Promise<string | undefined> {

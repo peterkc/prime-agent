@@ -1,6 +1,7 @@
 import { ChildProcess, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -28,6 +29,7 @@ import { sessionMovePaths } from "../src/core/session-move.js";
 import { resolveSessionPath } from "../src/core/session-resolver.js";
 import { enrollmentPath } from "../src/modes/daemon/cotal/enrollment.js";
 import { DAEMON_PROTOCOL_INFO, type DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
+import { defaultDaemonSocketPath } from "../src/modes/daemon/daemon-socket.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import { spawnHidden } from "../src/utils/child-process.js";
 
@@ -292,6 +294,7 @@ const refusals = [
 	["parent", "upgrade"],
 	["unsafe", "Unsafe session ID"],
 	["hidden", "Unsafe session ID"],
+	["dotted", "moves require mesh-compatible IDs"],
 	["escape", "not a direct child"],
 	["old", "session_move"],
 	["schema", "session_move"],
@@ -316,10 +319,10 @@ async function refusal(kind: string): Promise<[string, string]> {
 		selector = join(home, "outside.jsonl");
 		session(selector);
 	}
-	if (["child", "version", "parent", "unsafe", "hidden"].includes(kind))
+	if (["child", "version", "parent", "unsafe", "hidden", "dotted"].includes(kind))
 		session(
 			f.sourceFile,
-			kind === "unsafe" ? "a/b" : kind === "hidden" ? ".hidden" : "session-1",
+			kind === "unsafe" ? "a/b" : kind === "hidden" ? ".hidden" : kind === "dotted" ? "session.1" : "session-1",
 			"moving",
 			kind === "child"
 				? { rlmDepth: 1 }
@@ -426,7 +429,6 @@ describe("session move command", () => {
 					expect(output()).toContain(text);
 		},
 	);
-
 	it.each(["delayed", "disconnect", "timeout", "before-send"])(
 		"F2 move reply %s distinguishes sent and unsent requests",
 		async (mode) => {
@@ -461,7 +463,6 @@ describe("session move command", () => {
 			}
 		},
 	);
-
 	it.each(
 		[[], ["--dry-run"], ["--dry-run", "--json"]].flatMap((flags) =>
 			refusals.map(([kind, reason]) => ({ flags, kind, reason })),
@@ -519,7 +520,7 @@ describe("session move command", () => {
 				outside ? join(home, "inherited-session-dir/session-1.jsonl") : f.paths.targetFile,
 				f.sourceFile,
 				f.paths.sourceArtifacts,
-				"enrolled",
+				"Mesh: enrolled",
 				"no process has the session open",
 				"--resume session-1",
 			])
@@ -529,17 +530,16 @@ describe("session move command", () => {
 		},
 	);
 	it("AC-28 JSON dry run has the preview fields and no side effects", async () => {
-		session(f.sourceFile, "session.1");
 		const before = tree(),
 			env = { ...process.env };
 		await run(["--dry-run", "--json"]);
 		expect(JSON.parse(output())).toMatchObject({
 			dryRun: true,
-			sessionId: "session.1",
+			sessionId: "session-1",
 			name: "moving",
-			targetFile: join(f.targetDir, "session.1.jsonl"),
-			original: { file: f.sourceFile, artifacts: join(dirname(f.paths.sourceArtifacts), "session.1") },
-			mesh: { enrolled: false },
+			targetFile: f.paths.targetFile,
+			original: { file: f.sourceFile, artifacts: f.paths.sourceArtifacts },
+			mesh: { enrolled: true },
 			recheck: expect.stringContaining("no process has the session open"),
 		});
 		expect(promptYesNo).not.toHaveBeenCalled();
@@ -549,7 +549,7 @@ describe("session move command", () => {
 		["absent", "session-1"],
 		["running", "session-1"],
 		["running", "-session-1"],
-		["persisted", "session.1"],
+		["persisted", "session-1"],
 		["environment", "session-1"],
 	])("AC-21/AC-22/AC-23 move never contacts %s target; printed ID %s resumes saved-only", async (state, id) => {
 		targetRunning = state === "running";
@@ -590,10 +590,9 @@ describe("session move command", () => {
 		expect(result.openCommand).toBe(`cd '${folder.replaceAll("'", `'"'"'`)}' && prime-agent ${resume}`);
 		const parsed = parseArgs(result.openCommand.split(" && prime-agent ")[1].split(" "));
 		expect(parsed.resume).toBe(id);
-		expect(await resolveSessionPath(String(parsed.resume), folder, targetDir)).toMatchObject({
-			path: targetFile,
-		});
-		expect(connected).not.toContain(f.targetSocket);
+		expect(await resolveSessionPath(String(parsed.resume), folder, targetDir)).toMatchObject({ path: targetFile });
+		expect(connected).not.toContain(state === "environment" ? defaultDaemonSocketPath() : f.targetSocket);
+		if (state === "persisted") expect(existsSync(f.targetDir)).toBe(false);
 		expect(spawnHidden).not.toHaveBeenCalled();
 		if (state !== "environment" && state !== "persisted")
 			expect(readFileSync(join(f.target, ".git/info/exclude"), "utf8")).toContain("/.prime/agent/sessions/");

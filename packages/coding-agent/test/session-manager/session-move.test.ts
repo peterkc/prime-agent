@@ -375,7 +375,7 @@ describe("session relocation", () => {
 		untouchedSource(f);
 		expect((await recover(f)).status).toBe("absent");
 	});
-	it.each(["suspend", "copy", "preflight-child", "late-child"] as const)(
+	it.each(["suspend", "late-symlink", "preflight-child", "late-child"] as const)(
 		"AC-4/#55 relocation refuses %s and preserves source artifacts",
 		async (step) => {
 			const f = fixture();
@@ -384,7 +384,7 @@ describe("session relocation", () => {
 			f.callbacks.suspend = async () => {
 				if (step === "suspend") throw new Error("suspend failed");
 				if (step === "late-child") writeFileSync(child, jsonl(f.entries));
-				else if (step === "copy") symlinkSync(f.paths.sourceFile, join(f.paths.sourceArtifacts, "link"));
+				else if (step === "late-symlink") symlinkSync(f.paths.sourceFile, join(f.paths.sourceArtifacts, "link"));
 				return true;
 			};
 			const result = await move(f);
