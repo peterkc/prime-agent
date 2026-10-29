@@ -3,6 +3,7 @@ import {
 	closeSync,
 	constants,
 	copyFileSync,
+	existsSync,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -20,10 +21,12 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { RlmSpawnLedger, readLegacyRlmSubagentRegistry } from "../modes/daemon/rlm-ledger.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext } from "../utils/git.js";
-import { removeMovedSessionFile } from "./session-file-actions.js";
+import { AgentCronJobStore } from "./cron-jobs.js";
+import { removeMovedSessionFile, sessionArtifactFiles } from "./session-file-actions.js";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
@@ -35,7 +38,10 @@ import {
 	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	getSessionArtifactsRoot,
+	readSessionInfo,
 	type SessionHeader,
+	type SessionInfo,
+	SessionManager,
 } from "./session-manager.js";
 
 export type SessionMoveResult<T> =
@@ -86,6 +92,7 @@ export interface SessionMoveReport {
 	readonly targetFile?: string;
 	readonly journalPath: string;
 	readonly committed?: true;
+	readonly meshRecordsWritten?: boolean;
 	readonly originalMethod?: "trash" | "unlink";
 	readonly messages: readonly string[];
 	readonly backups: readonly SessionMoveBackup[];
@@ -196,6 +203,76 @@ export function sessionMovePaths(input: SessionMoveInput): SessionMoveResult<Ses
 	}
 }
 
+/** Side-effect-free saved-session checks shared by the CLI and supervisor. */
+export async function preflightSessionMove(
+	input: Omit<SessionMoveInput, "sessionId">,
+): Promise<{ paths: SessionMovePaths; info: SessionInfo }> {
+	const header: unknown = JSON.parse(readFirstLineSync(input.sourceFile) ?? "null");
+	if (
+		!header ||
+		typeof header !== "object" ||
+		!("type" in header) ||
+		header.type !== "session" ||
+		!("id" in header) ||
+		typeof header.id !== "string"
+	)
+		throw new Error("Invalid session header");
+	const checked = sessionMovePaths({ ...input, sessionId: header.id });
+	if (!checked.ok) throw new Error(checked.reason);
+	const paths = checked.value;
+	if (
+		!("version" in header) ||
+		header.version !== CURRENT_SESSION_VERSION ||
+		("parentSession" in header &&
+			header.parentSession &&
+			(!("rlmDepth" in header) || !Number.isSafeInteger(header.rlmDepth) || Number(header.rlmDepth) < 0))
+	)
+		throw new Error("Open the session once in its own repository first to upgrade it");
+	const info = await readSessionInfo(paths.sourceFile);
+	if (!info) throw new Error(`Session not found: ${paths.sourceFile}`);
+	if ((info.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
+	const ledger = new RlmSpawnLedger(paths.agentDir, paths.sourceSessionDir);
+	const edges = await ledger.liveEdges();
+	if (edges.some((edge) => canonicalSessionPath(edge.parent) === paths.sourceFile)) {
+		throw new Error("Cannot move a session with RLM children");
+	}
+	if (!existsSync(ledger.ledgerPath)) {
+		const legacy = await readLegacyRlmSubagentRegistry(join(paths.sourceArtifacts, "rlm-subagents.jsonl"), {
+			throwOnReadError: true,
+		});
+		if (legacy.some((child) => child.status !== "deleted" && existsSync(child.sessionFile))) {
+			throw new Error("Cannot move a session with RLM children");
+		}
+	}
+	if (!sessionArtifactFiles(paths.sourceArtifacts).next().done) {
+		throw new Error("Cannot move a session with RLM children in its artifact tree");
+	}
+	const jobs = AgentCronJobStore.forSessionArtifacts();
+	jobs.registerSessionArtifact(info.id, paths.sourceArtifacts);
+	const blockingJobs = jobs.list().filter((job) => job.status === "active" || job.status === "paused");
+	if (blockingJobs.length > 0) {
+		throw new Error(
+			`Cannot move a session with an active or paused scheduled job; cancel these jobs first: ${blockingJobs.map((job) => job.id).join(", ")}`,
+		);
+	}
+	for (const path of [
+		paths.journalPath,
+		paths.sourceBackup,
+		paths.targetFile,
+		paths.fileTemporary,
+		paths.targetArtifacts,
+		paths.artifactTemporary,
+	]) {
+		if (present(path)) throw new Error(`Move destination already exists: ${path}`);
+	}
+	for (const target of await SessionManager.listAll(undefined, paths.targetSessionDir)) {
+		if (target.id === info.id) throw new Error(`Target already holds session ${info.id}`);
+		if ((target.rlmDepth ?? 0) === 0 && info.name && target.name === info.name)
+			throw new Error(`Target already has a top-level session named ${info.name}`);
+	}
+	return { paths, info };
+}
+
 export function validateSessionMoveJournal(
 	journal: SessionMoveJournal,
 	agentDir: string,
@@ -274,11 +351,17 @@ function readMoveEntries(path: string): FileEntry[] {
 }
 
 function fsyncPath(path: string): void {
-	const descriptor = openSync(path, "r");
+	const directory = statSync(path).isDirectory();
 	try {
-		fsyncSync(descriptor);
-	} finally {
-		closeSync(descriptor);
+		const descriptor = openSync(path, "r");
+		try {
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+	} catch (error) {
+		// Windows does not support opening/fsyncing directory handles.
+		if (process.platform !== "win32" || !directory) throw error;
 	}
 }
 
@@ -552,6 +635,7 @@ export async function relocateSession(options: {
 	const { paths, callbacks } = options;
 	let journal: SessionMoveJournal | undefined;
 	let committed = false;
+	let meshRecordsWritten = false;
 	let originalMethod: "trash" | "unlink" | undefined;
 	try {
 		const checked = sessionMovePaths(paths);
@@ -630,6 +714,7 @@ export async function relocateSession(options: {
 		writeJournal(journal);
 		const cleanupJournal = { ...journal };
 		await callbacks.writeMeshRecords(journal, { enrollment: true, directory: true });
+		meshRecordsWritten = true;
 		const deletion = await deleteSessionMoveOriginal(journal, paths);
 		originalMethod = deletion.method;
 		deleteJournal(cleanupJournal);
@@ -641,6 +726,7 @@ export async function relocateSession(options: {
 				deletion.backups,
 			),
 			originalMethod,
+			meshRecordsWritten,
 		};
 	} catch (error) {
 		if (journal && present(journal.journalPath)) {
@@ -648,6 +734,7 @@ export async function relocateSession(options: {
 				return {
 					...report(journal, "pending", ["Session published; recovery is pending", errorMessage(error)]),
 					committed: true,
+					meshRecordsWritten,
 					originalMethod,
 				};
 			const rolledBack = await rollbackSessionMove(journal, callbacks.resume);

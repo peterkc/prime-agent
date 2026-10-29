@@ -104,11 +104,16 @@ interface SessionReplacement {
 
 function syncTransferRecord(path: string): void {
 	for (const file of [path, dirname(path)]) {
-		const descriptor = openSync(file, "r");
 		try {
-			fsyncSync(descriptor);
-		} finally {
-			closeSync(descriptor);
+			const descriptor = openSync(file, "r");
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+		} catch (error) {
+			// Windows does not support opening/fsyncing directory handles; files stay strict.
+			if (process.platform !== "win32" || file === path) throw error;
 		}
 	}
 }
@@ -388,9 +393,28 @@ export class MeshEndpoints {
 	}
 
 	async resumeSession(sessionId: string): Promise<void> {
+		await this.enrolling.get(sessionId);
 		const transfer = this.transfers.get(sessionId);
 		if (!transfer) {
-			if (this.sessions.get(sessionId)?.state === "closed") await this.closeSession(sessionId);
+			const session = this.sessions.get(sessionId);
+			if (session && session.state !== "closed") return;
+			if (!existsSync(enrollmentPath(this.options.meshRoot, sessionId))) return;
+			const record = readEnrollment(this.options.meshRoot, sessionId);
+			const claim = claimEnrollment(this.options.meshRoot, sessionId, record.sessionFile);
+			this.moving.add(sessionId);
+			try {
+				// An explicit recovery pass may retry a failed stop, under a fresh enrollment claim.
+				if (session) session.close = undefined;
+				await this.closeSession(sessionId);
+				await session?.handoff;
+				this.sessions.delete(sessionId);
+				await this.startSession(sessionId, record.sessionFile, claim);
+			} catch (error) {
+				claim.release();
+				throw error;
+			} finally {
+				this.moving.delete(sessionId);
+			}
 			return;
 		}
 		await this.closeSession(sessionId);

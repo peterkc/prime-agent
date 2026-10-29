@@ -46,7 +46,14 @@ let sourceState: "capable" | "absent" | "old" | "schema" | "unreadable" | "inval
 let roster: object[];
 let mesh: "updated" | "not_enrolled" | "failed";
 let method: "trash" | "unlink";
+let meshReason: string;
+let recovered: object[];
+let moveFailure: boolean;
+let blockingJobId: string | undefined;
 let targetRunning: boolean;
+let holdMove: boolean;
+let moveReceived: () => void;
+let heldReply: () => void;
 const connected: string[] = [];
 const requests: { socket: string; command: DaemonCommand }[] = [];
 const sockets = new Set<Duplex>();
@@ -127,7 +134,12 @@ class WireSocket extends Duplex {
 					: sourceState === "unreadable"
 						? { success: false, error: "roster unavailable" }
 						: { success: true, data: { sessions: sourceState === "invalid-list" ? null : roster } };
-			this.push(`${JSON.stringify({ type: "response", id: envelope.id, command: command.type, ...response })}\n`);
+			const reply = () =>
+				this.push(`${JSON.stringify({ type: "response", id: envelope.id, command: command.type, ...response })}\n`);
+			if (command.type === "move_saved_session" && holdMove) {
+				heldReply = reply;
+				moveReceived();
+			} else reply();
 		}
 		done();
 	}
@@ -160,6 +172,7 @@ function connect(path: string): Duplex {
 	return socket;
 }
 function moved(command: Extract<DaemonCommand, { type: "move_saved_session" }>) {
+	if (moveFailure) return { success: false, error: "move refused", data: { recovered } };
 	const entries = readFileSync(command.sessionPath, "utf8")
 		.trim()
 		.split("\n")
@@ -187,9 +200,9 @@ function moved(command: Extract<DaemonCommand, { type: "move_saved_session" }>) 
 							]
 						: [],
 			},
-			mesh: { status: mesh, ...(mesh === "failed" ? { step: "directory", reason: "record refused" } : {}) },
+			mesh: { status: mesh, ...(mesh === "failed" ? { step: "directory", reason: meshReason } : {}) },
 			messages: ["Session moved"],
-			recovered: [],
+			recovered,
 			recoveryPending: mesh === "failed",
 		},
 	};
@@ -234,6 +247,11 @@ beforeEach(() => {
 	roster = [];
 	mesh = "updated";
 	method = "unlink";
+	meshReason = "record refused";
+	recovered = [];
+	moveFailure = false;
+	blockingJobId = undefined;
+	holdMove = false;
 	connected.length = 0;
 	requests.length = 0;
 	process.exitCode = undefined;
@@ -267,6 +285,7 @@ const refusals = [
 	["child", "RLM child"],
 	["children", "RLM children"],
 	["legacy-children", "RLM children"],
+	["artifact-child", "RLM children"],
 	["active", "scheduled job"],
 	["paused", "scheduled job"],
 	["journal", "already exists"],
@@ -311,6 +330,7 @@ async function refusal(kind: string): Promise<[string, string]> {
 						? { parentSession: "parent", rlmDepth: undefined }
 						: {},
 		);
+	if (kind === "artifact-child") session(join(f.paths.sourceArtifacts, "unregistered.data"), "child");
 	if (kind === "children" || kind === "legacy-children") {
 		const child = join(f.paths.sourceArtifacts, "child.jsonl");
 		session(child, "child");
@@ -347,6 +367,7 @@ async function refusal(kind: string): Promise<[string, string]> {
 			scheduleText: "in 1 day",
 		});
 		if (kind === "paused") await jobs.manageHeartbeat("session-1", job.id, "pause");
+		blockingJobId = job.id;
 	}
 	if (kind === "journal") {
 		mkdirSync(dirname(f.paths.journalPath));
@@ -387,6 +408,55 @@ async function refusal(kind: string): Promise<[string, string]> {
 	return [selector, folder];
 }
 describe("session move command", () => {
+	it.each([false, true].flatMap((failed) => [false, true].map((json) => ({ failed, json }))))(
+		"F6 recovery output survives failed=$failed json=$json",
+		async ({ failed, json }) => {
+			moveFailure = failed;
+			recovered = [
+				{
+					status: "moved",
+					messages: ["Finished earlier move"],
+					backups: [{ path: "/backup.moved", reason: "delete by hand" }],
+				},
+			];
+			await run(["--yes", ...(json ? ["--json"] : [])]);
+			expect(process.exitCode).toBe(failed ? 1 : undefined);
+			if (json) expect(JSON.parse(output()).recovered).toEqual(recovered);
+			else
+				for (const text of ["Recovered move: moved", "Finished earlier move", "/backup.moved", "delete by hand"])
+					expect(output()).toContain(text);
+		},
+	);
+
+	it.each(["delayed", "disconnect", "timeout"])(
+		"F2 move reply %s waits or reports an unknown result",
+		async (mode) => {
+			holdMove = true;
+			const received = new Promise<void>((resolve) => {
+				moveReceived = resolve;
+			});
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			const moving = run(["--yes"]);
+			try {
+				await received;
+				if (mode === "disconnect") for (const socket of sockets) socket.destroy();
+				else await vi.advanceTimersByTimeAsync(mode === "timeout" ? 24 * 60 * 60 * 1000 : 30_001);
+				if (mode === "delayed") heldReply();
+				await moving;
+				expect(process.exitCode).toBe(mode === "delayed" ? undefined : 1);
+				expect(errors()).toContain(mode === "delayed" ? "Moved" : "Move result is unknown");
+				if (mode !== "delayed") {
+					for (const text of [f.target, "--dry-run again"]) expect(errors()).toContain(text);
+					expect(errors()).not.toMatch(/nothing moved/i);
+				}
+			} finally {
+				heldReply();
+				await moving;
+				vi.useRealTimers();
+			}
+		},
+	);
+
 	it.each(
 		[[], ["--dry-run"], ["--dry-run", "--json"]].flatMap((flags) =>
 			refusals.map(([kind, reason]) => ({ flags, kind, reason })),
@@ -398,18 +468,32 @@ describe("session move command", () => {
 		await run(flags.length ? flags : ["--yes"], selector, folder);
 		expect(process.exitCode).toBe(1);
 		expect(errors()).toContain(reason);
+		if (blockingJobId) expect(errors()).toContain(`cancel these jobs first: ${blockingJobId}`);
 		if (flags.includes("--json"))
 			expect(JSON.parse(output())).toMatchObject({ dryRun: true, error: expect.stringContaining(reason) });
 		readOnly(before, env);
 		expect(promptYesNo).not.toHaveBeenCalled();
 	});
-	it.each(["declined", "no-terminal"])("AC-20 refuses %s before preparation", async (kind) => {
-		Object.defineProperty(process.stdin, "isTTY", { value: kind === "declined", configurable: true });
+	it.each(["declined", "declined-json", "no-terminal"])("AC-20 refuses %s before preparation", async (kind) => {
+		Object.defineProperty(process.stdin, "isTTY", { value: kind.startsWith("declined"), configurable: true });
 		const before = tree(),
 			env = { ...process.env };
-		await run();
+		vi.mocked(promptYesNo).mockImplementation(async () => {
+			for (const text of [
+				f.paths.sourceFile,
+				f.paths.targetFile,
+				f.paths.sourceArtifacts,
+				"Trash",
+				"unlinked if trash is missing",
+				"artifact folder is removed",
+			])
+				expect(errors()).toContain(text);
+			return false;
+		});
+		await run(kind === "declined-json" ? ["--json"] : []);
 		expect(process.exitCode).toBe(1);
-		expect(errors()).toContain(kind === "declined" ? "declined" : "--yes");
+		const error = kind === "declined-json" ? JSON.parse(output()).error : errors();
+		expect(error).toContain(kind.startsWith("declined") ? "declined" : "--yes");
 		readOnly(before, env);
 	});
 	it.each([
@@ -498,11 +582,12 @@ describe("session move command", () => {
 		expect(connected).not.toContain(f.targetSocket);
 		expect(requests.map(({ command }) => command.type)).not.toEqual(expect.arrayContaining(["shutdown", "restart"]));
 	});
-	it.each(["trash", "unlink", "not_enrolled", "failed"] as const)(
+	it.each(["trash", "unlink", "not_enrolled", "failed", "journal"] as const)(
 		"AC-23 prints deletion and mesh outcome %s with the open command",
 		async (outcome) => {
 			if (outcome === "trash" || outcome === "unlink") method = outcome;
-			else mesh = outcome;
+			else mesh = outcome === "journal" ? "failed" : outcome;
+			if (outcome === "journal") meshReason = "Mesh records were not written: committed journal write refused";
 			await run(["--yes"]);
 			expect(process.exitCode).toBeUndefined();
 			for (const text of ["moving", "session-1", f.paths.targetFile, "--resume session-1", "hosts"])
@@ -514,9 +599,9 @@ describe("session move command", () => {
 						? "unlinked"
 						: outcome === "not_enrolled"
 							? "not enrolled"
-							: "record refused",
+							: meshReason,
 			);
-			if (outcome === "failed")
+			if (mesh === "failed")
 				for (const text of [
 					"next start or move",
 					"backup to delete by hand",

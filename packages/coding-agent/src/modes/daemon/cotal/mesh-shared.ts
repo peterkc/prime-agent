@@ -1,4 +1,18 @@
+import { join } from "node:path";
 import { normalizeAgentSessionMessage } from "../../../core/agent-messages.js";
+
+function sessionKey(sessionId: string): string {
+	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
+	return sessionId;
+}
+
+export function enrollmentPath(meshRoot: string, sessionId: string): string {
+	return join(meshRoot, "enrollments", `${sessionKey(sessionId)}.json`);
+}
+
+export function directoryPath(meshRoot: string, sessionId: string): string {
+	return join(meshRoot, "directory", `${sessionKey(sessionId)}.json`);
+}
 
 export interface EnrollmentRecord {
 	readonly sessionId: string;

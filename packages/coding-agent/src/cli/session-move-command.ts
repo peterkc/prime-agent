@@ -1,24 +1,27 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { APP_NAME, expandTildePath, getAgentDir, getSessionsDir } from "../config.js";
-import { AgentCronJobStore } from "../core/cron-jobs.js";
 import { canonicalSessionPath } from "../core/session-lease.js";
-import { CURRENT_SESSION_VERSION, readSessionInfo, type SessionInfo, SessionManager } from "../core/session-manager.js";
-import { sessionMovePaths } from "../core/session-move.js";
+import { SessionManager } from "../core/session-manager.js";
+import { preflightSessionMove } from "../core/session-move.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
-import { enrollmentPath } from "../modes/daemon/cotal/enrollment.js";
+import { enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
 import { resolveCatalogSessionMatch } from "../modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
-import { DAEMON_COMMAND_COMPATIBILITY, meetsDaemonCommandCompatibility } from "../modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_COMMAND_COMPATIBILITY,
+	type DaemonResponse,
+	meetsDaemonCommandCompatibility,
+} from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { readPersistedDaemonFolders } from "../modes/daemon/daemon-supervisor.js";
-import { RlmSpawnLedger, readLegacyRlmSubagentRegistry } from "../modes/daemon/rlm-ledger.js";
-import { readFirstLineSync } from "../utils/file-lines.js";
 import { getCommandSpec } from "./command-registry.js";
 import { runStart } from "./daemon-command.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 import { prepareRepositoryDaemon, resolveRepositoryDaemon } from "./repository-daemon.js";
+
+const SESSION_MOVE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 interface MoveOptions {
 	readonly selector: string;
@@ -150,35 +153,43 @@ async function resolveSource(selector: string, sessionDir: string, roster: reado
 	return saved.path;
 }
 
-async function checkFamilyAndJobs(
-	info: SessionInfo,
-	agentDir: string,
-	sessionDir: string,
-	artifacts: string,
-): Promise<void> {
-	if (info.rlmDepth > 0) throw new Error("Cannot move an RLM child session");
-	const ledger = new RlmSpawnLedger(agentDir, sessionDir);
-	const edges = await ledger.liveEdges();
-	if (edges.some((edge) => canonicalSessionPath(edge.parent) === canonicalSessionPath(info.path))) {
-		throw new Error("Cannot move a session with RLM children");
-	}
-	if (!existsSync(ledger.ledgerPath)) {
-		const legacy = await readLegacyRlmSubagentRegistry(join(artifacts, "rlm-subagents.jsonl"), {
-			throwOnReadError: true,
-		});
-		if (legacy.some((child) => child.status !== "deleted" && existsSync(child.sessionFile))) {
-			throw new Error("Cannot move a session with RLM children");
-		}
-	}
-	const jobs = AgentCronJobStore.forSessionArtifacts();
-	jobs.registerSessionArtifact(info.id, artifacts);
-	if (jobs.list().some((job) => job.status === "active" || job.status === "paused")) {
-		throw new Error("Cannot move a session with an active or paused scheduled job");
-	}
-}
-
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+interface RecoveredMove {
+	readonly status: string;
+	readonly messages: readonly string[];
+	readonly backups: readonly { readonly path: string; readonly reason: string }[];
+}
+
+function parseRecovered(value: unknown): readonly RecoveredMove[] {
+	if (value === undefined) return [];
+	if (
+		!Array.isArray(value) ||
+		!value.every(
+			(row) =>
+				isRecord(row) &&
+				typeof row.status === "string" &&
+				Array.isArray(row.messages) &&
+				row.messages.every((message) => typeof message === "string") &&
+				Array.isArray(row.backups) &&
+				row.backups.every(
+					(backup) => isRecord(backup) && typeof backup.path === "string" && typeof backup.reason === "string",
+				),
+		)
+	) {
+		throw new Error("Source daemon returned invalid recovered move reports; inspect the move journals");
+	}
+	return value;
+}
+
+function printRecovered(recovered: readonly RecoveredMove[]): void {
+	for (const row of recovered) {
+		console.log(`Recovered move: ${row.status}`);
+		for (const message of row.messages) console.log(message);
+		for (const backup of row.backups) console.log(`Kept ${backup.path}: ${backup.reason}`);
+	}
 }
 
 interface MoveReply {
@@ -193,7 +204,7 @@ interface MoveReply {
 		| { readonly status: "updated" | "not_enrolled" }
 		| { readonly status: "failed"; readonly step: "enrollment" | "directory"; readonly reason: string };
 	readonly messages: readonly string[];
-	readonly recovered: readonly unknown[];
+	readonly recovered: readonly RecoveredMove[];
 	readonly recoveryPending: boolean;
 }
 
@@ -223,11 +234,12 @@ function parseReply(value: unknown): MoveReply {
 	) {
 		throw new Error("Source daemon returned an invalid move result; inspect the session before retrying");
 	}
-	return value as unknown as MoveReply;
+	return { ...value, recovered: parseRecovered(value.recovered) } as unknown as MoveReply;
 }
 
 export async function runSessionMove(args: readonly string[]): Promise<void> {
 	let client: DaemonClient | undefined;
+	let recovered: readonly RecoveredMove[] = [];
 	try {
 		const options = parseOptions(args);
 		const agentDir = getAgentDir();
@@ -246,42 +258,12 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		client = await readSourceDaemon(sourceSocket);
 		const roster = await readRoster(client);
 		const sessionPath = await resolveSource(options.selector, sourceSessionDir, roster);
-		const header: unknown = JSON.parse(readFirstLineSync(sessionPath) ?? "null");
-		if (!isRecord(header) || header.type !== "session" || typeof header.id !== "string")
-			throw new Error("Invalid session header");
-		const checked = sessionMovePaths({
-			sessionId: header.id,
+		const { paths, info } = await preflightSessionMove({
 			agentDir,
 			sourceSessionDir,
 			sourceFile: sessionPath,
 			targetSessionDir,
 		});
-		if (!checked.ok) throw new Error(checked.reason);
-		const paths = checked.value;
-		if (
-			header.version !== CURRENT_SESSION_VERSION ||
-			(header.parentSession && (!Number.isSafeInteger(header.rlmDepth) || Number(header.rlmDepth) < 0))
-		) {
-			throw new Error("Open the session once in its own repository first to upgrade it");
-		}
-		const info = await readSessionInfo(paths.sourceFile);
-		if (!info) throw new Error(`Session not found: ${sessionPath}`);
-		await checkFamilyAndJobs(info, agentDir, sourceSessionDir, paths.sourceArtifacts);
-		for (const path of [
-			paths.journalPath,
-			paths.sourceBackup,
-			paths.targetFile,
-			paths.fileTemporary,
-			paths.targetArtifacts,
-			paths.artifactTemporary,
-		]) {
-			if (present(path)) throw new Error(`Move destination already exists: ${path}`);
-		}
-		for (const target of await SessionManager.listAll(undefined, targetSessionDir)) {
-			if (target.id === info.id) throw new Error(`Target already holds session ${info.id}`);
-			if (target.rlmDepth === 0 && info.name && target.name === info.name)
-				throw new Error(`Target already has a top-level session named ${info.name}`);
-		}
 		if (
 			roster.some(
 				(row) =>
@@ -322,6 +304,10 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		if (!options.yes) {
 			if (!process.stdin.isTTY)
 				throw new Error("move requires terminal confirmation. Use --yes in non-interactive shells");
+			const print = options.json ? console.error : console.log;
+			print(`Source session file: ${paths.sourceFile}\nTarget session file: ${paths.targetFile}`);
+			print(`The original session file goes to the Trash, or is unlinked if trash is missing: ${paths.sourceFile}`);
+			print(`The original artifact folder is removed: ${paths.sourceArtifacts}`);
 			if (!(await promptYesNo(`Move ${info.name ?? info.id} (${info.id}) to ${targetCwd}?`)))
 				throw new Error("Session move declined");
 		}
@@ -346,13 +332,25 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			client = await readSourceDaemon(sourceSocket);
 			if (!client) throw new Error("Source daemon did not start");
 		}
-		const response = await client.request({
-			type: "move_saved_session",
-			sessionPath: paths.sourceFile,
-			targetSessionDir: paths.targetSessionDir,
-			targetCwd,
-			targetSocket,
-		});
+		let response: DaemonResponse;
+		try {
+			response = await client.request(
+				{
+					type: "move_saved_session",
+					sessionPath: paths.sourceFile,
+					targetSessionDir: paths.targetSessionDir,
+					targetCwd,
+					targetSocket,
+				},
+				SESSION_MOVE_TIMEOUT_MS,
+			);
+		} catch (error) {
+			throw new Error(
+				`Move result is unknown: ${error instanceof Error ? error.message : String(error)}. Check the target folder ${targetCwd} and run ${APP_NAME} move ${shellQuote(options.selector)} ${shellQuote(targetCwd)} --dry-run again.`,
+				{ cause: error },
+			);
+		}
+		recovered = parseRecovered(isRecord(response.data) ? response.data.recovered : undefined);
 		if (!response.success) throw new Error(response.error);
 		const reply = parseReply(response.data);
 		const note =
@@ -362,6 +360,7 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		const output = { ...reply, ...identity, targetFile: reply.targetFile, meshHosting: note };
 		if (options.json) console.log(JSON.stringify(output));
 		else {
+			printRecovered(reply.recovered);
 			console.log(`Moved ${info.name ?? "(unnamed)"} (${info.id}) to ${reply.targetFile}`);
 			if (reply.original.method)
 				console.log(
@@ -382,8 +381,17 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (args.includes("--json"))
-			console.log(JSON.stringify({ error: message, ...(args.includes("--dry-run") ? { dryRun: true } : {}) }));
-		else console.error(message);
+			console.log(
+				JSON.stringify({
+					error: message,
+					...(recovered.length ? { recovered } : {}),
+					...(args.includes("--dry-run") ? { dryRun: true } : {}),
+				}),
+			);
+		else {
+			printRecovered(recovered);
+			console.error(message);
+		}
 		process.exitCode = 1;
 	} finally {
 		client?.close();

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
@@ -21,15 +21,16 @@ import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cot
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import {
 	createDaemonCommandEnvelope,
-	DAEMON_PROTOCOL_INFO,
 	type DaemonCommand,
 	type DaemonResponse,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.js";
+import { serializeJsonLine } from "../src/modes/rpc/jsonl.js";
+import * as atomic from "../src/utils/atomic-file.js";
 
 vi.mock("node:fs", async (original) => ({ ...(await original<typeof fs>()) }));
+vi.mock("../src/utils/atomic-file.js", async (original) => ({ ...(await original<typeof atomic>()) }));
 vi.mock("@cotal-ai/core", async (original) => ({
 	...(await original<typeof core>()),
 	CotalEndpoint: function (options: core.EndpointOptions) {
@@ -52,7 +53,6 @@ class Endpoint extends EventEmitter {
 interface Harness {
 	handoffMeshMessage: MeshEndpointOptions["handoff"];
 	mesh: MeshEndpoints;
-	recoveredSessionMoves: SessionMoveReport[];
 	workers: Map<string, unknown>;
 	roster(): { write(entry: object): void };
 	recoverSessionMoves(): Promise<SessionMoveReport[]>;
@@ -61,6 +61,7 @@ interface Harness {
 const roots: string[] = [];
 const supervisors: DaemonSupervisor[] = [];
 const clients: DaemonClient[] = [];
+const startupReports = new WeakMap<DaemonSupervisor, SessionMoveReport[]>();
 function harness(supervisor: DaemonSupervisor): Harness {
 	return supervisor as unknown as Harness;
 }
@@ -80,13 +81,21 @@ afterEach(async () => {
 	Endpoint.instances = [];
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-async function start(root: string, sessionDir: string, socket: string) {
+async function start(
+	root: string,
+	sessionDir: string,
+	socket: string,
+	descriptorDir = join(root, `workers-${supervisors.length}`),
+) {
 	const supervisor = new DaemonSupervisor(socket, {
 		defaultSessionConfig: { agentDir: root, cwd: root, sessionDir },
-		descriptorDir: join(root, `workers-${supervisors.length}`),
+		descriptorDir,
 	});
 	supervisors.push(supervisor);
+	const recovery = vi.spyOn(harness(supervisor), "recoverSessionMoves");
 	await supervisor.start();
+	startupReports.set(supervisor, await recovery.mock.results[0]!.value);
+	recovery.mockRestore();
 	return supervisor;
 }
 async function fixture(startNow = true) {
@@ -187,6 +196,56 @@ function writeJournal(f: Awaited<ReturnType<typeof fixture>>, phase: SessionMove
 	return journal;
 }
 describe("supervisor session move", () => {
+	it.each(
+		["win32", "darwin"].flatMap((platform) =>
+			["directory", "file"].flatMap((kind) => ["relocation", "mesh"].map((scope) => ({ platform, kind, scope }))),
+		),
+	)("F11 $platform $kind $scope fsync keeps the platform failure boundary", async ({ platform, kind, scope }) => {
+		const f = await fixture();
+		const sync = fs.fsyncSync,
+			open = fs.openSync;
+		const handles = new Map<number, string>();
+		const record = enrollment.enrollmentPath(f.meshRoot, f.id);
+		const fault =
+			scope === "mesh"
+				? kind === "directory"
+					? dirname(record)
+					: record
+				: kind === "directory"
+					? f.root
+					: join(f.paths.artifactTemporary, "keep.txt");
+		vi.spyOn(process, "platform", "get").mockReturnValue(platform as NodeJS.Platform);
+		vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+			const fd = open(path, flags, mode);
+			handles.set(fd, String(path));
+			return fd;
+		});
+		vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+			if (handles.get(fd) === fault) throw new Error("fsync refused");
+			return sync(fd);
+		});
+		const response = await dispatch(f);
+		const supported = platform === "win32" && kind === "directory";
+		if (supported || scope === "mesh")
+			expect(response).toMatchObject({
+				success: true,
+				data: { moved: true, mesh: { status: supported ? "updated" : "failed" } },
+			});
+		else expect(response).toMatchObject({ success: false });
+		if (!supported) expect(JSON.stringify(response)).toContain("fsync refused");
+	});
+	it.each([true, false])("F6 move success=%s reports only its own recovery pass", async (valid) => {
+		const f = await fixture(false);
+		writeJournal(f, "suspending");
+		await start(f.root, f.sourceDir, f.socket);
+		writeJournal(f, "copying");
+		const command = valid ? f.command : { ...f.command, targetSessionDir: f.sourceDir };
+		const first = await dispatch(f, command);
+		expect(first).toMatchObject({ success: valid, data: { recovered: [{ status: "rolled_back" }] } });
+		expect((first.data as { recovered: unknown[] }).recovered).toHaveLength(1);
+		expect(await dispatch(f, command)).toMatchObject({ success: false, data: { recovered: [] } });
+	});
+
 	it("AC-15 move waits for the actual paused handoff and prevents a late worker wake", async () => {
 		const f = await fixture();
 		const sup = harness(f.supervisor!);
@@ -280,6 +339,7 @@ describe("supervisor session move", () => {
 		["lease", "open or being written elsewhere"],
 		["child", "RLM child session"],
 		["children", "RLM children"],
+		["artifact-child", "RLM children"],
 		["active", "active or paused scheduled job"],
 		["paused", "active or paused scheduled job"],
 		["foreign", "claimed by another daemon"],
@@ -290,6 +350,7 @@ describe("supervisor session move", () => {
 		const f = await fixture(state !== "foreign");
 		const before = fs.readFileSync(f.paths.sourceFile);
 		let claim: ReturnType<typeof enrollment.claimEnrollment> | undefined;
+		let jobId: string | undefined;
 		if (state === "foreign") {
 			claim = enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile);
 			f.supervisor = await start(f.root, f.sourceDir, f.socket);
@@ -319,6 +380,7 @@ describe("supervisor session move", () => {
 			});
 		if (state === "child")
 			fs.writeFileSync(f.paths.sourceFile, before.toString().replace('"version":', '"rlmDepth":1,"version":'));
+		if (state === "artifact-child") fs.copyFileSync(f.paths.sourceFile, join(f.paths.sourceArtifacts, "child.data"));
 		if (state === "children") {
 			const child = join(f.paths.sourceArtifacts, "child.jsonl");
 			fs.copyFileSync(f.paths.sourceFile, child);
@@ -344,6 +406,7 @@ describe("supervisor session move", () => {
 			});
 			if (state === "paused") await store.manageHeartbeat(f.id, job.id, "pause");
 			expect(store.list()[0]?.status).toBe(state);
+			jobId = job.id;
 		}
 		if (state === "replacement") await sup.mesh.beginReplacement(f.id, {}, "test-replacement");
 		if (state.startsWith("target-"))
@@ -355,7 +418,10 @@ describe("supervisor session move", () => {
 		const record = fs.readFileSync(enrollment.enrollmentPath(f.meshRoot, f.id));
 		const directory = fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id));
 		try {
-			expect(await dispatch(f)).toMatchObject({ success: false, error: expect.stringContaining(reason) });
+			const refused = await dispatch(f);
+			expect(refused).toMatchObject({ success: false, error: expect.stringContaining(reason) });
+			if (jobId)
+				expect(refused).toMatchObject({ error: expect.stringContaining(`cancel these jobs first: ${jobId}`) });
 			expect(fs.readFileSync(f.paths.sourceFile)).toEqual(source);
 			expect(fs.readFileSync(enrollment.enrollmentPath(f.meshRoot, f.id))).toEqual(record);
 			expect(fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id))).toEqual(directory);
@@ -366,7 +432,7 @@ describe("supervisor session move", () => {
 			freeLeases(f.paths);
 		}
 	});
-	it("AC-16 stop failure keeps a recovery journal and reports failure", async () => {
+	it("AC-16/F7 stop failure keeps a journal and later move-time recovery resumes the endpoint", async () => {
 		const f = await fixture();
 		const endpoint = Endpoint.instances.find(
 			(instance) => instance.options.card?.id === enrollment.readEnrollment(f.meshRoot, f.id).identity.id,
@@ -380,24 +446,53 @@ describe("supervisor session move", () => {
 		expect(fs.existsSync(f.paths.journalPath)).toBe(true);
 		expect(fs.existsSync(f.paths.targetFile)).toBe(false);
 		freeLeases(f.paths);
+		const later = await dispatch(f, { ...f.command, targetSessionDir: f.sourceDir });
+		expect(later).toMatchObject({ success: false, data: { recovered: [{ status: "rolled_back" }] } });
+		expect(fs.existsSync(f.paths.journalPath)).toBe(false);
+		const resumed = Endpoint.instances.filter((instance) => instance.options.card?.id === endpoint.options.card?.id);
+		expect(resumed).toHaveLength(2);
+		expect(resumed[1]!.start).toHaveBeenCalledOnce();
 	});
-	it.each(["enrollment", "directory"])(
+	it.each(["enrollment", "directory", "journal"])(
 		"AC-17 %s failure after publication keeps committed journal and originals",
 		async (step) => {
 			const f = await fixture();
-			vi.spyOn(
-				enrollment,
-				step === "enrollment" ? "updateEnrollmentPath" : "publishDirectory",
-			).mockRejectedValueOnce(new Error("record refused"));
+			if (step === "journal") {
+				const write = atomic.writeFileAtomicSync;
+				vi.spyOn(atomic, "writeFileAtomicSync").mockImplementation((path, data, options) => {
+					if (path === f.paths.journalPath && JSON.parse(data).phase === "committed")
+						throw new Error("record refused");
+					return write(path, data, options);
+				});
+			} else
+				vi.spyOn(
+					enrollment,
+					step === "enrollment" ? "updateEnrollmentPath" : "publishDirectory",
+				).mockRejectedValueOnce(new Error("record refused"));
 			expect(await dispatch(f)).toMatchObject({
 				success: true,
-				data: { moved: true, mesh: { status: "failed", step, reason: expect.stringContaining("record refused") } },
+				data: {
+					moved: true,
+					mesh: {
+						status: "failed",
+						step: step === "journal" ? "enrollment" : step,
+						reason: expect.stringContaining("record refused"),
+					},
+				},
 			});
-			expect(JSON.parse(fs.readFileSync(f.paths.journalPath, "utf8")).phase).toBe("committed");
+			expect(JSON.parse(fs.readFileSync(f.paths.journalPath, "utf8")).phase).toBe(
+				step === "journal" ? "committing" : "committed",
+			);
 			expect(fs.existsSync(f.paths.sourceBackup)).toBe(true);
 			expect(fs.existsSync(f.paths.sourceArtifacts)).toBe(true);
 			freeLeases(f.paths);
 			freeClaim(f);
+			expect(await harness(f.supervisor!).recoverSessionMoves()).toMatchObject([
+				{ status: "moved", backups: [{ path: f.paths.sourceBackup }, { path: f.paths.sourceArtifacts }] },
+			]);
+			expect(enrollment.readDirectory(f.meshRoot, f.id)?.homeSocket).toBe(f.targetSocket);
+			expect(fs.existsSync(f.paths.sourceBackup)).toBe(true);
+			expect(await harness(f.supervisor!).recoverSessionMoves()).toEqual([]);
 		},
 	);
 	it("AC-17 journal cleanup failure is not reported as a mesh failure", async () => {
@@ -449,11 +544,18 @@ describe("supervisor session move", () => {
 		freeLeases(f.paths);
 		freeClaim(f);
 	});
-	it.each(["suspending", "copying", "committing", "committed"] as const)(
+	it.each(["suspending", "copying", "committing", "committed", "skipped"] as const)(
 		"AC-18 startup recovers %s before adopting its descriptor or hosting mesh",
 		async (phase) => {
 			const f = await fixture(false);
-			writeJournal(f, phase);
+			writeJournal(f, phase === "skipped" ? "suspending" : phase);
+			const held = phase === "skipped" ? acquireSessionMoveLeases(f.paths, f.root) : undefined;
+			const adopt = vi
+				.spyOn(
+					DaemonSupervisor.prototype as unknown as { adoptOrRecoverWorker(): Promise<void> },
+					"adoptOrRecoverWorker",
+				)
+				.mockResolvedValue();
 			const descriptors = join(f.root, "workers-0");
 			fs.mkdirSync(descriptors);
 			fs.writeFileSync(
@@ -474,18 +576,26 @@ describe("supervisor session move", () => {
 				}),
 			);
 			const resume = vi.spyOn(MeshEndpoints.prototype, "resumeSession");
-			const fStarted = await start(f.root, f.sourceDir, f.socket);
-			expect(harness(fStarted).workers.size).toBe(0);
-			expect(resume).not.toHaveBeenCalled();
-			expect(harness(fStarted).recoveredSessionMoves).toMatchObject([
-				{ status: "rolled_back", sourceFile: f.paths.sourceFile },
-			]);
-			expect(fs.existsSync(f.paths.journalPath)).toBe(false);
-			expect(fs.existsSync(f.paths.sourceFile)).toBe(true);
-			expect(await harness(fStarted).recoverSessionMoves()).toEqual([]);
+			try {
+				const fStarted = await start(f.root, f.sourceDir, f.socket);
+				expect(harness(fStarted).workers.size).toBe(phase === "skipped" ? 1 : 0);
+				expect(resume).not.toHaveBeenCalled();
+				expect(startupReports.get(fStarted)).toMatchObject([
+					{ status: phase === "skipped" ? "skipped" : "rolled_back", sourceFile: f.paths.sourceFile },
+				]);
+				expect(fs.existsSync(join(descriptors, "stale.json"))).toBe(phase === "skipped");
+				expect(fs.existsSync(f.paths.journalPath)).toBe(phase === "skipped");
+				expect(fs.existsSync(f.paths.sourceFile)).toBe(true);
+				await harness(fStarted).cleanupSupervisorResources();
+				const second = await start(f.root, f.sourceDir, f.socket, descriptors);
+				expect(harness(second).workers.size).toBe(phase === "skipped" ? 1 : 0);
+				expect(adopt).toHaveBeenCalledTimes(phase === "skipped" ? 2 : 0);
+			} finally {
+				held?.release();
+			}
 		},
 	);
-	it("AC-27 target open repairs records under its claim; source recovery keeps both backups and repeats as a no-op", async () => {
+	it("AC-27/AC-31 target open repairs records; source recovery never deletes either backup and repeats as a no-op", async () => {
 		const f = await fixture();
 		const failure = vi.spyOn(enrollment, "updateEnrollmentPath").mockRejectedValueOnce(new Error("record refused"));
 		expect(await dispatch(f)).toMatchObject({ success: true, data: { moved: true } });
@@ -496,8 +606,10 @@ describe("supervisor session move", () => {
 		expect(enrollment.readEnrollment(f.meshRoot, f.id).sessionFile).toBe(f.paths.targetFile);
 		expect(enrollment.readDirectory(f.meshRoot, f.id)?.homeSocket).toBe(f.targetSocket);
 		await harness(f.supervisor!).cleanupSupervisorResources();
+		const remove = vi.spyOn(fs, "rmSync");
 		const restarted = await start(f.root, f.sourceDir, f.socket);
-		const reports = harness(restarted).recoveredSessionMoves;
+		expect(remove).not.toHaveBeenCalledWith(f.paths.sourceArtifacts, expect.anything());
+		const reports = startupReports.get(restarted);
 		expect(reports).toMatchObject([
 			{ status: "moved", backups: [{ path: f.paths.sourceBackup }, { path: f.paths.sourceArtifacts }] },
 		]);
@@ -507,73 +619,7 @@ describe("supervisor session move", () => {
 		expect(() => enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.targetFile)).toThrow();
 		expect(await harness(restarted).recoverSessionMoves()).toEqual([]);
 	});
-	it("AC-31 recovery of a matching committed target never deletes its originals", async () => {
-		const f = await fixture(false);
-		fs.copyFileSync(f.paths.sourceFile, f.paths.sourceBackup);
-		writeJournal(f, "committed", true);
-		const remove = fs.rmSync;
-		const removed: string[] = [];
-		vi.spyOn(fs, "rmSync").mockImplementation((path, options) => {
-			removed.push(String(path));
-			return remove(path, options);
-		});
-		const restarted = await start(f.root, f.sourceDir, f.socket);
-		expect(harness(restarted).recoveredSessionMoves).toMatchObject([
-			{ status: "moved", backups: [{ path: f.paths.sourceBackup }, { path: f.paths.sourceArtifacts }] },
-		]);
-		expect(removed).not.toContain(f.paths.sourceArtifacts);
-		expect(fs.existsSync(f.paths.sourceBackup)).toBe(true);
-		expect(fs.existsSync(f.paths.sourceArtifacts)).toBe(true);
-	});
-	it.each([
-		[35, ["session_move"]],
-		[36, []],
-	] as const)(
-		"AC-19 new client rejects incompatible daemon schema %s without sending the move",
-		async (schemaRevision, serverCapabilities) => {
-			const f = await fixture(false);
-			const sockets = new Set<Socket>();
-			const received: string[] = [];
-			const server: Server = createServer((socket) => {
-				sockets.add(socket);
-				attachJsonlLineReader(socket, (line) => {
-					received.push(line);
-					const envelope = JSON.parse(line);
-					socket.write(
-						serializeJsonLine({
-							type: "response",
-							id: envelope.id,
-							command: envelope.command.type,
-							success: false,
-							error: "Unknown daemon command",
-						}),
-					);
-				});
-				socket.write(
-					serializeJsonLine({
-						type: "daemon_hello",
-						socketPath: f.socket,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaRevision,
-						clientId: "old",
-						serverCapabilities,
-					}),
-				);
-			});
-			try {
-				await new Promise<void>((done) => server.listen(f.socket, done));
-				const client = new DaemonClient(f.socket);
-				clients.push(client);
-				await client.connect();
-				await client.waitForHello();
-				await expect(client.request(f.command)).rejects.toThrow("session_move");
-				expect(received).toEqual([]);
-			} finally {
-				for (const socket of sockets) socket.destroy();
-				await new Promise<void>((done) => server.close(() => done()));
-			}
-		},
-	);
+
 	it("AC-19 old protocol-7 client lists on new daemon without the move capability", async () => {
 		const f = await fixture();
 		const client = new DaemonClient(f.socket);

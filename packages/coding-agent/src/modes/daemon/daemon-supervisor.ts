@@ -58,20 +58,14 @@ import {
 	getProcessStartId,
 	SessionAlreadyActiveError,
 } from "../../core/session-lease.js";
-import {
-	CURRENT_SESSION_VERSION,
-	getSessionArtifactPathForFile,
-	readSessionInfo,
-	type SessionInfo,
-	SessionManager,
-} from "../../core/session-manager.js";
+import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import {
 	acquireSessionMoveLeases,
+	preflightSessionMove,
 	recoverSessionMove,
 	relocateSession,
 	type SessionMovePaths,
 	type SessionMoveReport,
-	sessionMovePaths,
 } from "../../core/session-move.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
@@ -82,7 +76,6 @@ import {
 	signalProcessGroupOrProcess,
 	spawnHidden,
 } from "../../utils/child-process.js";
-import { readFirstLineSync } from "../../utils/file-lines.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -784,7 +777,6 @@ export class DaemonSupervisor {
 	private readonly meshCredentialLifetimeSeconds?: number;
 	private mesh?: MeshEndpoints;
 	private readonly activeSessionMoves = new Set<string>();
-	private readonly recoveredSessionMoves: SessionMoveReport[] = [];
 	private rosterStore?: AgentRoster;
 	private readonly pendingRosterChanged = new Set<string>();
 	private readonly pendingRosterRemoved = new Set<string>();
@@ -911,12 +903,17 @@ export class DaemonSupervisor {
 				});
 			}
 			const recoveredMoves = await this.recoverSessionMoves();
-			const movedSources = new Set(recoveredMoves.map((report) => canonicalSessionPath(report.sourceFile)));
+			const movedSources = new Set(
+				recoveredMoves
+					.filter((report) => report.status === "moved" || report.status === "rolled_back")
+					.map((report) => canonicalSessionPath(report.sourceFile)),
+			);
 			for (const worker of workersToAdopt) {
 				const files = [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath];
 				if (!files.some((file) => file !== undefined && movedSources.has(canonicalSessionPath(file)))) continue;
 				this.workers.delete(worker.descriptor.workerId);
-				this.log(`Skipped worker ${worker.descriptor.workerId}: its source session has a move journal`);
+				this.deleteWorkerDescriptor(worker);
+				this.log(`Skipped worker ${worker.descriptor.workerId}: its source session has a handled move journal`);
 			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
@@ -3228,60 +3225,14 @@ export class DaemonSupervisor {
 	): Promise<{ paths: SessionMovePaths; info: SessionInfo }> {
 		const agentDir = this.defaultSessionConfig.agentDir!;
 		this.assertSessionMoveClosed(command.sessionPath);
-		const header: unknown = JSON.parse(readFirstLineSync(command.sessionPath) ?? "null");
-		if (
-			!header ||
-			typeof header !== "object" ||
-			!("type" in header) ||
-			header.type !== "session" ||
-			!("id" in header) ||
-			typeof header.id !== "string"
-		)
-			throw new Error("Invalid session header");
-		const checked = sessionMovePaths({
-			sessionId: header.id,
+		const { paths, info } = await preflightSessionMove({
 			agentDir,
 			sourceFile: command.sessionPath,
 			sourceSessionDir: this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir),
 			targetSessionDir: command.targetSessionDir,
 		});
-		if (!checked.ok) throw new Error(checked.reason);
-		const paths = checked.value;
-		if (
-			!("version" in header) ||
-			header.version !== CURRENT_SESSION_VERSION ||
-			("parentSession" in header &&
-				header.parentSession &&
-				(!("rlmDepth" in header) || !Number.isSafeInteger(header.rlmDepth) || Number(header.rlmDepth) < 0))
-		)
-			throw new Error("Open the session once in its own repository first to upgrade it");
-		const info = await readSessionInfo(paths.sourceFile);
-		if (!info) throw new Error(`Session not found: ${paths.sourceFile}`);
-		if ((info.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
-		const edges = await this.rlmSpawnLedger().liveEdges();
-		if (edges.some((edge) => canonicalSessionPath(edge.parent) === paths.sourceFile))
-			throw new Error("Cannot move a session with RLM children");
-		const jobs = AgentCronJobStore.forSessionArtifacts();
-		jobs.registerSessionArtifact(info.id, paths.sourceArtifacts);
-		if (jobs.list().some((job) => job.status === "active" || job.status === "paused"))
-			throw new Error("Cannot move a session with an active or paused scheduled job");
 		if (!statSync(command.targetCwd).isDirectory() || !statSync(paths.targetSessionDir).isDirectory())
 			throw new Error("Target repository and session folder must be directories");
-		for (const path of [
-			paths.journalPath,
-			paths.sourceBackup,
-			paths.targetFile,
-			paths.fileTemporary,
-			paths.targetArtifacts,
-			paths.artifactTemporary,
-		]) {
-			if (existsSync(path)) throw new Error(`Move destination already exists: ${path}`);
-		}
-		for (const target of await SessionManager.listAll(undefined, paths.targetSessionDir)) {
-			if (target.id === info.id) throw new Error(`Target already holds session ${info.id}`);
-			if ((target.rlmDepth ?? 0) === 0 && info.name && target.name === info.name)
-				throw new Error(`Target already has a top-level session named ${info.name}`);
-		}
 		this.assertSessionMoveClosed(paths.sourceFile);
 		return { paths, info };
 	}
@@ -3289,11 +3240,12 @@ export class DaemonSupervisor {
 	private async moveSavedSession(
 		command: Extract<DaemonCommand, { type: "move_saved_session" }>,
 	): Promise<DaemonResponse> {
+		let recovered: SessionMoveReport[] = [];
 		try {
 			for (const value of [command.sessionPath, command.targetSessionDir, command.targetCwd, command.targetSocket])
 				if (typeof value !== "string" || !value)
 					throw new Error("Move requires non-empty source, target folders and socket");
-			await this.recoverSessionMoves();
+			recovered = await this.recoverSessionMoves();
 			const { paths } = await this.checkSessionMove(command);
 			if (this.activeSessionMoves.has(paths.sourceFile)) throw new Error("Session move is already in progress");
 			this.activeSessionMoves.add(paths.sourceFile);
@@ -3346,7 +3298,6 @@ export class DaemonSupervisor {
 					},
 				});
 				const moved = report.status === "moved" || report.committed === true;
-				const recovered = [...this.recoveredSessionMoves];
 				if (!moved)
 					return {
 						...failure(command.id, command.type, report.messages.join("; ")),
@@ -3365,9 +3316,15 @@ export class DaemonSupervisor {
 						deleted: !existsSync(paths.sourceBackup) && !existsSync(paths.sourceArtifacts),
 						backups: report.backups,
 					},
-					mesh: meshFailure
-						? { status: "failed", ...meshFailure }
-						: { status: enrolled ? "updated" : "not_enrolled" },
+					mesh:
+						enrolled && !report.meshRecordsWritten
+							? {
+									status: "failed",
+									step: meshFailure?.step ?? "enrollment",
+									reason:
+										meshFailure?.reason ?? `Mesh records were not written: ${report.messages.join("; ")}`,
+								}
+							: { status: enrolled ? "updated" : "not_enrolled" },
 					recoveryPending: report.status === "pending",
 					messages: report.messages,
 					recovered,
@@ -3379,7 +3336,7 @@ export class DaemonSupervisor {
 		} catch (error) {
 			return {
 				...failure(command.id, command.type, error, serializeDaemonError(error)),
-				data: { moved: false, recovered: [...this.recoveredSessionMoves] },
+				data: { moved: false, recovered },
 			};
 		}
 	}
@@ -3460,7 +3417,6 @@ export class DaemonSupervisor {
 			reports.push(report);
 			this.log(`Move journal ${journalPath}: ${report.status}; ${report.messages.join("; ")}`);
 		}
-		this.recoveredSessionMoves.push(...reports);
 		return reports;
 	}
 

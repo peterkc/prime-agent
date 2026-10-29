@@ -12,6 +12,42 @@ import {
 } from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
+/** Session headers in artifact files, plus already-leased files when deleting. */
+export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: string): Generator<string> {
+	const directories = [artifactDirectory];
+	while (directories.length > 0) {
+		const directory = directories.pop()!;
+		let entries: Dirent[];
+		try {
+			// rm removes directory symlinks themselves, not the trees they point at.
+			if (!lstatSync(directory).isDirectory()) continue;
+			entries = readdirSync(directory, { withFileTypes: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		for (const entry of entries) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				directories.push(path);
+				continue;
+			}
+			if (!agentDir || !hasSessionLease(path, agentDir)) {
+				if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+				try {
+					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
+					const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
+					if (header?.type !== "session") continue;
+				} catch {
+					// No existing lease: a failed probe identifies no owner to protect.
+					continue;
+				}
+			}
+			yield path;
+		}
+	}
+}
+
 /** Reserve the target and artifact files before a recursive saved-session delete. */
 export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string): { release(): void } {
 	const leases: SessionLease[] = [];
@@ -29,39 +65,8 @@ export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string
 	};
 	try {
 		acquire(sessionPath);
-		const directories = basename(sessionPath).replace(/\.jsonl$/, "")
-			? [getSessionArtifactPathForFile(sessionPath)]
-			: [];
-		while (directories.length > 0) {
-			const directory = directories.pop()!;
-			let entries: Dirent[];
-			try {
-				// rm removes directory symlinks themselves, not the trees they point at.
-				if (!lstatSync(directory).isDirectory()) continue;
-				entries = readdirSync(directory, { withFileTypes: true });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				throw error;
-			}
-			for (const entry of entries) {
-				const path = join(directory, entry.name);
-				if (entry.isDirectory()) {
-					directories.push(path);
-					continue;
-				}
-				if (!hasSessionLease(path, agentDir)) {
-					if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-					try {
-						if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
-						const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
-						if (header?.type !== "session") continue;
-					} catch {
-						// No existing lease: a failed probe identifies no owner to protect.
-						continue;
-					}
-				}
-				acquire(path);
-			}
+		if (basename(sessionPath).replace(/\.jsonl$/, "")) {
+			for (const path of sessionArtifactFiles(getSessionArtifactPathForFile(sessionPath), agentDir)) acquire(path);
 		}
 		return { release };
 	} catch (error) {

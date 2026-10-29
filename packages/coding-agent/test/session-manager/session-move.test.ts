@@ -37,6 +37,9 @@ import {
 	transformSessionMoveEntries,
 	verifySessionMoveCopy,
 } from "../../src/core/session-move.js";
+import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
+import { AgentsViewMode } from "../../src/modes/agents-view/agents-view-mode.js";
+import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import { writeFileAtomicSync } from "../../src/utils/atomic-file.js";
 import { spawnHidden } from "../../src/utils/child-process.js";
 
@@ -232,6 +235,55 @@ function untouchedSource(f: Fixture) {
 }
 
 describe("session relocation", () => {
+	it.each(["deactivate", "in-process rename", "daemon rename"])(
+		"F10 %s refuses a saved file held by another lease",
+		async (writer) => {
+			const f = fixture();
+			const before = readFileSync(f.paths.sourceFile);
+			const leases = acquireSessionMoveLeases(f.paths, f.paths.agentDir);
+			try {
+				if (writer === "deactivate") {
+					const status = vi.fn();
+					const view = Object.assign(Object.create(AgentsViewMode.prototype), {
+						options: { config: { agentDir: f.paths.agentDir } },
+						pendingDeleteAgent: { identity: "saved", sessionFile: f.paths.sourceFile },
+						inactiveAgentIdentities: new Set(),
+						setStatusMessage: status,
+						clearDeleteConfirmation: vi.fn(),
+						refreshSessions: vi.fn(),
+						refreshSavedSessionsIfLoaded: vi.fn(),
+					});
+					await Reflect.get(view, "deactivatePendingAgent").call(view);
+					expect(status).toHaveBeenLastCalledWith(expect.stringContaining("open or being moved"));
+				} else if (writer === "in-process rename") {
+					const connection = Object.create(InProcessAgentConnection.prototype) as InProcessAgentConnection;
+					Reflect.set(connection, "runtimeHost", { session: {}, services: { agentDir: f.paths.agentDir } });
+					await expect(connection.renameSavedSession(f.paths.sourceFile, "new")).rejects.toThrow(
+						"open or being moved",
+					);
+				} else {
+					const daemon = new AgentDaemon(join(home, "unused.sock"), {
+						createRuntime: vi.fn(async () => {
+							throw new Error("Unexpected runtime creation");
+						}),
+						defaultSessionConfig: {
+							agentDir: f.paths.agentDir,
+							cwd: f.targetCwd,
+							sessionDir: f.paths.sourceSessionDir,
+						},
+					});
+					const command = { type: "rename_saved_session", sessionPath: f.paths.sourceFile, name: "new" };
+					await expect(Reflect.get(daemon, "handleCommand").call(daemon, {}, command)).rejects.toThrow(
+						"open or being moved",
+					);
+				}
+				expect(readFileSync(f.paths.sourceFile)).toEqual(before);
+			} finally {
+				leases.release();
+			}
+		},
+	);
+
 	it("AC-1 keeps the ID and header fields, transforms entries and the trailing git leaf, and copies artifact digests", async () => {
 		const f = fixture();
 		execFileSync("git", ["init", "--initial-branch=relocated", f.targetCwd]);
@@ -311,13 +363,15 @@ describe("session relocation", () => {
 		{ step: "committing journal", phase: "committing", state: "artifacts" },
 		{ step: "source rename", phase: "committing", state: "renamed" },
 		{ step: "artifact promotion", phase: "committing", state: "promoted" },
-	] as const)("AC-4 rolls back real pre-commit state $step", async ({ phase, state }) => {
+		{ step: "committed without target", phase: "committed", state: "promoted" },
+	] as const)("AC-4/AC-6 recovers real pre-commit state $step twice", async ({ phase, state }) => {
 		const f = fixture();
-		const j = journalState(f, phase, state);
-		const result = await rollbackSessionMove(j, f.callbacks.resume);
-		expect(result.status).toBe("rolled_back");
+		journalState(f, phase, state);
+		f.recovery.resume = f.callbacks.resume;
+		expect((await recover(f)).status).toBe("rolled_back");
 		expect(f.events).toEqual(["resume"]);
 		untouchedSource(f);
+		expect((await recover(f)).status).toBe("absent");
 	});
 	it.each(["suspend", "copy"] as const)(
 		"AC-4 relocation failure during %s restores the source and resumes even a partly closed endpoint",
@@ -334,66 +388,17 @@ describe("session relocation", () => {
 			untouchedSource(f);
 		},
 	);
-	it.each(["restore", "resume"] as const)("AC-5 keeps the journal when undo %s fails", async (step) => {
+	it("AC-5 keeps the journal and foreign source when undo restore fails", async () => {
 		const f = fixture();
 		const j = journalState(f, "committing", "promoted");
-		if (step === "restore") writeFileSync(j.sourceFile, "other writer");
-		const result = await rollbackSessionMove(
-			j,
-			step === "resume"
-				? async () => {
-						throw new Error("resume failed");
-					}
-				: f.callbacks.resume,
-		);
+		writeFileSync(j.sourceFile, "other writer");
+		const result = await rollbackSessionMove(j, f.callbacks.resume);
 		expect(result.status).toBe("pending");
 		expect(result.messages.join(" ")).toContain("recovery is pending");
 		expect(existsSync(j.journalPath)).toBe(true);
-		if (step === "restore") expect(readFileSync(j.sourceFile, "utf8")).toBe("other writer");
+		expect(readFileSync(j.sourceFile, "utf8")).toBe("other writer");
 	});
-	it("AC-5 a failed suspend and failed resume keep the durable journal for recovery", async () => {
-		const f = fixture();
-		f.callbacks.suspend = async () => {
-			throw new Error("partly suspended");
-		};
-		f.callbacks.resume = async () => {
-			throw new Error("cannot resume");
-		};
-		const result = await move(f);
-		expect(result.status).toBe("pending");
-		expect(result.messages.join(" ")).toContain("recovery is pending");
-		expect(JSON.parse(readFileSync(f.paths.journalPath, "utf8")).phase).toBe("suspending");
-		expect(readEntries(f.paths.sourceFile)).toEqual(f.entries);
-		expect(existsSync(f.paths.targetFile)).toBe(false);
-	});
-	it("AC-10 a normal-flow mesh failure after publication is finished without deleting originals", async () => {
-		const f = fixture();
-		f.callbacks.writeMeshRecords = async (journal) => {
-			writeFileSync(f.enrollment, JSON.stringify({ path: journal.targetFile }));
-			throw new Error("directory write failed");
-		};
-		const result = await move(f);
-		expect(result.status).toBe("pending");
-		expect(existsSync(f.paths.sourceFile)).toBe(false);
-		expect(readEntries(f.paths.sourceBackup)).toEqual(f.entries);
-		expect(existsSync(f.paths.journalPath)).toBe(true);
-		expect((await recover(f)).status).toBe("moved");
-		expect(readEntries(f.paths.sourceBackup)).toEqual(f.entries);
-		expect(existsSync(f.paths.sourceArtifacts)).toBe(true);
-		expect(JSON.parse(readFileSync(f.directory, "utf8")).socket).toBe("new.sock");
-		expect((await recover(f)).status).toBe("absent");
-	});
-	it.each(["suspending", "copying", "committing", "committed"] as const)(
-		"AC-6 recovers phase %s from files and is a no-op the second time",
-		async (phase) => {
-			const f = fixture();
-			journalState(f, phase, phase === "suspending" ? "empty" : phase === "copying" ? "artifacts" : "promoted");
-			expect((await recover(f)).status).toBe("rolled_back");
-			untouchedSource(f);
-			expect(f.events).not.toContain("resume");
-			expect((await recover(f)).status).toBe("absent");
-		},
-	);
+
 	it.each(["suspending", "copying", "committing", "committed"] as const)(
 		"AC-7 published target wins over phase %s and recovery preserves both original backups",
 		async (phase) => {

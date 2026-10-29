@@ -1032,6 +1032,7 @@ describe("mesh enrollment", () => {
 			} });
 		`;
 		const script = `
+			import ${JSON.stringify(resolve("src/main.ts"))};
 			import { DaemonSupervisor } from ${JSON.stringify(resolve("src/modes/daemon/daemon-supervisor.ts"))};
 			import ${JSON.stringify(resolve("src/modes/daemon/daemon-mode.ts"))};
 			const supervisor = new DaemonSupervisor(${JSON.stringify(join(root, "probe.sock"))}, {
