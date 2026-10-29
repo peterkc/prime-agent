@@ -419,6 +419,7 @@ describe("supervisor session move", () => {
 		const source = fs.readFileSync(f.paths.sourceFile);
 		const record = fs.readFileSync(enrollment.enrollmentPath(f.meshRoot, f.id));
 		const directory = fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id));
+		const claims = vi.spyOn(enrollment, "claimEnrollment");
 		try {
 			const refused = await dispatch(f);
 			expect(refused).toMatchObject({ success: false, error: expect.stringContaining(reason) });
@@ -429,32 +430,41 @@ describe("supervisor session move", () => {
 			expect(fs.readFileSync(enrollment.directoryPath(f.meshRoot, f.id))).toEqual(directory);
 			expect(fs.existsSync(f.paths.targetFile)).toBe(false);
 			expect(fs.existsSync(f.paths.journalPath)).toBe(false);
+			if (state === "replacement") expect(claims).not.toHaveBeenCalled();
 		} finally {
 			claim?.release();
 			sup.workers.clear();
 			freeLeases(f.paths);
 		}
 	});
-	it("AC-16/F7 stop failure keeps a journal and later move-time recovery resumes the endpoint", async () => {
-		const f = await fixture();
-		const endpoint = Endpoint.instances.find(
-			(instance) => instance.options.card?.id === enrollment.readEnrollment(f.meshRoot, f.id).identity.id,
-		)!;
-		endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
-		expect(await dispatch(f)).toMatchObject({
-			success: false,
-			error: expect.stringContaining("recovery is pending"),
-		});
-		expect(fs.existsSync(f.paths.sourceFile)).toBe(true);
+	it.each([false, true])("AC-16/F7/H1 restart=%s move-time recovery resumes the endpoint", async (restart) => {
+		const f = await fixture(!restart);
+		if (restart) {
+			writeJournal(f, "committing");
+			const held = acquireSessionMoveLeases(f.paths, f.root);
+			try {
+				f.supervisor = await start(f.root, f.sourceDir, f.socket);
+				await harness(f.supervisor).mesh.start();
+				expect(Endpoint.instances.filter((instance) => instance.options.card?.kind === "agent")).toHaveLength(0);
+			} finally {
+				held.release();
+			}
+		} else {
+			const endpoint = Endpoint.instances.find((instance) => instance.options.card?.kind === "agent")!;
+			endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
+			const failed = await dispatch(f);
+			expect(failed).toMatchObject({ success: false, error: expect.stringContaining("recovery is pending") });
+		}
+		expect(fs.existsSync(f.paths.sourceFile)).toBe(!restart);
 		expect(fs.existsSync(f.paths.journalPath)).toBe(true);
 		expect(fs.existsSync(f.paths.targetFile)).toBe(false);
 		freeLeases(f.paths);
 		const later = await dispatch(f, { ...f.command, targetSessionDir: f.sourceDir });
 		expect(later).toMatchObject({ success: false, data: { recovered: [{ status: "rolled_back" }] } });
 		expect(fs.existsSync(f.paths.journalPath)).toBe(false);
-		const resumed = Endpoint.instances.filter((instance) => instance.options.card?.id === endpoint.options.card?.id);
-		expect(resumed).toHaveLength(2);
-		expect(resumed[1]!.start).toHaveBeenCalledOnce();
+		const resumed = Endpoint.instances.filter((instance) => instance.options.card?.kind === "agent");
+		expect(resumed).toHaveLength(restart ? 1 : 2);
+		expect(resumed.at(-1)!.start).toHaveBeenCalledOnce();
 	});
 	it.each(["enrollment", "directory", "journal"])(
 		"AC-17 %s failure after publication keeps committed journal and originals",
