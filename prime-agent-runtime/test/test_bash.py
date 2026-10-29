@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import resource
@@ -8,6 +9,7 @@ import secrets
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1184,15 +1186,68 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         finally:
             handle._job = None
 
-    def test_darwin_start_id_uses_absolute_ps(self):
-        completed = mock.Mock(stdout="Mon Jan  1 00:00:00 2026\n")
-        with mock.patch.object(bash_module.sys, "platform", "darwin"):
-            with mock.patch("builtins.open", side_effect=OSError):
-                with mock.patch.object(bash_module.subprocess, "run", return_value=completed) as run:
+    def test_process_start_id_matches_host_format(self):
+        single = "ps:Thu Jan  1 00:00:00 2026"
+        double = "ps:Mon Jan 12 00:00:00 2026"
+        self.addCleanup(time.tzset)
+        cases = [
+            ("darwin", 1767225600, 136, None, single),
+            ("darwin", 1768176000, 136, None, double),
+            ("darwin", 1767225600, 0, single[3:] + "\n", single),
+            ("darwin", 1767225600, 135, single[3:], single),
+            ("darwin", 1767225600, None, single[3:], single),
+            ("darwin", 1767225600, 0, None, None),
+            ("darwin", 0, 0, "", None),
+            ("linux", 0, 0, None, "proc:987"),
+        ]
+        for platform, seconds, copied, stdout, expected in cases:
+            with self.subTest(platform=platform, seconds=seconds,
+                              copied=copied, stdout=stdout):
+                def query(pid, flavor, arg, buffer, size):
+                    if copied is None:
+                        raise OSError("libproc unavailable")
+                    payload = struct.pack("=4I104xQ8x", 0, 0, 0, pid, seconds)
+                    ctypes.memmove(buffer, payload, len(payload))
+                    return copied
+
+                native = SimpleNamespace(
+                    proc_pidinfo=mock.Mock(side_effect=query)
+                )
+                proc_stat = mock.mock_open(
+                    read_data="1234 (name with ) parens) " + "0 " * 19 + "987"
+                )
+                if platform == "darwin":
+                    proc_stat.side_effect = FileNotFoundError
+                with (
+                    mock.patch.object(bash_module.sys, "platform", platform),
+                    mock.patch("ctypes.CDLL", return_value=native),
+                    mock.patch("builtins.open", proc_stat),
+                    mock.patch.dict(os.environ, {
+                        "TZ": "America/Los_Angeles", "LANG": "en_US.UTF-8",
+                        "LC_ALL": "en_US.UTF-8",
+                    }),
+                    mock.patch.object(
+                        bash_module.subprocess, "run",
+                        return_value=SimpleNamespace(stdout=stdout),
+                        side_effect=PermissionError if stdout is None
+                        else None,
+                    ) as run,
+                ):
+                    time.tzset()
+                    actual = bash_module._process_start_id(1234)
+                    self.assertEqual(actual, expected)
+                if copied == 136 or platform == "linux":
+                    run.assert_not_called()
+                else:
                     self.assertEqual(
-                        bash_module._process_start_id(1234), "ps:Mon Jan  1 00:00:00 2026"
+                        run.call_args.args[0],
+                        ["/bin/ps", "-p", "1234", "-o", "lstart="],
                     )
-        self.assertEqual(run.call_args.args[0][0], "/bin/ps")
+                    env = run.call_args.kwargs["env"]
+                    self.assertEqual(
+                        [env[k] for k in ("LC_ALL", "LANG", "TZ")],
+                        ["C", "C", "UTC"],
+                    )
 
     async def test_undelivered_kill_leaves_journal_record_active(self):
         if not bash_module._IS_POSIX:
