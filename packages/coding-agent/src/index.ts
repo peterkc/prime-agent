@@ -92,6 +92,7 @@ export type {
 	LoadExtensionsResult,
 	MessageRenderer,
 	MessageRenderOptions,
+	ModelChangeOptions,
 	ProviderConfig,
 	ProviderModelConfig,
 	RefineCompleteEvent,

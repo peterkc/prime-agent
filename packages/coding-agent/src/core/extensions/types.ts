@@ -765,6 +765,8 @@ export interface ModelSelectEvent {
 	model: Model<any>;
 	previousModel: Model<any> | undefined;
 	source: ModelSelectSource;
+	/** Whether this selection updates the global model defaults and recent models. */
+	persisted: boolean;
 }
 
 /** Fired when a new thinking level is selected */
@@ -1157,14 +1159,21 @@ export interface ExtensionAPI {
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
-	/** Set the current model. Returns false if no API key available. */
-	setModel(model: Model<any>): Promise<boolean>;
+	/**
+	 * Set the current model. Returns false if no API key is available.
+	 * Defaults to persisting global model defaults and recent models.
+	 * With persist: false, only session state and history change, including any thinking clamp.
+	 */
+	setModel(model: Model<any>, options?: ModelChangeOptions): Promise<boolean>;
 
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel;
 
-	/** Set thinking level (clamped to model capabilities). */
-	setThinkingLevel(level: ThinkingLevel): void;
+	/**
+	 * Set thinking level (clamped to model capabilities).
+	 * With persist: false, leave the global thinking default unchanged.
+	 */
+	setThinkingLevel(level: ThinkingLevel, options?: ModelChangeOptions): void;
 	/**
 	 * Register or override a model provider.
 	 *
@@ -1353,11 +1362,17 @@ export type SetActiveToolsHandler = (toolNames: string[]) => void;
 
 export type RefreshToolsHandler = () => void;
 
-export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
+/** Persistence policy for explicit model and thinking-level changes. */
+export interface ModelChangeOptions {
+	/** Update global defaults (and recent models for model changes). Defaults to true. */
+	readonly persist?: boolean;
+}
+
+export type SetModelHandler = (model: Model<any>, options?: ModelChangeOptions) => Promise<boolean>;
 
 export type GetThinkingLevelHandler = () => ThinkingLevel;
 
-export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
+export type SetThinkingLevelHandler = (level: ThinkingLevel, options?: ModelChangeOptions) => void;
 
 export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 

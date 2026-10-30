@@ -150,6 +150,7 @@ import {
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
+	type ModelChangeOptions,
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeRefineResult,
@@ -1556,6 +1557,8 @@ export class AgentSession {
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 	private _serviceTierPreference: ServiceTier;
+	/** Runtime-only override; resume restores the effective level recorded in history. */
+	private _thinkingLevelPreference?: ThinkingLevel;
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -8566,6 +8569,7 @@ export class AgentSession {
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
 		source: "set" | "cycle" | "restore",
+		persisted: boolean,
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
 		await this._extensionRunner.emit({
@@ -8573,6 +8577,7 @@ export class AgentSession {
 			model: nextModel,
 			previousModel,
 			source,
+			persisted,
 		});
 	}
 
@@ -8580,9 +8585,12 @@ export class AgentSession {
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
 		source: "set" | "cycle" | "restore",
+		persisted: boolean,
 	): Promise<void> {
 		const emit = () =>
-			this._modelSelectEmitContext.run(true, () => this._emitModelSelect(nextModel, previousModel, source));
+			this._modelSelectEmitContext.run(true, () =>
+				this._emitModelSelect(nextModel, previousModel, source, persisted),
+			);
 		this._modelSelectEmitQueueIdle = false;
 		const promise = this._modelSelectEmitQueue.then(emit, emit);
 		const queued = promise.catch(() => {});
@@ -8595,7 +8603,8 @@ export class AgentSession {
 		return promise;
 	}
 
-	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
+	/** Change the session model and history; persist global defaults unless explicitly disabled. */
+	async setModel(model: Model<any>, options: ModelSelectOptions & ModelChangeOptions = {}): Promise<void> {
 		// Explicit selection recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
 		const staleOnly =
@@ -8620,12 +8629,16 @@ export class AgentSession {
 		this.agent.state.model = model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (options.persist !== false) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, {
+			persist: options.persist !== false && this._thinkingLevelPreference === undefined,
+		});
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set");
+		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set", options.persist !== false);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8690,10 +8703,10 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle");
+		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", true);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8730,10 +8743,10 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle");
+		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", true);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8748,20 +8761,32 @@ export class AgentSession {
 		};
 	}
 
-	setThinkingLevel(level: ThinkingLevel): void {
+	/**
+	 * Change the clamped session level and history; persist the global default unless persist: false.
+	 * A later xai metadata refresh persists a capability clamp only when no session-only level is set.
+	 */
+	setThinkingLevel(level: ThinkingLevel, options: ModelChangeOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
+		const hadPreference = this._thinkingLevelPreference !== undefined;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
+		this._thinkingLevelPreference = options.persist === false ? level : undefined;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
+		}
+		if (
+			options.persist !== false &&
+			(isChanging || hadPreference) &&
+			(this.supportsThinking() || effectiveLevel !== "off")
+		) {
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+		}
+		if (isChanging) {
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",
@@ -8843,9 +8868,11 @@ export class AgentSession {
 			return explicitLevel;
 		}
 		if (!this.supportsThinking()) {
-			return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+			return (
+				this._thinkingLevelPreference ?? this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL
+			);
 		}
-		return this.thinkingLevel;
+		return this._thinkingLevelPreference ?? this.thinkingLevel;
 	}
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
@@ -10857,7 +10884,9 @@ export class AgentSession {
 	refreshModelMetadata(): void {
 		if (this.model?.provider === "xai") {
 			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
-			this.setThinkingLevel(this.thinkingLevel);
+			this.setThinkingLevel(this._thinkingLevelPreference ?? this.thinkingLevel, {
+				persist: this._thinkingLevelPreference === undefined,
+			});
 			this._clampServiceTierForModel();
 		}
 		this._scopedModels = this._scopedModels.map((scoped) =>
@@ -10948,13 +10977,13 @@ export class AgentSession {
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
-				setModel: async (model) => {
+				setModel: async (model, options) => {
 					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
-					await this.setModel(model);
+					await this.setModel(model, options);
 					return true;
 				},
 				getThinkingLevel: () => this.thinkingLevel,
-				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				setThinkingLevel: (level, options) => this.setThinkingLevel(level, options),
 			},
 			{
 				getModel: () => this.model,

@@ -101,6 +101,7 @@ export type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
+	ModelChangeOptions,
 	SlashCommandInfo,
 	SlashCommandSource,
 	ToolDefinition,

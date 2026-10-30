@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, getApiProvider, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -6,7 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
 import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.js";
-import { createAgentSession } from "../../src/core/sdk.js";
+import { type CreateAgentSessionOptions, createAgentSession } from "../../src/core/sdk.js";
+import { SessionManager } from "../../src/core/session-manager.js";
+import { SettingsManager } from "../../src/core/settings-manager.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { conversationMessages, createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
@@ -93,7 +96,7 @@ describe("AgentSession model and extension characterization", () => {
 		harnesses.push(h);
 		return h;
 	}
-	async function secretSdkSession(h: Harness) {
+	async function secretSdkSession(h: Harness, options: CreateAgentSessionOptions = {}) {
 		const { session } = await createAgentSession({
 			cwd: h.tempDir,
 			agentDir: h.tempDir,
@@ -105,6 +108,7 @@ describe("AgentSession model and extension characterization", () => {
 			resourceLoader: h.session.resourceLoader,
 			tools: ["echo"],
 			includeGoals: false,
+			...options,
 		});
 		return session;
 	}
@@ -520,6 +524,125 @@ describe("AgentSession model and extension characterization", () => {
 		return { harness, handlerStarted, finishHandler, handlerCompleted: () => completed };
 	}
 
+	it("session-only extension changes isolate defaults, reject atomically and survive resume", async () => {
+		let pi!: ExtensionAPI;
+		const events: unknown[] = [];
+		const h = await createHarness({
+			provider: "session-test",
+			models: MODELS,
+			extensionFactories: [
+				(api) => {
+					pi = api;
+					api.on("model_select", (event) => void events.push(event));
+				},
+			],
+		});
+		harnesses.push(h);
+		const path = join(h.tempDir, "settings.json");
+		const initial =
+			'{"defaultProvider":"session-test","defaultModel":"faux-1","defaultThinkingLevel":"high","recentModels":["original/model"]}';
+		writeFileSync(path, initial);
+		const settingsManager = SettingsManager.create(h.tempDir, h.tempDir);
+		async function open(sessionManager: SessionManager) {
+			const session = await secretSdkSession(h, { model: undefined, settingsManager, sessionManager });
+			h.session.registerDisposeCallback(() => session.dispose());
+			return session;
+		}
+		const first = await open(SessionManager.create(h.tempDir, join(h.tempDir, "sessions")));
+		first.sessionManager.appendMessage(fauxAssistantMessage("saved"));
+		const next = h.getModel("faux-2")!;
+		const runtime = first.resourceLoader.getExtensions().runtime;
+		const setModel = vi.spyOn(runtime, "setModel");
+		const setThinkingLevel = vi.spyOn(runtime, "setThinkingLevel");
+		const sessionOptions = { persist: false, waitForExtensions: false };
+		await expect(pi.setModel({ ...next, provider: "missing" }, { persist: false })).resolves.toBe(false);
+		vi.spyOn(first.modelRegistry, "canUseModel").mockResolvedValueOnce(false);
+		await expect(pi.setModel(next, { persist: false })).rejects.toThrow("not available");
+		expect(first.sessionManager.getEntries().filter((e) => e.type === "model_change")).toHaveLength(1);
+		expect(first.model?.id).toBe("faux-1");
+		pi.setThinkingLevel("low", sessionOptions);
+		expect(setThinkingLevel).toHaveBeenLastCalledWith("low", { persist: false });
+		await pi.setModel({ ...first.model!, reasoning: false }, { persist: false });
+		expect(first.thinkingLevel).toBe("off");
+		await pi.setModel(next, sessionOptions);
+		expect(setModel).toHaveBeenLastCalledWith(next, { persist: false });
+		expect(sessionOptions).toEqual({ persist: false, waitForExtensions: false });
+		setThinkingLevel.mockRestore();
+		setModel.mockRestore();
+		expect(first.thinkingLevel).toBe("low");
+		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
+		expect(first.thinkingLevel).toBe("medium");
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await pi.setModel(next, { persist: false });
+		expect(first.thinkingLevel).toBe("low");
+		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
+		const second = await open(SessionManager.inMemory());
+		await pi.setModel(h.getModel("faux-3")!, { persist: false });
+		expect([first.model?.id, second.model?.id]).toEqual(["faux-2", "faux-3"]);
+		const resumed = await open(SessionManager.open(first.sessionFile!));
+		expect([resumed.model?.id, resumed.thinkingLevel]).toEqual(["faux-2", "medium"]);
+		const fresh = await open(SessionManager.inMemory());
+		expect([fresh.model?.id, fresh.thinkingLevel]).toEqual(["faux-1", "high"]);
+		await settingsManager.flush();
+		expect(readFileSync(path, "utf8")).toBe(initial);
+		expect(events).toMatchObject([
+			{ model: { id: "faux-2" }, persisted: false },
+			{ model: { id: "faux-3" }, persisted: false },
+		]);
+		await pi.setModel(next);
+		expect(settingsManager.getDefaultModel()).toBe("faux-2");
+		pi.setThinkingLevel("low", { persist: false });
+		const entries = fresh.sessionManager.getEntries();
+		const changes: unknown[] = [];
+		const unsubscribe = fresh.subscribe((event) => changes.push(event));
+		pi.on("thinking_level_select", (event) => void changes.push(event));
+		pi.setThinkingLevel("low");
+		unsubscribe();
+		expect(changes).toEqual([]);
+		expect(fresh.sessionManager.getEntries()).toEqual(entries);
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("low");
+		pi.setThinkingLevel("low", { persist: false });
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		pi.setThinkingLevel("off");
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("low");
+		settingsManager.setDefaultThinkingLevel("medium");
+		await pi.setModel(next, { persist: false });
+		expect(fresh.thinkingLevel).toBe("medium");
+		pi.setThinkingLevel("low", { persist: false });
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await fresh.cycleModel();
+		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await pi.setModel(next);
+		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
+	});
+	it.each([
+		[false, "low", "high"],
+		[true, "medium", "medium"],
+	] as const)(
+		"PR #57 refreshModelMetadata preserves thinking persistence=%s",
+		async (persist, expectedDefault, restored) => {
+			const h = await createHarness({
+				provider: "xai",
+				models: MODELS.slice(0, 2),
+				settings: { defaultThinkingLevel: "low" },
+			});
+			harnesses.push(h);
+			h.session.setThinkingLevel("high", { persist });
+			const clamped = { ...h.getModel(), thinkingLevelMap: { high: null } };
+			vi.spyOn(h.session.modelRegistry, "getModelForCurrentAuth")
+				.mockReturnValueOnce(clamped)
+				.mockReturnValueOnce(h.getModel());
+			h.session.refreshModelMetadata();
+			expect(h.session.thinkingLevel).toBe("medium");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
+			h.session.refreshModelMetadata();
+			expect(h.session.thinkingLevel).toBe(restored);
+			await h.session.setModel({ ...h.getModel("faux-2")!, thinkingLevelMap: { high: null } });
+			expect(h.session.thinkingLevel).toBe("medium");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
+		},
+	);
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
 		const harness = await createHarness({
@@ -527,24 +650,32 @@ describe("AgentSession model and extension characterization", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("model_select", async (event) => {
-						modelEvents.push(`${event.previousModel?.id ?? "none"}->${event.model.id}:${event.source}`);
+						modelEvents.push(
+							`${event.previousModel?.id ?? "none"}->${event.model.id}:${event.source}:${event.persisted}`,
+						);
 					});
 				},
 			],
 		});
 		harnesses.push(harness);
-		const nextModel = harness.getModel("faux-2")!;
+		const nextModel = { ...harness.getModel("faux-2")!, thinkingLevelMap: { high: null } };
 
+		harness.session.setThinkingLevel("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("high");
 		await harness.session.setModel(nextModel);
 
 		expect(harness.session.model?.id).toBe("faux-2");
-		expect(modelEvents).toEqual(["faux-1->faux-2:set"]);
+		expect(modelEvents).toEqual(["faux-1->faux-2:set:true"]);
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
+		expect(harness.settingsManager.getDefaultModel()).toBe("faux-2");
 		expect(
 			harness.sessionManager
 				.getEntries()
 				.filter((entry) => entry.type === "model_change")
 				.map((entry) => `${entry.provider}/${entry.modelId}`),
 		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
+		await harness.session.cycleModel();
+		expect(modelEvents).toEqual(["faux-1->faux-2:set:true", "faux-2->faux-1:cycle:true"]);
 	});
 
 	it.each(["set", "cycle"] as const)(
@@ -811,12 +942,19 @@ describe("AgentSession model and extension characterization", () => {
 
 		await harness.session.cycleModel();
 		expect(harness.session.model?.id).toBe("faux-2");
+		expect(harness.settingsManager.getDefaultModel()).toBe("faux-2");
 		expect(harness.session.thinkingLevel).toBe("off");
 		expect(harness.session.cycleThinkingLevel()).toBeUndefined();
 
 		await harness.session.cycleModel();
 		expect(harness.session.model?.id).toBe("faux-1");
 		expect(harness.session.thinkingLevel).toBe("high");
+		harness.session.setThinkingLevel("medium");
+		harness.session.setThinkingLevel("low", { persist: false });
+		await harness.session.cycleModel();
+		await harness.session.cycleModel();
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 	});
 
 	it("throws when setModel is called without configured auth", async () => {
