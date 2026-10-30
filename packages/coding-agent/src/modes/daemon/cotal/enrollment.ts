@@ -21,6 +21,7 @@ import {
 	canonicalSessionPath,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
 	type SessionLease,
 } from "../../../core/session-lease.js";
 import { readSessionInfo } from "../../../core/session-manager.js";
@@ -170,12 +171,18 @@ export function gateWatcherPath(meshRoot: string): string {
 
 export function claimGateWatcher(meshRoot: string): SessionLease {
 	mkSecretDir(join(meshRoot, "senders"));
-	const claim = acquireSessionLease(gateWatcherPath(meshRoot), meshRoot, {
-		[SESSION_LEASES_ENABLED_ENV]: "1",
-		[SESSION_LEASE_OWNER_ID_ENV]: "gate-watcher",
-	});
-	if (!claim) throw new Error("Mesh sender gate-watcher: claim was not acquired");
-	return claim;
+	try {
+		const claim = acquireSessionLease(gateWatcherPath(meshRoot), meshRoot, {
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+			[SESSION_LEASE_OWNER_ID_ENV]: "gate-watcher",
+		});
+		if (!claim) throw new Error("Mesh sender gate-watcher: claim was not acquired");
+		return claim;
+	} catch (error) {
+		if (error instanceof SessionAlreadyActiveError)
+			throw new Error("Mesh sender gate-watcher: claim is already held", { cause: error });
+		throw error;
+	}
 }
 
 export function readGateWatcherRecord(meshRoot: string): GateWatcherRecord {

@@ -175,11 +175,17 @@ function parseNotifyResult(value: unknown): MeshNotifyResult {
 async function runNotify(args: string[]): Promise<void> {
 	const separator = args.indexOf("--");
 	const json = args.slice(0, separator === -1 ? args.length : separator).includes("--json");
+	let parsed: NotifyArgs;
+	try {
+		parsed = parseNotifyArgs(args);
+	} catch (error) {
+		printNotifyResult({ outcome: "failed", error: redactMeshError(error) }, json);
+		return;
+	}
 	let client: DaemonClient | undefined;
 	let requested = false;
 	let result: MeshNotifyResult;
 	try {
-		const parsed = parseNotifyArgs(args);
 		const socketPath = parsed.socketPath ?? repositoryDaemon(process.cwd())?.socketPath ?? defaultDaemonSocketPath();
 		client = new DaemonClient(socketPath);
 		await client.connect();
@@ -217,6 +223,10 @@ async function runNotify(args: string[]): Promise<void> {
 	} finally {
 		client?.close();
 	}
+	printNotifyResult(result, json);
+}
+
+function printNotifyResult(result: MeshNotifyResult, json: boolean): void {
 	switch (result.outcome) {
 		case "stored":
 			process.exitCode = 0;
@@ -237,7 +247,7 @@ async function runNotify(args: string[]): Promise<void> {
 			return;
 		default: {
 			const unhandled: never = result;
-			return unhandled;
+			throw new Error(`Unexpected notify outcome: ${unhandled}`);
 		}
 	}
 }

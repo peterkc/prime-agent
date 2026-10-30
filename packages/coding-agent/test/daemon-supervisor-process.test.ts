@@ -2206,6 +2206,7 @@ describe("mesh supervisor compatibility", () => {
 		try {
 			const target = await f.create(receiver, "reviewer");
 			expect(sender.client.supportsServerCapability("mesh_notify")).toBe(true);
+			writeFileSync(join(f.agentDir, "wake-esrch"), "");
 			const result = (await f.request(sender.client, {
 				type: "mesh_notify",
 				target: "ReViEwEr",
@@ -2235,7 +2236,7 @@ describe("mesh supervisor compatibility", () => {
 			).toHaveLength(1);
 			expect(
 				await f.request(receiver.client, { type: "mesh_notify", target: target.sessionId, message: "blocked" }),
-			).toMatchObject({ outcome: "failed", error: expect.stringContaining("already active") });
+			).toMatchObject({ outcome: "failed", error: expect.stringContaining("claim is already held") });
 			expect(childDiagnostics.get(receiver.child)?.stdout).not.toContain('"type":"notification-published"');
 		} finally {
 			sender.client.close();

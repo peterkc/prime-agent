@@ -920,7 +920,8 @@ export class MeshEndpoints {
 			return hosted;
 		} catch (error) {
 			if (source) {
-				await this.closeGateWatcher(source);
+				// Close logs stop failures and retains the claim; preserve the startup error.
+				await this.closeGateWatcher(source).catch(() => undefined);
 				this.gateWatcher = undefined;
 			} else claim.release();
 			throw error;

@@ -251,6 +251,7 @@ describe("daemon command", () => {
 		expect(daemonClientMock.instances).toHaveLength(0);
 		expect(console.log).toHaveBeenCalledTimes(1);
 		expect(JSON.parse(String(vi.mocked(console.log).mock.calls[0]![0])).outcome).toBe("failed");
+		expect(String(vi.mocked(console.log).mock.calls[0]![0])).not.toContain("Message was not stored:");
 	});
 
 	it.each(["stored", "failed", "unknown"])(
