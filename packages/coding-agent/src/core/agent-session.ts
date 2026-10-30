@@ -8633,7 +8633,9 @@ export class AgentSession {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 		}
 
-		this.setThinkingLevel(thinkingLevel, options);
+		this.setThinkingLevel(thinkingLevel, {
+			persist: options.persist !== false && this._thinkingLevelPreference === undefined,
+		});
 		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set", options.persist !== false);
@@ -8701,7 +8703,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", true);
@@ -8741,7 +8743,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", true);

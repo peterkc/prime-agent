@@ -590,6 +590,13 @@ describe("AgentSession model and extension characterization", () => {
 		settingsManager.setDefaultThinkingLevel("medium");
 		await pi.setModel(next, { persist: false });
 		expect(fresh.thinkingLevel).toBe("medium");
+		pi.setThinkingLevel("low", { persist: false });
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await fresh.cycleModel();
+		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await pi.setModel(next);
+		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
 	});
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
@@ -897,6 +904,11 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.cycleModel();
 		expect(harness.session.model?.id).toBe("faux-1");
 		expect(harness.session.thinkingLevel).toBe("high");
+		harness.session.setThinkingLevel("medium");
+		harness.session.setThinkingLevel("low", { persist: false });
+		await harness.session.cycleModel();
+		await harness.session.cycleModel();
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 	});
 
 	it("throws when setModel is called without configured auth", async () => {
