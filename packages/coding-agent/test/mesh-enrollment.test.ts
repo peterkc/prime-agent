@@ -136,10 +136,8 @@ describe("mesh enrollment", () => {
 		const handle = Object.assign(Object.create(DaemonSupervisor.prototype), { mesh }) as {
 			handleCommand(client: object, command: DaemonCommand): Promise<unknown>;
 		};
-		expect(await handle.handleCommand({}, { type: "mesh_notify", target: "b", message: "hello" })).toMatchObject({
-			success: true,
-			data: { outcome, error: text },
-		});
+		const response = await handle.handleCommand({}, { type: "mesh_notify", target: "b", message: "hello" });
+		expect(response).toMatchObject({ success: true, data: { outcome, error: text } });
 	});
 
 	async function notificationFixture() {

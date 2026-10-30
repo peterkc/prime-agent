@@ -3215,7 +3215,7 @@ describe("mesh supervisor compatibility", () => {
 			try {
 				const target = await f.create(holder, "old-name");
 				const sender = await f.create(other, "sender");
-				if (path === "saved")
+				if (path === "saved" || path === "other" || path === "directory-error")
 					await f.request(holder.client, { type: "kill", activeSessionId: target.activeSessionId! });
 				const before = JSON.parse(
 					readFileSync(join(f.agentDir, "mesh", "directory", `${target.sessionId}.json`), "utf8"),
@@ -3467,13 +3467,14 @@ describe("mesh supervisor compatibility", () => {
 			}
 			expect(requestWorker).toHaveBeenCalledTimes(4);
 			resolver.mockReturnValue(undefined);
+			const isOpen = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
 			await expect(
 				internals.handoffMeshMessage(
 					{ sessionFile: targetFile, sessionId: "child" },
 					message,
 					2,
 					bind,
-					() => false,
+					isOpen,
 					"attempt",
 				),
 			).rejects.toThrow("closed before handoff");

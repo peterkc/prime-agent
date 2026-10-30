@@ -222,7 +222,9 @@ describe("daemon command", () => {
 		expect(printed.outcome).toBe(expected);
 		if (expected === "stored") expect(printed).toEqual({ outcome: "stored", receipt });
 		else if (outcome === "old-daemon")
-			expect(printed.error).toContain("The running Prime Agent daemon does not support mesh_notify; restart the daemon");
+			expect(printed.error).toContain(
+				"The running Prime Agent daemon does not support mesh_notify; restart the daemon",
+			);
 		else expect(printed.error).toEqual(expect.any(String));
 		expect(process.exitCode).toBe(expected === "stored" ? 0 : expected === "failed" ? 1 : 2);
 		const client = daemonClientMock.instances[0]!;
@@ -232,20 +234,18 @@ describe("daemon command", () => {
 		expect(spawnMock.calls).toHaveLength(spawns);
 	});
 
-	it.each(
-		[
-			["--json", "--json", "b", "--", "hello"],
-			["--daemon-socket", "a", "--daemon-socket", "b", "--json", "b", "--", "hello"],
-			["--json", "b", "--from", "a", "--", "hello"],
-			["--json", "--bogus", "b", "--", "hello"],
-			["--json", "b", "extra", "--", "hello"],
-			["--json", "--", "hello"],
-			["--json", "b", "hello"],
-			["--json", "b", "--", " "],
-			["--json", "*", "--", "hello"],
-			["--json", "b", "--", "x".repeat(16385)],
-		].map((args) => [args]),
-	)("mesh-notify rejects usage before connecting %#", async (args) => {
+	it.each([
+		["--json", "--json", "b", "--", "hello"],
+		["--daemon-socket", "a", "--daemon-socket", "b", "--json", "b", "--", "hello"],
+		["--json", "b", "--from", "a", "--", "hello"],
+		["--json", "--bogus", "b", "--", "hello"],
+		["--json", "b", "extra", "--", "hello"],
+		["--json", "--", "hello"],
+		["--json", "b", "hello"],
+		["--json", "b", "--", " "],
+		["--json", "*", "--", "hello"],
+		["--json", "b", "--", "x".repeat(16385)],
+	])("mesh-notify rejects usage before connecting %#", async (...args) => {
 		await handleDaemonCommand(["daemon", "notify", ...args]);
 		expect(process.exitCode).toBe(1);
 		expect(daemonClientMock.instances).toHaveLength(0);
@@ -260,9 +260,8 @@ describe("daemon command", () => {
 			daemonClientMock.behavior.notifyData =
 				outcome === "stored" ? { outcome, receipt } : { outcome, error: "visible reason" };
 			await handleDaemonCommand([...notifyArgs, "b", "--", "--json", "literal"]);
-			expect(daemonClientMock.instances[0]!.requests).toEqual([
-				{ type: "mesh_notify", target: "b", message: "--json literal" },
-			]);
+			const client = daemonClientMock.instances[0]!;
+			expect(client.requests).toEqual([{ type: "mesh_notify", target: "b", message: "--json literal" }]);
 			expect(console[outcome === "stored" ? "log" : "error"]).toHaveBeenCalledExactlyOnceWith(
 				outcome === "stored" ? "Stored for b" : "visible reason",
 			);

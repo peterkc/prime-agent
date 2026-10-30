@@ -45,7 +45,7 @@ import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-co
 import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
-	it("accepts schema-33/35 client list envelopes on the schema-36 supervisor", async () => {
+	it("accepts schema-33/35 client list envelopes on the schema-37 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
 		vi.stubEnv("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR", join(root, "owners"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
@@ -92,11 +92,8 @@ describe("daemon protocol helpers", () => {
 	);
 
 	async function checkMeshCapability(type: "mesh_send" | "mesh_replace" | "mesh_notify") {
-		if (type === "mesh_notify") {
-			expect(WORKER_DAEMON_COMMAND_TYPES.has(type)).toBe(false);
-			expect(DAEMON_COMMAND_PLANE[type]).toBe("control");
-			expect(isDaemonMutatingCommand({ type })).toBe(true);
-		}
+		expect(DAEMON_COMMAND_PLANE[type]).toBe("control");
+		expect(isDaemonMutatingCommand({ type })).toBe(true);
 		const client = new DaemonClient("unused");
 		const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
 		const state = client as unknown as {
