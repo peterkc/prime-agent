@@ -26,9 +26,9 @@ import {
 import { readSessionInfo } from "../../../core/session-manager.js";
 import { writeFileAtomicSync } from "../../../utils/atomic-file.js";
 import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
-import { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
+import { directoryPath, type EnrollmentRecord, enrollmentPath, redactMeshError } from "./mesh-shared.js";
 
-export { type EnrollmentRecord, redactMeshError } from "./mesh-shared.js";
+export { directoryPath, type EnrollmentRecord, enrollmentPath, redactMeshError } from "./mesh-shared.js";
 
 export interface MeshConfiguration {
 	readonly space: string;
@@ -94,19 +94,6 @@ export function readSigner(meshRoot: string, space: string): SpaceAuth {
 		account: { pub: account.pub, signingSeed: account.signingSeed, seed: "", jwt: "", signingPub: "" },
 		sys: { pub: "", jwt: "" },
 	};
-}
-
-function sessionKey(sessionId: string): string {
-	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
-	return sessionId;
-}
-
-export function enrollmentPath(meshRoot: string, sessionId: string): string {
-	return join(meshRoot, "enrollments", `${sessionKey(sessionId)}.json`);
-}
-
-export function directoryPath(meshRoot: string, sessionId: string): string {
-	return join(meshRoot, "directory", `${sessionKey(sessionId)}.json`);
 }
 
 export function claimEnrollment(meshRoot: string, sessionId: string, sessionFile?: string): SessionLease {

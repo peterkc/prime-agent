@@ -59,6 +59,14 @@ import {
 	SessionAlreadyActiveError,
 } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
+import {
+	acquireSessionMoveLeases,
+	preflightSessionMove,
+	recoverSessionMove,
+	relocateSession,
+	type SessionMovePaths,
+	type SessionMoveReport,
+} from "../../core/session-move.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { writeFileAtomicSync } from "../../utils/atomic-file.js";
@@ -85,7 +93,12 @@ import {
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import type { MeshEndpoints } from "./cotal/mesh-endpoints.js";
-import { type EnrollmentRecord, meshMessageText, redactMeshError } from "./cotal/mesh-shared.js";
+import {
+	type EnrollmentRecord,
+	MeshTransferRecordError,
+	meshMessageText,
+	redactMeshError,
+} from "./cotal/mesh-shared.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import {
 	DaemonSessionRecoveringError,
@@ -214,6 +227,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	"direct_peer_transport",
 	"mesh_send",
 	"mesh_replacement",
+	"session_move",
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -762,6 +776,7 @@ export class DaemonSupervisor {
 	private readonly agentMessageTransport: "native" | "cotal";
 	private readonly meshCredentialLifetimeSeconds?: number;
 	private mesh?: MeshEndpoints;
+	private readonly activeSessionMoves = new Set<string>();
 	private rosterStore?: AgentRoster;
 	private readonly pendingRosterChanged = new Set<string>();
 	private readonly pendingRosterRemoved = new Set<string>();
@@ -887,11 +902,25 @@ export class DaemonSupervisor {
 						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
 				});
 			}
+			const recoveredMoves = await this.recoverSessionMoves();
+			const movedSources = new Set(
+				recoveredMoves
+					.filter((report) => report.status === "moved" || report.status === "rolled_back")
+					.map((report) => canonicalSessionPath(report.sourceFile)),
+			);
+			for (const worker of workersToAdopt) {
+				const files = [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath];
+				if (!files.some((file) => file !== undefined && movedSources.has(canonicalSessionPath(file)))) continue;
+				this.workers.delete(worker.descriptor.workerId);
+				this.deleteWorkerDescriptor(worker);
+				this.log(`Skipped worker ${worker.descriptor.workerId}: its source session has a handled move journal`);
+			}
 			await this.seedRosterLedger();
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
 			await Promise.all(
 				workersToAdopt.map(async (worker) => {
+					if (!this.workers.has(worker.descriptor.workerId)) return;
 					try {
 						await this.adoptOrRecoverWorker(worker);
 					} catch (error) {
@@ -2858,6 +2887,8 @@ export class DaemonSupervisor {
 					return response;
 				});
 			}
+			case "move_saved_session":
+				return this.moveSavedSession(command);
 			case "delete_saved_session": {
 				if (!command.activeSessionId) {
 					const deletedSession = this.mesh ? await readSessionInfo(command.sessionPath) : undefined;
@@ -3181,6 +3212,214 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private assertSessionMoveClosed(sessionFile: string): void {
+		const path = canonicalSessionPath(sessionFile);
+		if (this.roster().bySessionFile(path)?.summary.activeSessionId !== undefined)
+			throw new Error("Cannot move the currently active session");
+		const owner = this.findWorkerBySessionFile(path);
+		if (owner) throw new Error(`Cannot move session: its worker is ${this.effectiveWorkerState(owner)}`);
+	}
+
+	private async checkSessionMove(
+		command: Extract<DaemonCommand, { type: "move_saved_session" }>,
+	): Promise<{ paths: SessionMovePaths; info: SessionInfo }> {
+		const agentDir = this.defaultSessionConfig.agentDir!;
+		this.assertSessionMoveClosed(command.sessionPath);
+		const { paths, info } = await preflightSessionMove({
+			agentDir,
+			sourceFile: command.sessionPath,
+			sourceSessionDir: this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir),
+			targetSessionDir: command.targetSessionDir,
+		});
+		if (!statSync(command.targetCwd).isDirectory() || !statSync(paths.targetSessionDir).isDirectory())
+			throw new Error("Target repository and session folder must be directories");
+		this.assertSessionMoveClosed(paths.sourceFile);
+		return { paths, info };
+	}
+
+	private async moveSavedSession(
+		command: Extract<DaemonCommand, { type: "move_saved_session" }>,
+	): Promise<DaemonResponse> {
+		let recovered: SessionMoveReport[] = [];
+		try {
+			for (const value of [command.sessionPath, command.targetSessionDir, command.targetCwd, command.targetSocket])
+				if (typeof value !== "string" || !value)
+					throw new Error("Move requires non-empty source, target folders and socket");
+			recovered = await this.recoverSessionMoves();
+			const { paths } = await this.checkSessionMove(command);
+			if (this.activeSessionMoves.has(paths.sourceFile)) throw new Error("Session move is already in progress");
+			this.activeSessionMoves.add(paths.sourceFile);
+			let leases: ReturnType<typeof acquireSessionMoveLeases> | undefined;
+			try {
+				try {
+					leases = acquireSessionMoveLeases(paths, paths.agentDir);
+				} catch (error) {
+					if (error instanceof SessionAlreadyActiveError)
+						throw new Error(`Cannot move session ${error.sessionPath}: it is open or being written elsewhere`, {
+							cause: error,
+						});
+					throw error;
+				}
+				const { info } = await this.checkSessionMove(command);
+				let enrolled = false;
+				let meshFailure: { step: "enrollment" | "directory"; reason: string } | undefined;
+				const report = await relocateSession({
+					paths,
+					targetCwd: command.targetCwd,
+					targetSocket: command.targetSocket,
+					callbacks: {
+						suspend: async () => {
+							enrolled = (await this.mesh?.suspendSession(info.id)) ?? false;
+							return enrolled;
+						},
+						resume: async () => {
+							await this.mesh?.resumeSession(info.id);
+						},
+						writeMeshRecords: async (journal, writes) => {
+							if (!enrolled) return;
+							try {
+								await this.mesh!.writeTransferRecords(
+									info.id,
+									journal.targetFile,
+									journal.targetSocket,
+									writes,
+								);
+							} catch (error) {
+								if (error instanceof MeshTransferRecordError)
+									meshFailure = { step: error.step, reason: error.message };
+								throw error;
+							}
+						},
+						releaseClaim: () => this.mesh?.releaseClaim(info.id),
+						releaseLeases: () => {
+							leases?.release();
+							leases = undefined;
+						},
+					},
+				});
+				const moved = report.status === "moved" || report.committed === true;
+				if (!moved)
+					return {
+						...failure(command.id, command.type, report.messages.join("; ")),
+						data: { moved: false, recovery: report, recovered },
+					};
+				const entry = this.roster().bySessionFile(paths.sourceFile);
+				if (entry) this.roster().delete(entry.agentId);
+				this.invalidatePassiveScheduledJobs();
+				return success(command.id, command.type, {
+					sessionId: info.id,
+					name: info.name,
+					targetFile: paths.targetFile,
+					moved,
+					original: {
+						method: report.originalMethod,
+						deleted: !existsSync(paths.sourceBackup) && !existsSync(paths.sourceArtifacts),
+						backups: report.backups,
+					},
+					mesh:
+						enrolled && !report.meshRecordsWritten
+							? {
+									status: "failed",
+									step: meshFailure?.step ?? "enrollment",
+									reason:
+										meshFailure?.reason ?? `Mesh records were not written: ${report.messages.join("; ")}`,
+								}
+							: { status: enrolled ? "updated" : "not_enrolled" },
+					recoveryPending: report.status === "pending",
+					messages: report.messages,
+					recovered,
+				});
+			} finally {
+				leases?.release();
+				this.activeSessionMoves.delete(paths.sourceFile);
+			}
+		} catch (error) {
+			return {
+				...failure(command.id, command.type, error, serializeDaemonError(error)),
+				data: { moved: false, recovered },
+			};
+		}
+	}
+
+	private async recoverSessionMoves(): Promise<SessionMoveReport[]> {
+		const agentDir = this.defaultSessionConfig.agentDir!;
+		const sourceSessionDir = canonicalSessionPath(this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir));
+		const folder = join(agentDir, "session-moves");
+		if (!existsSync(folder)) return [];
+		const reports: SessionMoveReport[] = [];
+		const meshRoot = join(agentDir, "mesh");
+		for (const name of readdirSync(folder).sort()) {
+			if (!name.endsWith(".json")) continue;
+			const journalPath = join(folder, name);
+			let sourceFile: string;
+			try {
+				const raw: unknown = JSON.parse(readFileSync(journalPath, "utf8"));
+				if (!raw || typeof raw !== "object" || !("sourceFile" in raw) || typeof raw.sourceFile !== "string")
+					throw new Error("Move journal has no source file");
+				sourceFile = canonicalSessionPath(raw.sourceFile);
+				if (dirname(sourceFile) !== sourceSessionDir) continue;
+			} catch (error) {
+				const messages = [`Move journal kept: ${String(error)}`];
+				reports.push({ status: "pending", sourceFile: "", journalPath, messages, backups: [] });
+				this.log(`Move journal ${journalPath}: ${messages[0]}`);
+				continue;
+			}
+			if (this.activeSessionMoves.has(sourceFile)) continue;
+			// Keep Cotal off native-daemon startup, as with the MeshEndpoints import.
+			const { enrollmentPath, readDirectory, readEnrollment } = await import("./cotal/enrollment.js");
+			const enrolled = (id: string) => existsSync(enrollmentPath(meshRoot, id));
+			let claimedId: string | undefined;
+			const report = await recoverSessionMove({
+				journalPath,
+				agentDir,
+				sourceSessionDir,
+				callbacks: {
+					acquireLeases: (journal) => acquireSessionMoveLeases(journal, agentDir),
+					readEnrollmentPath: (journal) =>
+						enrolled(journal.sessionId)
+							? readEnrollment(meshRoot, journal.sessionId).sessionFile
+							: journal.targetFile,
+					readDirectorySocket: (journal) =>
+						enrolled(journal.sessionId)
+							? readDirectory(meshRoot, journal.sessionId)?.homeSocket
+							: journal.targetSocket,
+					acquireClaim: async (journal) => {
+						if (!this.mesh) throw new Error("Mesh is not enabled; enrolled move recovery is pending");
+						try {
+							const claimed = await this.mesh.suspendSession(journal.sessionId);
+							if (claimed) claimedId = journal.sessionId;
+							return claimed;
+						} catch (error) {
+							if (error instanceof Error && error.cause instanceof SessionAlreadyActiveError) return false;
+							throw error;
+						}
+					},
+					writeMeshRecords: async (journal, writes) => {
+						await this.mesh!.writeTransferRecords(
+							journal.sessionId,
+							journal.targetFile,
+							journal.targetSocket,
+							writes,
+						);
+					},
+					releaseClaim: () => {
+						if (claimedId) this.mesh?.releaseClaim(claimedId);
+					},
+					...(this.startupComplete
+						? {
+								resume: async (journal: { sessionId: string }) => {
+									await this.mesh?.resumeSession(journal.sessionId);
+								},
+							}
+						: {}),
+				},
+			});
+			reports.push(report);
+			this.log(`Move journal ${journalPath}: ${report.status}; ${report.messages.join("; ")}`);
+		}
+		return reports;
+	}
+
 	private async handleList(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
@@ -3369,6 +3608,8 @@ export class DaemonSupervisor {
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		if (command.sessionPath && this.activeSessionMoves.has(canonicalSessionPath(command.sessionPath)))
+			throw new Error("Cannot open session while it is being moved");
 		let createCommand = command;
 		if (command.name !== undefined) {
 			const normalizedName = command.name.trim();
@@ -3665,6 +3906,8 @@ export class DaemonSupervisor {
 		});
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
+		if (createCommand.sessionPath && this.activeSessionMoves.has(canonicalSessionPath(createCommand.sessionPath)))
+			throw new Error("Cannot open session while it is being moved");
 		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
@@ -3790,6 +4033,8 @@ export class DaemonSupervisor {
 				child.unref();
 			}
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
+			if (createCommand.sessionPath && this.activeSessionMoves.has(canonicalSessionPath(createCommand.sessionPath)))
+				throw new Error("Cannot open session while it is being moved");
 			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
@@ -3959,6 +4204,7 @@ export class DaemonSupervisor {
 		const text = meshMessageText(message);
 		if (!existsSync(record.sessionFile))
 			throw new Error(`Mesh session ${record.sessionId}: session file is missing: ${record.sessionFile}`);
+		if (!isOpen()) throw new Error("Mesh endpoint closed before worker wake");
 		const worker = await this.createOrReuseWorker("mesh", {
 			type: "create",
 			sessionPath: record.sessionFile,

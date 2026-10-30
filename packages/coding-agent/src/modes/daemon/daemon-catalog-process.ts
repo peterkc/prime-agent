@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import { getPackageDir, isBunBinary } from "../../config.js";
+import { getAgentDir, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import {
@@ -201,7 +201,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
 			case "rename":
-				appendSessionInfoToExistingFile(request.sessionPath, request.name.trim());
+				appendSessionInfoToExistingFile(request.sessionPath, request.name.trim(), getAgentDir());
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
 			case "delete":
@@ -224,7 +224,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					return;
 				}
 				if (session.state?.status !== "archived") {
-					appendSessionStateToExistingFile(request.sessionPath, { status: "archived" });
+					appendSessionStateToExistingFile(request.sessionPath, { status: "archived" }, getAgentDir());
 				}
 				sendCatalogMessage({
 					type: "response",
@@ -244,6 +244,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 						activeSessionId: request.activeSessionId,
 						operations: request.operations,
 					},
+					getAgentDir(),
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;

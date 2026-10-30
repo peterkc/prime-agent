@@ -28,6 +28,7 @@ import {
 	runIncident,
 } from "./incident.js";
 import { runMeshCommand } from "./mesh-command.js";
+import { runSessionMove } from "./session-move-command.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -116,6 +117,9 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "rename":
 			if (!requireOperandCount(args.slice(1), 2, undefined, "rename")) return HANDLED;
 			return runInternalAgentCommand("rename", args.slice(1));
+		case "move":
+			await runSessionMove(args.slice(1));
+			return HANDLED;
 		case "send":
 			return runInternalAgentCommand("send", args.slice(1));
 		case "schedule":

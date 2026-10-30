@@ -73,8 +73,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 33 adds capability-gated native questionnaire forms.
 // Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
 // Revision 35 adds capability-gated mesh replacement barriers with worker-created nonces and handoff attempt tokens.
-export const DAEMON_SCHEMA_REVISION = 35;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-35-mesh-replacement";
+// Revision 36 adds capability-gated relocation of closed saved sessions.
+export const DAEMON_SCHEMA_REVISION = 36;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-36-session-move";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -124,6 +125,7 @@ export type DaemonServerCapability =
 	| "direct_peer_transport"
 	| "mesh_send"
 	| "mesh_replacement"
+	| "session_move"
 	| "abort_and_send_queued"
 	| "render_mode";
 
@@ -691,6 +693,14 @@ export type DaemonCommand =
 	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
 	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
+	| {
+			id?: string;
+			type: "move_saved_session";
+			sessionPath: string;
+			targetSessionDir: string;
+			targetCwd: string;
+			targetSocket: string;
+	  }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
 	| { id?: string; type: "get_session_tree"; activeSessionId: string }
 	| { id?: string; type: "get_user_messages_for_forking"; activeSessionId: string }
@@ -800,6 +810,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	send_message: LEGACY_DAEMON_COMMAND,
 	mesh_send: { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" },
 	mesh_replace: { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" },
+	move_saved_session: { minProtocol: 7, minSchemaRevision: 36, capability: "session_move" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
@@ -894,6 +905,7 @@ const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
 	"list_agent_peers",
 	"mesh_send",
 	"mesh_replace",
+	"move_saved_session",
 	"promote_owned_session",
 	"reattach",
 	"roster_subscribe",
@@ -942,6 +954,7 @@ export const DAEMON_COMMAND_PLANE = {
 	send_message: "control",
 	mesh_send: "control",
 	mesh_replace: "control",
+	move_saved_session: "control",
 	agent_messages_status: "control",
 	agent_messages_pause: "control",
 	agent_messages_resume: "control",
@@ -1080,6 +1093,7 @@ export type DaemonResponse =
 			type: "response";
 			command: string;
 			success: false;
+			data?: unknown;
 			error: string;
 			errorInfo?: DaemonErrorInfo;
 	  };

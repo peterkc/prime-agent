@@ -696,9 +696,12 @@ function nextDefaultSessionName(sessions: SessionSummary[]): string {
 	return fallback;
 }
 
-async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
+export async function runStart(
+	parsed: ParsedDaemonClientCommand,
+	options: { readonly quiet?: boolean } = {},
+): Promise<void> {
 	if (await canConnectToDaemon(parsed.socketPath, 250)) {
-		console.log(`Daemon already running on ${parsed.socketPath}`);
+		if (!options.quiet) console.log(`Daemon already running on ${parsed.socketPath}`);
 		return;
 	}
 
@@ -728,7 +731,7 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 	const deadline = Date.now() + 10000;
 	while (Date.now() < deadline) {
 		if (await canConnectToDaemon(parsed.socketPath, 250)) {
-			console.log(`Daemon started on ${parsed.socketPath} (pid ${child.pid})`);
+			if (!options.quiet) console.log(`Daemon started on ${parsed.socketPath} (pid ${child.pid})`);
 			return;
 		}
 		await delay(25);

@@ -46,6 +46,7 @@ import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 describe("daemon protocol helpers", () => {
 	it("accepts the revision-33 client command envelope on a revision-34 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
+		vi.stubEnv("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR", join(root, "owners"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
 			defaultSessionConfig: { cwd: root, agentDir: root },
 		});
@@ -80,6 +81,7 @@ describe("daemon protocol helpers", () => {
 		} finally {
 			await internals.cleanupSupervisorResources();
 			rmSync(root, { recursive: true, force: true });
+			vi.unstubAllEnvs();
 		}
 	});
 
@@ -265,8 +267,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(35);
-		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-35-/);
+		expect(DAEMON_SCHEMA_REVISION).toBe(36);
+		expect(DAEMON_SCHEMA_ID).toMatch(/^protocol-7-schema-36-/);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,
@@ -324,6 +326,7 @@ describe("daemon protocol helpers", () => {
 	it.each([
 		["mesh_send", { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" }, false],
 		["mesh_replace", { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" }, false],
+		["move_saved_session", { minProtocol: 7, minSchemaRevision: 36, capability: "session_move" }, false],
 		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }, true],
 		["replace_acp_mcp_servers", { minProtocol: 7, minSchemaRevision: 22, capability: "acp_mcp_servers" }, true],
 		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }, true],
@@ -508,6 +511,7 @@ describe("daemon protocol helpers", () => {
 			"list_agent_peers",
 			"mesh_send",
 			"mesh_replace",
+			"move_saved_session",
 			"promote_owned_session",
 			"reattach",
 			"roster_subscribe",

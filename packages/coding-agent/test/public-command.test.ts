@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
 	reapCalls: [] as Array<[boolean, boolean]>,
 	shutdownCalls: [] as Array<[boolean, boolean]>,
 	restartCalls: [] as string[][],
+	moveCalls: [] as string[][],
 	mcpCommands: [] as string[][],
 	incidentCalls: [] as Array<Record<string, string | undefined>>,
 	incidentWindows: [] as Array<{ sinceMs: number; untilMs: number } | undefined>,
@@ -65,6 +66,10 @@ vi.mock("../src/cli/daemon-restart.js", () => ({
 	runRestart: async (args: string[]) => void mocks.restartCalls.push(args),
 }));
 
+vi.mock("../src/cli/session-move-command.js", () => ({
+	runSessionMove: async (args: string[]) => void mocks.moveCalls.push(args),
+}));
+
 import { INTERNAL_RUNTIME_COMMAND_MARKER } from "../src/cli/args.js";
 import { formatTopLevelHelp } from "../src/cli/command-registry.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "../src/cli/daemon-update-restart.js";
@@ -78,6 +83,7 @@ describe("public command routing", () => {
 		mocks.reapCalls.length = 0;
 		mocks.shutdownCalls.length = 0;
 		mocks.restartCalls.length = 0;
+		mocks.moveCalls.length = 0;
 		mocks.mcpCommands.length = 0;
 		mocks.incidentCalls.length = 0;
 		mocks.incidentWindows.length = 0;
@@ -419,6 +425,23 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalled();
 		expect(mocks.packageCommands).toEqual([]);
 		expect(mocks.daemonCommands).toEqual([]);
+	});
+
+	it.each([
+		["help", "move"],
+		["move", "--help"],
+	])("AC-23 prints move help %j", async (...argv) => {
+		await handlePublicCommand(argv);
+		expect(formatTopLevelHelp()).toContain("move");
+		expect(console.log).toHaveBeenLastCalledWith(
+			expect.stringContaining("move <session> <folder> [--dry-run] [--yes] [--json]"),
+		);
+		expect(mocks.moveCalls).toEqual([]);
+	});
+	it("AC-23 dispatches move without entering interactive startup", async () => {
+		const args = ["saved", "folder", "--dry-run", "--json"];
+		expect(await handlePublicCommand(["move", ...args])).toMatchObject({ handled: true });
+		expect(mocks.moveCalls).toEqual([args]);
 	});
 
 	it("routes restart arguments after global-flag rotation", async () => {

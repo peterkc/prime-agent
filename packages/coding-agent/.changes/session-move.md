@@ -1,0 +1,1 @@
+- Added `prime-agent move` to move a closed session and its artifacts to another folder without opening it there. Use `--dry-run` to check a move without changing anything.

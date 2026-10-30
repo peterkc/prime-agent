@@ -19,7 +19,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
-import { SessionManager } from "../../core/session-manager.js";
+import { appendSessionInfoToExistingFile, SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
@@ -611,7 +611,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			this.session.setSessionName(trimmedName);
 			return;
 		}
-		SessionManager.open(sessionPath).appendSessionInfo(trimmedName);
+		appendSessionInfoToExistingFile(sessionPath, trimmedName, this.runtimeHost.services.agentDir);
 	}
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {

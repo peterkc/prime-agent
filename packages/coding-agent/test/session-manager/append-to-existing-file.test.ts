@@ -93,7 +93,7 @@ describe("append metadata to an existing session file", () => {
 		resetIo();
 		appendSessionInfoToExistingFile(file, "  Renamed  ");
 
-		expect(fsMocks.readFileSync).not.toHaveBeenCalled(); // no full-file read or parse
+		expect(fsMocks.readFileSync.mock.calls.some(([path]) => path === file)).toBe(false); // no transcript read
 		expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1); // exactly one appended line
 		expect(appended(before, file)).toMatchObject({ type: "session_info", name: "Renamed", parentId: "e17999" });
 	});
@@ -107,7 +107,7 @@ describe("append metadata to an existing session file", () => {
 		]);
 		resetIo();
 		appendSessionInfoToExistingFile(file, "Renamed");
-		expect(fsMocks.readFileSync).toHaveBeenCalled(); // the full open parsed the transcript
+		expect(fsMocks.readFileSync.mock.calls.some(([path]) => path === file)).toBe(true); // the full open parsed the transcript
 		const lines = rawFile(file).toString("utf8").trimEnd().split("\n");
 		expect(JSON.parse(lines.at(-1)!)).toMatchObject({ type: "session_info", name: "Renamed" });
 		expect(JSON.parse(lines[0]!).version).toBe(3); // the migration rewrote what it read
@@ -123,7 +123,7 @@ describe("append metadata to an existing session file", () => {
 		appendCustomMessageToExistingFile(noticeFile, "prime-agent.worker_recovery", "worker interrupted", false, {
 			activeSessionId: "active-1",
 		});
-		expect(fsMocks.readFileSync).toHaveBeenCalled(); // the tail window could not resolve the leaf
+		expect(fsMocks.readFileSync.mock.calls.some(([path]) => path === noticeFile)).toBe(true); // the tail window could not resolve the leaf
 		expect(fsMocks.appendFileSync).not.toHaveBeenCalled();
 		expect(rawFile(noticeFile).equals(noticeBefore)).toBe(true);
 	});

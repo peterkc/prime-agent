@@ -49,6 +49,12 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Rename an agent",
 	},
 	{
+		path: ["move"],
+		usage: "move <session> <folder> [--dry-run] [--yes] [--json]",
+		summary: "Move a closed session to another folder",
+		options: ["--dry-run  Check without changing anything", "--yes      Skip confirmation", "--json     Print JSON"],
+	},
+	{
 		path: ["send"],
 		usage: "send [--from <agent>] <agent> <message>",
 		summary: "Send a message to an agent",

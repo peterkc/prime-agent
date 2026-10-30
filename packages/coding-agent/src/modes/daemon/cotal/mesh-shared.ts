@@ -1,4 +1,18 @@
+import { join } from "node:path";
 import { normalizeAgentSessionMessage } from "../../../core/agent-messages.js";
+
+function sessionKey(sessionId: string): string {
+	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
+	return sessionId;
+}
+
+export function enrollmentPath(meshRoot: string, sessionId: string): string {
+	return join(meshRoot, "enrollments", `${sessionKey(sessionId)}.json`);
+}
+
+export function directoryPath(meshRoot: string, sessionId: string): string {
+	return join(meshRoot, "directory", `${sessionKey(sessionId)}.json`);
+}
 
 export interface EnrollmentRecord {
 	readonly sessionId: string;
@@ -25,6 +39,15 @@ export function redactMeshError(error: unknown, includeMessage = true): string {
 	const code = typeof fields?.code === "string" ? ` (${redact(fields.code)})` : "";
 	const message = typeof error === "string" ? error : fields?.message;
 	return `${name}${code}${includeMessage && typeof message === "string" ? `: ${redact(message)}` : ""}`;
+}
+
+export class MeshTransferRecordError extends Error {
+	constructor(
+		readonly step: "enrollment" | "directory",
+		cause: unknown,
+	) {
+		super(`Mesh ${step} transfer failed: ${redactMeshError(cause)}`, { cause });
+	}
 }
 
 /** Only payload-validation failures are permanent; residency and I/O failures may recover. */

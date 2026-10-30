@@ -1,6 +1,6 @@
 import { type Dirent, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { spawnSyncHidden } from "../utils/child-process.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import {
@@ -11,6 +11,42 @@ import {
 	type SessionLease,
 } from "./session-lease.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
+
+/** Session headers in artifact files, plus already-leased files when deleting. */
+export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: string): Generator<string> {
+	const directories = [artifactDirectory];
+	while (directories.length > 0) {
+		const directory = directories.pop()!;
+		let entries: Dirent[];
+		try {
+			// rm removes directory symlinks themselves, not the trees they point at.
+			if (!lstatSync(directory).isDirectory()) continue;
+			entries = readdirSync(directory, { withFileTypes: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		for (const entry of entries) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				directories.push(path);
+				continue;
+			}
+			if (!agentDir || !hasSessionLease(path, agentDir)) {
+				if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+				try {
+					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
+					const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
+					if (header?.type !== "session") continue;
+				} catch {
+					// No existing lease: a failed probe identifies no owner to protect.
+					continue;
+				}
+			}
+			yield path;
+		}
+	}
+}
 
 /** Reserve the target and artifact files before a recursive saved-session delete. */
 export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string): { release(): void } {
@@ -29,39 +65,8 @@ export function acquireSessionDeleteLeases(sessionPath: string, agentDir: string
 	};
 	try {
 		acquire(sessionPath);
-		const directories = basename(sessionPath).replace(/\.jsonl$/, "")
-			? [getSessionArtifactPathForFile(sessionPath)]
-			: [];
-		while (directories.length > 0) {
-			const directory = directories.pop()!;
-			let entries: Dirent[];
-			try {
-				// rm removes directory symlinks themselves, not the trees they point at.
-				if (!lstatSync(directory).isDirectory()) continue;
-				entries = readdirSync(directory, { withFileTypes: true });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				throw error;
-			}
-			for (const entry of entries) {
-				const path = join(directory, entry.name);
-				if (entry.isDirectory()) {
-					directories.push(path);
-					continue;
-				}
-				if (!hasSessionLease(path, agentDir)) {
-					if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-					try {
-						if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
-						const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
-						if (header?.type !== "session") continue;
-					} catch {
-						// No existing lease: a failed probe identifies no owner to protect.
-						continue;
-					}
-				}
-				acquire(path);
-			}
+		if (basename(sessionPath).replace(/\.jsonl$/, "")) {
+			for (const path of sessionArtifactFiles(getSessionArtifactPathForFile(sessionPath), agentDir)) acquire(path);
 		}
 		return { release };
 	} catch (error) {
@@ -118,6 +123,26 @@ async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFile
 		const trashErrorHint = getTrashErrorHint();
 		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
 		return { ok: false, error };
+	}
+}
+
+/** Unlike ordinary delete, a move backup is kept when an installed trash command fails. */
+export async function removeMovedSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
+	const args = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+	const result = spawnSyncHidden("trash", args, { encoding: "utf-8" });
+	if (!existsSync(sessionPath)) return { ok: true, method: "trash" };
+	const extensions = process.platform === "win32" ? ["", ".exe", ".com", ".cmd", ".bat"] : [""];
+	const installed = (process.env.PATH ?? "")
+		.split(delimiter)
+		.some((directory) => extensions.some((extension) => existsSync(join(directory, `trash${extension}`))));
+	if ((result.error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT" || installed) {
+		return { ok: false, error: `trash failed: ${result.error?.message ?? (result.stderr?.trim() || result.status)}` };
+	}
+	try {
+		await unlink(sessionPath);
+		return { ok: true, method: "unlink" };
+	} catch (error) {
+		return { ok: false, error: error instanceof Error ? error.message : String(error) };
 	}
 }
 

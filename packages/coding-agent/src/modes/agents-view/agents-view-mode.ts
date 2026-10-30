@@ -23,7 +23,7 @@ import {
 } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
-import { SessionManager } from "../../core/session-manager.js";
+import { appendSessionStateToExistingFile, readSessionInfo } from "../../core/session-manager.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
 	isBuiltinSlashCommandName,
@@ -2346,9 +2346,13 @@ export class AgentsViewMode implements Component, Focusable {
 			if (pending.sessionFile && existsSync(pending.sessionFile)) {
 				// Persist archived unless it already is: sessions with no prior
 				// session_state entry would otherwise resurface on the next scan.
-				const sessionManager = SessionManager.open(pending.sessionFile, this.options.config.sessionDir);
-				if (sessionManager.getSessionState()?.status !== "archived") {
-					sessionManager.appendSessionState({ status: "archived" });
+				const session = await readSessionInfo(pending.sessionFile);
+				if (session?.state?.status !== "archived") {
+					appendSessionStateToExistingFile(
+						pending.sessionFile,
+						{ status: "archived" },
+						this.options.config.agentDir ?? getAgentDir(),
+					);
 				}
 			}
 			this.inactiveAgentIdentities.add(pending.identity);
