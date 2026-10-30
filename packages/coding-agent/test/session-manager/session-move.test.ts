@@ -422,12 +422,12 @@ describe("session relocation", () => {
 		expect(existsSync(j.journalPath)).toBe(true);
 		expect(readFileSync(j.sourceFile, "utf8")).toBe("other writer");
 	});
-
-	it.each(["suspending", "copying", "committing", "committed"] as const)(
-		"AC-7 published target wins over phase %s and recovery preserves both original backups",
+	it.each(["suspending", "copying", "committing", "committed", "appended"] as const)(
+		"AC-7/#55 published target wins over %s state and recovery preserves both original backups",
 		async (phase) => {
 			const f = fixture();
-			const j = journalState(f, phase, "published");
+			const j = journalState(f, phase === "appended" ? "committed" : phase, "published");
+			if (phase === "appended") writeFileSync(j.targetFile, "\n", { flag: "a" });
 			expect((await rollbackSessionMove(j)).status).toBe("pending");
 			const result = await recover(f);
 			expect(result.status).toBe("moved");
@@ -439,23 +439,32 @@ describe("session relocation", () => {
 			expect((await recover(f)).status).toBe("absent");
 		},
 	);
-	it.each(["", "not-json\n", '{"type":"session","id":"foreign"}\n', '{"type":"session"}\n', "{}\n"])(
-		"AC-8 keeps an invalid published target %j and changes no files",
-		async (content) => {
-			const f = fixture();
-			const j = journalState(f, "committing", "promoted");
-			writeFileSync(j.targetFile, content);
-			const before = [j.journalPath, j.sourceBackup, f.enrollment, f.directory].map((path) => readFileSync(path));
-			const result = await recover(f);
-			expect(result.status).toBe("pending");
-			expect(f.events).toEqual([]);
-			expect([j.journalPath, j.sourceBackup, f.enrollment, f.directory].map((path) => readFileSync(path))).toEqual(
-				before,
-			);
-			expect(readFileSync(j.targetFile, "utf8")).toBe(content);
-			expect(existsSync(j.sourceArtifacts)).toBe(true);
-		},
-	);
+	it.each(
+		["", "not-json\n", '{"type":"session","id":"foreign"}\n', '{"type":"session"}\n', "{}\n"].concat([
+			"truncated prefix",
+			"changed prefix",
+			"fileBytes",
+			"fileSha256",
+		]),
+	)("AC-8/#55 keeps an invalid published target %j and changes no files", async (content) => {
+		const f = fixture();
+		const j = journalState(f, "committing", "promoted");
+		if (content === "fileBytes" || content === "fileSha256") {
+			writeFileSync(j.journalPath, JSON.stringify({ ...j, [content]: undefined }));
+			content = jsonl(f.expected);
+		}
+		if (content === "truncated prefix") content = jsonl(f.expected).slice(0, -1);
+		if (content === "changed prefix") content = jsonl(f.expected).replace("Named", "Other");
+		writeFileSync(j.targetFile, content);
+		const paths = [j.journalPath, j.sourceBackup, f.enrollment, f.directory];
+		const before = paths.map((path) => readFileSync(path));
+		const result = await recover(f);
+		expect(result).toMatchObject({ status: "pending", messages: [expect.stringMatching(/header|prefix|SHA-256/)] });
+		expect(f.events).toEqual([]);
+		expect(paths.map((path) => readFileSync(path))).toEqual(before);
+		expect(readFileSync(j.targetFile, "utf8")).toBe(content);
+		expect(existsSync(j.sourceArtifacts)).toBe(true);
+	});
 	it("AC-9 skips rollback when another process holds a journal file lease", async () => {
 		const f = fixture();
 		const j = journalState(f, "copying", "artifacts");
@@ -550,10 +559,7 @@ describe("session relocation", () => {
 			f.callbacks.writeMeshRecords = async (journal, writes) => {
 				await writeRecords(journal, writes);
 				if (kind === "prefix")
-					writeFileSync(
-						journal.targetFile,
-						jsonl([{ ...f.expected[0], cwd: "/changed" }, ...f.expected.slice(1)]),
-					);
+					writeFileSync(journal.targetFile, jsonl(f.expected).replace(f.targetCwd, "/changed"));
 				else if (kind === "path") Object.assign(journal, { sourceArtifacts: outside });
 				else if (kind === "artifacts") writeFileSync(join(journal.sourceArtifacts, "late"), "new artifact");
 				else fakeTrash(f, "success", true);

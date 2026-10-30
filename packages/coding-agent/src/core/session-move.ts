@@ -914,6 +914,8 @@ export async function recoverSessionMove(options: {
 					`Published target has a missing, malformed, or different session header: ${journal.targetFile}`,
 				]);
 			}
+			const verified = verifySessionMovePrefix(journal);
+			if (!verified.ok) return report(journal, "pending", [verified.reason]);
 			const enrollment = (await callbacks.readEnrollmentPath(journal)) !== journal.targetFile;
 			const directory = (await callbacks.readDirectorySocket(journal)) !== journal.targetSocket;
 			if (enrollment || directory) {
