@@ -2,6 +2,7 @@ import type { Socket } from "node:net";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonSessionCreateError, deserializeDaemonCreateError } from "../src/modes/daemon/daemon-errors.js";
 import {
 	createDaemonCommandEnvelope,
 	type DaemonCommand,
@@ -97,6 +98,60 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
+	it.each<[string, DaemonCommand?]>([
+		["shutdown"],
+		["lease"],
+		["parse"],
+		["ready"],
+		["ownership"],
+		["fence"],
+		["update"],
+		["post-dispatch"],
+		["shutdown", { type: "create" }],
+		["parse", { type: "create" }],
+		["shutdown", { type: "list" }],
+		["parse", { type: "list" }],
+		["shutdown", { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" }],
+		["parse", { type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "hello" }],
+	])(
+		"mesh-notify/legacy distinguishes %s refusal before dispatch from uncertainty (%j)",
+		async (stage, command = { type: "mesh_notify", target: "b", message: "hello" }) => {
+			const error = new Error("shutting down; retry the command");
+			const dispatch = vi.fn(async () => success("notice", "mesh_notify", { outcome: "stored" }));
+			const owner = client("notify-client");
+			const current = vi.fn(async () => undefined);
+			if (stage === "ownership") current.mockRejectedValueOnce(error);
+			if (stage === "fence" || stage === "post-dispatch")
+				current.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+			const supervisor = Object.assign(createHarness({ assertCurrent: current }), {
+				handleCommand: dispatch,
+				write: vi.fn(),
+				shuttingDown: stage === "shutdown",
+				socketLeaseCompromise: stage === "lease" ? error : undefined,
+				idleEvictionFence: stage === "fence" ? Promise.resolve() : undefined,
+				updateRestartPhase: stage === "update" ? "fencing" : undefined,
+			});
+			if (stage === "ready") Object.assign(supervisor, { ready: Promise.reject(error) });
+			const line = commandLine({ ...command, id: "notice" });
+			await supervisor.handleLine(owner, stage === "parse" ? JSON.stringify({ id: "notice", command }) : line);
+			expect(dispatch).toHaveBeenCalledTimes(stage === "post-dispatch" ? 1 : 0);
+			const response = supervisor.write.mock.calls[0]![1] as Extract<DaemonResponse, { success: false }>;
+			const untyped = ["shutdown", "lease", "parse", "post-dispatch"].includes(stage);
+			expect(response).toMatchObject({
+				id: "notice",
+				success: false,
+				...(stage === "post-dispatch"
+					? { command: command.type, error: error.message }
+					: untyped
+						? { command: stage === "parse" ? "parse" : "dispatch" }
+						: { errorInfo: { code: stage === "update" ? "update_restarting" : "command_not_dispatched" } }),
+			});
+			if (command.type === "create")
+				expect(deserializeDaemonCreateError(response)).toBeInstanceOf(DaemonSessionCreateError);
+			if (untyped) expect(response).not.toHaveProperty("errorInfo");
+		},
+	);
+
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

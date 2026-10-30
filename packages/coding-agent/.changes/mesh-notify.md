@@ -1,0 +1,1 @@
+- Added `prime-agent notify` to send one-way Cotal notifications as `gate-watcher`, with stored, failed and unknown outcomes. Any process running as the same OS user can send as `gate-watcher`.

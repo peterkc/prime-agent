@@ -14,13 +14,23 @@ export function directoryPath(meshRoot: string, sessionId: string): string {
 	return join(meshRoot, "directory", `${sessionKey(sessionId)}.json`);
 }
 
-export interface EnrollmentRecord {
-	readonly sessionId: string;
-	readonly sessionFile: string;
+export interface MeshIdentityRecord {
 	readonly identity: { readonly id: string; readonly seed: string };
 	readonly lifecycleUid: string;
 	readonly allowSubscribe: string[];
 }
+
+export interface EnrollmentRecord extends MeshIdentityRecord {
+	readonly sessionId: string;
+	readonly sessionFile: string;
+}
+
+export interface GateWatcherRecord extends MeshIdentityRecord {
+	readonly name: "gate-watcher";
+}
+
+export class MeshNotStoredError extends Error {}
+export class MeshStorageUnknownError extends Error {}
 
 /** Preserve diagnostic fields, never a request-bearing cause or credential material. */
 export function redactMeshError(error: unknown, includeMessage = true): string {

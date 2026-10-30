@@ -21,12 +21,20 @@ import {
 	canonicalSessionPath,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
 	type SessionLease,
 } from "../../../core/session-lease.js";
 import { readSessionInfo } from "../../../core/session-manager.js";
 import { writeFileAtomicSync } from "../../../utils/atomic-file.js";
 import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
-import { directoryPath, type EnrollmentRecord, enrollmentPath, redactMeshError } from "./mesh-shared.js";
+import {
+	directoryPath,
+	type EnrollmentRecord,
+	enrollmentPath,
+	type GateWatcherRecord,
+	type MeshIdentityRecord,
+	redactMeshError,
+} from "./mesh-shared.js";
 
 export { directoryPath, type EnrollmentRecord, enrollmentPath, redactMeshError } from "./mesh-shared.js";
 
@@ -157,6 +165,67 @@ export function ensureEnrollmentRecord(meshRoot: string, sessionId: string, sess
 	}
 }
 
+export function gateWatcherPath(meshRoot: string): string {
+	return join(meshRoot, "senders", "gate-watcher.json");
+}
+
+export function claimGateWatcher(meshRoot: string): SessionLease {
+	mkSecretDir(join(meshRoot, "senders"));
+	try {
+		const claim = acquireSessionLease(gateWatcherPath(meshRoot), meshRoot, {
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+			[SESSION_LEASE_OWNER_ID_ENV]: "gate-watcher",
+		});
+		if (!claim) throw new Error("Mesh sender gate-watcher: claim was not acquired");
+		return claim;
+	} catch (error) {
+		if (error instanceof SessionAlreadyActiveError)
+			throw new Error("Mesh sender gate-watcher: claim is already held", { cause: error });
+		throw error;
+	}
+}
+
+export function readGateWatcherRecord(meshRoot: string): GateWatcherRecord {
+	const path = gateWatcherPath(meshRoot);
+	assertPrivateFile(path);
+	const value = object(readJson(path));
+	const identity = object(value?.identity);
+	if (
+		value?.name !== "gate-watcher" ||
+		!isUserNkey(identity?.id) ||
+		typeof identity?.seed !== "string" ||
+		typeof value.lifecycleUid !== "string" ||
+		!Array.isArray(value.allowSubscribe) ||
+		value.allowSubscribe.length !== 0
+	)
+		throw new Error(`Mesh sender ${path}: invalid record`);
+	return {
+		name: "gate-watcher",
+		identity: { id: identity.id, seed: identity.seed },
+		lifecycleUid: value.lifecycleUid,
+		allowSubscribe: [],
+	};
+}
+
+export function ensureGateWatcherRecord(meshRoot: string): GateWatcherRecord {
+	const path = gateWatcherPath(meshRoot);
+	if (existsSync(path)) return readGateWatcherRecord(meshRoot);
+	mkSecretDir(join(meshRoot, "senders"));
+	const record: GateWatcherRecord = {
+		name: "gate-watcher",
+		identity: newIdentity(),
+		lifecycleUid: mintLifecycleUid(),
+		allowSubscribe: [],
+	};
+	try {
+		writeSecretFileCreateOnly(path, `${JSON.stringify(record)}\n`);
+		return record;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		return readGateWatcherRecord(meshRoot);
+	}
+}
+
 export async function updateEnrollmentPath(
 	meshRoot: string,
 	sessionId: string,
@@ -176,7 +245,7 @@ export async function updateEnrollmentPath(
 export function credentialSource(
 	meshRoot: string,
 	space: string,
-	record: EnrollmentRecord,
+	record: MeshIdentityRecord,
 	expiresInSeconds = 3600,
 ): () => Promise<string> {
 	return async () => {
@@ -200,6 +269,23 @@ export async function provisionEnrollment(
 	config: MeshConfiguration,
 	record: EnrollmentRecord,
 ): Promise<void> {
+	return provisionIdentity(meshRoot, config, record, `session ${record.sessionId}`);
+}
+
+export function provisionGateWatcher(
+	meshRoot: string,
+	config: MeshConfiguration,
+	record: GateWatcherRecord,
+): Promise<void> {
+	return provisionIdentity(meshRoot, config, record, "sender gate-watcher");
+}
+
+async function provisionIdentity(
+	meshRoot: string,
+	config: MeshConfiguration,
+	record: MeshIdentityRecord,
+	label: string,
+): Promise<void> {
 	const auth = readSigner(meshRoot, config.space);
 	let creds: string;
 	try {
@@ -222,7 +308,7 @@ export async function provisionEnrollment(
 	});
 	let failure: Error | undefined;
 	provisioner.on("error", (error: unknown) => {
-		failure ??= new Error(`Mesh session ${record.sessionId}: provisioner error: ${redactMeshError(error)}`);
+		failure ??= new Error(`Mesh ${label}: provisioner error: ${redactMeshError(error)}`);
 	});
 	try {
 		await provisioner.start();
@@ -232,12 +318,12 @@ export async function provisionEnrollment(
 			subscribe: record.allowSubscribe,
 		});
 	} catch (error) {
-		failure = new Error(`Mesh session ${record.sessionId}: provisioning failed: ${redactMeshError(error)}`);
+		failure = new Error(`Mesh ${label}: provisioning failed: ${redactMeshError(error)}`);
 	}
 	try {
 		await provisioner.stop();
 	} catch (error) {
-		failure ??= new Error(`Mesh session ${record.sessionId}: provisioner stop failed: ${redactMeshError(error)}`);
+		failure ??= new Error(`Mesh ${label}: provisioner stop failed: ${redactMeshError(error)}`);
 	}
 	if (failure) throw failure;
 }

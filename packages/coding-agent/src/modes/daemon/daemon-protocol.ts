@@ -1,6 +1,6 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, TextContent, Transport } from "@earendil-works/pi-ai";
-import type { AgentSessionMessageDeliveryMode } from "../../core/agent-messages.js";
+import type { AgentSessionMessageDeliveryMode, AgentSessionMessageReceipt } from "../../core/agent-messages.js";
 import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
@@ -74,8 +74,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
 // Revision 35 adds capability-gated mesh replacement barriers with worker-created nonces and handoff attempt tokens.
 // Revision 36 adds capability-gated relocation of closed saved sessions.
-export const DAEMON_SCHEMA_REVISION = 36;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-36-session-move";
+// Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal
+// and command_not_dispatched failure info for mesh_notify refusals before dispatch.
+export const DAEMON_SCHEMA_REVISION = 37;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-37-mesh-notify";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -124,6 +126,7 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
 	| "mesh_send"
+	| "mesh_notify"
 	| "mesh_replacement"
 	| "session_move"
 	| "abort_and_send_queued"
@@ -533,6 +536,7 @@ export type DaemonCommand =
 	// targetSessionId carries an exact ID or a directory address. IDs win over names;
 	// Supervisors built before name addressing (same revision 34) refuse names before storage.
 	| { id?: string; type: "mesh_send"; fromActiveSessionId: string; targetSessionId: string; message: string }
+	| { id?: string; type: "mesh_notify"; target: string; message: string }
 	| {
 			id?: string;
 			type: "mesh_replace";
@@ -809,6 +813,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
 	mesh_send: { minProtocol: 7, minSchemaRevision: 34, capability: "mesh_send" },
+	mesh_notify: { minProtocol: 7, minSchemaRevision: 37, capability: "mesh_notify" },
 	mesh_replace: { minProtocol: 7, minSchemaRevision: 35, capability: "mesh_replacement" },
 	move_saved_session: { minProtocol: 7, minSchemaRevision: 36, capability: "session_move" },
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
@@ -904,6 +909,7 @@ const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
 	"get_direct_worker_transport",
 	"list_agent_peers",
 	"mesh_send",
+	"mesh_notify",
 	"mesh_replace",
 	"move_saved_session",
 	"promote_owned_session",
@@ -953,6 +959,7 @@ export const DAEMON_COMMAND_PLANE = {
 	resume_queue: "session",
 	send_message: "control",
 	mesh_send: "control",
+	mesh_notify: "control",
 	mesh_replace: "control",
 	move_saved_session: "control",
 	agent_messages_status: "control",
@@ -1086,6 +1093,11 @@ export function meetsDaemonCommandCompatibility(
 	);
 }
 
+export type MeshNotifyResult =
+	| { readonly outcome: "stored"; readonly receipt: AgentSessionMessageReceipt }
+	| { readonly outcome: "failed"; readonly error: string }
+	| { readonly outcome: "unknown"; readonly error: string };
+
 export type DaemonResponse =
 	| { id?: string; type: "response"; command: string; success: true; data?: unknown }
 	| {
@@ -1104,6 +1116,7 @@ export type DaemonErrorInfo =
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "update_restarting" }
+	| { code: "command_not_dispatched" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";

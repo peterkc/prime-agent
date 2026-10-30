@@ -7,6 +7,8 @@ import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
+	assertDirectAgentMessageTarget,
+	normalizeAgentSessionMessage,
 } from "../../../core/agent-messages.js";
 import { canonicalSessionPath, SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
 import type { SessionMoveMeshWrites } from "../../../core/session-move.js";
@@ -14,29 +16,43 @@ import { readDeletedRlmChildPaths } from "../rlm-ledger.js";
 import { resolveDirectoryAddress } from "./address.js";
 import {
 	claimEnrollment,
+	claimGateWatcher,
 	credentialSource,
 	deprovisionEnrollment,
 	directoryPath,
 	type EnrollmentRecord,
 	enrollmentPath,
 	ensureEnrollmentRecord,
+	ensureGateWatcherRecord,
 	homeEnrollments,
 	loadMeshConfiguration,
 	type MeshConfiguration,
 	type MeshDirectoryEntry,
 	provisionEnrollment,
+	provisionGateWatcher,
 	publishDirectory,
 	readDirectory,
 	readEnrollment,
+	readGateWatcherRecord,
 	readSigner,
 	removeEnrollment,
 	renameDirectory,
 	updateEnrollmentPath,
 	withDirectoryLock,
 } from "./enrollment.js";
-import { InvalidMeshPayloadError, MeshTransferRecordError, meshMessageText, redactMeshError } from "./mesh-shared.js";
+import {
+	type GateWatcherRecord,
+	InvalidMeshPayloadError,
+	MeshNotStoredError,
+	MeshStorageUnknownError,
+	MeshTransferRecordError,
+	meshMessageText,
+	redactMeshError,
+} from "./mesh-shared.js";
 
 export { MeshTransferRecordError } from "./mesh-shared.js";
+
+const MESH_SEND_TIMEOUT_MS = 30_000;
 
 export interface MeshEndpointOptions {
 	readonly meshRoot: string;
@@ -61,16 +77,26 @@ interface QueuedDelivery {
 	stallTimer?: ReturnType<typeof setTimeout>;
 }
 
-interface SessionEndpoint {
-	readonly record: EnrollmentRecord;
-	readonly claim: SessionLease;
+interface SendingEndpoint {
+	readonly label: string;
 	readonly endpoint: CotalEndpoint;
-	readonly queue: QueuedDelivery[];
-	handoff?: Promise<void>;
-	current?: QueuedDelivery;
 	state: "starting" | "connected" | "transport-disconnected" | "reconnecting" | "closed";
 	readonly abort: AbortController;
 	credentialExpiresAt?: number;
+}
+
+interface GateWatcherEndpoint extends SendingEndpoint {
+	readonly record: GateWatcherRecord;
+	readonly claim: SessionLease;
+	close?: Promise<void>;
+}
+
+interface SessionEndpoint extends SendingEndpoint {
+	readonly record: EnrollmentRecord;
+	readonly claim: SessionLease;
+	readonly queue: QueuedDelivery[];
+	handoff?: Promise<void>;
+	current?: QueuedDelivery;
 	close?: Promise<void>;
 	retirement?: Promise<void>;
 }
@@ -139,6 +165,8 @@ export class MeshEndpoints {
 	>();
 	private readonly replacements = new Map<string, SessionReplacement>();
 	private readonly replacementBegins = new Map<string, ReplacementBegin>();
+	private gateWatcher?: GateWatcherEndpoint;
+	private startingGateWatcher?: Promise<GateWatcherEndpoint>;
 	private closing = false;
 	private stopping?: Promise<void>;
 	private reconciling?: Promise<void>;
@@ -293,7 +321,15 @@ export class MeshEndpoints {
 					return creds;
 				},
 			});
-			session = { record, claim, endpoint, queue: [], state: "starting", abort: new AbortController() };
+			session = {
+				label: sessionId,
+				record,
+				claim,
+				endpoint,
+				queue: [],
+				state: "starting",
+				abort: new AbortController(),
+			};
 			this.sessions.set(sessionId, session);
 			const startedSession = session;
 			endpoint.on("connection", ({ connected }: { connected: boolean }) => {
@@ -713,7 +749,8 @@ export class MeshEndpoints {
 	}
 
 	async resolveAddress(selector: string): Promise<string> {
-		if (!this.config || this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
+		if (!this.config || this.refusal)
+			throw new MeshNotStoredError(`Message was not stored: mesh unavailable: ${this.refusal}`);
 		let result: Awaited<ReturnType<typeof resolveDirectoryAddress>>;
 		try {
 			result = await resolveDirectoryAddress(this.options.meshRoot, this.config.space, selector, (file) => {
@@ -722,11 +759,11 @@ export class MeshEndpoints {
 				this.options.log(`Mesh directory entry ${JSON.stringify(file)}: unreadable or invalid; ignored`);
 			});
 		} catch (error) {
-			throw new Error(`Message was not stored: directory lookup failed: ${redactMeshError(error)}`);
+			throw new MeshNotStoredError(`Message was not stored: directory lookup failed: ${redactMeshError(error)}`);
 		}
 		if (!result.ok) {
 			const reason = result.reason === "unknown" ? this.enrollmentFailures.get(selector) : undefined;
-			throw new Error(`Message was not stored: ${reason ?? result.error}`);
+			throw new MeshNotStoredError(`Message was not stored: ${reason ?? result.error}`);
 		}
 		return result.entry.sessionId;
 	}
@@ -756,18 +793,179 @@ export class MeshEndpoints {
 		return undefined;
 	}
 
+	async sendService(target: string, message: string): Promise<AgentSessionMessageReceipt> {
+		const deadline = Date.now() + MESH_SEND_TIMEOUT_MS;
+		let source: GateWatcherEndpoint;
+		let targetSessionId: string;
+		let text: string;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			if (typeof target !== "string" || typeof message !== "string")
+				throw new Error("Mesh notify requires one target and a text message");
+			const selector = assertDirectAgentMessageTarget(target);
+			text = normalizeAgentSessionMessage(message);
+			targetSessionId = await this.resolveAddress(selector);
+			source = await Promise.race([
+				this.gateWatcherEndpoint(),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("mesh send deadline elapsed during sender setup")),
+						Math.max(0, deadline - Date.now()),
+					);
+				}),
+			]);
+		} catch (error) {
+			if (error instanceof MeshNotStoredError) throw error;
+			throw new MeshNotStoredError(`Message was not stored: ${redactMeshError(error)}`);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+		return this.sendFrom(
+			source,
+			{ sessionName: "gate-watcher", clientId: `local.${source.record.identity.id}` },
+			targetSessionId,
+			text,
+			deadline,
+			() => {
+				const record = readGateWatcherRecord(this.options.meshRoot);
+				if (record.identity.id !== source.record.identity.id || record.lifecycleUid !== source.record.lifecycleUid)
+					throw new Error("sender record changed while reconnecting");
+			},
+		);
+	}
+
+	private async gateWatcherEndpoint(): Promise<GateWatcherEndpoint> {
+		if (this.closing) throw new Error("mesh is shutting down");
+		if (this.refusal || !this.config) throw new Error(`mesh unavailable: ${this.refusal}`);
+		if (this.startingGateWatcher) return this.startingGateWatcher;
+		if (this.gateWatcher) {
+			if (this.gateWatcher.state === "closed") throw new Error("sender gate-watcher is closed");
+			return this.gateWatcher;
+		}
+		this.startingGateWatcher = this.startGateWatcher(this.config);
+		try {
+			return await this.startingGateWatcher;
+		} finally {
+			this.startingGateWatcher = undefined;
+		}
+	}
+
+	private async startGateWatcher(config: MeshConfiguration): Promise<GateWatcherEndpoint> {
+		const claim = claimGateWatcher(this.options.meshRoot);
+		let source: GateWatcherEndpoint | undefined;
+		try {
+			const record = ensureGateWatcherRecord(this.options.meshRoot);
+			await provisionGateWatcher(this.options.meshRoot, config, record);
+			if (this.closing) throw new Error("mesh is shutting down");
+			const credentials = credentialSource(
+				this.options.meshRoot,
+				config.space,
+				record,
+				this.options.credentialLifetimeSeconds,
+			);
+			let nextCredentialExpiresAt: number | undefined;
+			const endpoint = new CotalEndpoint({
+				space: config.space,
+				servers: config.server,
+				card: { name: "gate-watcher", kind: "agent", id: record.identity.id },
+				lifecycleUid: record.lifecycleUid,
+				channels: [],
+				watchPresence: false,
+				watchChannels: false,
+				creds: async () => {
+					const creds = await credentials();
+					if (!source || source.state === "starting" || source.state === "reconnecting") {
+						const exp = credsClaims(creds).exp;
+						nextCredentialExpiresAt = exp === undefined ? undefined : exp * 1000;
+					}
+					return creds;
+				},
+			});
+			source = { label: "gate-watcher", record, claim, endpoint, state: "starting", abort: new AbortController() };
+			this.gateWatcher = source;
+			const hosted = source;
+			endpoint.on("connection", ({ connected }: { connected: boolean }) => {
+				if (hosted.state === "closed") return;
+				hosted.state = connected ? "connected" : "reconnecting";
+				if (connected) hosted.credentialExpiresAt = nextCredentialExpiresAt;
+			});
+			endpoint.on("transport", ({ connected }: { connected: boolean }) => {
+				if (!connected && hosted.state === "connected") hosted.state = "transport-disconnected";
+				else if (connected && hosted.state === "transport-disconnected") {
+					hosted.state = "connected";
+					hosted.credentialExpiresAt = nextCredentialExpiresAt;
+				}
+			});
+			endpoint.on("creds-adopted", ({ exp }: { exp?: number }) => {
+				nextCredentialExpiresAt = exp === undefined ? undefined : exp * 1000;
+			});
+			for (const event of ["error", "warning"])
+				endpoint.on(event, (error: unknown) =>
+					this.options.log(`Mesh sender gate-watcher: endpoint ${event}: ${redactMeshError(error)}`),
+				);
+			endpoint.on("message", (_message: CotalMessage, delivery: Delivery) => {
+				if (this.closing || hosted.state === "closed") return;
+				try {
+					delivery.ack();
+					this.options.log("Mesh sender gate-watcher: unsupported reply dropped and acknowledged");
+				} catch (error) {
+					this.options.log(
+						`Mesh sender gate-watcher: unsupported reply acknowledgement failed: ${redactMeshError(error)}`,
+					);
+				}
+			});
+			await endpoint.start();
+			if (this.closing) throw new Error("mesh is shutting down");
+			hosted.state = "connected";
+			return hosted;
+		} catch (error) {
+			if (source) {
+				// Close logs stop failures and retains the claim; preserve the startup error.
+				await this.closeGateWatcher(source).catch(() => undefined);
+				this.gateWatcher = undefined;
+			} else claim.release();
+			throw error;
+		}
+	}
+
+	private closeGateWatcher(source: GateWatcherEndpoint): Promise<void> {
+		if (source.close) return source.close;
+		source.state = "closed";
+		source.abort.abort();
+		source.close = source.endpoint.stop().then(
+			() => source.claim.release(),
+			(error: unknown) => {
+				this.options.log(
+					`Mesh sender gate-watcher: endpoint stop failed; claim retained: ${redactMeshError(error)}`,
+				);
+				throw error;
+			},
+		);
+		return source.close;
+	}
+
+	private async stopGateWatcher(): Promise<void> {
+		try {
+			if (this.gateWatcher) await this.closeGateWatcher(this.gateWatcher);
+		} finally {
+			// Stop the endpoint first so a late first connect tears itself down;
+			// initialization still owns provisioning cleanup.
+			await this.startingGateWatcher?.catch(() => undefined);
+		}
+	}
+
 	async send(
 		sender: AgentSessionMessageSender & { sessionId: string },
 		targetSessionId: string,
 		message: string,
 	): Promise<AgentSessionMessageReceipt> {
-		const deadline = Date.now() + 30_000;
+		const deadline = Date.now() + MESH_SEND_TIMEOUT_MS;
 		const senderSessionId = sender.sessionId;
-		if (this.closing) throw new Error("Message was not stored: mesh is shutting down");
-		if (this.refusal) throw new Error(`Message was not stored: mesh unavailable: ${this.refusal}`);
+		if (this.closing) throw new MeshNotStoredError("Message was not stored: mesh is shutting down");
+		if (this.refusal) throw new MeshNotStoredError(`Message was not stored: mesh unavailable: ${this.refusal}`);
 		const source = this.sessions.get(senderSessionId);
 		if (!source)
-			throw new Error(
+			throw new MeshNotStoredError(
 				`Message was not stored: sender ${senderSessionId} ${this.enrollmentFailures.get(senderSessionId) ?? "is not enrolled"}`,
 			);
 		let senderEnrolled: boolean;
@@ -776,20 +974,38 @@ export class MeshEndpoints {
 				existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) &&
 				!!readDirectory(this.options.meshRoot, senderSessionId);
 		} catch (error) {
-			throw new Error(`Message was not stored: ${redactMeshError(error)}`);
+			throw new MeshNotStoredError(`Message was not stored: ${redactMeshError(error)}`);
 		}
 		if (!senderEnrolled)
-			throw new Error(
+			throw new MeshNotStoredError(
 				`Message was not stored: sender ${senderSessionId} has no enrollment record or directory entry`,
 			);
+		return this.sendFrom(source, sender, targetSessionId, message, deadline, () => {
+			if (
+				!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
+				!readDirectory(this.options.meshRoot, senderSessionId)
+			)
+				throw new Error("sender enrollment disappeared while reconnecting");
+		});
+	}
+
+	private async sendFrom(
+		source: SendingEndpoint,
+		sender: AgentSessionMessageSender,
+		targetSessionId: string,
+		message: string,
+		deadline: number,
+		validateSource: () => void,
+	): Promise<AgentSessionMessageReceipt> {
+		const senderSessionId = source.label;
 		let target: ReturnType<typeof readDirectory>;
 		try {
 			target = readDirectory(this.options.meshRoot, targetSessionId);
 		} catch (error) {
-			throw new Error(`Message was not stored: ${redactMeshError(error)}`);
+			throw new MeshNotStoredError(`Message was not stored: ${redactMeshError(error)}`);
 		}
 		if (!target || !existsSync(enrollmentPath(this.options.meshRoot, targetSessionId))) {
-			throw new Error(
+			throw new MeshNotStoredError(
 				`Message was not stored: target ${targetSessionId} ${this.enrollmentFailures.get(targetSessionId) ?? "is not enrolled: no enrollment record or directory entry"}`,
 			);
 		}
@@ -797,16 +1013,12 @@ export class MeshEndpoints {
 			await this.waitForConnection(source, deadline);
 			if (this.closing || source.state === "closed") throw new Error("mesh endpoint closed");
 			if (Date.now() >= deadline) throw new Error("mesh send deadline elapsed before publish");
-			if (
-				!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
-				!readDirectory(this.options.meshRoot, senderSessionId)
-			)
-				throw new Error("sender enrollment disappeared while reconnecting");
+			validateSource();
 			target = readDirectory(this.options.meshRoot, targetSessionId);
 			if (!target || !existsSync(enrollmentPath(this.options.meshRoot, targetSessionId)))
 				throw new Error("target enrollment disappeared while reconnecting");
 		} catch (error) {
-			throw new Error(`Message was not stored: sender ${senderSessionId}: ${redactMeshError(error)}`);
+			throw new MeshNotStoredError(`Message was not stored: sender ${senderSessionId}: ${redactMeshError(error)}`);
 		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
@@ -832,7 +1044,7 @@ export class MeshEndpoints {
 				cotalId: msg.id,
 			};
 		} catch (error) {
-			throw new Error(
+			throw new MeshStorageUnknownError(
 				`Message storage outcome is unknown: ${redactMeshError(error)}; a resend can show the message twice`,
 			);
 		} finally {
@@ -840,15 +1052,16 @@ export class MeshEndpoints {
 		}
 	}
 
-	private waitForConnection(session: SessionEndpoint, deadline: number): Promise<void> {
+	private waitForConnection(session: SendingEndpoint, deadline: number): Promise<void> {
 		if (
 			session.state === "connected" &&
 			session.credentialExpiresAt !== undefined &&
 			Date.now() >= session.credentialExpiresAt
 		) {
 			session.state = "reconnecting";
+			const label = session === this.gateWatcher ? "sender gate-watcher" : `session ${session.label}`;
 			void session.endpoint.reconnect().catch((error: unknown) => {
-				this.options.log(`Mesh session ${session.record.sessionId}: reconnect failed: ${redactMeshError(error)}`);
+				this.options.log(`Mesh ${label}: reconnect failed: ${redactMeshError(error)}`);
 			});
 		}
 		if (session.state === "connected") return Promise.resolve();
@@ -1053,7 +1266,10 @@ export class MeshEndpoints {
 		this.closing = true;
 		for (const beginning of this.replacementBegins.values()) beginning.state = "failed";
 		// stop() is the public pull-stop operation. It also closes the connection; no ack is permitted now.
-		const stops = Promise.allSettled([...this.sessions.values()].map((session) => session.endpoint.stop()));
+		const stops = Promise.allSettled([
+			...[...this.sessions.values()].map((session) => session.endpoint.stop()),
+			this.stopGateWatcher(),
+		]);
 		this.stopping = this.finishStop(stops);
 		return this.stopping;
 	}

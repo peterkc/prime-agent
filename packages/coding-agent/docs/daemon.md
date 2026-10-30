@@ -213,9 +213,53 @@ family. Closing a worker or its session does not release the session's mesh clai
 Open the session in the daemon that holds its claim.
 Stopping that daemon releases its claims. Workers from
 before mesh support must be restarted; restarting only the supervisor can leave them
-running. Mesh sends and handoffs refuse old workers with a restart message. Sends from daemon
-clients that are not sessions (`prime-agent send` and RPC `send_message`) are refused in
-Cotal mode and have no mesh path.
+running. Mesh sends and handoffs refuse old workers with a restart message.
+`prime-agent send` and RPC `send_message` still refuse non-session clients in Cotal mode.
+Use `prime-agent notify` for a model-free, one-way notification from `gate-watcher`:
+
+```sh
+prime-agent notify --daemon-socket /path/to/daemon.sock --json reviewer -- "Gate check finished. No reply expected."
+```
+
+`notify` accepts one session ID or unambiguous name. Options must precede `--`;
+all text after it is message content, including flags. It has no `--from` option.
+The daemon must already be running with Cotal enabled and advertise `mesh_notify`
+(protocol 7, schema 37). The command never starts a daemon or falls back to native delivery.
+Socket selection is explicit `--daemon-socket`, then the repository daemon for the
+current folder, then the default daemon. **Launchd callers must pass `--daemon-socket`**
+to select one sender host without relying on the working folder or temporary directory.
+All participating daemons must share the same agent directory and mesh.
+
+The sender host lazily creates a private `senders/gate-watcher.json` record under the
+mesh home. It reuses that NKey and lifecycle after restart and holds an exclusive
+process lease while hosting the endpoint. A second live host refuses before publishing.
+There is no sender session, transcript, worker or directory entry. The recipient can
+still wake a worker and run a model turn. A stored receipt does not prove that it did.
+
+**Any process of the same OS user can send as `gate-watcher`.** The daemon socket is
+private to that user, but the daemon cannot tell one of the user's processes from
+another, so it does not refuse a session or script that runs `prime-agent notify`.
+No agent tool sends `mesh_notify`, but a session's shell can run `prime-agent notify`.
+Give the command only to the job that should send as `gate-watcher`.
+
+**`gate-watcher` is not a reply address.** Name-based replies fail if no real session
+has that name. A real session named `gate-watcher` receives replies addressed to that
+name. Direct Cotal replies to the notification principal are acknowledged and logged
+as unsupported-reply drops, without waking a worker or sending a response.
+
+With `--json`, stdout contains exactly one object:
+
+- Exit 0: `{ "outcome": "stored", "receipt": { ... } }`. The normal stored receipt
+  includes its broker `sequence` and `cotalId`.
+- Exit 1: `{ "outcome": "failed", "error": "..." }`. Nothing was published.
+- Exit 2: `{ "outcome": "unknown", "error": "..." }`. Storage is not confirmed;
+  this includes publish rejection, a lost acknowledgement or daemon response, and a
+  malformed result after submission. **Do not automatically resend an unknown outcome.**
+  A resend can duplicate the message. The watcher must track its own events.
+
+Without `--json`, the command prints one short result line. It sends one request with
+no reconnect recovery. Sender setup, reconnect and publish share a 30-second operation
+budget; the CLI allows 35 seconds for the daemon response.
 
 Switching to the current enrolled file also takes the replacement barrier: the
 endpoint closes before the open, and held messages return without an early acknowledgement.

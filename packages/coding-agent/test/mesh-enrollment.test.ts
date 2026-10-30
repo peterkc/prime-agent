@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { canonicalSessionPath } from "../src/core/session-lease.js";
+import { canonicalSessionPath, hasSessionLease } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
@@ -32,10 +32,13 @@ import {
 	directoryPath,
 	enrollmentPath,
 	ensureEnrollmentRecord,
+	ensureGateWatcherRecord,
+	gateWatcherPath,
 	publishDirectory,
 	readDirectory,
 	readDirectoryAsync,
 	readEnrollment,
+	readGateWatcherRecord,
 	readSigner,
 	redactMeshError,
 	removeEnrollment,
@@ -44,6 +47,7 @@ import {
 	withDirectoryLock,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
+import { MeshNotStoredError, MeshStorageUnknownError } from "../src/modes/daemon/cotal/mesh-shared.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import * as rlmLedger from "../src/modes/daemon/rlm-ledger.js";
@@ -64,10 +68,17 @@ class FakeEndpoint extends EventEmitter {
 	static instances: FakeEndpoint[] = [];
 	static failStart = false;
 	static afterProvision?: () => void;
+	static onStart?: (endpoint: FakeEndpoint) => void | Promise<void>;
 	readonly start = vi.fn(async () => {
 		if (FakeEndpoint.failStart) throw new Error("start failed");
+		await FakeEndpoint.onStart?.(this);
 	});
 	readonly stop = vi.fn(async () => undefined);
+	readonly reconnect = vi.fn(async () => undefined);
+	readonly unicastAttributed = vi.fn(async (_principal: string, _text: string) => ({
+		msg: { id: "notified" },
+		ack: { seq: 7, duplicate: false },
+	}));
 	readonly provisionDmInbox = vi.fn(async () => FakeEndpoint.afterProvision?.());
 	readonly provisionDlvInbox = vi.fn(async () => undefined);
 	readonly reissueAcl = vi.fn(async () => undefined);
@@ -84,6 +95,7 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	FakeEndpoint.instances = [];
 	FakeEndpoint.failStart = false;
+	FakeEndpoint.onStart = undefined;
 	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
 	vi.useRealTimers();
@@ -103,12 +115,296 @@ async function fixture() {
 	const sessionId = session.getSessionId();
 	const sessionFile = session.getSessionFile()!;
 	const log = vi.fn();
-	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log, handoff: vi.fn() });
+	const handoff = vi.fn();
+	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log, handoff });
 	meshes.push(mesh);
-	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh, log };
+	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh, log, handoff };
 }
 
 describe("mesh enrollment", () => {
+	it.each([
+		[new MeshNotStoredError("not published"), "failed", "not published"],
+		[new MeshStorageUnknownError("maybe published"), "unknown", "maybe published"],
+		[
+			new Error("unexpected publish failure"),
+			"unknown",
+			"Message storage outcome is unknown: Error: unexpected publish failure; a resend can show the message twice",
+		],
+	] as const)("mesh-notify supervisor maps %s to %s", async (error, outcome, text) => {
+		const { mesh } = await fixture();
+		vi.spyOn(mesh, "sendService").mockRejectedValueOnce(error);
+		const handle = Object.assign(Object.create(DaemonSupervisor.prototype), { mesh }) as {
+			handleCommand(client: object, command: DaemonCommand): Promise<unknown>;
+		};
+		const response = await handle.handleCommand({}, { type: "mesh_notify", target: "b", message: "hello" });
+		expect(response).toMatchObject({ success: true, data: { outcome, error: text } });
+	});
+
+	async function notificationFixture() {
+		const f = await fixture();
+		await f.mesh.enroll(f.sessionId, f.sessionFile);
+		return f;
+	}
+
+	it("mesh-notify reuses one private identity, endpoint and lease across overlap and restart; drops replies", async () => {
+		const { mesh, meshRoot, sessionId, log, handoff } = await notificationFixture();
+		const other = new MeshEndpoints({ meshRoot, homeSocket: "other", log, handoff });
+		meshes.push(other);
+		const claims = vi.spyOn(enrollment, "claimGateWatcher");
+		const alias = ensureEnrollmentRecord(meshRoot, "alias", "unused.jsonl");
+		writeFileSync(
+			directoryPath(meshRoot, "alias"),
+			JSON.stringify({
+				sessionId: "alias",
+				name: sessionId,
+				principal: `local.${alias.identity.id}`,
+				homeSocket: "other",
+			}),
+		);
+		const results = await Promise.all([mesh.sendService(sessionId, "one"), mesh.sendService(sessionId, "two")]);
+		const record = readGateWatcherRecord(meshRoot);
+		const hosted = FakeEndpoint.instances.filter((e) => e.options.card.name === "gate-watcher");
+		expect(hosted).toHaveLength(1);
+		expect(claims).toHaveBeenCalledTimes(1);
+		expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(true);
+		expect(statSync(gateWatcherPath(meshRoot)).mode & 0o777).toBe(0o600);
+		expect(ensureGateWatcherRecord(meshRoot)).toEqual(record);
+		expect(existsSync(enrollmentPath(meshRoot, "gate-watcher"))).toBe(false);
+		expect(readDirectory(meshRoot, "gate-watcher")).toBeUndefined();
+		for (const receipt of results)
+			expect(receipt).toMatchObject({
+				deliveryStatus: "stored",
+				sequence: 7,
+				cotalId: "notified",
+				from: { sessionName: "gate-watcher", clientId: `local.${record.identity.id}` },
+			});
+		expect(hosted[0]!.unicastAttributed.mock.calls).toEqual([
+			[`local.${readEnrollment(meshRoot, sessionId).identity.id}`, "one"],
+			[`local.${readEnrollment(meshRoot, sessionId).identity.id}`, "two"],
+		]);
+		const creds = hosted[0]!.options.creds;
+		if (typeof creds !== "function") throw new Error("Expected renewable credentials");
+		const claimsValue = core.credsClaims(await creds());
+		expect(claimsValue.sub).toBe(record.identity.id);
+		expect(JSON.stringify(claimsValue.nats)).toContain(record.lifecycleUid);
+		const ack = vi.fn();
+		hosted[0]!.emit("message", {}, { ack }, { kind: "dm" });
+		expect(ack).toHaveBeenCalledTimes(1);
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("unsupported reply dropped and acknowledged"));
+		expect(handoff).not.toHaveBeenCalled();
+		expect(hosted[0]!.unicastAttributed).toHaveBeenCalledTimes(2);
+		await expect(other.sendService(sessionId, "blocked")).rejects.toBeInstanceOf(MeshNotStoredError);
+		expect(FakeEndpoint.instances.filter((e) => e.options.card.name === "gate-watcher")).toHaveLength(1);
+		const stopped = mesh.stop();
+		expect(mesh.stop()).toBe(stopped);
+		await stopped;
+		await expect(mesh.sendService(sessionId, "after stop")).rejects.toBeInstanceOf(MeshNotStoredError);
+		expect(hosted[0]!.stop).toHaveBeenCalledTimes(1);
+		expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(false);
+		await other.sendService(sessionId, "after restart");
+		expect(readGateWatcherRecord(meshRoot)).toEqual(record);
+		expect(FakeEndpoint.instances.at(-1)!.options).toMatchObject({
+			card: { name: "gate-watcher", id: record.identity.id },
+			lifecycleUid: record.lifecycleUid,
+			channels: [],
+			watchChannels: false,
+			watchPresence: false,
+		});
+	});
+
+	it.each(["provision", "endpoint"])(
+		"mesh-notify shutdown joins %s initialization without publishing or leaking",
+		async (stage) => {
+			const { mesh, meshRoot, sessionId } = await notificationFixture();
+			const entered = createDeferred();
+			const release = createDeferred();
+			if (stage === "provision")
+				vi.spyOn(enrollment, "provisionGateWatcher").mockImplementationOnce(async () => {
+					entered.resolve();
+					await release.promise;
+				});
+			else
+				FakeEndpoint.onStart = async (endpoint) => {
+					if (endpoint.options.card.name === "gate-watcher") {
+						entered.resolve();
+						await release.promise;
+					}
+				};
+			const send = expect(mesh.sendService(sessionId, "held")).rejects.toBeInstanceOf(MeshNotStoredError);
+			await entered.promise;
+			let stopSettled = false;
+			const stopped = mesh.stop().then(() => {
+				stopSettled = true;
+			});
+			try {
+				expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(true);
+				if (stage === "endpoint") expect(FakeEndpoint.instances.at(-1)!.stop).toHaveBeenCalledTimes(1);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(stopSettled).toBe(false);
+				release.resolve();
+				await stopped;
+				expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(false);
+			} finally {
+				release.resolve();
+				await stopped;
+				await send;
+			}
+			for (const endpoint of FakeEndpoint.instances) {
+				expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+				expect(endpoint.stop).toHaveBeenCalledTimes(1);
+			}
+		},
+	);
+
+	it.each(["symlink", "mode", "record", "signer"])("mesh-notify refuses private %s state", async (reason) => {
+		const { mesh, meshRoot, sessionId } = await notificationFixture();
+		const record = ensureGateWatcherRecord(meshRoot);
+		const path = gateWatcherPath(meshRoot);
+		if (reason === "symlink") {
+			renameSync(path, `${path}.real`);
+			symlinkSync(`${path}.real`, path);
+		}
+		if (reason === "mode") chmodSync(path, 0o644);
+		if (reason === "record") writeFileSync(path, JSON.stringify({ ...record, allowSubscribe: ["work"] }));
+		if (reason === "signer") {
+			rmSync(join(meshRoot, "signer.json"));
+			symlinkSync(path, join(meshRoot, "signer.json"));
+		}
+		await expect(mesh.sendService(sessionId, "refused")).rejects.toBeInstanceOf(MeshNotStoredError);
+		for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+		expect(hasSessionLease(path, meshRoot)).toBe(false);
+	});
+
+	it("mesh-notify preserves startup failure and retains the claim when cleanup fails", async () => {
+		const { mesh, meshRoot, sessionId, log } = await notificationFixture();
+		FakeEndpoint.onStart = async (endpoint) => {
+			if (endpoint.options.card.name !== "gate-watcher") return;
+			endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
+			throw new Error("start failed");
+		};
+		const outcome = mesh.sendService(sessionId, "refused");
+		await expect(outcome).rejects.toBeInstanceOf(MeshNotStoredError);
+		await expect(outcome).rejects.toThrow("start failed");
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("claim retained: Error: stop failed"));
+		expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(true);
+		await expect(mesh.sendService(sessionId, "again")).rejects.toThrow("claim is already held");
+		for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+	});
+
+	it.each(["", "*", "all", "broadcast", "missing", "same", "elsewhere/target"])(
+		"mesh-notify rejects target %j before initialization",
+		async (target) => {
+			const { mesh, meshRoot, sessionFile } = await notificationFixture();
+			for (const id of ["alias-a", "alias-b"]) {
+				const record = ensureEnrollmentRecord(meshRoot, id, sessionFile);
+				writeFileSync(
+					directoryPath(meshRoot, id),
+					JSON.stringify({
+						sessionId: id,
+						name: "same",
+						principal: `local.${record.identity.id}`,
+						homeSocket: "other",
+					}),
+				);
+			}
+			await expect(mesh.sendService(target, "hello")).rejects.toBeInstanceOf(MeshNotStoredError);
+			expect(existsSync(gateWatcherPath(meshRoot))).toBe(false);
+			for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(["", "x".repeat(16385)])("mesh-notify rejects invalid message length without a sender %#", async (text) => {
+		const { mesh, meshRoot, sessionId } = await notificationFixture();
+		await expect(mesh.sendService(sessionId, text)).rejects.toBeInstanceOf(MeshNotStoredError);
+		expect(existsSync(gateWatcherPath(meshRoot))).toBe(false);
+		for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+	});
+
+	it.each(["target-record", "target-directory", "sender-record"])(
+		"mesh-notify refuses a removed %s without publishing",
+		async (missing) => {
+			const { mesh, meshRoot, sessionId } = await notificationFixture();
+			await mesh.sendService(sessionId, "warm");
+			const source = FakeEndpoint.instances.at(-1)!;
+			source.unicastAttributed.mockClear();
+			rmSync(
+				missing === "sender-record"
+					? gateWatcherPath(meshRoot)
+					: missing === "target-record"
+						? enrollmentPath(meshRoot, sessionId)
+						: directoryPath(meshRoot, sessionId),
+			);
+			await expect(mesh.sendService(sessionId, "removed")).rejects.toBeInstanceOf(MeshNotStoredError);
+			expect(source.unicastAttributed).not.toHaveBeenCalled();
+		},
+	);
+
+	it("mesh-notify names the sender when expired credentials cannot reconnect", async () => {
+		const { mesh, sessionId, log } = await notificationFixture();
+		await mesh.sendService(sessionId, "warm");
+		const source = FakeEndpoint.instances.at(-1)!;
+		const creds = source.options.creds;
+		if (typeof creds !== "function") throw new Error("Expected renewable credentials");
+		source.emit("connection", { connected: false });
+		const claims = core.credsClaims(await creds());
+		source.emit("connection", { connected: true });
+		vi.useFakeTimers();
+		vi.setSystemTime(claims.exp! * 1000);
+		source.reconnect.mockRejectedValueOnce(new Error("offline"));
+		const outcome = mesh.sendService(sessionId, "expired").catch((error: unknown) => error);
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(await outcome).toBeInstanceOf(MeshNotStoredError);
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("Mesh sender gate-watcher: reconnect failed:"));
+		expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["rejection", "lost-ack", "disconnect", "setup"])(
+		"mesh-notify bounds %s without resending a late acknowledgement",
+		async (failure) => {
+			const { mesh, sessionId } = await notificationFixture();
+			vi.useFakeTimers();
+			if (failure !== "setup") await mesh.sendService(sessionId, "warm");
+			const source = FakeEndpoint.instances.at(-1)!;
+			source.unicastAttributed.mockClear();
+			const entered = createDeferred();
+			const release = createDeferred();
+			if (failure === "setup")
+				vi.spyOn(enrollment, "provisionGateWatcher").mockImplementationOnce(async () => {
+					entered.resolve();
+					await release.promise;
+				});
+			if (failure === "disconnect") source.emit("connection", { connected: false });
+			if (failure === "rejection")
+				source.unicastAttributed.mockRejectedValueOnce(new Error("Message was not stored: broker rejected"));
+			if (failure === "lost-ack")
+				source.unicastAttributed.mockImplementationOnce(async () => {
+					await release.promise;
+					return { msg: { id: "late" }, ack: { seq: 9, duplicate: false } };
+				});
+			const outcome = mesh.sendService(sessionId, "bounded").catch((error: unknown) => error);
+			try {
+				if (failure === "setup") await entered.promise;
+				await vi.advanceTimersByTimeAsync(30_000);
+				expect(await outcome).toBeInstanceOf(
+					failure === "setup" || failure === "disconnect" ? MeshNotStoredError : MeshStorageUnknownError,
+				);
+				expect(source.unicastAttributed).toHaveBeenCalledTimes(
+					failure === "setup" || failure === "disconnect" ? 0 : 1,
+				);
+				release.resolve();
+				if (failure === "disconnect") source.emit("connection", { connected: true });
+				await vi.advanceTimersByTimeAsync(0);
+				for (const endpoint of FakeEndpoint.instances)
+					expect(endpoint.unicastAttributed.mock.calls.length).toBe(
+						endpoint === source && (failure === "rejection" || failure === "lost-ack") ? 1 : 0,
+					);
+			} finally {
+				release.resolve();
+				await mesh.stop();
+			}
+		},
+	);
+
 	it.each(["creation", "publication"] as const)(
 		"AC-34 rejects a parked enrollment after a committed delete (%s)",
 		async (phase) => {
@@ -1078,6 +1374,13 @@ describe("mesh enrollment", () => {
 		try {
 			await supervisor.start();
 			expect(FakeEndpoint.instances).toHaveLength(0);
+			const handle = supervisor as unknown as {
+				handleCommand(client: object, command: DaemonCommand): Promise<unknown>;
+			};
+			expect(await handle.handleCommand({}, { type: "mesh_notify", target: "b", message: "hello" })).toMatchObject({
+				success: true,
+				data: { outcome: "failed", error: expect.stringContaining("Cotal transport is not enabled") },
+			});
 			expect(existsSync(join(root, "mesh"))).toBe(false);
 		} finally {
 			await (supervisor as unknown as { cleanupSupervisorResources(): Promise<void> }).cleanupSupervisorResources();

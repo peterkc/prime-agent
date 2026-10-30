@@ -194,6 +194,32 @@ CotalEndpoint.prototype.stop = async () => undefined;
 CotalEndpoint.prototype.provisionDmInbox = async () => undefined;
 CotalEndpoint.prototype.provisionDlvInbox = async () => undefined;
 CotalEndpoint.prototype.reissueAcl = async () => undefined;
+CotalEndpoint.prototype.unicastAttributed = async function (principal, text) {
+	const meshRoot = join(agentDir, "mesh");
+	const target = readdirSync(join(meshRoot, "directory"))
+		.filter((name) => name.endsWith(".json"))
+		.map((name) => readDirectory(meshRoot, name.slice(0, -5)))
+		.find((entry) => entry?.principal === principal);
+	if (!target) throw new Error("Stub notification target missing");
+	const message: CotalMessage = {
+		id: randomUUID(),
+		ts: Date.now(),
+		space: "prime",
+		from: { id: this.card.id, name: this.card.name },
+		to: principal,
+		parts: [{ kind: "text", text }],
+	};
+	mkdirSync(mailbox, { recursive: true });
+	writeFileAtomicSync(join(mailbox, `${message.id}.json`), JSON.stringify({ target: target.sessionId, message }));
+	const pid = targetSupervisorPid(meshRoot, target.sessionId);
+	try {
+		if (pid !== undefined) process.kill(pid, "SIGUSR2");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	}
+	signal("notification-published", message.id);
+	return { msg: message, ack: { seq: 1, duplicate: false } };
+};
 function targetSupervisorPid(meshRoot: string, sessionId: string): number | undefined {
 	const path = canonicalSessionPath(enrollmentPath(meshRoot, sessionId));
 	const key = createHash("sha256").update(path).digest("hex");

@@ -658,7 +658,7 @@ describe("supervisor session move", () => {
 		clients.push(client);
 		await client.connect();
 		const hello = await client.waitForHello();
-		expect(hello.schemaRevision).toBe(36);
+		expect(hello.schemaRevision).toBe(37);
 		expect(hello.serverCapabilities).toContain("session_move");
 		const wire = createDaemonCommandEnvelope({ type: "list" }, "old-client", "old-client", 7);
 		const response = await new Promise<DaemonResponse>((done) => {
