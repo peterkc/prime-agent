@@ -915,7 +915,7 @@ export async function recoverSessionMove(options: {
 				]);
 			}
 			const verified = verifySessionMovePrefix(journal);
-			if (!verified.ok) return report(journal, "pending", [verified.reason]);
+			if (!verified.ok) return report(journal, "pending", [`${verified.reason}: ${journal.targetFile}`]);
 			const enrollment = (await callbacks.readEnrollmentPath(journal)) !== journal.targetFile;
 			const directory = (await callbacks.readDirectorySocket(journal)) !== journal.targetSocket;
 			if (enrollment || directory) {
