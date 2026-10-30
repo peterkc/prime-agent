@@ -1,8 +1,10 @@
 import chalk from "chalk";
+import { formatTable } from "./daemon-list-format.js";
 import type { DaemonInfo, DaemonStatus } from "./daemon-ps.js";
 
 type DaemonRow = {
 	socket: string;
+	root: string;
 	pid: string;
 	version: string;
 	status: string;
@@ -13,13 +15,18 @@ type DaemonRow = {
 export function formatDaemonListTable(daemons: readonly DaemonInfo[]): string {
 	const rows = daemons.map((daemon) => ({
 		socket: daemon.isDefault ? `${daemon.socketPath} *` : daemon.socketPath,
+		root: (daemon.root ?? "").replace(/\p{Cc}/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`),
 		pid: daemon.pid !== undefined ? String(daemon.pid) : "",
 		version: daemon.version ?? "",
 		status: daemon.status,
 		sessions: daemon.sessionCount !== undefined ? String(daemon.sessionCount) : "",
 		uptime: formatUptime(daemon.uptimeSeconds),
 	}));
-	const table = formatTable(["socket", "pid", "version", "status", "sessions", "uptime"], rows, formatDaemonCell);
+	const table = formatTable(
+		["socket", "root", "pid", "version", "status", "sessions", "uptime"],
+		rows,
+		formatDaemonCell,
+	);
 	return daemons.some((daemon) => daemon.isDefault)
 		? `${table}\n\n${chalk.dim("* default background service")}`
 		: table;
@@ -66,25 +73,4 @@ export function formatUptime(uptimeSeconds: number | undefined): string {
 		return `${days}d`;
 	}
 	return `${Math.floor(days / 7)}w`;
-}
-
-function formatTable<T extends Record<string, string>>(
-	columns: Array<keyof T>,
-	rows: T[],
-	formatCell?: (row: T, column: keyof T, value: string) => string,
-): string {
-	const widths = columns.map((column) =>
-		Math.max(String(column).length, ...rows.map((row) => String(row[column]).length)),
-	);
-	const lines = [columns.map((column, index) => String(column).padEnd(widths[index])).join("  ")];
-	for (const row of rows) {
-		const line = columns
-			.map((column, index) => {
-				const value = String(row[column]).padEnd(widths[index]);
-				return formatCell ? formatCell(row, column, value) : value;
-			})
-			.join("  ");
-		lines.push(line);
-	}
-	return lines.join("\n");
 }

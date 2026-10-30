@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { repositorySocketPath } from "../src/cli/repository-daemon.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
@@ -652,13 +653,20 @@ describe("supervisor session move", () => {
 		expect(await harness(restarted).recoverSessionMoves()).toEqual([]);
 	});
 
-	it("AC-19 old protocol-7 client lists on new daemon without the move capability", async () => {
-		const f = await fixture();
-		const client = new DaemonClient(f.socket);
+	it.each(["manual", "repository"])("AC-19 old protocol-7 client lists on new %s daemon", async (kind) => {
+		const f = await fixture(false);
+		const root = join(f.root, "checkout");
+		fs.mkdirSync(root);
+		vi.stubEnv("TMPDIR", f.root);
+		vi.spyOn(process, "cwd").mockReturnValue(root);
+		const socket = kind === "repository" ? repositorySocketPath(root) : f.socket;
+		await start(f.root, f.sourceDir, socket);
+		const client = new DaemonClient(socket);
 		clients.push(client);
 		await client.connect();
 		const hello = await client.waitForHello();
-		expect(hello.schemaRevision).toBe(37);
+		expect(hello.schemaRevision).toBe(38);
+		expect(hello.root).toBe(kind === "repository" ? root : undefined);
 		expect(hello.serverCapabilities).toContain("session_move");
 		const wire = createDaemonCommandEnvelope({ type: "list" }, "old-client", "old-client", 7);
 		const response = await new Promise<DaemonResponse>((done) => {

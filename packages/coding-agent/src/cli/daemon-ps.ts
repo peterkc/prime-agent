@@ -60,6 +60,7 @@ export interface DiscoveredDaemonProcess {
 
 export interface DaemonInfo {
 	socketPath: string;
+	root?: string;
 	pid?: number;
 	uptimeSeconds?: number;
 	version?: string;
@@ -259,6 +260,7 @@ function scanSocketDir(): string[] {
 }
 
 interface ProbeResult {
+	root?: string;
 	version?: string;
 	protocolVersion?: number;
 	schemaId?: string;
@@ -278,6 +280,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		return { reachable: false };
 	}
 	try {
+		let root: string | undefined;
 		let version: string | undefined;
 		let protocolVersion: number | undefined;
 		let schemaId: string | undefined;
@@ -287,6 +290,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		let greeted = false;
 		try {
 			const hello = await client.waitForHello(1500);
+			root = typeof hello.root === "string" ? hello.root : undefined;
 			version = hello.appVersion;
 			protocolVersion = hello.protocol.version;
 			schemaId = hello.schemaId;
@@ -310,6 +314,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			// Leave sessionCount undefined when the daemon will not answer list.
 		}
 		return {
+			root,
 			version,
 			protocolVersion,
 			schemaId,
@@ -391,6 +396,7 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 					: "orphan-file";
 			return {
 				socketPath,
+				...(probe.root !== undefined ? { root: probe.root } : {}),
 				pid,
 				uptimeSeconds: proc?.uptimeSeconds,
 				version: probe.version,

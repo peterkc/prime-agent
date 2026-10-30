@@ -76,8 +76,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 36 adds capability-gated relocation of closed saved sessions.
 // Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal
 // and command_not_dispatched failure info for mesh_notify refusals before dispatch.
-export const DAEMON_SCHEMA_REVISION = 37;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-37-mesh-notify";
+// Revision 38 adds optional repository-root metadata to daemon greetings.
+export const DAEMON_SCHEMA_REVISION = 38;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-repository-root";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1204,6 +1205,8 @@ export type DaemonOutbound =
 	| {
 			type: "daemon_hello";
 			socketPath: string;
+			/** Startup cwd, present only when it maps to this repository daemon socket. */
+			root?: string;
 			protocol: DaemonProtocolInfo;
 			schemaId?: string;
 			/** Monotonic wire-schema revision for field-sensitive compatibility checks. */
