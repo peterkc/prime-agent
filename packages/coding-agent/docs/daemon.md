@@ -236,6 +236,12 @@ process lease while hosting the endpoint. A second live host refuses before publ
 There is no sender session, transcript, worker or directory entry. The recipient can
 still wake a worker and run a model turn. A stored receipt does not prove that it did.
 
+**Any process of the same OS user can send as `gate-watcher`.** The daemon socket is
+private to that user, but the daemon cannot tell one of the user's processes from
+another, so it does not refuse a session or script that runs `prime-agent notify`.
+Session workers cannot send `mesh_notify` over their own connection. Give the command
+only to the job that should send as `gate-watcher`.
+
 **`gate-watcher` is not a reply address.** Name-based replies fail if no real session
 has that name. A real session named `gate-watcher` receives replies addressed to that
 name. Direct Cotal replies to the notification principal are acknowledged and logged
