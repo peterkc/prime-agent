@@ -551,15 +551,24 @@ describe("AgentSession model and extension characterization", () => {
 		const first = await open(SessionManager.create(h.tempDir, join(h.tempDir, "sessions")));
 		first.sessionManager.appendMessage(fauxAssistantMessage("saved"));
 		const next = h.getModel("faux-2")!;
+		const runtime = first.resourceLoader.getExtensions().runtime;
+		const setModel = vi.spyOn(runtime, "setModel");
+		const setThinkingLevel = vi.spyOn(runtime, "setThinkingLevel");
+		const sessionOptions = { persist: false, waitForExtensions: false };
 		await expect(pi.setModel({ ...next, provider: "missing" }, { persist: false })).resolves.toBe(false);
 		vi.spyOn(first.modelRegistry, "canUseModel").mockResolvedValueOnce(false);
 		await expect(pi.setModel(next, { persist: false })).rejects.toThrow("not available");
 		expect(first.sessionManager.getEntries().filter((e) => e.type === "model_change")).toHaveLength(1);
 		expect(first.model?.id).toBe("faux-1");
-		pi.setThinkingLevel("low", { persist: false });
+		pi.setThinkingLevel("low", sessionOptions);
+		expect(setThinkingLevel).toHaveBeenLastCalledWith("low", { persist: false });
 		await pi.setModel({ ...first.model!, reasoning: false }, { persist: false });
 		expect(first.thinkingLevel).toBe("off");
-		await pi.setModel(next, { persist: false });
+		await pi.setModel(next, sessionOptions);
+		expect(setModel).toHaveBeenLastCalledWith(next, { persist: false });
+		expect(sessionOptions).toEqual({ persist: false, waitForExtensions: false });
+		setThinkingLevel.mockRestore();
+		setModel.mockRestore();
 		expect(first.thinkingLevel).toBe("low");
 		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
 		expect(first.thinkingLevel).toBe("medium");
@@ -582,11 +591,20 @@ describe("AgentSession model and extension characterization", () => {
 		]);
 		await pi.setModel(next);
 		expect(settingsManager.getDefaultModel()).toBe("faux-2");
+		pi.setThinkingLevel("low", { persist: false });
+		const entries = fresh.sessionManager.getEntries();
+		const changes: unknown[] = [];
+		const unsubscribe = fresh.subscribe((event) => changes.push(event));
+		pi.on("thinking_level_select", (event) => void changes.push(event));
 		pi.setThinkingLevel("low");
+		unsubscribe();
+		expect(changes).toEqual([]);
+		expect(fresh.sessionManager.getEntries()).toEqual(entries);
 		expect(settingsManager.getDefaultThinkingLevel()).toBe("low");
 		pi.setThinkingLevel("low", { persist: false });
 		await pi.setModel({ ...next, reasoning: false }, { persist: false });
 		pi.setThinkingLevel("off");
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("low");
 		settingsManager.setDefaultThinkingLevel("medium");
 		await pi.setModel(next, { persist: false });
 		expect(fresh.thinkingLevel).toBe("medium");
@@ -598,6 +616,33 @@ describe("AgentSession model and extension characterization", () => {
 		await pi.setModel(next);
 		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
 	});
+	it.each([
+		[false, "low", "high"],
+		[true, "medium", "medium"],
+	] as const)(
+		"PR #57 refreshModelMetadata preserves thinking persistence=%s",
+		async (persist, expectedDefault, restored) => {
+			const h = await createHarness({
+				provider: "xai",
+				models: MODELS.slice(0, 2),
+				settings: { defaultThinkingLevel: "low" },
+			});
+			harnesses.push(h);
+			h.session.setThinkingLevel("high", { persist });
+			const clamped = { ...h.getModel(), thinkingLevelMap: { high: null } };
+			vi.spyOn(h.session.modelRegistry, "getModelForCurrentAuth")
+				.mockReturnValueOnce(clamped)
+				.mockReturnValueOnce(h.getModel());
+			h.session.refreshModelMetadata();
+			expect(h.session.thinkingLevel).toBe("medium");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
+			h.session.refreshModelMetadata();
+			expect(h.session.thinkingLevel).toBe(restored);
+			await h.session.setModel({ ...h.getModel("faux-2")!, thinkingLevelMap: { high: null } });
+			expect(h.session.thinkingLevel).toBe("medium");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
+		},
+	);
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
 		const harness = await createHarness({
@@ -908,6 +953,7 @@ describe("AgentSession model and extension characterization", () => {
 		harness.session.setThinkingLevel("low", { persist: false });
 		await harness.session.cycleModel();
 		await harness.session.cycleModel();
+		expect(harness.session.thinkingLevel).toBe("high");
 		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 	});
 

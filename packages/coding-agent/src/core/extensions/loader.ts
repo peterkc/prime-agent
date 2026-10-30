@@ -280,7 +280,7 @@ function createExtensionAPI(
 
 		setModel(model, options) {
 			runtime.assertActive();
-			return runtime.setModel(model, options);
+			return runtime.setModel(model, { persist: options?.persist });
 		},
 
 		getThinkingLevel() {
@@ -290,7 +290,7 @@ function createExtensionAPI(
 
 		setThinkingLevel(level, options) {
 			runtime.assertActive();
-			runtime.setThinkingLevel(level, options);
+			runtime.setThinkingLevel(level, { persist: options?.persist });
 		},
 
 		registerSecretValues(entries) {

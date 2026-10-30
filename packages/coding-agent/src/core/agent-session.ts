@@ -8763,7 +8763,7 @@ export class AgentSession {
 
 	/**
 	 * Change the clamped session level and history; persist the global default unless persist: false.
-	 * A later xai metadata refresh can still persist a capability clamp.
+	 * A later xai metadata refresh persists a capability clamp only when no session-only level is set.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelChangeOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
@@ -8771,15 +8771,22 @@ export class AgentSession {
 
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
+		const hadPreference = this._thinkingLevelPreference !== undefined;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 		this._thinkingLevelPreference = options.persist === false ? level : undefined;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (options.persist !== false && (this.supportsThinking() || effectiveLevel !== "off")) {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
+		}
+		if (
+			options.persist !== false &&
+			(isChanging || hadPreference) &&
+			(this.supportsThinking() || effectiveLevel !== "off")
+		) {
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+		}
+		if (isChanging) {
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",
@@ -10877,7 +10884,9 @@ export class AgentSession {
 	refreshModelMetadata(): void {
 		if (this.model?.provider === "xai") {
 			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
-			this.setThinkingLevel(this.thinkingLevel);
+			this.setThinkingLevel(this._thinkingLevelPreference ?? this.thinkingLevel, {
+				persist: this._thinkingLevelPreference === undefined,
+			});
 			this._clampServiceTierForModel();
 		}
 		this._scopedModels = this._scopedModels.map((scoped) =>
