@@ -563,6 +563,10 @@ describe("AgentSession model and extension characterization", () => {
 		expect(first.thinkingLevel).toBe("low");
 		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
 		expect(first.thinkingLevel).toBe("medium");
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		await pi.setModel(next, { persist: false });
+		expect(first.thinkingLevel).toBe("low");
+		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
 		const second = await open(SessionManager.inMemory());
 		await pi.setModel(h.getModel("faux-3")!, { persist: false });
 		expect([first.model?.id, second.model?.id]).toEqual(["faux-2", "faux-3"]);

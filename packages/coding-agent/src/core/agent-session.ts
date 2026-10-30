@@ -8863,7 +8863,7 @@ export class AgentSession {
 				this._thinkingLevelPreference ?? this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL
 			);
 		}
-		return this.thinkingLevel;
+		return this._thinkingLevelPreference ?? this.thinkingLevel;
 	}
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
