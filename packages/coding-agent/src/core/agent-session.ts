@@ -150,6 +150,7 @@ import {
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
+	type ModelChangeOptions,
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeRefineResult,
@@ -1037,7 +1038,7 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
-interface ModelSelectOptions {
+interface ModelSelectOptions extends ModelChangeOptions {
 	waitForExtensions?: boolean;
 }
 
@@ -8566,6 +8567,7 @@ export class AgentSession {
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
 		source: "set" | "cycle" | "restore",
+		persisted: boolean,
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
 		await this._extensionRunner.emit({
@@ -8573,6 +8575,7 @@ export class AgentSession {
 			model: nextModel,
 			previousModel,
 			source,
+			persisted,
 		});
 	}
 
@@ -8580,9 +8583,12 @@ export class AgentSession {
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
 		source: "set" | "cycle" | "restore",
+		persisted: boolean,
 	): Promise<void> {
 		const emit = () =>
-			this._modelSelectEmitContext.run(true, () => this._emitModelSelect(nextModel, previousModel, source));
+			this._modelSelectEmitContext.run(true, () =>
+				this._emitModelSelect(nextModel, previousModel, source, persisted),
+			);
 		this._modelSelectEmitQueueIdle = false;
 		const promise = this._modelSelectEmitQueue.then(emit, emit);
 		const queued = promise.catch(() => {});
@@ -8595,6 +8601,7 @@ export class AgentSession {
 		return promise;
 	}
 
+	/** Change the session model and history; persist global defaults unless explicitly disabled. */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
 		// Explicit selection recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
@@ -8620,12 +8627,14 @@ export class AgentSession {
 		this.agent.state.model = model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (options.persist !== false) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, options);
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set");
+		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set", options.persist !== false);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8688,12 +8697,14 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		if (options.persist !== false) {
+			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, options);
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle");
+		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", options.persist !== false);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8728,12 +8739,14 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		if (options.persist !== false) {
+			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel);
+		this.setThinkingLevel(thinkingLevel, options);
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle");
+		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", options.persist !== false);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8748,7 +8761,8 @@ export class AgentSession {
 		};
 	}
 
-	setThinkingLevel(level: ThinkingLevel): void {
+	/** Change the clamped session level and history without requiring a global default update. */
+	setThinkingLevel(level: ThinkingLevel, options: ModelChangeOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -8759,7 +8773,7 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
+			if (options.persist !== false && (this.supportsThinking() || effectiveLevel !== "off")) {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
@@ -10948,13 +10962,13 @@ export class AgentSession {
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
-				setModel: async (model) => {
+				setModel: async (model, options) => {
 					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
-					await this.setModel(model);
+					await this.setModel(model, options);
 					return true;
 				},
 				getThinkingLevel: () => this.thinkingLevel,
-				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				setThinkingLevel: (level, options) => this.setThinkingLevel(level, options),
 			},
 			{
 				getModel: () => this.model,

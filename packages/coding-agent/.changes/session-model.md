@@ -1,0 +1,1 @@
+- Added session-only model and thinking-level changes for extensions with `{ persist: false }`, without changing global defaults or recent models.

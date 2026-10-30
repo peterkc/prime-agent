@@ -278,9 +278,9 @@ function createExtensionAPI(
 			return runtime.getCommands();
 		},
 
-		setModel(model) {
+		setModel(model, options) {
 			runtime.assertActive();
-			return runtime.setModel(model);
+			return runtime.setModel(model, options);
 		},
 
 		getThinkingLevel() {
@@ -288,9 +288,9 @@ function createExtensionAPI(
 			return runtime.getThinkingLevel();
 		},
 
-		setThinkingLevel(level) {
+		setThinkingLevel(level, options) {
 			runtime.assertActive();
-			runtime.setThinkingLevel(level);
+			runtime.setThinkingLevel(level, options);
 		},
 
 		registerSecretValues(entries) {

@@ -85,6 +85,7 @@ export type {
 	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
+	ModelChangeOptions,
 	ModelSelectEvent,
 	ModelSelectSource,
 	ProviderConfig,
