@@ -42,7 +42,7 @@ const daemonClientMock = vi.hoisted(() => {
 		notifyCapable: true,
 		notifyData: undefined as unknown,
 		notifyError: undefined as Error | undefined,
-		notifyEnvelopeFailure: undefined as string | undefined,
+		notifyEnvelopeFailure: undefined as Extract<Response, { success: false }> | undefined,
 	};
 
 	class MockDaemonClient {
@@ -74,15 +74,8 @@ const daemonClientMock = vi.hoisted(() => {
 			if (command.type === "mesh_notify") {
 				this.notifyRequests.push({ timeoutMs, options });
 				if (behavior.notifyError) throw behavior.notifyError;
-				return behavior.notifyEnvelopeFailure
-					? {
-							type: "response",
-							command: command.type,
-							success: false,
-							error: "shutting down; retry the command",
-							errorInfo: { code: behavior.notifyEnvelopeFailure },
-						}
-					: { type: "response", command: command.type, success: true, data: behavior.notifyData };
+				if (behavior.notifyEnvelopeFailure) return behavior.notifyEnvelopeFailure;
+				return { type: "response", command: command.type, success: true, data: behavior.notifyData };
 			}
 			if (command.type === "list") {
 				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
@@ -167,6 +160,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
+	const notifyArgs = ["daemon", "notify", "--daemon-socket", "/tmp/notify.sock"];
 	const receipt = {
 		id: "agentmsg_one",
 		source: "agent_message",
@@ -178,22 +172,27 @@ describe("daemon command", () => {
 		cotalId: "one",
 	};
 
-	it.each([
-		"stored",
-		"failed",
-		"unknown",
-		"timeout",
-		"close",
-		"malformed",
-		"bad-receipt",
-		"journal",
-		"update_restarting",
-		"command_not_dispatched",
-		"unrecognized",
-		"not-sent",
-		"old-daemon",
-		"connect",
-	])("mesh-notify JSON and exit code for %s", async (outcome) => {
+	it.each<[string, string, string?, string?]>([
+		["stored", "stored"],
+		["failed", "failed"],
+		["unknown", "unknown"],
+		["timeout", "unknown"],
+		["close", "unknown"],
+		["malformed", "unknown"],
+		["bad-receipt", "unknown"],
+		["journal", "unknown", "mesh_notify", "command_result_uncertain"],
+		["update_restarting", "failed", "mesh_notify", "update_restarting"],
+		["command_not_dispatched", "failed", "mesh_notify", "command_not_dispatched"],
+		["dispatch", "failed", "dispatch"],
+		["parse", "failed", "parse"],
+		["wrong-label-not-dispatched", "unknown", "list", "command_not_dispatched"],
+		["wrong-label-restarting", "unknown", "list", "update_restarting"],
+		["unrecognized", "unknown", "mesh_notify", "unrecognized"],
+		["untyped", "unknown", "mesh_notify"],
+		["not-sent", "failed"],
+		["old-daemon", "failed"],
+		["connect", "failed"],
+	])("mesh-notify JSON and exit code for %s", async (outcome, expected, command, code) => {
 		daemonClientMock.behavior.notifyData =
 			outcome === "stored"
 				? { outcome, receipt }
@@ -203,38 +202,23 @@ describe("daemon command", () => {
 						? { outcome, error: "visible reason" }
 						: null;
 		if (outcome === "timeout" || outcome === "close") daemonClientMock.behavior.notifyError = new Error(outcome);
-		if (["journal", "update_restarting", "command_not_dispatched", "unrecognized"].includes(outcome))
-			daemonClientMock.behavior.notifyEnvelopeFailure = outcome === "journal" ? "command_result_uncertain" : outcome;
+		if (command)
+			daemonClientMock.behavior.notifyEnvelopeFailure = {
+				type: "response",
+				command,
+				success: false,
+				error: "shutting down; retry the command",
+				...(code ? { errorInfo: { code } } : {}),
+			};
 		if (outcome === "not-sent")
 			daemonClientMock.behavior.notifyError = new DaemonCommandNotSentError("not connected");
 		if (outcome === "old-daemon") daemonClientMock.behavior.notifyCapable = false;
 		if (outcome === "connect") daemonClientMock.behavior.connectFails = true;
 		const spawns = spawnMock.calls.length;
-		await handleDaemonCommand([
-			"daemon",
-			"notify",
-			"--daemon-socket",
-			"/tmp/notify.sock",
-			"--json",
-			"b",
-			"--",
-			"hello",
-		]);
+		await handleDaemonCommand([...notifyArgs, "--json", "b", "--", "hello"]);
 		expect(console.log).toHaveBeenCalledTimes(1);
 		expect(console.error).not.toHaveBeenCalled();
 		const printed = JSON.parse(String(vi.mocked(console.log).mock.calls[0]![0]));
-		const expected = [
-			"failed",
-			"old-daemon",
-			"connect",
-			"update_restarting",
-			"command_not_dispatched",
-			"not-sent",
-		].includes(outcome)
-			? "failed"
-			: outcome === "stored"
-				? "stored"
-				: "unknown";
 		expect(printed.outcome).toBe(expected);
 		if (expected === "stored") expect(printed).toEqual({ outcome: "stored", receipt });
 		else if (outcome === "old-daemon")
@@ -274,16 +258,7 @@ describe("daemon command", () => {
 		async (outcome) => {
 			daemonClientMock.behavior.notifyData =
 				outcome === "stored" ? { outcome, receipt } : { outcome, error: "visible reason" };
-			await handleDaemonCommand([
-				"daemon",
-				"notify",
-				"--daemon-socket",
-				"/tmp/notify.sock",
-				"b",
-				"--",
-				"--json",
-				"literal",
-			]);
+			await handleDaemonCommand([...notifyArgs, "b", "--", "--json", "literal"]);
 			expect(daemonClientMock.instances[0]!.requests).toEqual([
 				{ type: "mesh_notify", target: "b", message: "--json literal" },
 			]);

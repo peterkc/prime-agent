@@ -15,7 +15,6 @@ import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { redactMeshError } from "../modes/daemon/cotal/mesh-shared.js";
 import {
-	DaemonCapabilityUnavailableError,
 	DaemonClient,
 	type DaemonClientMessageListener,
 	DaemonCommandNotSentError,
@@ -194,10 +193,13 @@ async function runNotify(args: string[]): Promise<void> {
 			{ recoverable: false },
 		);
 		if (!response.success) {
-			const expectedCommand = ["mesh_notify", "dispatch", "parse"].includes(response.command);
+			const expectedCommand = response.command === "mesh_notify";
 			if (
-				expectedCommand &&
-				(response.errorInfo?.code === "command_not_dispatched" || response.errorInfo?.code === "update_restarting")
+				response.command === "dispatch" ||
+				response.command === "parse" ||
+				(expectedCommand &&
+					(response.errorInfo?.code === "command_not_dispatched" ||
+						response.errorInfo?.code === "update_restarting"))
 			)
 				requested = false;
 			throw new Error(response.error);
@@ -205,11 +207,7 @@ async function runNotify(args: string[]): Promise<void> {
 		if (response.command !== "mesh_notify") throw new Error("Daemon returned a different command result");
 		result = parseNotifyResult(response.data);
 	} catch (error) {
-		if (
-			error instanceof DaemonCommandNotSentError ||
-			(error instanceof DaemonCapabilityUnavailableError && !error.afterReconnect)
-		)
-			requested = false;
+		if (error instanceof DaemonCommandNotSentError) requested = false;
 		result = requested
 			? {
 					outcome: "unknown",

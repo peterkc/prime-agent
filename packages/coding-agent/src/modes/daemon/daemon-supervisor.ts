@@ -2105,17 +2105,14 @@ export class DaemonSupervisor {
 		try {
 			this.assertSupervisorServing();
 		} catch (error) {
-			this.write(
-				client,
-				failure(salvageDaemonCommandId(line), "dispatch", error, { code: "command_not_dispatched" }),
-			);
+			this.write(client, failure(salvageDaemonCommandId(line), "dispatch", error, serializeDaemonError(error)));
 			return;
 		}
 		let preParsed: ReturnType<DaemonSupervisor["parseCommandAndRegisterPromptAdmission"]>;
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
-			this.write(client, failure(salvageDaemonCommandId(line), "parse", error, { code: "command_not_dispatched" }));
+			this.write(client, failure(salvageDaemonCommandId(line), "parse", error));
 			return;
 		}
 		const command = preParsed.command;

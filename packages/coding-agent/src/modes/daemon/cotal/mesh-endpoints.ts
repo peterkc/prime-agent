@@ -947,7 +947,8 @@ export class MeshEndpoints {
 		try {
 			if (this.gateWatcher) await this.closeGateWatcher(this.gateWatcher);
 		} finally {
-			// Stop interrupts first-connect; initialization still owns provisioning cleanup.
+			// Stop the endpoint first so a late first connect tears itself down;
+			// initialization still owns provisioning cleanup.
 			await this.startingGateWatcher?.catch(() => undefined);
 		}
 	}

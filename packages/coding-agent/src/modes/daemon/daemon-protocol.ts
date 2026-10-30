@@ -74,7 +74,8 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 34 adds capability-gated mesh sends and stored agent-message receipts.
 // Revision 35 adds capability-gated mesh replacement barriers with worker-created nonces and handoff attempt tokens.
 // Revision 36 adds capability-gated relocation of closed saved sessions.
-// Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal.
+// Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal
+// and command_not_dispatched failure info for mesh_notify refusals before dispatch.
 export const DAEMON_SCHEMA_REVISION = 37;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-37-mesh-notify";
 
