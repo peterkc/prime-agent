@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonHello } from "../src/modes/daemon/daemon-client.js";
-import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import {
+	DaemonClient,
+	DaemonCommandNotSentError,
+	getDaemonSocketCloseReason,
+} from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
@@ -114,6 +118,20 @@ function emitHello(
 }
 
 describe("DaemonClient", () => {
+	it.each(["request", "requestWire"] as const)("marks %s refusal before a write as not sent", async (method) => {
+		const client = new DaemonClient("unused");
+		const state = client as unknown as {
+			socket: { destroyed: boolean; write: ReturnType<typeof vi.fn> };
+			requestWire: DaemonClient["request"];
+		};
+		state.socket = { destroyed: true, write: vi.fn() };
+		for (const command of [{ type: "mesh_notify", target: "b", message: "hello" }, { type: "list" }] as const) {
+			const request = method === "request" ? client.request(command) : state.requestWire(command);
+			await expect(request).rejects.toBeInstanceOf(DaemonCommandNotSentError);
+		}
+		expect(state.socket.write).not.toHaveBeenCalled();
+	});
+
 	beforeEach(() => {
 		netMock.sockets.length = 0;
 		netMock.createConnection.mockClear();

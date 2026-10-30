@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repositoryDaemon } from "../src/cli/repository-daemon.js";
+import { DaemonCommandNotSentError } from "../src/modes/daemon/daemon-client.js";
 
 const daemonClientMock = vi.hoisted(() => {
 	type Listener = (message: { type: string; activeSessionId?: string; event?: { type: string } }) => void;
@@ -28,7 +29,7 @@ const daemonClientMock = vi.hoisted(() => {
 	};
 	type Response =
 		| { type: "response"; command: string; success: true; data?: unknown }
-		| { type: "response"; command: string; success: false; error: string };
+		| { type: "response"; command: string; success: false; error: string; errorInfo?: { code: string } };
 
 	const instances: MockDaemonClient[] = [];
 	const behavior = {
@@ -41,7 +42,7 @@ const daemonClientMock = vi.hoisted(() => {
 		notifyCapable: true,
 		notifyData: undefined as unknown,
 		notifyError: undefined as Error | undefined,
-		notifyEnvelopeFailure: false,
+		notifyEnvelopeFailure: undefined as string | undefined,
 	};
 
 	class MockDaemonClient {
@@ -74,7 +75,13 @@ const daemonClientMock = vi.hoisted(() => {
 				this.notifyRequests.push({ timeoutMs, options });
 				if (behavior.notifyError) throw behavior.notifyError;
 				return behavior.notifyEnvelopeFailure
-					? { type: "response", command: command.type, success: false, error: "command result uncertain" }
+					? {
+							type: "response",
+							command: command.type,
+							success: false,
+							error: "shutting down; retry the command",
+							errorInfo: { code: behavior.notifyEnvelopeFailure },
+						}
 					: { type: "response", command: command.type, success: true, data: behavior.notifyData };
 			}
 			if (command.type === "list") {
@@ -127,7 +134,8 @@ const daemonClientMock = vi.hoisted(() => {
 	return { MockDaemonClient, behavior, instances };
 });
 
-vi.mock("../src/modes/daemon/daemon-client.js", () => ({
+vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => ({
+	...(await importOriginal<Record<string, unknown>>()),
 	DaemonClient: daemonClientMock.MockDaemonClient,
 }));
 
@@ -159,6 +167,17 @@ vi.mock("node:child_process", async (importOriginal) => {
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
+	const receipt = {
+		id: "agentmsg_one",
+		source: "agent_message",
+		target: { activeSessionId: "b", sessionId: "b" },
+		from: { sessionName: "gate-watcher", clientId: "local.sender" },
+		message: "hello",
+		deliveryStatus: "stored",
+		sequence: 1,
+		cotalId: "one",
+	};
+
 	it.each([
 		"stored",
 		"failed",
@@ -168,19 +187,13 @@ describe("daemon command", () => {
 		"malformed",
 		"bad-receipt",
 		"journal",
+		"update_restarting",
+		"command_not_dispatched",
+		"unrecognized",
+		"not-sent",
 		"old-daemon",
 		"connect",
 	])("mesh-notify JSON and exit code for %s", async (outcome) => {
-		const receipt = {
-			id: "agentmsg_one",
-			source: "agent_message",
-			target: { activeSessionId: "b", sessionId: "b" },
-			from: { sessionName: "gate-watcher", clientId: "local.sender" },
-			message: "hello",
-			deliveryStatus: "stored",
-			sequence: 1,
-			cotalId: "one",
-		};
 		daemonClientMock.behavior.notifyData =
 			outcome === "stored"
 				? { outcome, receipt }
@@ -190,7 +203,10 @@ describe("daemon command", () => {
 						? { outcome, error: "visible reason" }
 						: null;
 		if (outcome === "timeout" || outcome === "close") daemonClientMock.behavior.notifyError = new Error(outcome);
-		if (outcome === "journal") daemonClientMock.behavior.notifyEnvelopeFailure = true;
+		if (["journal", "update_restarting", "command_not_dispatched", "unrecognized"].includes(outcome))
+			daemonClientMock.behavior.notifyEnvelopeFailure = outcome === "journal" ? "command_result_uncertain" : outcome;
+		if (outcome === "not-sent")
+			daemonClientMock.behavior.notifyError = new DaemonCommandNotSentError("not connected");
 		if (outcome === "old-daemon") daemonClientMock.behavior.notifyCapable = false;
 		if (outcome === "connect") daemonClientMock.behavior.connectFails = true;
 		const spawns = spawnMock.calls.length;
@@ -207,7 +223,14 @@ describe("daemon command", () => {
 		expect(console.log).toHaveBeenCalledTimes(1);
 		expect(console.error).not.toHaveBeenCalled();
 		const printed = JSON.parse(String(vi.mocked(console.log).mock.calls[0]![0]));
-		const expected = ["failed", "old-daemon", "connect"].includes(outcome)
+		const expected = [
+			"failed",
+			"old-daemon",
+			"connect",
+			"update_restarting",
+			"command_not_dispatched",
+			"not-sent",
+		].includes(outcome)
 			? "failed"
 			: outcome === "stored"
 				? "stored"
@@ -246,23 +269,31 @@ describe("daemon command", () => {
 		expect(JSON.parse(String(vi.mocked(console.log).mock.calls[0]![0])).outcome).toBe("failed");
 	});
 
-	it("mesh-notify treats --json after the separator as message content and prints one human line", async () => {
-		daemonClientMock.behavior.notifyData = { outcome: "failed", error: "not stored" };
-		await handleDaemonCommand([
-			"daemon",
-			"notify",
-			"--daemon-socket",
-			"/tmp/notify.sock",
-			"b",
-			"--",
-			"--json",
-			"literal",
-		]);
-		expect(daemonClientMock.instances[0]!.requests).toEqual([
-			{ type: "mesh_notify", target: "b", message: "--json literal" },
-		]);
-		expect(console.log).toHaveBeenCalledExactlyOnceWith("not stored");
-	});
+	it.each(["stored", "failed", "unknown"])(
+		"mesh-notify human %s uses the right stream and preserves literal --json",
+		async (outcome) => {
+			daemonClientMock.behavior.notifyData =
+				outcome === "stored" ? { outcome, receipt } : { outcome, error: "visible reason" };
+			await handleDaemonCommand([
+				"daemon",
+				"notify",
+				"--daemon-socket",
+				"/tmp/notify.sock",
+				"b",
+				"--",
+				"--json",
+				"literal",
+			]);
+			expect(daemonClientMock.instances[0]!.requests).toEqual([
+				{ type: "mesh_notify", target: "b", message: "--json literal" },
+			]);
+			expect(console[outcome === "stored" ? "log" : "error"]).toHaveBeenCalledExactlyOnceWith(
+				outcome === "stored" ? "Stored for b" : "visible reason",
+			);
+			expect(console[outcome === "stored" ? "error" : "log"]).not.toHaveBeenCalled();
+			expect(process.exitCode).toBe(outcome === "stored" ? 0 : outcome === "failed" ? 1 : 2);
+		},
+	);
 
 	// Table-driven argv parsing: every row runs `daemon --socket <socket> <argv>` and pins the first
 	// request the CLI puts on the wire.
@@ -355,7 +386,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.notifyCapable = true;
 		daemonClientMock.behavior.notifyData = undefined;
 		daemonClientMock.behavior.notifyError = undefined;
-		daemonClientMock.behavior.notifyEnvelopeFailure = false;
+		daemonClientMock.behavior.notifyEnvelopeFailure = undefined;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);

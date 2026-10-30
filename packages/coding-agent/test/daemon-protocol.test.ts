@@ -45,7 +45,7 @@ import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-co
 import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
-	it("accepts the revision-33 client command envelope on a revision-34 supervisor", async () => {
+	it("accepts schema-33/35 client list envelopes on the schema-36 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
 		vi.stubEnv("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR", join(root, "owners"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
@@ -64,7 +64,7 @@ describe("daemon protocol helpers", () => {
 		} as DaemonSocketClient;
 		try {
 			await supervisor.start();
-			// Revision 33 uses protocol 7. Schema revision is in the server hello, not in client commands.
+			// Schema 33 and 35 clients use protocol 7. The command carries no client schema revision.
 			const envelope = {
 				type: "command",
 				id: "old-list",

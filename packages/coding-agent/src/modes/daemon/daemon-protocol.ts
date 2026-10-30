@@ -1115,6 +1115,7 @@ export type DaemonErrorInfo =
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "update_restarting" }
+	| { code: "command_not_dispatched" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";

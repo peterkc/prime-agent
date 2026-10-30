@@ -97,6 +97,39 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
+	it.each(["shutdown", "lease", "parse", "ready", "ownership", "fence", "update", "post-dispatch"])(
+		"mesh-notify distinguishes %s refusal before dispatch from uncertainty",
+		async (stage) => {
+			const error = new Error("shutting down; retry the command");
+			const dispatch = vi.fn(async () => success("notice", "mesh_notify", { outcome: "stored" }));
+			const owner = client("notify-client");
+			const current = vi.fn(async () => undefined);
+			if (stage === "ownership") current.mockRejectedValueOnce(error);
+			if (stage === "fence" || stage === "post-dispatch")
+				current.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+			const supervisor = Object.assign(createHarness({ assertCurrent: current }), {
+				handleCommand: dispatch,
+				write: vi.fn(),
+				shuttingDown: stage === "shutdown",
+				socketLeaseCompromise: stage === "lease" ? error : undefined,
+				idleEvictionFence: stage === "fence" ? Promise.resolve() : undefined,
+				updateRestartPhase: stage === "update" ? "fencing" : undefined,
+			});
+			if (stage === "ready") Object.assign(supervisor, { ready: Promise.reject(error) });
+			const line = commandLine({ id: "notice", type: "mesh_notify", target: "b", message: "hello" });
+			await supervisor.handleLine(owner, stage === "parse" ? JSON.stringify({ id: "notice" }) : line);
+			expect(dispatch).toHaveBeenCalledTimes(stage === "post-dispatch" ? 1 : 0);
+			expect(supervisor.write.mock.calls[0]![1]).toMatchObject({
+				id: "notice",
+				success: false,
+				...(stage === "post-dispatch"
+					? { error: error.message }
+					: { errorInfo: { code: stage === "update" ? "update_restarting" : "command_not_dispatched" } }),
+			});
+			if (stage === "post-dispatch") expect(supervisor.write.mock.calls[0]![1]).not.toHaveProperty("errorInfo");
+		},
+	);
+
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

@@ -2105,14 +2105,17 @@ export class DaemonSupervisor {
 		try {
 			this.assertSupervisorServing();
 		} catch (error) {
-			this.write(client, failure(salvageDaemonCommandId(line), "dispatch", error, serializeDaemonError(error)));
+			this.write(
+				client,
+				failure(salvageDaemonCommandId(line), "dispatch", error, { code: "command_not_dispatched" }),
+			);
 			return;
 		}
 		let preParsed: ReturnType<DaemonSupervisor["parseCommandAndRegisterPromptAdmission"]>;
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
-			this.write(client, failure(salvageDaemonCommandId(line), "parse", error));
+			this.write(client, failure(salvageDaemonCommandId(line), "parse", error, { code: "command_not_dispatched" }));
 			return;
 		}
 		const command = preParsed.command;
@@ -2136,7 +2139,15 @@ export class DaemonSupervisor {
 			await waitForPromptAdmission(this.ready, parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-			this.write(client, failure(command.id, command.type, error));
+			this.write(
+				client,
+				failure(
+					command.id,
+					command.type,
+					error,
+					command.type === "mesh_notify" ? { code: "command_not_dispatched" } : undefined,
+				),
+			);
 			return;
 		}
 		const envelopeClientId = preParsed.envelopeClientId;
@@ -2168,7 +2179,15 @@ export class DaemonSupervisor {
 			await waitForPromptAdmission(this.assertServingCurrentOwnership(), parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-			this.write(client, failure(command.id, command.type, error));
+			this.write(
+				client,
+				failure(
+					command.id,
+					command.type,
+					error,
+					command.type === "mesh_notify" ? { code: "command_not_dispatched" } : undefined,
+				),
+			);
 			return;
 		}
 
@@ -2216,7 +2235,15 @@ export class DaemonSupervisor {
 					await this.assertServingCurrentOwnership();
 				} catch (error) {
 					if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-					this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+					this.write(
+						client,
+						failure(
+							command.id,
+							command.type,
+							error,
+							command.type === "mesh_notify" ? { code: "command_not_dispatched" } : serializeDaemonError(error),
+						),
+					);
 					return;
 				}
 			}

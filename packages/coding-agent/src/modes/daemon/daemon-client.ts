@@ -80,6 +80,9 @@ export class DaemonSocketClosedError extends Error {
 	}
 }
 
+/** The request failed before any command bytes were submitted to the socket. */
+export class DaemonCommandNotSentError extends Error {}
+
 export class DaemonCapabilityUnavailableError extends Error {
 	constructor(
 		readonly command: DaemonCommand["type"],
@@ -316,7 +319,7 @@ export class DaemonClient {
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
-			throw new Error(
+			throw new DaemonCommandNotSentError(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
 		}
@@ -358,7 +361,7 @@ export class DaemonClient {
 		compatibilities: readonly DaemonCommandCompatibility[] = [],
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
-			throw new Error(
+			throw new DaemonCommandNotSentError(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
 		}

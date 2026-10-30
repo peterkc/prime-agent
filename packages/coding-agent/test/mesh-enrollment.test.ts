@@ -122,6 +122,26 @@ async function fixture() {
 }
 
 describe("mesh enrollment", () => {
+	it.each([
+		[new MeshNotStoredError("not published"), "failed", "not published"],
+		[new MeshStorageUnknownError("maybe published"), "unknown", "maybe published"],
+		[
+			new Error("unexpected publish failure"),
+			"unknown",
+			"Message storage outcome is unknown: Error: unexpected publish failure; a resend can show the message twice",
+		],
+	] as const)("mesh-notify supervisor maps %s to %s", async (error, outcome, text) => {
+		const { mesh } = await fixture();
+		vi.spyOn(mesh, "sendService").mockRejectedValueOnce(error);
+		const handle = Object.assign(Object.create(DaemonSupervisor.prototype), { mesh }) as {
+			handleCommand(client: object, command: DaemonCommand): Promise<unknown>;
+		};
+		expect(await handle.handleCommand({}, { type: "mesh_notify", target: "b", message: "hello" })).toMatchObject({
+			success: true,
+			data: { outcome, error: text },
+		});
+	});
+
 	async function notificationFixture() {
 		const f = await fixture();
 		await f.mesh.enroll(f.sessionId, f.sessionFile);
@@ -177,7 +197,10 @@ describe("mesh enrollment", () => {
 		expect(hosted[0]!.unicastAttributed).toHaveBeenCalledTimes(2);
 		await expect(other.sendService(sessionId, "blocked")).rejects.toBeInstanceOf(MeshNotStoredError);
 		expect(FakeEndpoint.instances.filter((e) => e.options.card.name === "gate-watcher")).toHaveLength(1);
-		await mesh.stop();
+		const stopped = mesh.stop();
+		expect(mesh.stop()).toBe(stopped);
+		await stopped;
+		await expect(mesh.sendService(sessionId, "after stop")).rejects.toBeInstanceOf(MeshNotStoredError);
 		expect(hosted[0]!.stop).toHaveBeenCalledTimes(1);
 		expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(false);
 		await other.sendService(sessionId, "after restart");
@@ -211,15 +234,23 @@ describe("mesh enrollment", () => {
 				};
 			const send = expect(mesh.sendService(sessionId, "held")).rejects.toBeInstanceOf(MeshNotStoredError);
 			await entered.promise;
-			const stopped = mesh.stop();
+			let stopSettled = false;
+			const stopped = mesh.stop().then(() => {
+				stopSettled = true;
+			});
 			try {
 				expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(true);
+				if (stage === "endpoint") expect(FakeEndpoint.instances.at(-1)!.stop).toHaveBeenCalledTimes(1);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(stopSettled).toBe(false);
+				release.resolve();
+				await stopped;
+				expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(false);
 			} finally {
 				release.resolve();
-				await send;
 				await stopped;
+				await send;
 			}
-			expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(false);
 			for (const endpoint of FakeEndpoint.instances) {
 				expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
 				expect(endpoint.stop).toHaveBeenCalledTimes(1);
@@ -297,6 +328,25 @@ describe("mesh enrollment", () => {
 		},
 	);
 
+	it("mesh-notify names the sender when expired credentials cannot reconnect", async () => {
+		const { mesh, sessionId, log } = await notificationFixture();
+		await mesh.sendService(sessionId, "warm");
+		const source = FakeEndpoint.instances.at(-1)!;
+		const creds = source.options.creds;
+		if (typeof creds !== "function") throw new Error("Expected renewable credentials");
+		source.emit("connection", { connected: false });
+		const claims = core.credsClaims(await creds());
+		source.emit("connection", { connected: true });
+		vi.useFakeTimers();
+		vi.setSystemTime(claims.exp! * 1000);
+		source.reconnect.mockRejectedValueOnce(new Error("offline"));
+		const outcome = mesh.sendService(sessionId, "expired").catch((error: unknown) => error);
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(await outcome).toBeInstanceOf(MeshNotStoredError);
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("Mesh sender gate-watcher: reconnect failed:"));
+		expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
+	});
+
 	it.each(["rejection", "lost-ack", "disconnect", "setup"])(
 		"mesh-notify bounds %s without resending a late acknowledgement",
 		async (failure) => {
@@ -330,12 +380,17 @@ describe("mesh enrollment", () => {
 				expect(source.unicastAttributed).toHaveBeenCalledTimes(
 					failure === "setup" || failure === "disconnect" ? 0 : 1,
 				);
+				release.resolve();
+				if (failure === "disconnect") source.emit("connection", { connected: true });
+				await vi.advanceTimersByTimeAsync(0);
+				for (const endpoint of FakeEndpoint.instances)
+					expect(endpoint.unicastAttributed.mock.calls.length).toBe(
+						endpoint === source && (failure === "rejection" || failure === "lost-ack") ? 1 : 0,
+					);
 			} finally {
 				release.resolve();
 				await mesh.stop();
 			}
-			for (const endpoint of FakeEndpoint.instances)
-				expect(endpoint.unicastAttributed.mock.calls.length).toBeLessThanOrEqual(1);
 		},
 	);
 

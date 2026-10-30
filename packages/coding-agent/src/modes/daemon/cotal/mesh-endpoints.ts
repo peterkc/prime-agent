@@ -944,9 +944,12 @@ export class MeshEndpoints {
 	}
 
 	private async stopGateWatcher(): Promise<void> {
-		// Initialization cleans up its own failures; shutdown must also join a late successful start.
-		await this.startingGateWatcher?.catch(() => undefined);
-		if (this.gateWatcher) await this.closeGateWatcher(this.gateWatcher);
+		try {
+			if (this.gateWatcher) await this.closeGateWatcher(this.gateWatcher);
+		} finally {
+			// Stop interrupts first-connect; initialization still owns provisioning cleanup.
+			await this.startingGateWatcher?.catch(() => undefined);
+		}
 	}
 
 	async send(
@@ -1054,8 +1057,9 @@ export class MeshEndpoints {
 			Date.now() >= session.credentialExpiresAt
 		) {
 			session.state = "reconnecting";
+			const label = session === this.gateWatcher ? "sender gate-watcher" : `session ${session.label}`;
 			void session.endpoint.reconnect().catch((error: unknown) => {
-				this.options.log(`Mesh session ${session.label}: reconnect failed: ${redactMeshError(error)}`);
+				this.options.log(`Mesh ${label}: reconnect failed: ${redactMeshError(error)}`);
 			});
 		}
 		if (session.state === "connected") return Promise.resolve();

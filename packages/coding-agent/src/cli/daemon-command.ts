@@ -14,7 +14,12 @@ import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js"
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { redactMeshError } from "../modes/daemon/cotal/mesh-shared.js";
-import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
+import {
+	DaemonCapabilityUnavailableError,
+	DaemonClient,
+	type DaemonClientMessageListener,
+	DaemonCommandNotSentError,
+} from "../modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	type DaemonOutbound,
@@ -188,10 +193,23 @@ async function runNotify(args: string[]): Promise<void> {
 			35_000,
 			{ recoverable: false },
 		);
-		if (!response.success) throw new Error(response.error);
+		if (!response.success) {
+			const expectedCommand = ["mesh_notify", "dispatch", "parse"].includes(response.command);
+			if (
+				expectedCommand &&
+				(response.errorInfo?.code === "command_not_dispatched" || response.errorInfo?.code === "update_restarting")
+			)
+				requested = false;
+			throw new Error(response.error);
+		}
 		if (response.command !== "mesh_notify") throw new Error("Daemon returned a different command result");
 		result = parseNotifyResult(response.data);
 	} catch (error) {
+		if (
+			error instanceof DaemonCommandNotSentError ||
+			(error instanceof DaemonCapabilityUnavailableError && !error.afterReconnect)
+		)
+			requested = false;
 		result = requested
 			? {
 					outcome: "unknown",
@@ -217,7 +235,7 @@ async function runNotify(args: string[]): Promise<void> {
 		case "unknown":
 			process.exitCode = result.outcome === "failed" ? 1 : 2;
 			if (json) printJson(result);
-			else console.log(result.error.replace(/[\r\n]+/g, " "));
+			else console.error(result.error.replace(/[\r\n]+/g, " "));
 			return;
 		default: {
 			const unhandled: never = result;
