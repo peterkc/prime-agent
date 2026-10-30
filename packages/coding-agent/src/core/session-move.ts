@@ -574,6 +574,35 @@ export async function rollbackSessionMove(
 		: report(journal, "rolled_back", ["Nothing moved"]);
 }
 
+/** Verify the moved prefix, not entries appended after publication. */
+function verifySessionMovePrefix(journal: SessionMoveJournal): SessionMoveResult<null> {
+	try {
+		if (journal.fileBytes === undefined || journal.fileSha256 === undefined) {
+			return failure("Verified file length or SHA-256 is missing");
+		}
+		const descriptor = openSync(journal.targetFile, "r");
+		try {
+			const hash = createHash("sha256");
+			const buffer = Buffer.alloc(Math.min(journal.fileBytes, 64 * 1024));
+			let offset = 0;
+			while (offset < journal.fileBytes) {
+				const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, journal.fileBytes - offset), offset);
+				if (count === 0) break;
+				hash.update(buffer.subarray(0, count));
+				offset += count;
+			}
+			if (offset !== journal.fileBytes || hash.digest("hex") !== journal.fileSha256) {
+				return failure("Published session's verified prefix changed");
+			}
+			return { ok: true, value: null };
+		} finally {
+			closeSync(descriptor);
+		}
+	} catch (error) {
+		return failure(errorMessage(error));
+	}
+}
+
 /** Normal flow only. The caller still holds its pre-publication target-file lease. */
 export async function deleteSessionMoveOriginal(
 	journal: SessionMoveJournal,
@@ -589,33 +618,8 @@ export async function deleteSessionMoveOriginal(
 	}
 	try {
 		if (!reason) {
-			if (journal.fileBytes === undefined || journal.fileSha256 === undefined) {
-				reason = "Verified file length or SHA-256 is missing";
-			} else {
-				const descriptor = openSync(journal.targetFile, "r");
-				try {
-					const hash = createHash("sha256");
-					const buffer = Buffer.alloc(Math.min(journal.fileBytes, 64 * 1024));
-					let offset = 0;
-					while (offset < journal.fileBytes) {
-						const count = readSync(
-							descriptor,
-							buffer,
-							0,
-							Math.min(buffer.length, journal.fileBytes - offset),
-							offset,
-						);
-						if (count === 0) break;
-						hash.update(buffer.subarray(0, count));
-						offset += count;
-					}
-					if (offset !== journal.fileBytes || hash.digest("hex") !== journal.fileSha256) {
-						reason = "Published session's verified prefix changed";
-					}
-				} finally {
-					closeSync(descriptor);
-				}
-			}
+			const verified = verifySessionMovePrefix(journal);
+			if (!verified.ok) reason = verified.reason;
 		}
 		if (!reason && artifactDigest(journal.sourceArtifacts) !== journal.artifactSha256) {
 			reason = "Source artifacts changed during the move; original kept";
