@@ -45,7 +45,7 @@ import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-co
 import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
-	it("accepts schema-33/35 client list envelopes on the schema-37 supervisor", async () => {
+	it("accepts schema-33/35 client list envelopes on the schema-38 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
 		vi.stubEnv("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR", join(root, "owners"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
@@ -276,8 +276,9 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(37);
-		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-37-mesh-notify");
+		expect(DAEMON_SCHEMA_REVISION).toBe(38);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-38-repository-root");
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.daemon_hello).toEqual({ minProtocol: 7 });
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 32,

@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import type { CotalMessage } from "@cotal-ai/core";
 import { getLogger } from "@earendil-works/pi-ai";
+import { repositoryRootForSocket } from "../../cli/repository-daemon.js";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -766,6 +767,7 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
+	private readonly repositoryRoot?: string;
 	private readonly descriptorDir: string;
 	private readonly generation = randomUUID();
 	private readonly supervisorConfigPath: string;
@@ -819,6 +821,7 @@ export class DaemonSupervisor {
 		private readonly socketPath: string,
 		options: DaemonSupervisorOptions,
 	) {
+		this.repositoryRoot = repositoryRootForSocket(process.cwd(), socketPath);
 		this.ready = new Promise<void>((resolveReady, rejectReady) => {
 			this.markReady = resolveReady;
 			this.rejectReady = rejectReady;
@@ -1820,6 +1823,7 @@ export class DaemonSupervisor {
 					this.write(client, {
 						type: "daemon_hello",
 						socketPath: this.socketPath,
+						...(this.repositoryRoot !== undefined ? { root: this.repositoryRoot } : {}),
 						protocol: DAEMON_PROTOCOL_INFO,
 						schemaId: DAEMON_SCHEMA_ID,
 						schemaRevision: DAEMON_SCHEMA_REVISION,

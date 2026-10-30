@@ -64,6 +64,10 @@ export function repositoryDaemonRoot(socketPath: string): string | undefined {
 	return roots.get(normalizeSocketPath(socketPath));
 }
 
+export function repositoryRootForSocket(cwd: string, socketPath: string): string | undefined {
+	return normalizeSocketPath(repositorySocketPath(cwd)) === normalizeSocketPath(socketPath) ? cwd : undefined;
+}
+
 export function repositorySocketPath(root: string): string {
 	const bytes = Buffer.from(root, "utf8");
 	// POSIX cksum includes the byte length, least-significant byte first.

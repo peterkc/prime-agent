@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { ensureInteractiveDaemonRunning } from "../src/cli/daemon-launch.js";
-import { repositoryDaemon, repositoryDaemonRoot, repositorySocketPath } from "../src/cli/repository-daemon.js";
+import {
+	repositoryDaemon,
+	repositoryDaemonRoot,
+	repositoryRootForSocket,
+	repositorySocketPath,
+} from "../src/cli/repository-daemon.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 import * as childProcess from "../src/utils/child-process.js";
@@ -14,6 +19,7 @@ vi.mock("node:child_process", { spy: true });
 it.each([
 	"repo",
 	"subfolder",
+	"symlink",
 	"worktree",
 	"submodule",
 	".prime",
@@ -55,6 +61,10 @@ it.each([
 			folder = join(root, "nested");
 			fs.mkdirSync(folder);
 		}
+		if (kind === "symlink") {
+			folder = join(temp, "linked");
+			fs.symlinkSync(root, folder, "dir");
+		}
 		if (kind === "git-dir") folder = join(root, ".git");
 		const session = join(root, kind === ".prime" ? "agent/sessions" : ".prime/agent/sessions");
 		const exclude =
@@ -90,7 +100,7 @@ it.each([
 			expect(repositoryDaemon(folder)).toBe(route);
 			expect(calls).not.toHaveBeenCalled();
 			expect(fs.readFileSync(exclude, "utf8")).toBe(content);
-			if (kind === "spawn") {
+			if (["spawn", "symlink"].includes(kind)) {
 				vi.spyOn(DaemonClient.prototype, "connect").mockRejectedValue(new Error("no listener"));
 				const spawn = vi.spyOn(childProcess, "spawnHidden").mockImplementation(() => {
 					throw new Error("captured spawn");
@@ -111,6 +121,9 @@ it.each([
 	["/Volumes/games", "games-4080299310.sock"],
 	["/Volumes/resume", "resume-3425465961.sock"],
 	["/Volumes/atlas/beads", "beads-3245780463.sock"],
+	["/Volumes/beads", "beads-546287293.sock"],
 ])("TM-05 literal root %s", (root, socket) => {
 	expect(repositorySocketPath(root)).toBe(join(defaultDaemonSocketDir(), socket));
+	expect(repositoryRootForSocket(root, repositorySocketPath(root))).toBe(root);
+	expect(repositoryRootForSocket(root, repositorySocketPath("/other"))).toBeUndefined();
 });

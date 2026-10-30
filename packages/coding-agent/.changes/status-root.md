@@ -1,0 +1,1 @@
+- Added repository root folders to the status table and JSON output for repository background services. Windows may show no root.
