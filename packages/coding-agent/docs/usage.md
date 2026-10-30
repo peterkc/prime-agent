@@ -179,6 +179,7 @@ prime-agent attach <agent>
 prime-agent stop <agent>
 prime-agent rename <agent> <name>
 prime-agent send <agent> <message>
+prime-agent notify <agent> -- <message>
 prime-agent schedule <list|add|cancel>
 prime-agent status
 prime-agent doctor [--fix]
