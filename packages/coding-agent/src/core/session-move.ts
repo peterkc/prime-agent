@@ -295,7 +295,13 @@ export function validateSessionMoveJournal(
 	for (const key of Object.keys(expected.value) as (keyof SessionMovePaths)[]) {
 		if (journal[key] !== expected.value[key]) return failure(`Invalid journal path or ID: ${key}`);
 	}
-	if (journal.journalPath !== resolve(journalPath)) return failure(`Invalid journal path: ${journalPath}`);
+	let physicalJournalPath: string;
+	try {
+		physicalJournalPath = physicalPath(journalPath);
+	} catch (error) {
+		return failure(errorMessage(error));
+	}
+	if (journal.journalPath !== physicalJournalPath) return failure(`Invalid journal path: ${journalPath}`);
 	const allowedDirectories = [dirname(journal.journalPath), journal.targetArtifactRoot];
 	if (journal.createdDirectories.some((path) => !allowedDirectories.includes(path))) {
 		return failure("Invalid created directory in move journal");

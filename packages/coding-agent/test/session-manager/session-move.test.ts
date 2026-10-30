@@ -366,9 +366,15 @@ describe("session relocation", () => {
 		{ step: "source rename", phase: "committing", state: "renamed" },
 		{ step: "artifact promotion", phase: "committing", state: "promoted" },
 		{ step: "committed without target", phase: "committed", state: "promoted" },
-	] as const)("AC-4/AC-6 recovers real pre-commit state $step twice", async ({ phase, state }) => {
+		{ step: "symlinked agent directory", phase: "copying", state: "file" },
+	] as const)("AC-4/AC-6 recovers real pre-commit state $step twice", async ({ step, phase, state }) => {
 		const f = fixture();
 		journalState(f, phase, state);
+		if (step === "symlinked agent directory") {
+			const agentDir = join(home, "agent-alias");
+			symlinkSync(f.paths.agentDir, agentDir, "dir");
+			Object.assign(f.paths, { agentDir, journalPath: join(agentDir, "session-moves", "session-1.json") });
+		}
 		f.recovery.resume = f.callbacks.resume;
 		expect((await recover(f)).status).toBe("rolled_back");
 		expect(f.events).toEqual(["resume"]);
