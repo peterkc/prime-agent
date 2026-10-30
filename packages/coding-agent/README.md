@@ -527,7 +527,7 @@ prime-agent attach <agent>                 # Attach the interactive UI
 prime-agent stop <agent>                   # Stop one agent
 prime-agent rename <agent> <name>          # Rename an agent
 prime-agent send <agent> <message>         # Send an agent-to-agent message
-prime-agent notify <agent> -- <message>    # Send one mesh message as gate-watcher
+prime-agent notify [--daemon-socket <path>] [--json] <session> -- <message>  # Send one mesh message as gate-watcher
 prime-agent status                         # Show background service status
 prime-agent doctor [--fix]                 # Inspect or safely clean up background services
 prime-agent shutdown [--force]             # Stop every agent, worker, and background service
