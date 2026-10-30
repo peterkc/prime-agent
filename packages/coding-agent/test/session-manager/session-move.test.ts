@@ -367,7 +367,7 @@ describe("session relocation", () => {
 		{ step: "artifact promotion", phase: "committing", state: "promoted" },
 		{ step: "committed without target", phase: "committed", state: "promoted" },
 		{ step: "symlinked agent directory", phase: "copying", state: "file" },
-	] as const)("AC-4/AC-6 recovers real pre-commit state $step twice", async ({ step, phase, state }) => {
+	] as const)("AC-4/AC-6/#55 recovers real pre-commit state $step twice", async ({ step, phase, state }) => {
 		const f = fixture();
 		journalState(f, phase, state);
 		if (step === "symlinked agent directory") {
@@ -600,19 +600,25 @@ describe("session relocation", () => {
 		"artifactTemporary",
 		"sourceBackup",
 		"journalPath",
+		"journal alias",
 	] as const;
 	it.each(escapedFields.flatMap((field) => (["promoted", "published"] as const).map((state) => ({ field, state }))))(
-		"AC-30 recovery keeps a journal with escaped $field in $state state and removes nothing",
+		"AC-30/#55 recovery keeps a journal with escaped or aliased $field in $state state and removes nothing",
 		async ({ field, state }) => {
 			const f = fixture();
 			const j = journalState(f, "committing", state);
 			const outside = join(home, "outside");
 			writeFileSync(outside, "do not remove");
-			writeFileSync(j.journalPath, JSON.stringify({ ...j, [field]: outside }));
+			if (field === "journal alias") {
+				const journalPath = join(dirname(j.journalPath), "a.json");
+				symlinkSync(j.journalPath, journalPath);
+				Object.assign(f.paths, { journalPath });
+			} else writeFileSync(j.journalPath, JSON.stringify({ ...j, [field]: outside }));
 			const before = readFileSync(j.journalPath);
 			expect((await recover(f)).status).toBe("pending");
 			expect(readFileSync(j.journalPath)).toEqual(before);
 			expect(readFileSync(outside, "utf8")).toBe("do not remove");
+			expect(lstatSync(f.paths.journalPath).isSymbolicLink()).toBe(field === "journal alias");
 			expect(existsSync(j.sourceBackup)).toBe(true);
 			expect(existsSync(j.targetFile)).toBe(state === "published");
 			expect(f.events).toEqual([]);

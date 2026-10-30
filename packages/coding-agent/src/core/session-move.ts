@@ -297,7 +297,11 @@ export function validateSessionMoveJournal(
 	}
 	let physicalJournalPath: string;
 	try {
-		physicalJournalPath = physicalPath(journalPath);
+		physicalJournalPath = join(
+			physicalPath(dirname(dirname(journalPath))),
+			basename(dirname(journalPath)),
+			basename(journalPath),
+		);
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
