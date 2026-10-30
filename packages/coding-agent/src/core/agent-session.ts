@@ -1038,7 +1038,7 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
-interface ModelSelectOptions extends ModelChangeOptions {
+interface ModelSelectOptions {
 	waitForExtensions?: boolean;
 }
 
@@ -1557,6 +1557,8 @@ export class AgentSession {
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 	private _serviceTierPreference: ServiceTier;
+	/** Runtime-only override; resume restores the effective level recorded in history. */
+	private _thinkingLevelPreference?: ThinkingLevel;
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -8602,7 +8604,7 @@ export class AgentSession {
 	}
 
 	/** Change the session model and history; persist global defaults unless explicitly disabled. */
-	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
+	async setModel(model: Model<any>, options: ModelSelectOptions & ModelChangeOptions = {}): Promise<void> {
 		// Explicit selection recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
 		const staleOnly =
@@ -8697,14 +8699,12 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		if (options.persist !== false) {
-			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
-		}
+		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
-		this.setThinkingLevel(thinkingLevel, options);
+		this.setThinkingLevel(thinkingLevel);
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", options.persist !== false);
+		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", true);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8739,14 +8739,12 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		if (options.persist !== false) {
-			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
-		}
+		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
-		this.setThinkingLevel(thinkingLevel, options);
+		this.setThinkingLevel(thinkingLevel);
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", options.persist !== false);
+		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", true);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8761,7 +8759,10 @@ export class AgentSession {
 		};
 	}
 
-	/** Change the clamped session level and history without requiring a global default update. */
+	/**
+	 * Change the clamped session level and history; persist the global default unless persist: false.
+	 * A later xai metadata refresh can still persist a capability clamp.
+	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelChangeOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
@@ -8770,6 +8771,7 @@ export class AgentSession {
 		const isChanging = effectiveLevel !== previousLevel;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
+		this._thinkingLevelPreference = options.persist === false ? level : undefined;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
@@ -8857,7 +8859,9 @@ export class AgentSession {
 			return explicitLevel;
 		}
 		if (!this.supportsThinking()) {
-			return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+			return (
+				this._thinkingLevelPreference ?? this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL
+			);
 		}
 		return this.thinkingLevel;
 	}

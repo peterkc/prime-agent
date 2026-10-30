@@ -557,6 +557,10 @@ describe("AgentSession model and extension characterization", () => {
 		expect(first.sessionManager.getEntries().filter((e) => e.type === "model_change")).toHaveLength(1);
 		expect(first.model?.id).toBe("faux-1");
 		pi.setThinkingLevel("low", { persist: false });
+		await pi.setModel({ ...first.model!, reasoning: false }, { persist: false });
+		expect(first.thinkingLevel).toBe("off");
+		await pi.setModel(next, { persist: false });
+		expect(first.thinkingLevel).toBe("low");
 		await pi.setModel({ ...next, thinkingLevelMap: { low: null } }, { persist: false });
 		expect(first.thinkingLevel).toBe("medium");
 		const second = await open(SessionManager.inMemory());
@@ -572,6 +576,16 @@ describe("AgentSession model and extension characterization", () => {
 			{ model: { id: "faux-2" }, persisted: false },
 			{ model: { id: "faux-3" }, persisted: false },
 		]);
+		await pi.setModel(next);
+		expect(settingsManager.getDefaultModel()).toBe("faux-2");
+		pi.setThinkingLevel("low");
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("low");
+		pi.setThinkingLevel("low", { persist: false });
+		await pi.setModel({ ...next, reasoning: false }, { persist: false });
+		pi.setThinkingLevel("off");
+		settingsManager.setDefaultThinkingLevel("medium");
+		await pi.setModel(next, { persist: false });
+		expect(fresh.thinkingLevel).toBe("medium");
 	});
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
@@ -580,18 +594,23 @@ describe("AgentSession model and extension characterization", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("model_select", async (event) => {
-						modelEvents.push(`${event.previousModel?.id ?? "none"}->${event.model.id}:${event.source}`);
+						modelEvents.push(
+							`${event.previousModel?.id ?? "none"}->${event.model.id}:${event.source}:${event.persisted}`,
+						);
 					});
 				},
 			],
 		});
 		harnesses.push(harness);
-		const nextModel = harness.getModel("faux-2")!;
+		const nextModel = { ...harness.getModel("faux-2")!, thinkingLevelMap: { high: null } };
 
+		harness.session.setThinkingLevel("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("high");
 		await harness.session.setModel(nextModel);
 
 		expect(harness.session.model?.id).toBe("faux-2");
-		expect(modelEvents).toEqual(["faux-1->faux-2:set"]);
+		expect(modelEvents).toEqual(["faux-1->faux-2:set:true"]);
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 		expect(harness.settingsManager.getDefaultModel()).toBe("faux-2");
 		expect(
 			harness.sessionManager
@@ -599,6 +618,8 @@ describe("AgentSession model and extension characterization", () => {
 				.filter((entry) => entry.type === "model_change")
 				.map((entry) => `${entry.provider}/${entry.modelId}`),
 		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
+		await harness.session.cycleModel();
+		expect(modelEvents).toEqual(["faux-1->faux-2:set:true", "faux-2->faux-1:cycle:true"]);
 	});
 
 	it.each(["set", "cycle"] as const)(

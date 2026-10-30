@@ -1628,7 +1628,7 @@ if (model) {
 
 Get or set the thinking level. Level is clamped to model capabilities (non-reasoning models always use "off"). Changes emit `thinking_level_select`.
 
-Pass `{ persist: false }` to leave the global thinking default unchanged. The session level and history still change. Omitting the option, or passing `{ persist: true }`, keeps the default persistence behavior for both setters.
+Pass `{ persist: false }` to leave the global thinking default unchanged. The session level and history still change. Omitting the option, or passing `{ persist: true }`, keeps the default persistence behavior for both setters. A later xai metadata refresh can still persist a capability clamp.
 
 ```typescript
 const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"

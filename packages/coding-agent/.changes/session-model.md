@@ -1,1 +1,1 @@
-- Added session-only model and thinking-level changes for extensions with `{ persist: false }`, without changing global defaults or recent models.
+- Added session-only model and thinking-level changes for extensions with `{ persist: false }`, without changing global defaults or recent models. The `model_select` event now reports `persisted`.
