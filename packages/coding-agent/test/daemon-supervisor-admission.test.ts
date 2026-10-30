@@ -141,7 +141,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 				id: "notice",
 				success: false,
 				...(stage === "post-dispatch"
-					? { error: error.message }
+					? { command: command.type, error: error.message }
 					: untyped
 						? { command: stage === "parse" ? "parse" : "dispatch" }
 						: { errorInfo: { code: stage === "update" ? "update_restarting" : "command_not_dispatched" } }),
