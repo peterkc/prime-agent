@@ -258,38 +258,40 @@ describe("mesh enrollment", () => {
 		},
 	);
 
-	it.each(["symlink", "mode", "record", "signer", "cleanup"])(
-		"mesh-notify refuses private %s state without publishing",
-		async (reason) => {
-			const { mesh, meshRoot, sessionId, log } = await notificationFixture();
-			const record = ensureGateWatcherRecord(meshRoot);
-			const path = gateWatcherPath(meshRoot);
-			if (reason === "symlink") {
-				renameSync(path, `${path}.real`);
-				symlinkSync(`${path}.real`, path);
-			}
-			if (reason === "mode") chmodSync(path, 0o644);
-			if (reason === "record") writeFileSync(path, JSON.stringify({ ...record, allowSubscribe: ["work"] }));
-			if (reason === "signer") {
-				rmSync(join(meshRoot, "signer.json"));
-				symlinkSync(path, join(meshRoot, "signer.json"));
-			}
-			if (reason === "cleanup")
-				FakeEndpoint.onStart = async (endpoint) => {
-					if (endpoint.options.card.name !== "gate-watcher") return;
-					endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
-					throw new Error("start failed");
-				};
-			const outcome = mesh.sendService(sessionId, "refused");
-			await expect(outcome).rejects.toBeInstanceOf(MeshNotStoredError);
-			if (reason === "cleanup") await expect(outcome).rejects.toThrow("start failed");
-			if (reason === "cleanup") expect(log).toHaveBeenCalledWith(expect.stringContaining("claim retained"));
-			for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
-			expect(hasSessionLease(path, meshRoot)).toBe(reason === "cleanup");
-			if (reason === "cleanup")
-				await expect(mesh.sendService(sessionId, "again")).rejects.toThrow("claim is already held");
-		},
-	);
+	it.each(["symlink", "mode", "record", "signer"])("mesh-notify refuses private %s state", async (reason) => {
+		const { mesh, meshRoot, sessionId } = await notificationFixture();
+		const record = ensureGateWatcherRecord(meshRoot);
+		const path = gateWatcherPath(meshRoot);
+		if (reason === "symlink") {
+			renameSync(path, `${path}.real`);
+			symlinkSync(`${path}.real`, path);
+		}
+		if (reason === "mode") chmodSync(path, 0o644);
+		if (reason === "record") writeFileSync(path, JSON.stringify({ ...record, allowSubscribe: ["work"] }));
+		if (reason === "signer") {
+			rmSync(join(meshRoot, "signer.json"));
+			symlinkSync(path, join(meshRoot, "signer.json"));
+		}
+		await expect(mesh.sendService(sessionId, "refused")).rejects.toBeInstanceOf(MeshNotStoredError);
+		for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+		expect(hasSessionLease(path, meshRoot)).toBe(false);
+	});
+
+	it("mesh-notify preserves startup failure and retains the claim when cleanup fails", async () => {
+		const { mesh, meshRoot, sessionId, log } = await notificationFixture();
+		FakeEndpoint.onStart = async (endpoint) => {
+			if (endpoint.options.card.name !== "gate-watcher") return;
+			endpoint.stop.mockRejectedValueOnce(new Error("stop failed"));
+			throw new Error("start failed");
+		};
+		const outcome = mesh.sendService(sessionId, "refused");
+		await expect(outcome).rejects.toBeInstanceOf(MeshNotStoredError);
+		await expect(outcome).rejects.toThrow("start failed");
+		expect(log).toHaveBeenCalledWith(expect.stringContaining("claim retained: Error: stop failed"));
+		expect(hasSessionLease(gateWatcherPath(meshRoot), meshRoot)).toBe(true);
+		await expect(mesh.sendService(sessionId, "again")).rejects.toThrow("claim is already held");
+		for (const endpoint of FakeEndpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+	});
 
 	it.each(["", "*", "all", "broadcast", "missing", "same", "elsewhere/target"])(
 		"mesh-notify rejects target %j before initialization",

@@ -213,7 +213,6 @@ CotalEndpoint.prototype.unicastAttributed = async function (principal, text) {
 	writeFileAtomicSync(join(mailbox, `${message.id}.json`), JSON.stringify({ target: target.sessionId, message }));
 	const pid = targetSupervisorPid(meshRoot, target.sessionId);
 	try {
-		if (existsSync(join(agentDir, "wake-esrch"))) throw Object.assign(new Error("wake failed"), { code: "ESRCH" });
 		if (pid !== undefined) process.kill(pid, "SIGUSR2");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
