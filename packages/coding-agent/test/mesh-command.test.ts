@@ -99,7 +99,7 @@ if (tool === "launchctl") {
     writeFileSync(args[3], control.seed, { mode: 0o600 });
     console.log(control.seed);
   }
-  if (args[0] === "deliver") { if (args[2] === control.failedSession) process.exit(1); console.log(control.invalidCounts ? "{broken" : JSON.stringify({ pending: 3, ackPending: 2 })); console.log("message-id sender message-content " + control.seed); }
+  if (args[0] === "deliver") { for (const id of control.leaveDuring?.[args[2]] ?? []) unlinkSync(join(cotalRoot, "enrollments", id + ".json")); if (args[2] === control.failedSession) process.exit(1); console.log(control.invalidCounts ? "{broken" : JSON.stringify({ pending: 3, ackPending: 2 })); console.log("message-id sender message-content " + control.seed); }
   if (args[0] === "doctor") console.log(control.seed);
 }
 `;
@@ -597,7 +597,7 @@ describe("mesh command", () => {
 		expect(output()).toContain("Launchd last exit code: 78");
 	});
 
-	it.each(["record", "counts", "broker", "auth", "pending"])(
+	it.each(["record", "counts", "broker", "auth", "pending", "mesh"])(
 		"reports a failed %s diagnosis without secret content",
 		async (broken) => {
 			await command("install");
@@ -614,6 +614,7 @@ describe("mesh command", () => {
 			if (broken === "pending") {
 				writeFileSync(join(mesh, "enrollments", "good.json"), JSON.stringify({ ...record, sessionId: "good" }));
 			}
+			if (broken === "mesh") rmSync(join(mesh, "mesh.json"));
 			configure({
 				failedSession: broken === "pending" ? "bad" : "",
 				invalidCounts: broken === "counts",
@@ -628,9 +629,26 @@ describe("mesh command", () => {
 				expect(output()).toContain("Session bad: count unavailable");
 				expect(output()).toContain("Session good: 5 unacknowledged");
 			}
-			expect(output()).toMatch(/unreadable|invalid counts|not serving|doctor auth failed|counts are unavailable/);
+			if (broken === "mesh") expect(output()).toContain("mesh.json: missing");
+			expect(output()).toMatch(
+				/unreadable|invalid counts|not serving|doctor auth failed|counts are unavailable|missing/,
+			);
 		},
 	);
+
+	it.each(["a", "b"])("reports a session that left while %s was counted and passes doctor", async (at) => {
+		await command("install");
+		mkdirSync(join(mesh, "enrollments"));
+		const record = { identity: { id: "UABC", seed }, lifecycleUid: "0123456789abcdefghijklmnop" };
+		for (const id of ["a", "b"])
+			writeFileSync(join(mesh, "enrollments", `${id}.json`), JSON.stringify({ ...record, sessionId: id }));
+		configure({ leaveDuring: { [at]: ["b"] }, failedSession: "b" });
+		await command("doctor");
+		expect(process.exitCode).toBeUndefined();
+		expect(output()).toContain("Session a: 5 unacknowledged");
+		expect(output()).toContain("Session b: left during the check");
+		expect(output()).not.toMatch(/unreadable|count unavailable/);
+	});
 
 	it.each(["uninstall", "start", "stop", "status", "doctor"])("fails %s when the service is absent", async (name) => {
 		mkdirSync(join(mesh, ".cotal"), { recursive: true });

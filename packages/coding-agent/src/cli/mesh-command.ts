@@ -794,9 +794,18 @@ function pendingCount(stdout: string): number {
 	return value.pending + value.ackPending;
 }
 
-async function readJson(path: string): Promise<unknown> {
+/** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
+async function readJson(path: string, allowMissing = false): Promise<unknown> {
+	let text: string;
 	try {
-		return JSON.parse(await readFile(path, "utf8"));
+		text = await readFile(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Mesh file ${path}: unreadable`);
+		if (allowMissing) return undefined;
+		throw new Error(`Mesh file ${path}: missing`);
+	}
+	try {
+		return JSON.parse(text);
 	} catch {
 		throw new Error(`Mesh file ${path}: unreadable JSON`);
 	}
@@ -920,7 +929,13 @@ async function status(
 		console.log(`${stream}: ${consumers[index]} consumers / 1000`);
 	for (const file of records) {
 		const sessionId = file.slice(0, -5);
-		const record = await readJson(join(enrollments, file));
+		const path = join(enrollments, file);
+		const record = await readJson(path, true);
+		// A session can unenroll after the listing above; that is not a mesh fault.
+		if (record === undefined) {
+			console.log(`Session ${sessionId}: left during the check`);
+			continue;
+		}
 		if (
 			!/^[A-Za-z0-9_-]+$/.test(sessionId) ||
 			!record ||
@@ -959,6 +974,10 @@ async function status(
 			],
 			options,
 		);
+		if (pending.code !== 0 && !existsSync(path)) {
+			console.log(`Session ${sessionId}: left during the check`);
+			continue;
+		}
 		if (pending.code !== 0) {
 			console.log(`Session ${sessionId}: count unavailable`);
 			countUnavailable = true;
