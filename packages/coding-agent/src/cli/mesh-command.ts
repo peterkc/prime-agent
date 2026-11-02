@@ -795,12 +795,21 @@ function pendingCount(stdout: string): number {
 }
 
 /** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
+/** True when nothing is at the path; a dangling symlink is still something there. */
+async function absent(path: string): Promise<boolean> {
+	return lstat(path).then(
+		() => false,
+		(error: NodeJS.ErrnoException) => error.code === "ENOENT",
+	);
+}
+
 async function readJson(path: string, allowMissing = false): Promise<unknown> {
 	let text: string;
 	try {
 		text = await readFile(path, "utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Mesh file ${path}: unreadable`);
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !(await absent(path)))
+			throw new Error(`Mesh file ${path}: unreadable`);
 		if (allowMissing) return undefined;
 		throw new Error(`Mesh file ${path}: missing`);
 	}
@@ -976,7 +985,8 @@ async function status(
 			],
 			options,
 		);
-		if (pending.code !== 0 && !existsSync(path)) {
+		// Recheck after either result: a count for a session that has left is stale.
+		if (await absent(path)) {
 			console.log(`Session ${sessionId}: left during the check`);
 			continue;
 		}

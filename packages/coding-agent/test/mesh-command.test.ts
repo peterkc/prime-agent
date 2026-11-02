@@ -597,7 +597,7 @@ describe("mesh command", () => {
 		expect(output()).toContain("Launchd last exit code: 78");
 	});
 
-	it.each(["record", "counts", "broker", "auth", "pending", "mesh", "directory"])(
+	it.each(["record", "counts", "broker", "auth", "pending", "mesh", "directory", "symlink"])(
 		"reports a failed %s diagnosis without secret content",
 		async (broken) => {
 			await command("install");
@@ -612,6 +612,7 @@ describe("mesh command", () => {
 				broken === "record" ? `{${seed}` : JSON.stringify(record),
 			);
 			if (broken === "directory") mkdirSync(join(mesh, "enrollments", "dir.json"));
+			if (broken === "symlink") symlinkSync(join(mesh, "gone.json"), join(mesh, "enrollments", "dir.json"));
 			if (broken === "pending") {
 				writeFileSync(join(mesh, "enrollments", "good.json"), JSON.stringify({ ...record, sessionId: "good" }));
 			}
@@ -630,20 +631,25 @@ describe("mesh command", () => {
 				expect(output()).toContain("Session bad: count unavailable");
 				expect(output()).toContain("Session good: 5 unacknowledged");
 			}
-			const expected: Record<string, RegExp> = { mesh: /mesh\.json: missing/, directory: /dir\.json: unreadable$/m };
+			const dir = /dir\.json: unreadable$/m;
+			const expected: Record<string, RegExp> = { mesh: /mesh\.json: missing/, directory: dir, symlink: dir };
 			expect(output()).toMatch(
 				expected[broken] ?? /unreadable|invalid counts|not serving|doctor auth failed|counts are unavailable/,
 			);
 		},
 	);
 
-	it.each(["a", "b"])("reports a session that left while %s was counted and passes doctor", async (at) => {
+	it.each([
+		["a", "b"],
+		["b", "b"],
+		["b", ""],
+	])("reports a session that left while %s was counted (failed: '%s') and passes doctor", async (at, failed) => {
 		await command("install");
 		mkdirSync(join(mesh, "enrollments"));
 		const record = { identity: { id: "UABC", seed }, lifecycleUid: "0123456789abcdefghijklmnop" };
 		for (const id of ["a", "b"])
 			writeFileSync(join(mesh, "enrollments", `${id}.json`), JSON.stringify({ ...record, sessionId: id }));
-		configure({ leaveDuring: { [at]: ["b"] }, failedSession: "b" });
+		configure({ leaveDuring: { [at]: ["b"] }, failedSession: failed });
 		await command("doctor");
 		expect(process.exitCode).toBeUndefined();
 		expect(output()).toContain("Session a: 5 unacknowledged");
