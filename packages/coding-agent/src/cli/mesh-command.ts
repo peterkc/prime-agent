@@ -794,7 +794,6 @@ function pendingCount(stdout: string): number {
 	return value.pending + value.ackPending;
 }
 
-/** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
 /** True when nothing is at the path; a dangling symlink is still something there. */
 async function absent(path: string): Promise<boolean> {
 	return lstat(path).then(
@@ -803,6 +802,7 @@ async function absent(path: string): Promise<boolean> {
 	);
 }
 
+/** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
 async function readJson(path: string, allowMissing = false): Promise<unknown> {
 	let text: string;
 	try {
