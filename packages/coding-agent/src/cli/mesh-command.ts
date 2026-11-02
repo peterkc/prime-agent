@@ -794,9 +794,27 @@ function pendingCount(stdout: string): number {
 	return value.pending + value.ackPending;
 }
 
-async function readJson(path: string): Promise<unknown> {
+/** True when nothing is at the path; a dangling symlink is still something there. */
+async function absent(path: string): Promise<boolean> {
+	return lstat(path).then(
+		() => false,
+		(error: NodeJS.ErrnoException) => error.code === "ENOENT",
+	);
+}
+
+/** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
+async function readJson(path: string, allowMissing = false): Promise<unknown> {
+	let text: string;
 	try {
-		return JSON.parse(await readFile(path, "utf8"));
+		text = await readFile(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !(await absent(path)))
+			throw new Error(`Mesh file ${path}: unreadable`);
+		if (allowMissing) return undefined;
+		throw new Error(`Mesh file ${path}: missing`);
+	}
+	try {
+		return JSON.parse(text);
 	} catch {
 		throw new Error(`Mesh file ${path}: unreadable JSON`);
 	}
@@ -913,14 +931,22 @@ async function status(
 	if (!serving) throw new Error("Mesh broker is not serving");
 	let countUnavailable = false;
 	const enrollments = join(options.meshHome, "enrollments");
-	const records = (existsSync(enrollments) ? await readdir(enrollments) : []).filter((file) => file.endsWith(".json"));
+	const records = (existsSync(enrollments) ? await readdir(enrollments) : [])
+		.filter((file) => file.endsWith(".json"))
+		.sort();
 	console.log(`Enrolled sessions: ${records.length}`);
 	const consumers = await inboxConsumerCounts(options.meshHome, config.space);
 	for (const [index, stream] of [`DM_${config.space}`, `DLV_${config.space}`].entries())
 		console.log(`${stream}: ${consumers[index]} consumers / 1000`);
 	for (const file of records) {
 		const sessionId = file.slice(0, -5);
-		const record = await readJson(join(enrollments, file));
+		const path = join(enrollments, file);
+		const record = await readJson(path, true);
+		// A session can unenroll after the listing above; that is not a mesh fault.
+		if (record === undefined) {
+			console.log(`Session ${sessionId}: left during the check`);
+			continue;
+		}
 		if (
 			!/^[A-Za-z0-9_-]+$/.test(sessionId) ||
 			!record ||
@@ -959,6 +985,11 @@ async function status(
 			],
 			options,
 		);
+		// Recheck after either result: a count for a session that has left is stale.
+		if (await absent(path)) {
+			console.log(`Session ${sessionId}: left during the check`);
+			continue;
+		}
 		if (pending.code !== 0) {
 			console.log(`Session ${sessionId}: count unavailable`);
 			countUnavailable = true;

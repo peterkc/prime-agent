@@ -138,7 +138,8 @@ scheduled. The error names `rotation.log` and `rotation.lock` for investigation.
   failure, service state, renewal-agent and rotation-agent states, the rotation job's
   last exit code, $SYS last-rotation and expiry times, store bytes, service-log and
   renewal-log bytes, enrolled-session count, and each
-  session's stored, unacknowledged message count. A missing renewal or rotation
+  session's stored, unacknowledged message count. A session that unenrolls during the
+  check is listed as left and does not fail status. A missing renewal or rotation
   agent fails status; reinstall the mesh to add it. A leftover temporary rotation
   plist also fails status. An unreadable $SYS credential is reported by filename;
   status finishes broker, store and session diagnostics before failing.

@@ -1,0 +1,1 @@
+- Fixed `prime-agent mesh status` and `mesh doctor` failing with "unreadable JSON" when a session unenrolled during the check; the session is now reported as "left during the check", and a missing mesh file is reported as missing instead of unreadable.
