@@ -922,7 +922,9 @@ async function status(
 	if (!serving) throw new Error("Mesh broker is not serving");
 	let countUnavailable = false;
 	const enrollments = join(options.meshHome, "enrollments");
-	const records = (existsSync(enrollments) ? await readdir(enrollments) : []).filter((file) => file.endsWith(".json"));
+	const records = (existsSync(enrollments) ? await readdir(enrollments) : [])
+		.filter((file) => file.endsWith(".json"))
+		.sort();
 	console.log(`Enrolled sessions: ${records.length}`);
 	const consumers = await inboxConsumerCounts(options.meshHome, config.space);
 	for (const [index, stream] of [`DM_${config.space}`, `DLV_${config.space}`].entries())

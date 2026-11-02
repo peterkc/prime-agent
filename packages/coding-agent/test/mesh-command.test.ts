@@ -597,7 +597,7 @@ describe("mesh command", () => {
 		expect(output()).toContain("Launchd last exit code: 78");
 	});
 
-	it.each(["record", "counts", "broker", "auth", "pending", "mesh"])(
+	it.each(["record", "counts", "broker", "auth", "pending", "mesh", "directory"])(
 		"reports a failed %s diagnosis without secret content",
 		async (broken) => {
 			await command("install");
@@ -611,6 +611,7 @@ describe("mesh command", () => {
 				join(mesh, "enrollments", "bad.json"),
 				broken === "record" ? `{${seed}` : JSON.stringify(record),
 			);
+			if (broken === "directory") mkdirSync(join(mesh, "enrollments", "dir.json"));
 			if (broken === "pending") {
 				writeFileSync(join(mesh, "enrollments", "good.json"), JSON.stringify({ ...record, sessionId: "good" }));
 			}
@@ -629,9 +630,9 @@ describe("mesh command", () => {
 				expect(output()).toContain("Session bad: count unavailable");
 				expect(output()).toContain("Session good: 5 unacknowledged");
 			}
-			if (broken === "mesh") expect(output()).toContain("mesh.json: missing");
+			const expected: Record<string, RegExp> = { mesh: /mesh\.json: missing/, directory: /dir\.json: unreadable$/m };
 			expect(output()).toMatch(
-				/unreadable|invalid counts|not serving|doctor auth failed|counts are unavailable|missing/,
+				expected[broken] ?? /unreadable|invalid counts|not serving|doctor auth failed|counts are unavailable/,
 			);
 		},
 	);
