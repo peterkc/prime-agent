@@ -18,7 +18,11 @@ import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { CustomMessage } from "../../core/messages.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
-import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
+import {
+	acquireSessionDeleteLeases,
+	type DeleteSessionFileResult,
+	deleteSessionFile,
+} from "../../core/session-file-actions.js";
 import { appendSessionInfoToExistingFile, SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
@@ -615,7 +619,12 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {
-		return deleteSessionFile(sessionPath);
+		const reservation = acquireSessionDeleteLeases(sessionPath, this.runtimeHost.services.agentDir);
+		try {
+			return await deleteSessionFile(sessionPath);
+		} finally {
+			reservation.release();
+		}
 	}
 
 	async watchSession(childId: string): Promise<AgentConnectionSessionWatcher | undefined> {

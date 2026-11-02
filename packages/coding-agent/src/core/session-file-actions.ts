@@ -1,8 +1,7 @@
-import { type Dirent, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename, delimiter, join } from "node:path";
-import { spawnSyncHidden } from "../utils/child-process.js";
-import { readFirstLineSync } from "../utils/file-lines.js";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { isProcessAlive, spawnSyncHidden } from "../utils/child-process.js";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
@@ -10,7 +9,14 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 	type SessionLease,
 } from "./session-lease.js";
-import { getSessionArtifactPathForFile } from "./session-manager.js";
+import { getSessionArtifactPathForFile, type SessionHeader } from "./session-manager.js";
+import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotation-state.js";
+import {
+	canonicalStoragePath,
+	isRotatableSessionId,
+	isSessionArchivePath,
+	sessionArchivePath,
+} from "./session-storage-paths.js";
 
 /** Session headers in artifact files, plus already-leased files when deleting. */
 export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: string): Generator<string> {
@@ -21,6 +27,7 @@ export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: stri
 		try {
 			// rm removes directory symlinks themselves, not the trees they point at.
 			if (!lstatSync(directory).isDirectory()) continue;
+			if (isSessionArchivePath(directory)) continue;
 			entries = readdirSync(directory, { withFileTypes: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -35,6 +42,7 @@ export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: stri
 			if (!agentDir || !hasSessionLease(path, agentDir)) {
 				if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 				try {
+					if (isSessionArchivePath(path)) continue;
 					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
 					const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
 					if (header?.type !== "session") continue;
@@ -146,20 +154,156 @@ export async function removeMovedSessionFile(sessionPath: string): Promise<Delet
 	}
 }
 
+function sessionEvidencePaths(sessionPath: string, header: SessionHeader | undefined): string[] {
+	if (!header || !isRotatableSessionId(header.id)) return [];
+	const path = canonicalStoragePath(sessionPath);
+	const archive = dirname(sessionArchivePath(path, header.id, 0));
+	const previous = header.previousSessionPaths ?? [];
+	if (!Array.isArray(previous) || new Set(previous).size !== previous.length)
+		throw new Error(`Invalid previous paths; archive orphan: ${archive}`);
+	const redirects = new Map<string, string>();
+	for (const old of previous) {
+		if (
+			typeof old !== "string" ||
+			resolve(old) !== old ||
+			canonicalStoragePath(old) !== old ||
+			old === path ||
+			isSessionArchivePath(old)
+		)
+			throw new Error(`Unsafe previous path; archive orphan: ${archive}`);
+		const redirect = `${old}.relocated`;
+		let value: unknown;
+		try {
+			if (!lstatSync(redirect).isFile() || canonicalStoragePath(redirect) !== redirect)
+				throw new Error(`Unsafe relocation orphan: ${redirect}`);
+			value = JSON.parse(readFileSync(redirect, "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw new Error(`Invalid relocation orphan: ${redirect}; archive orphan: ${archive}`, { cause: error });
+		}
+		if (
+			!value ||
+			typeof value !== "object" ||
+			!("version" in value) ||
+			value.version !== 1 ||
+			!("sessionId" in value) ||
+			value.sessionId !== header.id ||
+			!("target" in value) ||
+			typeof value.target !== "string" ||
+			(value.target !== path && !previous.includes(value.target))
+		)
+			throw new Error(`Foreign relocation orphan: ${redirect}`);
+		redirects.set(old, value.target);
+	}
+	for (const old of redirects.keys()) {
+		const visited = new Set<string>();
+		let current = old;
+		while (current !== path && redirects.has(current)) {
+			if (visited.has(current)) throw new Error(`Cyclic relocation orphan: ${old}.relocated`);
+			visited.add(current);
+			current = redirects.get(current)!;
+		}
+	}
+	if (existsSync(archive)) {
+		if (!lstatSync(archive).isDirectory()) throw new Error(`Unsafe archive orphan: ${archive}`);
+		for (const name of readdirSync(archive)) {
+			const file = join(archive, name);
+			const temporary =
+				/^(0|[1-9][0-9]*)\.jsonl\.([1-9][0-9]*)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/.exec(
+					name,
+				);
+			const deadTemp =
+				temporary && Number.isSafeInteger(Number(temporary[2])) && !isProcessAlive(Number(temporary[2]));
+			if ((!/^(0|[1-9][0-9]*)\.jsonl$/.test(name) && !deadTemp && name !== ".DS_Store") || !lstatSync(file).isFile())
+				throw new Error(`Unrecognized archive orphan: ${file}`);
+			if (deadTemp || name === ".DS_Store") continue;
+			let value: SessionHeader | null;
+			try {
+				value = JSON.parse(readFirstLineSync(file) ?? "null") as SessionHeader | null;
+			} catch (error) {
+				throw new Error(`Invalid archive orphan: ${file}`, { cause: error });
+			}
+			if (
+				value?.type !== "session" ||
+				value.id !== header.id ||
+				(value.rotation?.segment ?? 0) !== Number(name.slice(0, -6))
+			)
+				throw new Error(`Foreign archive orphan: ${file}`);
+		}
+	}
+	return [...(existsSync(archive) ? [archive] : []), ...[...redirects.keys()].map((old) => `${old}.relocated`)];
+}
+
+async function deleteSessionEvidence(sessionPath: string, header: SessionHeader | undefined): Promise<void> {
+	for (const path of sessionEvidencePaths(sessionPath, header)) {
+		if (path.endsWith(".relocated")) await unlink(path);
+		else await rm(path, { recursive: true });
+	}
+}
+
 /**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink.
  * Also permanently removes the session's artifact directory, but only
  * once the session file itself is gone — otherwise a failed delete would orphan a
  * session whose kernel snapshot has already been destroyed.
+ * The caller must hold the canonical transcript reservation through this operation.
  */
 export async function deleteSessionFile(
 	sessionPath: string,
 	options: DeleteSessionFileOptions = {},
 ): Promise<DeleteSessionFileResult> {
-	const result = await removeSessionFile(sessionPath);
+	if (isSessionArchivePath(sessionPath))
+		return { ok: false, error: `Cannot delete a session archive: ${sessionPath}` };
+	let header: SessionHeader | undefined;
+	try {
+		const value = JSON.parse(readFirstLineSync(sessionPath) ?? "null") as SessionHeader | null;
+		if (value?.type === "session") header = value;
+	} catch (error) {
+		if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const evidenceBacked = !!header?.rotation?.archives.length || !!header?.rotation?.parent;
+	const transcript = evidenceBacked ? canonicalStoragePath(sessionPath) : sessionPath;
+	if (evidenceBacked) {
+		try {
+			sessionEvidencePaths(transcript, header);
+		} catch (error) {
+			return {
+				ok: false,
+				error: `Cannot delete session: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	const result = await removeSessionFile(transcript);
 	if (result.ok) {
-		await options.afterFileRemoved?.();
-		await deleteSessionArtifacts(sessionPath);
+		if (!evidenceBacked) {
+			try {
+				await deleteSessionEvidence(transcript, header);
+			} catch (error) {
+				console.error(
+					`Session archive cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			await options.afterFileRemoved?.();
+			await deleteSessionArtifacts(sessionPath);
+			return result;
+		}
+		const failures: string[] = [];
+		for (const cleanup of [
+			() => options.afterFileRemoved?.(),
+			() => deleteSessionEvidence(transcript, header),
+			() => deleteSessionArtifacts(sessionPath),
+		]) {
+			try {
+				await cleanup();
+			} catch (error) {
+				failures.push(error instanceof Error ? error.message : String(error));
+			}
+		}
+		if (failures.length)
+			return {
+				ok: false,
+				error: `Session transcript removed; cleanup incomplete; inspect ${join(dirname(transcript), "archive", header!.id)}: ${failures.join("; ")}`,
+			};
 	}
 	return result;
 }

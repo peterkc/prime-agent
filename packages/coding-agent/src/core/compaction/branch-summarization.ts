@@ -96,11 +96,11 @@ export function collectEntriesForBranchSummary(
 	oldLeafId: string | null,
 	targetId: string,
 ): CollectEntriesResult {
-	if (!oldLeafId) {
-		return { entries: [], commonAncestorId: null };
-	}
-	const oldPath = new Set(session.getBranch(oldLeafId).map((e) => e.id));
 	const targetPath = session.getBranch(targetId);
+	if (!targetPath.length && session.getHeader()?.rotation) throw new Error(`Entry ${targetId} not found`);
+	if (!oldLeafId) return { entries: [], commonAncestorId: null };
+	const oldBranch = session.getBranch(oldLeafId);
+	const oldPath = new Set(oldBranch.map((entry) => entry.id));
 	let commonAncestorId: string | null = null;
 	for (let i = targetPath.length - 1; i >= 0; i--) {
 		if (oldPath.has(targetPath[i].id)) {
@@ -108,16 +108,8 @@ export function collectEntriesForBranchSummary(
 			break;
 		}
 	}
-	const entries: SessionEntry[] = [];
-	let current: string | null = oldLeafId;
-
-	while (current && current !== commonAncestorId) {
-		const entry = session.getEntry(current);
-		if (!entry) break;
-		entries.push(entry);
-		current = entry.parentId;
-	}
-	entries.reverse();
+	const commonIndex = oldBranch.findIndex((entry) => entry.id === commonAncestorId);
+	const entries = oldBranch.slice(commonIndex + 1);
 
 	return { entries, commonAncestorId };
 }

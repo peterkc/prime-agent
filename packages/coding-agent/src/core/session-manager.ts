@@ -1,17 +1,20 @@
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	chownSync,
 	closeSync,
 	existsSync,
 	fstatSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
 	readSync,
+	rmSync,
 	statSync,
 	writeSync,
 } from "fs";
@@ -20,7 +23,8 @@ import { basename, dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
-import { readBytesSync, readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
+import { isProcessAlive } from "../utils/child-process.js";
+import { readBytesSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -30,7 +34,36 @@ import {
 	createCustomMessage,
 	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "./messages.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV, SessionAlreadyActiveError } from "./session-lease.js";
+import {
+	acquireSessionLease,
+	ownsSessionLease,
+	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
+} from "./session-lease.js";
+import {
+	assertSessionHeaderBound,
+	originalParent,
+	projectAccounting,
+	type RotationRestart,
+	RotationRestartReader,
+	readSessionHeaderLineSync as readFirstLineSync,
+	restartOf,
+	rotationAssistants,
+	rotationOf,
+	rotationUsageEntries,
+	type SessionArchiveRef,
+	type SessionRotation,
+	serializeSessionEntries,
+	validateRotationEntries,
+	withRotationRestart,
+} from "./session-rotation-state.js";
+import {
+	canonicalStoragePath,
+	isRotatableSessionId,
+	isSessionArchivePath,
+	requireActiveSessionPath,
+	sessionArchivePath,
+} from "./session-storage-paths.js";
 import {
 	addAssistantUsage,
 	cloneUsage,
@@ -40,7 +73,11 @@ import {
 	subtractAssistantUsage,
 } from "./usage.js";
 
+export type { SessionArchiveRef, SessionRotation } from "./session-rotation-state.js";
+export { rotationUsageEntries } from "./session-rotation-state.js";
+
 export const CURRENT_SESSION_VERSION = 3;
+export const SESSION_ROTATION_THRESHOLD_BYTES = 32 * 1024 * 1024;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
@@ -82,7 +119,14 @@ export interface SessionHeader {
 	parentSession?: string;
 	rlmDepth?: number;
 	git?: GitContext;
+	rotation?: SessionRotation;
+	previousSessionPaths?: readonly string[];
 }
+
+export type SessionRotationResult =
+	| { readonly status: "skipped"; readonly reason?: string }
+	| { readonly status: "rotated"; readonly segment: number }
+	| { readonly status: "failed" | "committed-with-warning"; readonly step: string; readonly reason: string };
 
 export interface NewSessionOptions {
 	id?: string;
@@ -231,6 +275,16 @@ export type SessionEntry =
 
 export type FileEntry = SessionHeader | SessionEntry;
 
+interface EvidenceOperation {
+	readonly archives: Map<SessionManager, Map<string, SessionEntry>>;
+	readonly identities: Map<SessionManager, { readonly key: string; readonly paths: readonly string[] }>;
+	readonly generations: Map<SessionManager, string>;
+	readonly parents: Map<SessionManager, SessionManager>;
+}
+function evidenceOperation(): EvidenceOperation {
+	return { archives: new Map(), identities: new Map(), generations: new Map(), parents: new Map() };
+}
+
 export interface SessionTreeFlatNode {
 	entry: SessionEntry;
 	label?: string;
@@ -281,6 +335,7 @@ export type ReadonlySessionManager = Pick<
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
+	| "isEntryOnBranch"
 	| "getLabel"
 	| "getBranch"
 	| "getHeader"
@@ -332,12 +387,68 @@ export function getSessionArtifactPathForFile(sessionFile: string, sessionId?: s
 	return getSessionArtifactPath(dirname(sessionFile), sessionId ?? basename(sessionFile).replace(/\.jsonl$/, ""));
 }
 
-function generateId(byId: { has(id: string): boolean }): string {
+function assertRotationHeaderBeforeWrite(path: string): void {
+	if (!existsSync(path)) return;
+	let header: SessionHeader;
+	try {
+		header = JSON.parse(readFirstLineSync(path) ?? "null") as SessionHeader;
+	} catch (error) {
+		if (error instanceof SyntaxError) return;
+		throw error;
+	}
+	if (header?.type === "session") rotationOf(header);
+}
+
+function entryIndex(entries: readonly SessionEntry[]): Map<string, SessionEntry> {
+	const index = new Map<string, SessionEntry>();
+	for (const entry of entries) {
+		if (
+			!entry ||
+			typeof entry.id !== "string" ||
+			!entry.id ||
+			index.has(entry.id) ||
+			(entry.parentId !== null && typeof entry.parentId !== "string")
+		)
+			throw new Error("Invalid or duplicate session entry ID");
+		index.set(entry.id, entry);
+	}
+	const complete = new Set<string>();
+	for (const entry of entries) {
+		const path = new Set<string>();
+		let current: SessionEntry | undefined = entry;
+		while (current && !complete.has(current.id)) {
+			if (path.has(current.id)) throw new Error(`Cyclic session entry ancestry at ${current.id}`);
+			path.add(current.id);
+			current = current.parentId === null ? undefined : index.get(current.parentId);
+		}
+		for (const id of path) complete.add(id);
+	}
+	return index;
+}
+
+export function parseStoredSegment(bytes: Buffer): FileEntry[] {
+	const content = bytes.toString("utf8");
+	if (!Buffer.from(content, "utf8").equals(bytes)) throw new Error("Stored session segment is not valid UTF-8");
+	const entries = parseEntriesFromBuffer(bytes, true);
+	if (entries[0]?.type !== "session" || typeof entries[0].id !== "string")
+		throw new Error("Missing session segment header");
+	if (entries.slice(1).some((entry) => entry.type === "session")) throw new Error("Duplicate session segment header");
+	entryIndex(entries.slice(1) as SessionEntry[]);
+	return entries;
+}
+
+function segmentId(segment: number, id: string): string {
+	return segment === 0 ? id : `s${segment}-${id}`;
+}
+
+function generateId(byId: { has(id: string): boolean }, segment = 0): string {
 	for (let i = 0; i < 100; i++) {
-		const id = randomUUID().slice(0, 8);
+		const id = segmentId(segment, randomUUID().slice(0, 8));
 		if (!byId.has(id)) return id;
 	}
-	return randomUUID();
+	const id = segmentId(segment, randomUUID());
+	if (byId.has(id)) throw new Error("Unable to create a unique session entry ID");
+	return id;
 }
 
 function migrateV1ToV2(entries: FileEntry[]): void {
@@ -400,25 +511,15 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 }
 
 export function parseSessionEntries(content: string): FileEntry[] {
-	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
-
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines.
-		}
-	}
-
+	const entries = parseEntriesFromBuffer(Buffer.from(content));
 	applyChildUsageAttributions(entries);
 	return entries;
 }
 
 function applyChildUsageAttributions(entries: FileEntry[]): void {
 	const assistantEntriesById = new Map<string, AssistantSessionMessageEntry>();
+	const header = entries.find((entry) => entry.type === "session") as SessionHeader | undefined;
+	for (const entry of rotationAssistants(header)) assistantEntriesById.set(entry.id, entry);
 	for (const entry of entries) {
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			assistantEntriesById.set(entry.id, entry as AssistantSessionMessageEntry);
@@ -593,35 +694,60 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 
 // Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
 // (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
-function appendEntryFromBuffer(entries: FileEntry[], buffer: Buffer, start = 0, end = buffer.length): void {
-	if (end <= start) return;
-	try {
-		entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
-	} catch {
-		// Skip malformed or blank lines.
+class SessionEntriesParser {
+	readonly entries: FileEntry[] = [];
+	private restart: RotationRestartReader | undefined;
+	private segmented = false;
+	private physicalLines = 0;
+	constructor(private readonly strict = false) {}
+	add(line: Buffer, terminated = true): void {
+		const firstLine = this.physicalLines++ === 0;
+		if (this.restart?.read(line, terminated)) return;
+		if (!line.length) return;
+		let entry: FileEntry;
+		try {
+			entry = JSON.parse(line.toString("utf8")) as FileEntry;
+		} catch (error) {
+			if (this.strict && line.toString("utf8").trim()) throw error;
+			return;
+		}
+		if (entry.type === "session" && entry.rotation !== undefined && !firstLine)
+			throw new Error("Segmented session header must be the first physical line");
+		if (this.entries.length === 0 && entry.type === "session") {
+			this.segmented = entry.rotation !== undefined;
+			assertSessionHeaderBound(entry);
+			this.restart = new RotationRestartReader(entry);
+		} else if (this.segmented && (entry as { type: string }).type === "rotation_state")
+			throw new Error("Unexpected rotation storage record outside the restart prefix");
+		this.entries.push(entry);
+	}
+	finish(): FileEntry[] {
+		this.restart?.finish();
+		const header = this.entries[0];
+		if (header?.type === "session") validateRotationEntries(header, this.entries.slice(1) as SessionEntry[]);
+		return this.entries;
 	}
 }
 
-function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
-	const entries: FileEntry[] = [];
+function parseEntriesFromBuffer(buffer: Buffer, strict = false): FileEntry[] {
+	const parser = new SessionEntriesParser(strict);
 	let start = 0;
 	while (start < buffer.length) {
-		let end = buffer.indexOf(0x0a, start);
-		if (end === -1) end = buffer.length;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		const newline = buffer.indexOf(0x0a, start);
+		const end = newline === -1 ? buffer.length : newline;
+		parser.add(buffer.subarray(start, end), newline !== -1);
 		start = end + 1;
 	}
-	return entries;
+	return parser.finish();
 }
-
 async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]> {
-	const entries: FileEntry[] = [];
+	const parser = new SessionEntriesParser();
 	let start = 0;
 	let bytesSinceYield = 0;
 	while (start < buffer.length) {
-		let end = buffer.indexOf(0x0a, start);
-		if (end === -1) end = buffer.length;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		const newline = buffer.indexOf(0x0a, start);
+		const end = newline === -1 ? buffer.length : newline;
+		parser.add(buffer.subarray(start, end), newline !== -1);
 		bytesSinceYield += end - start + 1;
 		start = end + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
@@ -629,7 +755,7 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	return entries;
+	return parser.finish();
 }
 
 // Crash damage (torn tail, zero-filled append) poisons the NEXT append into the
@@ -666,8 +792,10 @@ function tailLooksDamaged(targetPath: string): boolean {
 }
 
 function repairJsonlDamage(filePath: string): void {
+	requireNormalSessionPath(filePath);
 	const targetPath = realpathIfPresentSync(filePath);
 	if (!tailLooksDamaged(targetPath)) return;
+
 	let buffer: Buffer;
 	let snapshot: { size: number; mtimeMs: number };
 	try {
@@ -678,6 +806,7 @@ function repairJsonlDamage(filePath: string): void {
 		return;
 	}
 	if (buffer.length === 0 || snapshot.size !== buffer.length) return;
+	parseEntriesFromBuffer(buffer);
 	const keptLines: Buffer[] = [];
 	let recoveredNulLines = 0;
 	let droppedLines = 0;
@@ -784,17 +913,20 @@ export async function loadEntriesFromFileAsync(
 		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath)));
 	}
 
-	const entries: FileEntry[] = [];
+	const parser = new SessionEntriesParser();
+	const size = (await stat(filePath)).size;
+	let offset = 0;
 	let bytesSinceYield = 0;
 	for await (const line of readLinesAsBuffers(filePath)) {
-		appendEntryFromBuffer(entries, line);
+		offset += line.length + 1;
+		parser.add(line, offset <= size);
 		bytesSinceYield += line.length + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
 			bytesSinceYield = 0;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	return finalizeLoadedEntries(entries);
+	return finalizeLoadedEntries(parser.finish());
 }
 
 // --- Append-only metadata writes for closed sessions -------------------------
@@ -914,17 +1046,15 @@ function readTailLeafId(filePath: string, fileSize: number): string | null | und
 		} catch {
 			continue;
 		}
-		if (parsed.type === "session") continue;
+		if (parsed.type === "session" || parsed.type === "rotation_state") continue;
 		return typeof parsed.id === "string" ? parsed.id : null;
 	}
 	return windowBytes === fileSize ? null : undefined;
 }
 
 function requireNormalSessionPath(path: string): void {
-	const name = basename(resolve(path));
-	if (name.endsWith(".moved") || name.endsWith(".moving")) {
-		throw new Error(`Cannot open move backup or temporary: ${path}`);
-	}
+	requireActiveSessionPath(path);
+	assertRotationHeaderBeforeWrite(path);
 }
 
 function appendEntryToExistingFile(
@@ -987,7 +1117,12 @@ function appendEntryWithoutLease(
 	// generateId checks the in-memory entry index, which only a full parse can
 	// build; without it, take generateId's guaranteed-unique fallback form. A
 	// duplicate short id would cycle the leaf-to-root walk in buildSessionContext.
-	const entry = buildEntry({ leafId, newId: () => randomUUID(), timestamp: new Date().toISOString() });
+	const segment = rotationOf(header as SessionHeader)?.segment ?? 0;
+	const entry = buildEntry({
+		leafId,
+		newId: () => segmentId(segment, randomUUID()),
+		timestamp: new Date().toISOString(),
+	});
 	mkdirSync(dirname(targetPath), { recursive: true });
 	appendFileSync(targetPath, `${JSON.stringify(entry)}\n`);
 	return entry.id;
@@ -1157,11 +1292,13 @@ function sessionHeaderMatchesCwd(header: Partial<SessionHeader> | undefined, cwd
 
 export function findMostRecentSessionForCwd(sessionDir: string, cwd: string): string | null {
 	try {
+		if (isSessionArchivePath(sessionDir)) return null;
 		const files = readdirSync(sessionDir)
 			.filter((f) => f.endsWith(".jsonl"))
 			.map((f) => join(sessionDir, f))
 			.map((path) => {
 				try {
+					if (isSessionArchivePath(path)) return undefined;
 					const header = readSessionHeader(path);
 					if (!sessionHeaderMatchesCwd(header, cwd)) {
 						return undefined;
@@ -1329,6 +1466,7 @@ function extractOversizedMessageSummary(line: string): {
 
 interface SessionScanAccumulator {
 	header?: SessionHeader;
+	restart?: RotationRestartReader;
 	model?: SessionModelRef;
 	/** The first parsed entry was not a session header; appends cannot repair this. */
 	invalid: boolean;
@@ -1377,6 +1515,11 @@ const sessionScanStates = new Map<string, SessionScanState>();
 const sessionScanQueue = new Map<string, Promise<SessionInfo | null>>();
 
 export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	try {
+		if (isSessionArchivePath(filePath) || filePath.endsWith(".relocated")) return Promise.resolve(null);
+	} catch {
+		return Promise.resolve(null);
+	}
 	const previous = sessionScanQueue.get(filePath);
 	const scan = previous
 		? previous.then(
@@ -1564,7 +1707,15 @@ function isCountOnlyMessageLine(line: string): boolean {
 	);
 }
 
-function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): void {
+function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer, terminated = true): void {
+	if (acc.restart?.read(lineBuffer, terminated)) return;
+	if (acc.restart) {
+		acc.restart.finish();
+		for (const assistant of rotationAssistants(acc.header))
+			acc.assistantUsageById.set(assistant.id, assistant.message.usage);
+		acc.firstMessage ||= restartOf(acc.header)?.firstMessage ?? "";
+		acc.restart = undefined;
+	}
 	const line = lineBuffer.toString("utf8");
 	if (!line.trim()) return;
 
@@ -1577,7 +1728,7 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 	// Large tool-result entries can be many MB. They do not carry the
 	// session-list metadata we need, and parsing them during every refresh
 	// can exhaust the daemon heap.
-	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+	if (acc.header !== undefined && line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
 		if (looksLikeMessageEntry(line)) {
 			acc.messageCount++;
 			const summary = extractOversizedMessageSummary(line);
@@ -1599,6 +1750,8 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 		return;
 	}
 
+	if (acc.header?.rotation && (entry as { type: string }).type === "rotation_state")
+		throw new Error("Unexpected rotation storage record outside the restart prefix");
 	if (entry.type === "session_info") {
 		const infoEntry = entry as SessionInfoEntry;
 		acc.name = infoEntry.name?.trim() || undefined;
@@ -1636,6 +1789,12 @@ function foldSessionScanLine(acc: SessionScanAccumulator, lineBuffer: Buffer): v
 			return;
 		}
 		acc.header = entry as SessionHeader;
+		const accounting = rotationOf(acc.header)?.accounting;
+		if (accounting) {
+			acc.messageCount = accounting.messageCount;
+			acc.lastActivityTime = accounting.lastActivityTime;
+			acc.restart = new RotationRestartReader(acc.header);
+		}
 	}
 
 	acc.lastActivityTime = updateLastActivityTime(acc.lastActivityTime, entry);
@@ -1679,9 +1838,16 @@ function snapshotSessionInfo(
 			attributedChildUsage: cloneUsage(persistent.attributedChildUsage),
 			summarizationUsage: cloneUsage(persistent.summarizationUsage),
 		};
-		foldSessionScanLine(acc, tornTail);
+		foldSessionScanLine(acc, tornTail, false);
 	}
 	if (acc.invalid || !acc.header) return null;
+	if (acc.restart) {
+		acc.restart.finish();
+		for (const assistant of rotationAssistants(acc.header))
+			if (!acc.assistantUsageById.has(assistant.id))
+				acc.assistantUsageById.set(assistant.id, assistant.message.usage);
+		acc.firstMessage ||= restartOf(acc.header)?.firstMessage ?? "";
+	}
 	const usageTotal = emptyUsage();
 	for (const usage of acc.assistantUsageById.values()) {
 		addAssistantUsage(usageTotal, usage);
@@ -1736,6 +1902,7 @@ async function listSessionsFromDir(
 	}
 
 	try {
+		if (isSessionArchivePath(dir)) return sessions;
 		const dirEntries = await readdir(dir);
 		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
 		const total = progressTotal ?? files.length;
@@ -1788,6 +1955,16 @@ export class SessionManager {
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 	private persistedEntryIds = new Set<string>();
+	private storageGeneration?: string;
+	private storageWriteError?: Error;
+	private logicalBranchCache?: { leafId: string | null; key: string; parents: Map<string, string | null> };
+	private parentEvidenceCache?: { key: string; manager: SessionManager };
+
+	private _generation(): string | undefined {
+		if (!this.sessionFile || !existsSync(this.sessionFile)) return undefined;
+		const stat = statSync(this.sessionFile);
+		return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+	}
 
 	private constructor(
 		cwd: string,
@@ -1796,6 +1973,7 @@ export class SessionManager {
 		persist: boolean,
 		preloadedEntries?: FileEntry[],
 	) {
+		if (persist && sessionDir) requireActiveSessionPath(sessionDir);
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
 		this.persist = persist;
@@ -1817,11 +1995,20 @@ export class SessionManager {
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		requireNormalSessionPath(sessionFile);
+		const resolvedFile = resolve(sessionFile);
+		let loaded = preloadedEntries;
+		if (existsSync(resolvedFile)) {
+			if (this.persist && loaded === undefined) repairJsonlDamage(resolvedFile);
+			loaded ??= loadEntriesFromFile(resolvedFile);
+			if (loaded[0]?.type === "session") validateRotationEntries(loaded[0], loaded.slice(1) as SessionEntry[]);
+		}
 		this.persistedEntryIds.clear();
-		this.sessionFile = resolve(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			if (this.persist && preloadedEntries === undefined) repairJsonlDamage(this.sessionFile);
-			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
+		this.logicalBranchCache = undefined;
+		this.parentEvidenceCache = undefined;
+		this.storageWriteError = undefined;
+		this.sessionFile = resolvedFile;
+		if (loaded !== undefined) {
+			this.fileEntries = loaded;
 			this._refreshHasAssistantEntry();
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
@@ -1849,6 +2036,7 @@ export class SessionManager {
 
 			this._buildIndex();
 			this.persistedEntryIds = new Set(this.getEntries().map((entry) => entry.id));
+			this.storageGeneration = this._generation();
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1901,6 +2089,10 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header];
+		this.storageGeneration = undefined;
+		this.storageWriteError = undefined;
+		this.logicalBranchCache = undefined;
+		this.parentEvidenceCache = undefined;
 		this.persistedEntryIds.clear();
 		this.hasAssistantEntry = false;
 		this.byId.clear();
@@ -1920,10 +2112,13 @@ export class SessionManager {
 	// it O(1) in _appendEntry; every fileEntries reassignment (open, branch,
 	// rollback) refreshes it here.
 	private _refreshHasAssistantEntry(): void {
-		this.hasAssistantEntry = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		this.hasAssistantEntry =
+			this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant") ||
+			rotationAssistants(this.getHeader()).length > 0;
 	}
 
 	private _buildIndex(): void {
+		if (rotationOf(this.getHeader())) entryIndex(this.getEntries());
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1947,7 +2142,9 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+		if (this.storageWriteError) throw this.storageWriteError;
+		requireNormalSessionPath(this.sessionFile);
+		const content = serializeSessionEntries(this.fileEntries);
 		const targetPath = realpathIfPresentSync(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
@@ -1963,6 +2160,7 @@ export class SessionManager {
 	}
 
 	private _notifyPersistListeners(): void {
+		this.storageGeneration = this._generation();
 		if (!this.sessionFile) {
 			return;
 		}
@@ -2017,6 +2215,7 @@ export class SessionManager {
 			return this.sessionFile;
 		}
 		const dir = sessionDir ?? (this.sessionDir || getDefaultSessionDir(this.cwd));
+		requireActiveSessionPath(dir);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
@@ -2065,6 +2264,8 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
+		if (this.storageWriteError) throw this.storageWriteError;
+		requireActiveSessionPath(this.sessionFile);
 
 		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
 		if (!this.hasAssistantEntry && !shouldPersistWithoutAssistant) {
@@ -2087,10 +2288,15 @@ export class SessionManager {
 		}
 	}
 
+	private _newEntryId(): string {
+		const rotation = rotationOf(this.getHeader());
+		return generateId(this.byId, rotation?.segment ?? 0);
+	}
+
 	private appendEntrySeed(): AppendEntrySeed {
 		return {
 			leafId: this.leafId,
-			newId: () => generateId(this.byId),
+			newId: () => this._newEntryId(),
 			timestamp: new Date().toISOString(),
 		};
 	}
@@ -2123,7 +2329,7 @@ export class SessionManager {
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -2135,7 +2341,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
@@ -2147,7 +2353,7 @@ export class SessionManager {
 	appendServiceTierChange(serviceTier: ServiceTier): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,
@@ -2159,7 +2365,7 @@ export class SessionManager {
 	appendModelChange(provider: string, modelId: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			provider,
@@ -2182,7 +2388,7 @@ export class SessionManager {
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			summary,
@@ -2204,7 +2410,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -2222,7 +2428,8 @@ export class SessionManager {
 		aggregateUsage: Usage,
 		origin?: ChildUsageAttributionEntry["origin"],
 	): string {
-		const target = this.byId.get(targetId);
+		const target =
+			this.byId.get(targetId) ?? rotationAssistants(this.getHeader()).find((entry) => entry.id === targetId);
 		if (target?.type !== "message" || target.message.role !== "assistant") {
 			throw new Error(`Assistant message entry ${targetId} not found`);
 		}
@@ -2230,7 +2437,7 @@ export class SessionManager {
 		target.message.usage = cloneUsage(aggregateUsage);
 		const entry: ChildUsageAttributionEntry = {
 			type: "child_usage_attributed",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -2308,7 +2515,7 @@ export class SessionManager {
 	appendAgentStatus(status: AgentStatus): string {
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			status: {
@@ -2324,7 +2531,7 @@ export class SessionManager {
 	appendGitState(git: GitContext): string {
 		const entry: GitStateEntry = {
 			type: "git_state",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			git,
@@ -2439,7 +2646,521 @@ export class SessionManager {
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		return this.byId.get(id);
+		const active = this.byId.get(id);
+		if (active) return active;
+		const entry = this._entryWithEvidence(id, evidenceOperation(), new Set());
+		if (entry?.type !== "message" || entry.message.role !== "assistant") return entry;
+		const accounting = rotationAssistants(this.getHeader()).find((row) => row.id === id);
+		return accounting
+			? { ...entry, message: { ...entry.message, usage: cloneUsage(accounting.message.usage) } }
+			: entry;
+	}
+
+	private _archiveIdentity(operation: EvidenceOperation): { key: string; paths: readonly string[] } {
+		const cached = operation.identities.get(this);
+		if (cached) return cached;
+		const rotation = rotationOf(this.getHeader());
+		const paths = (rotation?.archives ?? []).map((ref) =>
+			sessionArchivePath(this.sessionFile!, this.sessionId, ref.segment),
+		);
+		let key: string;
+		try {
+			key = paths
+				.map((path) => {
+					const s = statSync(path);
+					return `${path}:${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`;
+				})
+				.join("|");
+		} catch (error) {
+			throw new Error(
+				`Committed session archive is unavailable for ${this.sessionFile}; restore its archive directory`,
+				{ cause: error },
+			);
+		}
+		const identity = { key, paths };
+		operation.identities.set(this, identity);
+		return identity;
+	}
+
+	private _archives(operation: EvidenceOperation): Map<string, SessionEntry> {
+		const cached = operation.archives.get(this);
+		if (cached) return cached;
+		const rotation = rotationOf(this.getHeader());
+		const { paths } = this._archiveIdentity(operation);
+		const index = new Map<string, SessionEntry>();
+		const attributions = new Map<string, Usage>();
+		for (const entry of this.fileEntries)
+			if (entry.type === "child_usage_attributed") attributions.set(entry.targetId, entry.aggregateUsage);
+		for (let i = 0; i < paths.length; i++) {
+			const ref = rotation!.archives[i];
+			const bytes = readFileSync(paths[i]);
+			if (bytes.length !== ref.bytes || createHash("sha256").update(bytes).digest("hex") !== ref.sha256)
+				throw new Error(
+					`Committed session archive digest differs: ${paths[i]}; restore the original archive bytes`,
+				);
+			const entries = parseStoredSegment(bytes);
+			applyChildUsageAttributions(entries);
+			const header = entries[0] as SessionHeader;
+			const archived = rotationOf(header);
+			if (
+				header.id !== this.sessionId ||
+				(archived?.segment ?? 0) !== ref.segment ||
+				!isDeepStrictEqual(archived?.archives ?? [], rotation!.archives.slice(0, i))
+			)
+				throw new Error(`Foreign or inconsistent session archive lineage: ${paths[i]}`);
+			const restart = restartOf(header);
+			for (const entry of entries.slice(1) as SessionEntry[]) {
+				const parentId = originalParent(entry, restart);
+				const previous = index.get(entry.id);
+				if (previous && (previous.parentId !== parentId || !this._sameLogicalEntry(previous, entry, attributions)))
+					throw new Error(`Conflicting archived session ancestry or entry: ${entry.id}`);
+				index.set(entry.id, parentId === entry.parentId ? entry : { ...entry, parentId });
+			}
+		}
+		const restart = restartOf(this.getHeader());
+		for (const entry of this.byId.values()) {
+			const previous = index.get(entry.id);
+			if (
+				previous &&
+				(previous.parentId !== originalParent(entry, restart) ||
+					!this._sameLogicalEntry(previous, entry, attributions))
+			)
+				throw new Error(`Conflicting active/archive session entry: ${entry.id}`);
+		}
+		operation.archives.set(this, index);
+		return index;
+	}
+
+	private _sameLogicalEntry(a: SessionEntry, b: SessionEntry, attributions: ReadonlyMap<string, Usage>): boolean {
+		const normalized = (entry: SessionEntry): SessionEntry => {
+			let value = { ...entry, parentId: null };
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const usage = attributions.get(entry.id) ?? entry.message.usage;
+				value = { ...entry, parentId: null, message: { ...entry.message, usage } };
+			}
+			return value;
+		};
+		return isDeepStrictEqual(normalized(a), normalized(b));
+	}
+
+	private _parentEvidence(operation: EvidenceOperation): SessionManager {
+		const existing = operation.parents.get(this);
+		if (existing) return existing;
+		const header = this.getHeader();
+		const parent = rotationOf(header)?.parent;
+		if (!parent || !header?.parentSession || !this.sessionFile)
+			throw new Error("Missing inherited session archive boundary");
+		let path = canonicalStoragePath(resolve(dirname(this.sessionFile), header.parentSession));
+		const visited = new Set<string>();
+		while (!existsSync(path)) {
+			requireActiveSessionPath(path);
+			if (visited.has(path)) throw new Error(`Cyclic parent session relocation: ${path}`);
+			visited.add(path);
+			const redirect = `${path}.relocated`;
+			if (!existsSync(redirect)) break;
+			if (canonicalStoragePath(redirect) !== redirect || !lstatSync(redirect).isFile())
+				throw new Error(`Unsafe parent session relocation: ${redirect}`);
+			const record: unknown = JSON.parse(readFileSync(redirect, "utf8"));
+			if (
+				!record ||
+				typeof record !== "object" ||
+				!("version" in record) ||
+				record.version !== 1 ||
+				!("sessionId" in record) ||
+				record.sessionId !== parent.sessionId ||
+				!("target" in record) ||
+				typeof record.target !== "string" ||
+				resolve(record.target) !== record.target ||
+				canonicalStoragePath(record.target) !== record.target
+			)
+				throw new Error(`Invalid parent session relocation: ${redirect}`);
+			path = record.target;
+		}
+		requireActiveSessionPath(path);
+		let stat: ReturnType<typeof statSync>;
+		try {
+			stat = statSync(path);
+		} catch (error) {
+			throw new Error(
+				`Parent session evidence is unavailable: ${path}; its permanent deletion removes inherited archive access`,
+				{ cause: error },
+			);
+		}
+		const key = `${path}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+		if (this.parentEvidenceCache?.key === key) {
+			operation.parents.set(this, this.parentEvidenceCache.manager);
+			return this.parentEvidenceCache.manager;
+		}
+		const entries = parseStoredSegment(readFileSync(path));
+		const source = entries[0] as SessionHeader;
+		if (
+			source.id !== parent.sessionId ||
+			(rotationOf(source)?.segment ?? 0) < parent.segment ||
+			[...visited].some((old) => !source.previousSessionPaths?.includes(old))
+		) {
+			throw new Error(`Parent session evidence identity differs: ${path}`);
+		}
+		const manager = new SessionManager(source.cwd, dirname(path), path, false, entries);
+		this.parentEvidenceCache = { key, manager };
+		operation.parents.set(this, manager);
+		return manager;
+	}
+
+	private _entryWithEvidence(
+		id: string,
+		operation: EvidenceOperation,
+		lineage: Set<string>,
+	): SessionEntry | undefined {
+		const active = this.byId.get(id);
+		if (active) return active;
+		const archived = this._archives(operation).get(id);
+		if (archived) return archived;
+		const rotation = rotationOf(this.getHeader());
+		if (!rotation?.parent) return undefined;
+		const path = canonicalStoragePath(this.sessionFile!);
+		if (lineage.has(path)) throw new Error(`Cyclic inherited session archive lineage: ${path}`);
+		const next = new Set(lineage).add(path);
+		const parent = this._parentEvidence(operation);
+		if (!parent._logicalBranch(rotation.parent.leafId, operation, next).has(id)) return undefined;
+		return parent._entryWithEvidence(id, operation, next);
+	}
+
+	private _evidenceGeneration(operation: EvidenceOperation, lineage: Set<string>): string {
+		const cached = operation.generations.get(this);
+		if (cached !== undefined) return cached;
+		const path = this.sessionFile ? canonicalStoragePath(this.sessionFile) : "memory";
+		if (lineage.has(path)) throw new Error(`Cyclic inherited session archive lineage: ${path}`);
+		const rotation = rotationOf(this.getHeader());
+		const parentKey = rotation?.parent
+			? this._parentEvidence(operation)._evidenceGeneration(operation, new Set(lineage).add(path))
+			: "";
+		const key = `${this.storageGeneration}:${this.fileEntries.length}:${this._archiveIdentity(operation).key}:${parentKey}`;
+		operation.generations.set(this, key);
+		return key;
+	}
+
+	private _logicalBranch(
+		leafId: string | null,
+		operation = evidenceOperation(),
+		lineage = new Set<string>(),
+	): Map<string, string | null> {
+		const key = this._evidenceGeneration(operation, lineage);
+		const cached = this.logicalBranchCache;
+		if (cached?.leafId === leafId && cached.key === key) return cached.parents;
+		const parents = new Map<string, string | null>();
+		const restart = restartOf(this.getHeader());
+		let id = leafId;
+		while (id !== null) {
+			if (parents.has(id)) throw new Error(`Cyclic logical session ancestry at ${id}`);
+			const entry = this._entryWithEvidence(id, operation, lineage);
+			if (!entry) throw new Error(`Session ancestry entry is missing: ${id}`);
+			let parentId = originalParent(entry, restart);
+			const inherited = rotationOf(this.getHeader())?.parent;
+			if (inherited && !this.byId.has(id) && !this._archives(operation).has(id)) {
+				// Inherited active control entries use their owner's restart cuts, not this fork's.
+				const sourceParents = this._parentEvidence(operation)._logicalBranch(
+					inherited.leafId,
+					operation,
+					new Set(lineage).add(canonicalStoragePath(this.sessionFile!)),
+				);
+				parentId = sourceParents.get(id)!;
+			}
+			parents.set(id, parentId);
+			id = parentId;
+		}
+		for (const entry of this.getBranch(leafId ?? undefined))
+			if (!parents.has(entry.id)) parents.set(entry.id, entry.parentId);
+		this.logicalBranchCache = { leafId, key, parents };
+		return parents;
+	}
+
+	isEntryOnBranch(id: string): boolean {
+		if (this.byId.has(id)) return this.getBranch().some((entry) => entry.id === id);
+		const logical = this._logicalBranch(this.leafId);
+		return logical.has(id);
+	}
+
+	/** Remove only this transcript's recognizable atomic temps from dead processes, under its runtime lease. */
+	cleanupRotationTemps(agentDir = getDefaultAgentDir()): void {
+		try {
+			if (!this.sessionFile || !ownsSessionLease(this, this.sessionFile, agentDir)) return;
+			const rotation = rotationOf(this.getHeader());
+			if (!isRotatableSessionId(this.sessionId)) return;
+			const archiveRoot = dirname(sessionArchivePath(this.sessionFile, this.sessionId, rotation?.segment ?? 0));
+			if (!rotation && !existsSync(archiveRoot)) return;
+			const destinations = [canonicalStoragePath(this.sessionFile)];
+			if (rotation) {
+				for (const segment of [...rotation.archives.map((ref) => ref.segment), rotation.segment]) {
+					destinations.push(sessionArchivePath(this.sessionFile, this.sessionId, segment));
+				}
+			} else {
+				destinations.push(sessionArchivePath(this.sessionFile, this.sessionId, 0));
+			}
+			for (const destination of destinations) {
+				if (!existsSync(dirname(destination))) continue;
+				const prefix = `${basename(destination)}.`;
+				for (const entry of readdirSync(dirname(destination), { withFileTypes: true })) {
+					if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+					const suffix = entry.name.slice(prefix.length).split(".");
+					if (
+						suffix.length !== 3 ||
+						!/^[1-9][0-9]*$/.test(suffix[0]) ||
+						!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(suffix[1]) ||
+						suffix[2] !== "tmp"
+					)
+						continue;
+					const pid = Number(suffix[0]);
+					if (Number.isSafeInteger(pid) && !isProcessAlive(pid)) rmSync(join(dirname(destination), entry.name));
+				}
+			}
+		} catch (error) {
+			console.error(
+				`Session rotation temp cleanup skipped: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/** Called only at the shared successful-compaction boundary; all manager persistence is synchronous. */
+	rotateAfterCompaction(
+		compactionId: string,
+		agentDir = getDefaultAgentDir(),
+		pendingChildUsageParents = 0,
+	): SessionRotationResult {
+		if (!this.persist || !this.sessionFile || !existsSync(this.sessionFile)) return { status: "skipped" };
+		let step = "eligibility";
+		let candidate: FileEntry[] | undefined;
+		let nextSegment: number | undefined;
+		try {
+			const header = this.getHeader();
+			const current = rotationOf(header);
+			if (
+				current?.compactionId === compactionId ||
+				statSync(this.sessionFile).size <= SESSION_ROTATION_THRESHOLD_BYTES
+			)
+				return { status: "skipped" };
+			if (!isRotatableSessionId(this.sessionId)) {
+				const reason = "custom session ID is not a generated v4/v7 UUID; compaction is kept without rotation";
+				console.error(`Session rotation skipped: ${reason}`);
+				return { status: "skipped", reason };
+			}
+			if (pendingChildUsageParents > 0) {
+				const reason = "child usage batch is pending persistence; rotation waits for its flush";
+				console.error(`Session rotation skipped: ${reason}`);
+				return { status: "skipped", reason };
+			}
+			nextSegment = (current?.segment ?? 0) + 1;
+			step = "lease";
+			if (!ownsSessionLease(this, this.sessionFile, agentDir)) {
+				const reason = "exclusive canonical writer lease is not held by this runtime";
+				console.error(`Session rotation skipped: ${reason}`);
+				return { status: "skipped", reason };
+			}
+			step = "snapshot";
+			if (!header || this.storageGeneration !== this._generation())
+				throw new Error("Active session generation changed; reopen before rotation");
+			const compaction = this.byId.get(compactionId);
+			if (compaction?.type !== "compaction" || !this.isEntryPersisted(compactionId))
+				throw new Error("Successful compaction is not persisted");
+			const branch = this.getBranch();
+			const boundary = branch.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+			if (boundary < 0 || !branch.includes(compaction))
+				throw new Error("Compaction keep boundary is not on the active branch");
+			if (current?.archives.length) this._archives(evidenceOperation());
+			const original = readFileSync(this.sessionFile);
+			const headerEnd = original.indexOf(0x0a);
+			if (headerEnd < 0 || headerEnd + 1 >= 64 * 1024)
+				throw new Error("Archive input header exceeds the 64 KiB first-line bound");
+			const originalHeader = JSON.parse(original.subarray(0, headerEnd).toString("utf8")) as SessionHeader;
+			if (originalHeader?.type !== "session" || originalHeader.id !== this.sessionId)
+				throw new Error("Archive input must begin with its session header");
+			const persisted = parseStoredSegment(original);
+			applyChildUsageAttributions(persisted);
+			if (serializeSessionEntries(persisted) !== serializeSessionEntries(this.fileEntries))
+				throw new Error("Active session entries changed; reopen before rotation");
+			const kept = new Set(branch.slice(boundary).map((entry) => entry.id));
+			const supported = new Set([
+				...CONTENT_ENTRY_TYPES,
+				"session_state",
+				"agent_status",
+				"git_state",
+				"child_usage_attributed",
+			]);
+			const originalParents: Record<string, string | null> = Object.create(null);
+
+			const entries = this.getEntries();
+			entryIndex(entries);
+			for (const entry of entries) {
+				if (!supported.has(entry.type))
+					throw new Error(`Unknown top-level session entry type; retained unchanged without rotation`);
+			}
+			const retained = entries.filter((entry) => entry.type !== "message" || kept.has(entry.id));
+			const retainedIds = new Set(retained.map((entry) => entry.id));
+			const activeIndex = new Map(entries.map((entry) => [entry.id, entry]));
+			const nearest = (parentId: string | null): string | null => {
+				let id = parentId;
+				while (id !== null && !retainedIds.has(id)) id = activeIndex.get(id)?.parentId ?? null;
+				return id;
+			};
+			let replacement = retained.map((entry) => ({ ...entry, parentId: nearest(entry.parentId) }));
+			let model: SessionModelRef | null = null;
+			let retainedModel: SessionModelRef | null = null;
+			for (const entry of branch.slice(0, boundary)) {
+				if (entry.type === "model_change")
+					model = retainedModel = { provider: entry.provider, modelId: entry.modelId };
+				if (entry.type === "message" && entry.message.role === "assistant")
+					model = { provider: entry.message.provider, modelId: entry.message.model };
+			}
+			if (model && !isDeepStrictEqual(model, retainedModel)) {
+				const position = replacement.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+				const first = replacement[position];
+				const checkpoint: ModelChangeEntry = {
+					type: "model_change",
+					id: generateId(this.byId, nextSegment),
+					parentId: first.parentId,
+					timestamp: first.timestamp,
+					provider: model.provider,
+					modelId: model.modelId,
+				};
+				replacement[position] = { ...first, parentId: checkpoint.id };
+				replacement = [...replacement.slice(0, position), checkpoint, ...replacement.slice(position)];
+			}
+			const previousRestart = restartOf(header);
+			for (const entry of replacement) {
+				const originalEntry = activeIndex.get(entry.id);
+				if (!originalEntry) continue;
+				const parent = originalParent(originalEntry, previousRestart);
+				if (entry.parentId !== parent) originalParents[entry.id] = parent;
+			}
+			const assistants = new Map(rotationAssistants(header).map((entry) => [entry.id, entry]));
+			let messageCount = current?.accounting.messageCount ?? 0;
+			let firstMessage = previousRestart?.firstMessage ?? "";
+			let lastActivityTime = current?.accounting.lastActivityTime;
+			for (const entry of entries) {
+				if (entry.type !== "message" || retainedIds.has(entry.id)) continue;
+				messageCount++;
+				lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+				if (!firstMessage && entry.message.role === "user") {
+					const text = extractTextContent(entry.message);
+					firstMessage =
+						JSON.stringify(entry).length > SESSION_LIST_PARSE_MAX_LINE_CHARS
+							? text.slice(0, SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS)
+							: text;
+				}
+				if (entry.message.role === "assistant") {
+					const { api, provider, model, stopReason, timestamp, usage } = entry.message;
+					assistants.set(entry.id, {
+						...entry,
+						message: {
+							role: "assistant",
+							content: [],
+							api,
+							provider,
+							model,
+							stopReason,
+							timestamp,
+							usage: cloneUsage(usage),
+						},
+					});
+				}
+			}
+			const archive: SessionArchiveRef = {
+				segment: current?.segment ?? 0,
+				bytes: original.length,
+				sha256: createHash("sha256").update(original).digest("hex"),
+			};
+			const rotation: SessionRotation = {
+				version: 1,
+				segment: nextSegment,
+				archives: [...(current?.archives ?? []), archive],
+				restart: { version: 1, count: 0, sha256: createHash("sha256").digest("hex") },
+				compactionId,
+				...(current?.parent ? { parent: current.parent } : {}),
+				accounting: { messageCount, lastActivityTime },
+			};
+			const projected = projectAccounting(header, entries, assistants, originalParents);
+			candidate = [
+				withRotationRestart({ ...header, rotation }, { originalParents, accounting: projected, firstMessage }),
+				...replacement,
+			];
+			const serialized = serializeSessionEntries(candidate);
+			if (Buffer.byteLength(serialized) >= original.length)
+				throw new Error(
+					`Retained session state cannot shrink the active file (${Buffer.byteLength(serialized)} bytes)`,
+				);
+			candidate = parseStoredSegment(Buffer.from(serialized));
+			applyChildUsageAttributions(candidate);
+			const candidateEntries = candidate.slice(1) as SessionEntry[];
+			if (
+				JSON.stringify(this.buildSessionContext()) !==
+				JSON.stringify(buildSessionContext(candidateEntries, this.leafId))
+			)
+				throw new Error("Replacement context differs; rotation refused");
+			const archivePath = sessionArchivePath(this.sessionFile, this.sessionId, archive.segment);
+			const metadata = statMetadataIfPresent(this.sessionFile)!;
+			step = "archive publication";
+			mkdirSync(dirname(archivePath), { recursive: true });
+			writeFileAtomicSync(archivePath, original.toString("utf8"), {
+				mode: metadata.mode,
+				fsync: true,
+				fsyncDir: true,
+				beforeRename: (temp) => {
+					chownSync(temp, metadata.uid, metadata.gid);
+					if (!readFileSync(temp).equals(original)) throw new Error("Archive bytes differ before publication");
+				},
+			});
+			step = "active publication";
+			const activePath = canonicalStoragePath(this.sessionFile);
+			writeFileAtomicSync(activePath, serialized, {
+				mode: metadata.mode,
+				fsync: true,
+				fsyncDir: true,
+				beforeRename: (temp) => {
+					chownSync(temp, metadata.uid, metadata.gid);
+					if (!readFileSync(this.sessionFile!).equals(original))
+						throw new Error("Active generation changed before publication");
+					if (!isDeepStrictEqual(finalizeLoadedEntries(parseStoredSegment(readFileSync(temp))), candidate))
+						throw new Error("Replacement validation differs");
+				},
+			});
+			step = "index refresh";
+			this._adoptPublishedSegment(candidate);
+			return { status: "rotated", segment: nextSegment };
+		} catch (error) {
+			let committed = false;
+			try {
+				const rotation = rotationOf(readSessionHeader(this.sessionFile) as SessionHeader | undefined);
+				committed =
+					nextSegment !== undefined && rotation?.segment === nextSegment && rotation.compactionId === compactionId;
+				if (committed)
+					this._adoptPublishedSegment(finalizeLoadedEntries(parseStoredSegment(readFileSync(this.sessionFile))));
+			} catch (reconcileError) {
+				if (committed)
+					this.storageWriteError = new Error(
+						"Rotation committed but indexes cannot be restored; stop writing and reopen",
+						{ cause: reconcileError },
+					);
+			}
+			const reason =
+				error instanceof SyntaxError
+					? "invalid stored JSON"
+					: error instanceof Error
+						? error.message
+						: "unknown storage failure";
+			const status = committed ? "committed-with-warning" : "failed";
+			console.error(`Session rotation ${status} at ${step}: ${reason}`);
+			return { status, step, reason };
+		}
+	}
+
+	private _adoptPublishedSegment(entries: FileEntry[]): void {
+		validateRotationEntries(entries[0] as SessionHeader, entries.slice(1) as SessionEntry[]);
+		this.fileEntries = entries;
+		this.logicalBranchCache = undefined;
+		this._refreshHasAssistantEntry();
+		this._buildIndex();
+		this.persistedEntryIds = new Set(this.getEntries().map((entry) => entry.id));
+		this.flushed = true;
+		this._notifyPersistListeners();
 	}
 
 	getChildren(parentId: string): SessionEntry[] {
@@ -2462,7 +3183,7 @@ export class SessionManager {
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -2595,7 +3316,7 @@ export class SessionManager {
 		this.leafBranchCache = null;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.byId),
+			id: this._newEntryId(),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId: branchFromId ?? "root",
@@ -2608,14 +3329,157 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	private _forkRotation(
+		leafId: string,
+		copiedEntries: readonly SessionEntry[],
+	): { rotation: SessionRotation; restart: RotationRestart; parentSession: string | undefined } | undefined {
+		const header = this.getHeader()!;
+		const source = rotationOf(header);
+		if (!source || (!source.archives.length && !source.parent)) return undefined;
+		const inheritedOnly = !source.archives.length && !!source.parent;
+		const active = this.getBranch(leafId);
+		const state = restartOf(header)!;
+		const operation = evidenceOperation();
+		const parents = inheritedOnly
+			? new Map(active.map((entry) => [entry.id, originalParent(entry, state)]))
+			: this._logicalBranch(leafId, operation);
+		const copied = new Set(copiedEntries.map((entry) => entry.id));
+		const dropped = new Set(
+			this.getEntries()
+				.filter((entry) => (entry.type === "git_state" || entry.type === "label") && !copied.has(entry.id))
+				.map((entry) => entry.id),
+		);
+		while (!inheritedOnly && dropped.has(leafId)) {
+			const parent = parents.get(leafId);
+			if (!parent) return undefined;
+			leafId = parent;
+		}
+		const assistants: AssistantSessionMessageEntry[] = inheritedOnly
+			? [...rotationUsageEntries(header, active, this.getEntries())]
+			: [];
+		const accountedUsage = new Map(
+			rotationAssistants(this.getHeader()).map((entry) => [entry.id, entry.message.usage]),
+		);
+		let messageCount = inheritedOnly ? source.accounting.messageCount : 0;
+		let firstMessage = inheritedOnly ? state.firstMessage : "";
+		let lastActivityTime = inheritedOnly ? source.accounting.lastActivityTime : undefined;
+		for (const id of [...parents.keys()].reverse()) {
+			const entry = this._entryWithEvidence(id, operation, new Set())!;
+			if (entry.type !== "message") continue;
+			if (!firstMessage && entry.message.role === "user") {
+				const text = extractTextContent(entry.message);
+				firstMessage =
+					JSON.stringify(entry).length > SESSION_LIST_PARSE_MAX_LINE_CHARS
+						? text.slice(0, SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS)
+						: text;
+			}
+			if (copied.has(id)) continue;
+			messageCount++;
+			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+			if (entry.message.role === "assistant") {
+				const { api, provider, model, stopReason, timestamp, usage } = entry.message;
+				assistants.push({
+					...entry,
+					message: {
+						role: "assistant",
+						content: [],
+						api,
+						provider,
+						model,
+						stopReason,
+						timestamp,
+						usage: cloneUsage(accountedUsage.get(entry.id) ?? usage),
+					},
+				});
+			}
+		}
+		const originalParents: Record<string, string | null> = Object.create(null);
+		for (const entry of copiedEntries) {
+			let parent = parents.get(entry.id);
+			while (parent !== undefined && parent !== null && dropped.has(parent)) parent = parents.get(parent);
+			if (parent !== undefined && parent !== entry.parentId) originalParents[entry.id] = parent;
+		}
+		const accounting = projectAccounting(
+			this.getHeader()!,
+			this.getEntries(),
+			new Map(assistants.map((entry) => [entry.id, entry])),
+			originalParents,
+			parents,
+		);
+		return {
+			parentSession: inheritedOnly ? header.parentSession : this.sessionFile,
+			rotation: inheritedOnly
+				? source
+				: {
+						version: 1,
+						segment: source.segment + 1,
+						archives: [],
+						restart: { version: 1, count: 0, sha256: createHash("sha256").digest("hex") },
+						parent: { sessionId: this.sessionId, leafId, segment: source.segment },
+						accounting: { messageCount, lastActivityTime },
+					},
+			restart: { originalParents, accounting, firstMessage },
+		};
+	}
+
+	/** Classify active ancestry once, without loading archived conversation. */
+	private _unrestorableContextIds(): Set<string> {
+		const refused = new Set<string>();
+		const state = restartOf(this.getHeader());
+		if (!state) return refused;
+		const children = new Map<string | null, SessionEntry[]>();
+		for (const entry of this.getEntries()) {
+			const parent = entry.parentId && this.byId.has(entry.parentId) ? entry.parentId : null;
+			const siblings = children.get(parent) ?? [];
+			siblings.push(entry);
+			children.set(parent, siblings);
+		}
+		const depths = new Map<string, number>();
+		const stack = (children.get(null) ?? []).map((entry) => ({ entry, cut: -1, boundary: -1, exit: false }));
+		while (stack.length) {
+			const frame = stack.pop()!;
+			const { entry } = frame;
+			if (frame.exit) {
+				depths.delete(entry.id);
+				continue;
+			}
+			const depth = depths.size;
+			depths.set(entry.id, depth);
+			const cut = Object.hasOwn(state.originalParents, entry.id) ? depth : frame.cut;
+			const boundary = entry.type === "compaction" ? (depths.get(entry.firstKeptEntryId) ?? -1) : frame.boundary;
+			if (cut > boundary) refused.add(entry.id);
+			stack.push({ ...frame, exit: true });
+			for (const child of children.get(entry.id) ?? []) stack.push({ entry: child, cut, boundary, exit: false });
+		}
+		return refused;
+	}
+
+	/** Refuse active targets whose shortened ancestry has no covering compaction. */
+	assertRestorableContext(leafId: string): void {
+		if (this._unrestorableContextIds().has(leafId))
+			throw new Error(`Cannot restore entry ${leafId}: archived ancestry is not covered by a compaction`);
+	}
+
 	createBranchedSession(leafId: string): string | undefined {
+		this.assertRestorableContext(leafId);
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
 
-		const pathWithoutLabels = path.filter((e) => e.type !== "label");
+		let pathWithoutLabels = path.filter((e) => e.type !== "label");
+		const sourceRotation = rotationOf(this.getHeader());
+		if (sourceRotation?.archives.length || sourceRotation?.parent) {
+			const copied = new Set(pathWithoutLabels.map((entry) => entry.id));
+			pathWithoutLabels = pathWithoutLabels.map((entry) => {
+				let parentId = entry.parentId;
+				while (parentId !== null && !copied.has(parentId) && this.byId.has(parentId))
+					parentId = this.byId.get(parentId)!.parentId;
+				return parentId === entry.parentId ? entry : { ...entry, parentId };
+			});
+		}
+		const forkRotation = this._forkRotation(leafId, pathWithoutLabels);
 
 		const target = this.persist
 			? createUniqueSessionFileTarget(this.getSessionDir())
@@ -2624,17 +3488,20 @@ export class SessionManager {
 		const timestamp = new Date().toISOString();
 		const newSessionFile = target.sessionFile;
 
-		const header: SessionHeader = {
+		let header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: newSessionId,
 			timestamp,
 			cwd: this.cwd,
-			parentSession: this.persist ? previousSessionFile : undefined,
+			parentSession: this.persist ? (forkRotation?.parentSession ?? previousSessionFile) : undefined,
 			rlmDepth: resolveSessionRlmDepth(this.getHeader() ?? {}, previousSessionFile ?? newSessionFile ?? ""),
 			git: this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined,
+			...(forkRotation ? { rotation: forkRotation.rotation } : {}),
 		};
 
+		if (forkRotation) header = withRotationRestart(header, forkRotation.restart);
+		assertSessionHeaderBound(header);
 		const pathEntryIds = new Set(pathWithoutLabels.map((e) => e.id));
 		const labelsToWrite: Array<{ targetId: string; label: string; timestamp: string }> = [];
 		for (const [targetId, label] of this.labelsById) {
@@ -2650,7 +3517,7 @@ export class SessionManager {
 			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 				const labelEntry: LabelEntry = {
 					type: "label",
-					id: generateId(new Set(pathEntryIds)),
+					id: generateId(new Set(pathEntryIds), forkRotation?.rotation.segment ?? 0),
 					parentId,
 					timestamp: labelTimestamp,
 					targetId,
@@ -2688,7 +3555,10 @@ export class SessionManager {
 		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 			const labelEntry: LabelEntry = {
 				type: "label",
-				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
+				id: generateId(
+					new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)]),
+					forkRotation?.rotation.segment ?? 0,
+				),
 				parentId,
 				timestamp: labelTimestamp,
 				targetId,
@@ -2766,7 +3636,35 @@ export class SessionManager {
 		return new SessionManager(cwd, sessionDir, undefined, false);
 	}
 
+	static assertImportEvidence(sourcePath: string, destinationPath: string): void {
+		let header: Partial<SessionHeader> | undefined;
+		try {
+			header = readSessionHeader(sourcePath);
+		} catch (error) {
+			if (error instanceof SyntaxError) return;
+			throw error;
+		}
+		if (!header?.rotation) return;
+		try {
+			const entries = loadEntriesFromFile(sourcePath);
+			const manager = new SessionManager(header.cwd!, dirname(destinationPath), destinationPath, false, entries);
+			const operation = evidenceOperation();
+			manager._archives(operation);
+			const parent = rotationOf(manager.getHeader())?.parent;
+			if (parent)
+				manager
+					._parentEvidence(operation)
+					._logicalBranch(parent.leafId, operation, new Set([canonicalStoragePath(destinationPath)]));
+		} catch (error) {
+			throw new Error(
+				`Cannot import segmented session without destination evidence: ${destinationPath}; ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
+		}
+	}
+
 	static forkFrom(sourcePath: string, targetCwd: string, sessionDir?: string): SessionManager {
+		requireNormalSessionPath(sourcePath);
 		const sourceEntries = loadEntriesFromFile(sourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${sourcePath}`);
@@ -2777,8 +3675,67 @@ export class SessionManager {
 			throw new Error(`Cannot fork: source session has no header: ${sourcePath}`);
 		}
 		migrateToCurrentVersion(sourceEntries);
+		const sourceManager = new SessionManager(sourceHeader.cwd, dirname(sourcePath), sourcePath, false, sourceEntries);
+		if (sourceManager.getLeafId()) sourceManager.assertRestorableContext(sourceManager.getLeafId()!);
+		const leafBranch = new Set(sourceHeader.rotation ? sourceManager.getBranch().map((entry) => entry.id) : []);
+		const omitted = sourceManager._unrestorableContextIds();
+		for (const id of leafBranch) omitted.delete(id);
+		const entries = sourceManager.getEntries();
+		const children = new Map<string, string[]>();
+		for (const entry of omitted.size ? entries : []) {
+			if (entry.parentId === null) continue;
+			const siblings = children.get(entry.parentId) ?? [];
+			siblings.push(entry.id);
+			children.set(entry.parentId, siblings);
+		}
+		const omittedSubtree = [...omitted];
+		while (omittedSubtree.length) {
+			for (const id of children.get(omittedSubtree.pop()!) ?? []) {
+				if (omitted.has(id)) continue;
+				omitted.add(id);
+				omittedSubtree.push(id);
+			}
+		}
+		const repointedLabels = new Map<string, string>();
+		if (sourceHeader.rotation) {
+			const labelsByTarget = new Map<string, LabelEntry[]>();
+			for (const entry of entries) {
+				if (entry.type !== "label" || !omitted.has(entry.id)) continue;
+				const labels = labelsByTarget.get(entry.targetId) ?? [];
+				labels.push(entry);
+				labelsByTarget.set(entry.targetId, labels);
+			}
+			const kept = entries
+				.filter((entry) => entry.type !== "git_state" && !omitted.has(entry.id))
+				.map((entry) => entry.id);
+			while (kept.length) {
+				const target = kept.pop()!;
+				for (const label of labelsByTarget.get(target) ?? []) {
+					omitted.delete(label.id);
+					repointedLabels.set(label.id, target);
+					kept.push(label.id);
+				}
+			}
+		}
+		const droppedParent = new Map<string, string | null>();
+		for (const entry of entries) {
+			if (entry.type === "git_state" || (entry.type === "label" && omitted.has(entry.id)))
+				droppedParent.set(entry.id, entry.parentId);
+		}
+		const copiedEntries = entries
+			.filter((entry) => entry.type !== "git_state" && !omitted.has(entry.id))
+			.map((entry) => {
+				let parentId = repointedLabels.get(entry.id) ?? entry.parentId;
+				while (parentId !== null && droppedParent.has(parentId)) parentId = droppedParent.get(parentId) ?? null;
+				return parentId === entry.parentId ? entry : { ...entry, parentId };
+			});
+
+		const forkRotation = sourceManager.getLeafId()
+			? sourceManager._forkRotation(sourceManager.getLeafId()!, copiedEntries)
+			: undefined;
 
 		const dir = sessionDir ?? getDefaultSessionDir(targetCwd);
+		requireActiveSessionPath(dir);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
@@ -2788,44 +3745,28 @@ export class SessionManager {
 		const timestamp = new Date().toISOString();
 		const newSessionFile = target.sessionFile;
 
-		const newHeader: SessionHeader = {
+		let newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: newSessionId,
 			timestamp,
 			cwd: targetCwd,
-			parentSession: sourcePath,
+			parentSession: forkRotation?.parentSession ?? sourcePath,
 			rlmDepth: resolveSessionRlmDepth(sourceHeader, sourcePath),
 			git: captureGitContext(targetCwd) ?? undefined,
+			...(forkRotation ? { rotation: forkRotation.rotation } : {}),
 		};
-		// The whole fork flows through one descriptor: one openSync, one
-		// writeAllSync per line, one closeSync. writeAllSync loops past short
-		// counts so every JSONL line lands whole, and "w" creates the target
-		// fresh because createUniqueSessionFileTarget guarantees it does not
-		// exist yet.
-		const descriptor = openSync(newSessionFile, "w");
-		try {
-			writeAllSync(descriptor, `${JSON.stringify(newHeader)}\n`, newSessionFile);
-
-			// Drop the source's git_state entries (re-linking children): they describe the source repo,
-			// so the fork would otherwise report the source's git instead of its own target context.
-			const droppedParent = new Map<string, string | null>();
-			for (const entry of sourceEntries) {
-				if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
+		if (forkRotation) newHeader = withRotationRestart(newHeader, forkRotation.restart);
+		const content = serializeSessionEntries([newHeader, ...copiedEntries]);
+		if (forkRotation) {
+			writeFileAtomicSync(newSessionFile, content);
+		} else {
+			const descriptor = openSync(newSessionFile, "w");
+			try {
+				writeAllSync(descriptor, content, newSessionFile);
+			} finally {
+				closeSync(descriptor);
 			}
-			const liveParent = (parentId: string | null): string | null => {
-				let pid = parentId;
-				while (pid !== null && droppedParent.has(pid)) pid = droppedParent.get(pid) ?? null;
-				return pid;
-			};
-			for (const entry of sourceEntries) {
-				if (entry.type === "session" || entry.type === "git_state") continue;
-				const parentId = liveParent(entry.parentId);
-				const out = parentId === entry.parentId ? entry : { ...entry, parentId };
-				writeAllSync(descriptor, `${JSON.stringify(out)}\n`, newSessionFile);
-			}
-		} finally {
-			closeSync(descriptor);
 		}
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);

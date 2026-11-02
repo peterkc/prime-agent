@@ -13,7 +13,8 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { execFileSyncHidden, isProcessAlive } from "../utils/child-process.js";
-import { readFirstLineSync } from "../utils/file-lines.js";
+import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotation-state.js";
+import { isSessionArchivePath } from "./session-storage-paths.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 export const SESSION_LEASE_OWNER_ID_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
@@ -44,20 +45,40 @@ export class SessionAlreadyActiveError extends Error {
 	}
 }
 
+const ownedSessionLeases = new Map<string, SessionLease>();
+const runtimeWriterLeases = new WeakMap<object, SessionLease>();
+
 export class SessionLease {
 	private released = false;
+	private writer: object | undefined;
+
+	bindWriter(manager: object): void {
+		this.writer = manager;
+	}
+	isWriter(manager: object): boolean {
+		return this.writer === manager;
+	}
 
 	constructor(
 		readonly sessionPath: string,
 		private readonly directory: string,
 		private readonly token: string,
-	) {}
+	) {
+		ownedSessionLeases.set(directory, this);
+	}
+
+	isHeld(): boolean {
+		if (this.released) return false;
+		const owner = readLeaseOwner(this.directory);
+		return typeof owner === "object" && owner.token === this.token && owner.pid === process.pid;
+	}
 
 	release(): void {
 		if (this.released) {
 			return;
 		}
 		this.released = true;
+		if (ownedSessionLeases.get(this.directory) === this) ownedSessionLeases.delete(this.directory);
 		try {
 			withLeaseGuard(this.directory, () => {
 				const owner = readLeaseOwner(this.directory);
@@ -92,6 +113,26 @@ export function canonicalSessionPath(sessionPath: string): string {
 			return resolvedPath;
 		}
 	}
+}
+
+/** The runtime binds its existing lease; an unrelated SDK manager cannot borrow it by pathname. */
+export function bindSessionWriterLease(manager: object, lease: SessionLease | undefined): void {
+	if (lease) {
+		lease.bindWriter(manager);
+		runtimeWriterLeases.set(manager, lease);
+	} else runtimeWriterLeases.delete(manager);
+}
+
+export function ownsSessionLease(manager: object, sessionPath: string, agentDir: string): boolean {
+	const path = canonicalSessionPath(sessionPath);
+	const lease = runtimeWriterLeases.get(manager);
+	return (
+		lease !== undefined &&
+		lease.sessionPath === path &&
+		ownedSessionLeases.get(leaseDirectory(agentDir, path)) === lease &&
+		lease.isWriter(manager) &&
+		lease.isHeld()
+	);
 }
 
 /** Conservative presence; acquisition decides whether an owner permits the operation. */
@@ -376,6 +417,9 @@ export function acquireSessionLease(
 	agentDir: string,
 	environment: NodeJS.ProcessEnv = process.env,
 ): SessionLease | undefined {
+	if (sessionPath && isSessionArchivePath(sessionPath)) {
+		throw new Error(`Cannot acquire a session archive lease: ${sessionPath}`);
+	}
 	if (!sessionPath || !leasesEnabled(environment)) {
 		return undefined;
 	}

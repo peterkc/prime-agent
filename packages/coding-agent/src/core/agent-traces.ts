@@ -4,7 +4,6 @@ import { type Dirent, existsSync, mkdirSync, renameSync, writeFileSync } from "n
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { appendRotatingLog, getAgentDir, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
-import { readFirstLineSync } from "../utils/file-lines.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
 	fetchWithTimeout,
@@ -21,6 +20,8 @@ import {
 	resolvePrimeAgentTracesBaseUrl,
 } from "./prime-inference-auth.js";
 import { getSessionArtifactsRoot, type SessionHeader, type SessionManager } from "./session-manager.js";
+import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotation-state.js";
+import { isSessionArchivePath } from "./session-storage-paths.js";
 import type { SettingsManager } from "./settings-manager.js";
 
 const MAX_TRACE_BYTES = 20 * 1024 * 1024;
@@ -229,6 +230,7 @@ function isSessionHeader(value: unknown): value is SessionHeader {
 
 function readSessionHeader(sessionFile: string): SessionHeader | undefined {
 	try {
+		if (isSessionArchivePath(sessionFile) || sessionFile.endsWith(".relocated")) return undefined;
 		const firstLine = readFirstLineSync(sessionFile);
 		if (!firstLine?.trim()) {
 			return undefined;
@@ -479,6 +481,7 @@ export async function previewAgentTraceFile(options: AgentTracePreviewOptions): 
 async function findSessionFilesUnder(root: string, files: Set<string>): Promise<void> {
 	let entries: Dirent[];
 	try {
+		if (isSessionArchivePath(root)) return;
 		entries = await readdir(root, { withFileTypes: true });
 	} catch {
 		return;
