@@ -1,0 +1,1 @@
+- Fixed negative input-token usage when Responses providers report more cached tokens than input tokens.

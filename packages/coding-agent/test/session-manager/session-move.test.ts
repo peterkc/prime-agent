@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import {
+import fs, {
 	cpSync,
 	existsSync,
 	lstatSync,
@@ -15,19 +15,35 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionAlreadyActiveError } from "../../src/core/session-lease.js";
+import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
+import { findAgentTraceFiles } from "../../src/core/agent-traces.js";
+import {
+	acquireSessionDeleteLeases,
+	deleteSessionFile,
+	sessionArtifactFiles,
+} from "../../src/core/session-file-actions.js";
+import {
+	acquireSessionLease,
+	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
+} from "../../src/core/session-lease.js";
 import {
 	appendCustomMessageToExistingFile,
 	appendSessionInfoToExistingFile,
 	appendSessionStateToExistingFile,
 	type FileEntry,
+	getSessionArtifactPathForFile,
+	loadEntriesFromFile,
 	SessionManager,
 } from "../../src/core/session-manager.js";
 import {
 	acquireSessionMoveLeases,
+	preflightSessionMove,
 	recoverSessionMove,
 	relocateSession,
 	rollbackSessionMove,
@@ -38,11 +54,14 @@ import {
 	transformSessionMoveEntries,
 	verifySessionMoveCopy,
 } from "../../src/core/session-move.js";
+import { restartOf, serializeSessionEntries, withRotationRestart } from "../../src/core/session-rotation-state.js";
+import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { AgentsViewMode } from "../../src/modes/agents-view/agents-view-mode.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import { writeFileAtomicSync } from "../../src/utils/atomic-file.js";
 import { spawnHidden } from "../../src/utils/child-process.js";
+import { assistantMsg, userMsg } from "../utilities.js";
 
 let home: string;
 beforeEach(() => {
@@ -50,6 +69,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	vi.restoreAllMocks();
+	syncBuiltinESMExports();
 	vi.unstubAllEnvs();
 	rmSync(home, { recursive: true, force: true });
 });
@@ -58,13 +78,10 @@ function hash(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 function jsonl(entries: readonly FileEntry[]): string {
-	return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	return serializeSessionEntries(entries);
 }
 function readEntries(path: string): FileEntry[] {
-	return readFileSync(path, "utf8")
-		.trimEnd()
-		.split("\n")
-		.map((line) => JSON.parse(line));
+	return loadEntriesFromFile(path);
 }
 function fixture() {
 	const sourceSessionDir = join(home, "source", "sessions");
@@ -628,6 +645,675 @@ describe("session relocation", () => {
 			expect(existsSync(j.sourceBackup)).toBe(true);
 			expect(existsSync(j.targetFile)).toBe(state === "published");
 			expect(f.events).toEqual([]);
+		},
+	);
+});
+function segmentedFixture() {
+	const f = fixture();
+	const id = "11111111-1111-4111-8111-111111111111";
+	const built = sessionMovePaths({
+		...f.paths,
+		sessionId: id,
+		sourceFile: join(f.paths.sourceSessionDir, `${id}.jsonl`),
+	});
+	if (!built.ok) throw new Error(built.reason);
+	renameSync(f.paths.sourceFile, built.value.sourceFile);
+	Object.assign(f.paths, built.value);
+	const header = { type: "session", version: 3, id, timestamp: "2026-01-01", cwd: home, rlmDepth: 0 } as const;
+	const old = { type: "message", id: "old", parentId: null, timestamp: "t1", message: userMsg("original") } as const;
+	const answer = { ...old, id: "answer", parentId: "old", timestamp: "t2", message: assistantMsg("original reply") };
+	const kept = { type: "message", id: "kept", parentId: "answer", timestamp: "t3", message: userMsg("kept") } as const;
+	const leaf = { ...answer, id: "leaf", parentId: "kept", timestamp: "t4", message: assistantMsg("last") } as const;
+	const compact = {
+		type: "compaction",
+		id: "compact",
+		parentId: "leaf",
+		timestamp: "t5",
+		summary: "summary",
+		firstKeptEntryId: "kept",
+		tokensBefore: 100,
+	} as const;
+	const original = [header, old, answer, kept, leaf, compact];
+	const archive = sessionArchivePath(f.paths.sourceFile, id, 0);
+	mkdirSync(dirname(archive), { recursive: true });
+	const archiveBytes = Buffer.from(jsonl(original));
+	writeFileSync(archive, archiveBytes);
+	const reference = { segment: 0, bytes: archiveBytes.length, sha256: hash(archiveBytes) };
+	const accounted = { ...answer, message: { ...answer.message, content: [] } };
+	const segmentedHeader = withRotationRestart(
+		{
+			...header,
+			rotation: {
+				version: 1,
+				segment: 1,
+				archives: [reference],
+				restart: { version: 1, count: 0, sha256: hash(Buffer.alloc(0)) },
+				compactionId: "compact",
+				accounting: { messageCount: 2 },
+			},
+		},
+		{
+			originalParents: { kept: "answer" },
+			firstMessage: "original",
+			accounting: [{ kind: "assistant", entry: accounted, accountingParentId: null }],
+		},
+	);
+	writeFileSync(f.paths.sourceFile, jsonl([segmentedHeader, { ...kept, parentId: null }, leaf, compact]));
+	return { ...f, archive, old };
+}
+async function moveCrash(f: ReturnType<typeof segmentedFixture>, point: string) {
+	const moveUrl = new URL("../../src/core/session-move.ts", import.meta.url).href;
+	const script = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+import {relocateSession,acquireSessionMoveLeases} from ${JSON.stringify(moveUrl)};
+const [paths,cwd,point]=JSON.parse(process.argv[1]); const rename=fs.renameSync;
+fs.renameSync=(from,to)=>{ const archive=to.endsWith('/archive/'+paths.sessionId);
+const active=to===paths.targetFile; const redirect=to===paths.sourceFile+'.relocated';
+const hit=point.startsWith('archive')?archive:point.startsWith('active')?active:redirect;
+if(hit&&point.endsWith('before'))process.exit(73); rename(from,to); if(hit&&point.endsWith('after'))process.exit(73); };
+syncBuiltinESMExports(); const leases=acquireSessionMoveLeases(paths,paths.agentDir);
+await relocateSession({paths,targetCwd:cwd,targetSocket:'new.sock',callbacks:{suspend:async()=>true,resume:async()=>{},writeMeshRecords:async()=>{},releaseClaim:()=>{},releaseLeases:()=>leases.release()}}); process.exit(74);`;
+	const child = spawnHidden(
+		process.execPath,
+		["--import", "tsx", "--input-type=module", "-e", script, JSON.stringify([f.paths, f.targetCwd, point])],
+		{ stdio: "ignore" },
+	);
+	expect((await once(child, "exit"))[0]).toBe(73);
+}
+async function recoverFresh(f: ReturnType<typeof segmentedFixture>) {
+	const url = new URL("../../src/core/session-move.ts", import.meta.url).href;
+	const script = `import {recoverSessionMove,acquireSessionMoveLeases} from ${JSON.stringify(url)};
+const paths=JSON.parse(process.argv[1]);const result=await recoverSessionMove({...paths,callbacks:{acquireLeases:j=>acquireSessionMoveLeases(j,j.agentDir),readEnrollmentPath:j=>j.targetFile,readDirectorySocket:j=>j.targetSocket,acquireClaim:()=>true,writeMeshRecords:async()=>{},releaseClaim:()=>{}}});process.stdout.write(JSON.stringify(result));`;
+	return JSON.parse(
+		execFileSync(
+			process.execPath,
+			["--import", "tsx", "--input-type=module", "-e", script, JSON.stringify(f.paths)],
+			{ encoding: "utf8" },
+		),
+	) as { status: string; messages: string[] };
+}
+describe("archive lifecycle", () => {
+	it.each(["plain", "segmented", "collision"])(
+		"peterkc/prime-agent#60 preserves the archive owner (%s copy)",
+		async (kind) => {
+			const f = segmentedFixture();
+			noTrash();
+			const bytes = readFileSync(f.archive);
+			const path = join(f.paths.sourceSessionDir, "session-export.jsonl");
+			writeFileSync(path, kind === "segmented" ? readFileSync(f.paths.sourceFile) : bytes);
+			expect(() => SessionManager.assertImportEvidence(path, path)).not.toThrow();
+			const paths = sessionMovePaths({ ...f.paths, sourceFile: path });
+			if (!paths.ok) throw new Error(paths.reason);
+			const legacy = join(f.paths.targetSessionDir, `2026-01-01_${f.paths.sessionId}.jsonl`);
+			if (kind === "collision") writeFileSync(legacy, bytes);
+			if (kind === "segmented") await expect(preflightSessionMove(paths.value)).rejects.toThrow(/archive owner/);
+			if (kind !== "plain") {
+				const moved = await move({ ...f, paths: paths.value });
+				expect(moved.status).toBe("rolled_back");
+				expect(moved.messages.join(" ")).toContain("archive owner");
+				expect(existsSync(paths.value.journalPath) || existsSync(paths.value.targetFile)).toBe(false);
+			}
+			if (kind === "collision") expect(readFileSync(legacy)).toEqual(bytes);
+			expect((await deleteSessionFile(path)).ok).toBe(true);
+			expect(readFileSync(f.archive)).toEqual(bytes);
+			expect(existsSync(f.paths.sourceFile)).toBe(true);
+		},
+	);
+	it.each(["archive-before", "archive-after", "active-after", "redirect-before", "redirect-after"])(
+		"recovers a fresh process at %s without changing archive bytes or later appends",
+		async (point) => {
+			const f = segmentedFixture();
+			const bytes = readFileSync(f.archive);
+			const source = readFileSync(f.paths.sourceFile);
+			for (const name of [".DS_Store", "2.jsonl.999999.11111111-1111-4111-8111-111111111111.tmp"])
+				writeFileSync(join(dirname(f.archive), name), "clutter");
+			await moveCrash(f, point);
+			const committed = point.startsWith("active") || point.startsWith("redirect");
+			expect(await findAgentTraceFiles(f.paths.targetSessionDir)).toEqual(committed ? [f.paths.targetFile] : []);
+			if (committed) SessionManager.open(f.paths.targetFile).appendCustomEntry("late", { keep: true });
+			const appended = committed ? readFileSync(f.paths.targetFile) : undefined;
+			const activeTarget = committed
+				? acquireSessionLease(f.paths.targetFile, f.paths.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" })
+				: undefined;
+			try {
+				expect((await recoverFresh(f)).status).toBe(committed ? "moved" : "rolled_back");
+			} finally {
+				activeTarget?.release();
+			}
+			expect(
+				readFileSync(committed ? sessionArchivePath(f.paths.targetFile, f.paths.sessionId, 0) : f.archive),
+			).toEqual(bytes);
+			if (committed) {
+				expect(readFileSync(f.paths.targetFile)).toEqual(appended);
+				expect(SessionManager.open(f.paths.targetFile).getEntry("old")).toEqual(f.old);
+				expect(JSON.parse(readFileSync(`${f.paths.sourceFile}.relocated`, "utf8"))).toEqual({
+					version: 1,
+					sessionId: f.paths.sessionId,
+					target: f.paths.targetFile,
+				});
+			} else {
+				expect(readFileSync(f.paths.sourceFile)).toEqual(source);
+				expect(existsSync(`${f.paths.sourceFile}.relocated`)).toBe(false);
+			}
+			expect((await recoverFresh(f)).status).toBe("absent");
+		},
+	);
+	it.each(["forkFrom", "createBranchedSession"] as const)(
+		"keeps bounded %s and fork-of-fork evidence across source moves, then reports permanent deletion",
+		async (kind) => {
+			const f = segmentedFixture();
+			noTrash();
+			const bytes = readFileSync(f.archive);
+			const originalFile = f.paths.sourceFile;
+			const source = SessionManager.open(f.paths.sourceFile);
+			const fork =
+				kind === "forkFrom"
+					? SessionManager.forkFrom(f.paths.sourceFile, home, f.paths.sourceSessionDir)
+					: SessionManager.open(source.createBranchedSession(source.getLeafId()!)!);
+			const nested = SessionManager.forkFrom(fork.getSessionFile()!, home, f.paths.sourceSessionDir);
+			const late = SessionManager.open(f.paths.sourceFile).appendMessage(userMsg("post-fork"));
+			expect((await move(f)).status).toBe("moved");
+			const after = SessionManager.forkFrom(f.paths.targetFile, home, f.paths.sourceSessionDir);
+			const finalDir = join(home, "final", "sessions");
+			mkdirSync(finalDir, { recursive: true });
+			const again = sessionMovePaths({
+				...f.paths,
+				sourceSessionDir: f.paths.targetSessionDir,
+				sourceFile: f.paths.targetFile,
+				targetSessionDir: finalDir,
+			});
+			if (!again.ok) throw new Error(again.reason);
+			Object.assign(f.paths, again.value);
+			expect((await move(f)).status).toBe("moved");
+			for (const child of [fork, nested, after]) {
+				expect(child.getEntry("old")).toEqual(f.old);
+				expect(child.isEntryOnBranch("old")).toBe(true);
+				expect(child.getEntries().some((entry) => entry.id === "old")).toBe(false);
+				expect(child.getTree().some((node) => node.entry.id === "old")).toBe(false);
+				expect(existsSync(dirname(sessionArchivePath(child.getSessionFile()!, child.getSessionId(), 0)))).toBe(
+					false,
+				);
+			}
+			expect(fork.getEntry(late)).toBeUndefined();
+			expect(nested.isEntryOnBranch(late)).toBe(false);
+			expect(readFileSync(sessionArchivePath(f.paths.targetFile, f.paths.sessionId, 0))).toEqual(bytes);
+			const ownBytes = readFileSync(fork.getSessionFile()!);
+			const ownHeader = fork.getHeader()!;
+			const ownRotation = ownHeader.rotation!;
+			const ownArchive = sessionArchivePath(fork.getSessionFile()!, fork.getSessionId(), ownRotation.segment);
+			mkdirSync(dirname(ownArchive), { recursive: true });
+			writeFileSync(ownArchive, ownBytes);
+			const reference = { segment: ownRotation.segment, bytes: ownBytes.length, sha256: hash(ownBytes) };
+			const rotation = { ...ownRotation, segment: ownRotation.segment + 1, archives: [reference] };
+			const archivedHeader = withRotationRestart({ ...ownHeader, rotation }, restartOf(ownHeader)!);
+			writeFileSync(fork.getSessionFile()!, jsonl([archivedHeader, ...fork.getEntries()]));
+			fork.setSessionFile(fork.getSessionFile()!);
+			const connection = Object.create(InProcessAgentConnection.prototype) as InProcessAgentConnection;
+			Reflect.set(connection, "runtimeHost", { services: { agentDir: f.paths.agentDir } });
+			expect((await connection.deleteSavedSession(f.paths.targetFile)).ok).toBe(true);
+			for (const file of [f.paths.sourceFile, originalFile]) expect(existsSync(`${file}.relocated`)).toBe(false);
+			for (const child of [fork, nested, after]) {
+				expect(child.getEntry("kept")?.id).toBe("kept");
+				expect(() => child.getEntry("old")).toThrow(/permanent deletion/);
+				const local = child.appendCustomEntry("usable", { keep: true });
+				expect(child.getEntry(local)?.id).toBe(local);
+				expect(child.isEntryOnBranch(local)).toBe(true);
+				const header = child.getHeader()!;
+				const files = readdirSync(child.getSessionDir());
+				if (header.rotation!.archives.length) {
+					const bytes = readFileSync(child.getSessionFile()!);
+					expect(() => child.createBranchedSession(local)).toThrow(/permanent deletion/);
+					expect(readFileSync(child.getSessionFile()!)).toEqual(bytes);
+					expect(readdirSync(child.getSessionDir())).toEqual(files);
+				} else {
+					const cold = SessionManager.open(child.createBranchedSession(local)!);
+					expect(cold.getHeader()).toMatchObject({
+						parentSession: header.parentSession,
+						rotation: header.rotation,
+					});
+					expect(cold.isEntryOnBranch(local)).toBe(true);
+					expect(() => cold.getEntry("old")).toThrow(/permanent deletion/);
+				}
+			}
+		},
+	);
+	it.each(["valid", "corrupt", "missing"])(
+		"refuses %s archives and lexical/symlink aliases in move and raw delete",
+		async (state) => {
+			const f = segmentedFixture();
+			if (state === "corrupt") writeFileSync(f.archive, "not-json");
+			if (state === "missing") rmSync(f.archive);
+			const alias = join(home, "archive-alias");
+			symlinkSync(dirname(f.archive), alias, "dir");
+			const paths = [
+				f.archive,
+				join(dirname(f.archive), "..", f.paths.sessionId, "0.jsonl"),
+				join(alias, "0.jsonl"),
+			];
+			const before = existsSync(f.archive) ? readFileSync(f.archive) : undefined;
+			for (const path of paths) {
+				expect((await deleteSessionFile(path)).ok).toBe(false);
+				expect(sessionMovePaths({ ...f.paths, sourceFile: path }).ok).toBe(false);
+				expect(
+					(
+						await relocateSession({
+							paths: { ...f.paths, sourceFile: path },
+							targetCwd: f.targetCwd,
+							targetSocket: "new.sock",
+							callbacks: f.callbacks,
+						})
+					).status,
+				).toBe("rolled_back");
+			}
+			expect(existsSync(f.archive) ? readFileSync(f.archive) : undefined).toEqual(before);
+			expect(readdirSync(dirname(f.archive))).toEqual(state === "missing" ? [] : ["0.jsonl"]);
+			expect(existsSync(join(f.paths.agentDir, "session-leases"))).toBe(false);
+		},
+	);
+	it.each([
+		"success",
+		"transcript-failure",
+		"cleanup-failure",
+		"cleanup-json",
+		"dead-temp",
+		"finder-file",
+		"late-failure",
+		"cleanup-once",
+		"legacy-late-failure",
+		"legacy-cleanup-once",
+		"owner-original",
+		"owner-backup",
+		"redirect",
+		"missing-redirect",
+		"live-temp",
+	])(
+		"validates evidence before saved deletion and reports %s without removing another session archive",
+		async (scenario) => {
+			const state = scenario.replace(/^legacy-/, "");
+			let f = segmentedFixture();
+			noTrash();
+			if (scenario.startsWith("legacy-")) {
+				const path = join(f.paths.sourceSessionDir, `2026-01-01_${f.paths.sessionId}.jsonl`);
+				renameSync(f.paths.sourceFile, path);
+				f = { ...f, paths: { ...f.paths, sourceFile: path } };
+			}
+			const duplicate = state.startsWith("owner-");
+			if (duplicate) {
+				const path = join(f.paths.sourceSessionDir, `backup_${f.paths.sessionId}.jsonl`);
+				writeFileSync(path, readFileSync(f.paths.sourceFile));
+				if (state === "owner-backup") f = { ...f, paths: { ...f.paths, sourceFile: path } };
+				const paths = sessionMovePaths(f.paths);
+				if (!paths.ok) throw new Error(paths.reason);
+				f = { ...f, paths: paths.value };
+			}
+			const incomplete = duplicate || ["late-failure", "cleanup-once"].includes(state);
+			const artifacts = getSessionArtifactPathForFile(f.paths.sourceFile);
+			const other = join(dirname(dirname(f.archive)), "22222222-2222-4222-8222-222222222222");
+			mkdirSync(other);
+			writeFileSync(join(other, "0.jsonl"), "other");
+			if (state === "cleanup-json") writeFileSync(f.archive, "{");
+			if (state === "dead-temp")
+				writeFileSync(join(dirname(f.archive), "2.jsonl.999999.11111111-1111-4111-8111-111111111111.tmp"), "torn");
+			if (state === "finder-file") writeFileSync(join(dirname(f.archive), ".DS_Store"), "finder");
+			mkdirSync(artifacts, { recursive: true });
+			writeFileSync(join(artifacts, "keep"), "artifact");
+			if (state === "live-temp")
+				writeFileSync(`${f.archive}.${process.pid}.11111111-1111-4111-8111-111111111111.tmp`, "live");
+			if (state === "redirect" || state === "missing-redirect") {
+				const source = SessionManager.open(f.paths.sourceFile);
+				source.getHeader()!.previousSessionPaths = [join(home, "previous.jsonl")];
+				if (state === "redirect") writeFileSync(join(home, "previous.jsonl.relocated"), "{");
+				writeFileSync(f.paths.sourceFile, jsonl([source.getHeader()!, ...source.getEntries()]));
+			}
+			const before = readFileSync(f.archive);
+			if (state === "transcript-failure") {
+				vi.spyOn(fsPromises, "unlink").mockRejectedValue(new Error("unlink refused"));
+				syncBuiltinESMExports();
+			}
+			if (state === "cleanup-failure") symlinkSync(other, join(dirname(f.archive), "foreign"), "dir");
+			if (duplicate || state === "cleanup-failure" || state === "live-temp") {
+				const moved = await move(f);
+				expect(moved.status).toBe("rolled_back");
+				if (duplicate) expect(moved.messages.join(" ")).toContain("archive owner");
+				expect(existsSync(f.paths.journalPath) || existsSync(f.paths.targetFile)).toBe(false);
+			}
+			if (state === "cleanup-once") {
+				vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("archive removal failed"));
+				syncBuiltinESMExports();
+			}
+			const sourceBytes = readFileSync(f.paths.sourceFile);
+			const reservation = acquireSessionDeleteLeases(f.paths.sourceFile, f.paths.agentDir);
+			let removed = false;
+			try {
+				const result = await deleteSessionFile(f.paths.sourceFile, {
+					afterFileRemoved: () => {
+						removed = true;
+						expect(existsSync(f.paths.sourceFile)).toBe(false);
+						expect(readFileSync(f.archive)).toEqual(before);
+						if (state === "late-failure") writeFileSync(join(dirname(f.archive), "late-unknown"), "keep");
+					},
+				});
+				const refused = ["cleanup-failure", "cleanup-json", "redirect", "live-temp"].includes(state);
+				expect(result.ok).toBe(!refused && state !== "transcript-failure" && !incomplete);
+				if (refused) expect(readFileSync(f.paths.sourceFile).equals(sourceBytes)).toBe(true);
+				if (!result.ok) {
+					expect(result.error).toMatch(
+						state === "transcript-failure"
+							? /unlink refused/
+							: incomplete
+								? /transcript removed; cleanup incomplete/
+								: /Cannot delete/,
+					);
+					if (state !== "transcript-failure") expect(result.error).toContain(dirname(f.archive));
+					if (duplicate) expect(result.error).toContain("archive owner");
+				}
+			} finally {
+				reservation.release();
+			}
+			const kept = ["transcript-failure", "cleanup-failure", "cleanup-json", "redirect", "live-temp"].includes(
+				state,
+			);
+			expect(removed).toBe(!kept);
+			expect(existsSync(artifacts)).toBe(kept);
+			expect(existsSync(f.archive)).toBe(kept || incomplete);
+			if (incomplete) {
+				expect(readFileSync(f.archive)).toEqual(before);
+				const retried = await deleteSessionFile(f.paths.sourceFile);
+				expect(retried).toMatchObject({ ok: false, error: expect.stringContaining(dirname(f.archive)) });
+				expect(existsSync(f.archive)).toBe(true);
+			}
+			expect(readFileSync(join(other, "0.jsonl"), "utf8")).toBe("other");
+		},
+	);
+	it("reserves in-process saved deletion against a live canonical writer and permits it after release", async () => {
+		const f = segmentedFixture();
+		noTrash();
+		const connection = Object.create(InProcessAgentConnection.prototype) as InProcessAgentConnection;
+		Reflect.set(connection, "runtimeHost", { services: { agentDir: f.paths.agentDir } });
+		const lease = acquireSessionLease(f.paths.sourceFile, f.paths.agentDir, {
+			PRIME_AGENT_INTERNAL_SESSION_LEASES: "1",
+		});
+		try {
+			await expect(connection.deleteSavedSession(f.paths.sourceFile)).rejects.toThrow(SessionAlreadyActiveError);
+			expect(existsSync(f.archive)).toBe(true);
+		} finally {
+			lease?.release();
+		}
+		expect((await connection.deleteSavedSession(f.paths.sourceFile)).ok).toBe(true);
+		expect(existsSync(f.archive)).toBe(false);
+	});
+	it.each(["digest", "identity", "incomplete", "path", "version", "owner"])(
+		"keeps both archive sets when committed recovery cannot prove %s",
+		async (kind) => {
+			const f = segmentedFixture();
+			await moveCrash(f, "active-after");
+			const journal = JSON.parse(readFileSync(f.paths.journalPath, "utf8"));
+			if (kind === "digest") writeFileSync(sessionArchivePath(f.paths.targetFile, f.paths.sessionId, 0), "damaged");
+			else if (kind === "identity") journal.archiveMove.identity = "0:0";
+			else if (kind === "incomplete") delete journal.archiveMove.sourceIdentity;
+			else if (kind === "path") journal.archiveMove.source = home;
+			else if (kind === "owner") {
+				const paths = sessionMovePaths({
+					...f.paths,
+					sourceFile: join(f.paths.sourceSessionDir, "session-copy.jsonl"),
+				});
+				if (!paths.ok) throw new Error(paths.reason);
+				Object.assign(journal, paths.value);
+				journal.archiveMove.previousPaths = [paths.value.sourceFile];
+			} else journal.archiveMove.version = 2;
+			writeFileSync(f.paths.journalPath, JSON.stringify(journal));
+			const before = readFileSync(f.paths.journalPath);
+			expect((await recoverFresh(f)).status).toBe("pending");
+			expect(readFileSync(f.paths.journalPath)).toEqual(before);
+			expect(existsSync(f.archive)).toBe(true);
+			expect(existsSync(sessionArchivePath(f.paths.targetFile, f.paths.sessionId, 0))).toBe(true);
+		},
+	);
+	it("refuses a rollback temporary redirected to another session archive even with its copied directory identity", async () => {
+		const f = segmentedFixture();
+		await moveCrash(f, "archive-before");
+		const journal = JSON.parse(readFileSync(f.paths.journalPath, "utf8"));
+		const other = join(dirname(journal.archiveMove.target), "22222222-2222-4222-8222-222222222222");
+		mkdirSync(other);
+		const file = join(other, "0.jsonl");
+		writeFileSync(
+			file,
+			readFileSync(f.archive, "utf8").replace(f.paths.sessionId, "22222222-2222-4222-8222-222222222222"),
+		);
+		const bytes = readFileSync(file);
+		const stat = lstatSync(other, { bigint: true });
+		journal.archiveMove.temporary = other;
+		journal.archiveMove.identity = `${stat.dev}:${stat.ino}`;
+		writeFileSync(f.paths.journalPath, JSON.stringify(journal));
+		expect((await recoverFresh(f)).status).toBe("pending");
+		expect(readFileSync(file)).toEqual(bytes);
+		expect(existsSync(f.archive)).toBe(true);
+	});
+	it("moves an inherited-only fork without copying its parent's archives", async () => {
+		const f = segmentedFixture();
+		noTrash();
+		const parent = f.paths.sourceFile;
+		const fork = SessionManager.forkFrom(parent, home, f.paths.sourceSessionDir);
+		const paths = sessionMovePaths({
+			...f.paths,
+			sessionId: fork.getSessionId(),
+			sourceFile: fork.getSessionFile()!,
+		});
+		if (!paths.ok) throw new Error(paths.reason);
+		Object.assign(f.paths, paths.value);
+		expect((await move(f)).status).toBe("moved");
+		const moved = SessionManager.open(f.paths.targetFile);
+		expect(moved.getEntry("old")).toEqual(f.old);
+		expect(existsSync(dirname(sessionArchivePath(f.paths.targetFile, moved.getSessionId(), 0)))).toBe(false);
+		expect(existsSync(f.archive)).toBe(true);
+	});
+	it.each(["file", "folder"])("deletes through a %s symlink", async (kind) => {
+		const f = segmentedFixture();
+		noTrash();
+		const folder = join(home, "logical", "sessions");
+		mkdirSync(dirname(folder));
+		if (kind === "folder") symlinkSync(f.paths.sourceSessionDir, folder, "dir");
+		else mkdirSync(folder);
+		const alias = join(folder, kind === "file" ? "alias.jsonl" : basename(f.paths.sourceFile));
+		if (kind === "file") symlinkSync(f.paths.sourceFile, alias);
+		const artifacts = join(dirname(folder), "session-artifacts", basename(alias).replace(/\.jsonl$/, ""));
+		mkdirSync(artifacts, { recursive: true });
+		writeFileSync(join(artifacts, "keep"), "artifact");
+		const reservation = acquireSessionDeleteLeases(alias, f.paths.agentDir);
+		try {
+			expect((await deleteSessionFile(alias)).ok).toBe(true);
+		} finally {
+			reservation.release();
+		}
+		for (const path of [f.paths.sourceFile, f.archive, artifacts]) expect(existsSync(path)).toBe(false);
+	});
+});
+describe("lifecycle and segmented header bounds", () => {
+	it.each(["own", "inherited"])("import checks %s evidence before writing its destination", async (kind) => {
+		const f = segmentedFixture();
+		const incoming = SessionManager.open(f.paths.sourceFile);
+		if (kind === "inherited") incoming.createBranchedSession(incoming.getLeafId()!);
+		const path = incoming.getSessionFile()!;
+		const destination = join(home, "uncreated-import");
+		const runtime = Object.create(AgentSessionRuntime.prototype) as AgentSessionRuntime;
+		Reflect.set(runtime, "_session", { sessionManager: SessionManager.inMemory(home, destination) });
+		const before = readFileSync(path);
+		expect(() => SessionManager.assertImportEvidence(path, path)).not.toThrow();
+		if (kind === "inherited") rmSync(f.paths.sourceFile);
+		await expect(runtime.importFromJsonl(path)).rejects.toThrow(/without destination evidence/);
+		expect(existsSync(destination)).toBe(false);
+		expect(existsSync(join(f.paths.agentDir, "session-leases"))).toBe(false);
+		expect(readFileSync(path).equals(before)).toBe(true);
+	});
+	it("segmented forkFrom never publishes a torn target", () => {
+		const f = segmentedFixture();
+		const directory = join(home, "forks");
+		mkdirSync(directory);
+		const write = fs.writeSync;
+		vi.spyOn(fs, "writeSync").mockImplementationOnce((descriptor) => {
+			write(descriptor, Buffer.from("{"));
+			throw new Error("injected fork write failure");
+		});
+		syncBuiltinESMExports();
+		expect(() => SessionManager.forkFrom(f.paths.sourceFile, home, directory)).toThrow(/injected fork write failure/);
+		expect(readdirSync(directory)).toEqual([]);
+		expect(SessionManager.open(f.paths.sourceFile).getEntry("old")).toEqual(f.old);
+	});
+	it.each(["move", "forkFrom"])("r2: %s skips dropped git_state ancestry after source move", async (kind) => {
+		const f = segmentedFixture();
+		const source = SessionManager.open(f.paths.sourceFile);
+		const dropped = [source.appendGitState({ branch: "one" }), source.appendGitState({ branch: "two" })];
+		const leaf = source.appendMessage(userMsg("after git"));
+		dropped.push(source.appendGitState({ branch: "trailing" }));
+		const fork =
+			kind === "forkFrom" ? SessionManager.forkFrom(f.paths.sourceFile, home, f.paths.sourceSessionDir) : undefined;
+		expect((await move(f)).status).toBe("moved");
+		const view = SessionManager.open(fork?.getSessionFile() ?? f.paths.targetFile);
+		for (const id of dropped) expect(view.isEntryOnBranch(id)).toBe(false);
+		expect(view.isEntryOnBranch("old")).toBe(true);
+		expect(view.getEntry("old")).toEqual(f.old);
+		const cold = SessionManager.open(view.createBranchedSession(leaf)!);
+		expect(cold.isEntryOnBranch("old")).toBe(true);
+	});
+	it.each(["symlink-loop", "archive-zero", "archive-temp", "unknown-temp", "no-archive"])(
+		"never-rotated saved deletion preserves base outcome with %s",
+		async (kind) => {
+			const f = segmentedFixture();
+			noTrash();
+			writeFileSync(
+				f.paths.sourceFile,
+				jsonl([{ ...SessionManager.inMemory(home).getHeader()!, id: f.paths.sessionId }, f.old]),
+			);
+			const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+			const temp = `${f.archive}.${kind === "unknown-temp" ? "unknown" : "999999.11111111-1111-4111-8111-111111111111"}.tmp`;
+			if (kind.endsWith("temp")) writeFileSync(temp, "uncommitted");
+			if (kind === "no-archive") rmSync(dirname(f.archive), { recursive: true });
+			if (kind === "symlink-loop") {
+				mkdirSync(f.paths.sourceArtifacts, { recursive: true });
+				symlinkSync("y", join(f.paths.sourceArtifacts, "x"));
+				symlinkSync("x", join(f.paths.sourceArtifacts, "y"));
+				expect([...sessionArtifactFiles(f.paths.sourceArtifacts)]).toEqual([]);
+			}
+			acquireSessionDeleteLeases(f.paths.sourceFile, f.paths.agentDir).release();
+			expect(await deleteSessionFile(f.paths.sourceFile)).toEqual({ ok: true, method: "unlink" });
+			expect(existsSync(f.paths.sourceFile) || existsSync(f.paths.sourceArtifacts)).toBe(false);
+			expect(existsSync(dirname(f.archive))).toBe(kind === "unknown-temp");
+			expect(diagnostic).toHaveBeenCalledTimes(Number(kind === "unknown-temp"));
+			if (kind === "unknown-temp") {
+				expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining(temp));
+				expect(readFileSync(temp, "utf8")).toBe("uncommitted");
+			}
+		},
+	);
+	it("reserves nested child transcripts, never their archives or uncommitted temps", async () => {
+		const f = segmentedFixture();
+		const child = SessionManager.create(home, join(f.paths.sourceArtifacts, "sub-01234567"));
+		child.appendMessage(userMsg("child"));
+		child.appendMessage(assistantMsg("reply"));
+		const path = child.getSessionFile()!;
+		const archive = sessionArchivePath(path, child.getSessionId(), 0);
+		mkdirSync(dirname(archive), { recursive: true });
+		const bytes = readFileSync(path);
+		writeFileSync(archive, bytes);
+		writeFileSync(`${archive}.999999.11111111-1111-4111-8111-111111111111.tmp`, bytes);
+		const rows = child.getEntries();
+		const header = withRotationRestart(
+			{
+				...child.getHeader()!,
+				rotation: {
+					version: 1,
+					segment: 1,
+					archives: [{ segment: 0, bytes: bytes.length, sha256: hash(bytes) }],
+					restart: { version: 1, count: 0, sha256: hash(Buffer.alloc(0)) },
+					accounting: { messageCount: 0 },
+				},
+			},
+			{ originalParents: {}, accounting: [], firstMessage: "" },
+		);
+		writeFileSync(path, serializeSessionEntries([header, ...rows]));
+		const competing = acquireSessionLease(path, f.paths.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		try {
+			expect(() => acquireSessionDeleteLeases(f.paths.sourceFile, f.paths.agentDir)).toThrow(
+				SessionAlreadyActiveError,
+			);
+		} finally {
+			competing?.release();
+		}
+		const reservation = acquireSessionDeleteLeases(f.paths.sourceFile, f.paths.agentDir);
+		try {
+			expect((await deleteSessionFile(f.paths.sourceFile)).ok).toBe(true);
+		} finally {
+			reservation.release();
+		}
+		for (const file of [path, archive, f.archive]) expect(existsSync(file)).toBe(false);
+	});
+	it.each(["callback", "artifacts"])("preserves never-rotated %s error rejection", async (kind) => {
+		const f = fixture();
+		const failure = new Error("ordinary cleanup failure");
+		if (kind === "artifacts") vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(failure);
+		syncBuiltinESMExports();
+		await expect(
+			deleteSessionFile(f.paths.sourceFile, {
+				afterFileRemoved:
+					kind === "callback"
+						? () => {
+								throw failure;
+							}
+						: undefined,
+			}),
+		).rejects.toThrow(failure);
+		expect(existsSync(f.paths.sourceFile)).toBe(false);
+	});
+	it.each(["move", "forkFrom", "createBranchedSession", "rewrite"])(
+		"keeps authoritative bytes when %s transforms a near-bound segmented header",
+		async (kind) => {
+			const f = segmentedFixture();
+			const archiveBytes = readFileSync(f.archive);
+			const manager = SessionManager.open(f.paths.sourceFile);
+			const entries = loadEntriesFromFile(f.paths.sourceFile);
+			const header = entries[0];
+			if (header.type !== "session") throw new Error("header");
+			if (kind === "forkFrom" || kind === "createBranchedSession") {
+				const before = readFileSync(f.paths.sourceFile);
+				const files = readdirSync(f.paths.sourceSessionDir);
+				const huge = "é".repeat(33000);
+				if (kind === "forkFrom")
+					expect(() => SessionManager.forkFrom(f.paths.sourceFile, huge, f.paths.sourceSessionDir)).toThrow(
+						/header.*bound/,
+					);
+				else
+					expect(() =>
+						SessionManager.open(f.paths.sourceFile, undefined, huge).createBranchedSession(manager.getLeafId()!),
+					).toThrow(/header.*bound/);
+				expect(readFileSync(f.paths.sourceFile)).toEqual(before);
+				expect(readdirSync(f.paths.sourceSessionDir)).toEqual(files);
+				return;
+			}
+			const transformed = {
+				...header,
+				...(kind === "rewrite"
+					? { parentSession: join(home, "missing-parent.jsonl"), rlmDepth: undefined }
+					: { previousSessionPaths: Array.from({ length: 8 }, (_, i) => join(home, `previous-${i}.jsonl`)) }),
+				opaque: "",
+			};
+			const size = Buffer.byteLength(`${JSON.stringify(transformed)}\n`);
+			transformed.opaque = "x".repeat(65536 - size - 4);
+			writeFileSync(f.paths.sourceFile, serializeSessionEntries([transformed, ...entries.slice(1)]));
+			const before = readFileSync(f.paths.sourceFile);
+			if (kind === "rewrite") expect(() => SessionManager.open(f.paths.sourceFile)).toThrow(/header.*bound/);
+			else {
+				const result = await relocateSession({
+					paths: f.paths,
+					targetCwd: f.targetCwd,
+					targetSocket: "new.sock",
+					callbacks: f.callbacks,
+				});
+				expect(result.status).toBe("rolled_back");
+				expect(result.messages.join(" ")).toMatch(/header.*bound/);
+				expect(existsSync(f.paths.targetFile)).toBe(false);
+				expect(existsSync(f.paths.fileTemporary)).toBe(false);
+			}
+			expect(readFileSync(f.paths.sourceFile)).toEqual(before);
+			expect(readFileSync(f.archive)).toEqual(archiveBytes);
 		},
 	);
 });

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -23,6 +23,7 @@ import {
 } from "../../src/core/semantic-edges.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../src/core/session-lease.js";
 import { SessionManager } from "../../src/core/session-manager.js";
+import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import type {
 	ExtensionAPI,
@@ -162,6 +163,7 @@ describe("AgentSessionRuntime characterization", () => {
 	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void }) {
 		const disposeSession = vi.fn();
 		const session = {
+			sessionManager: { cleanupRotationTemps: () => {} },
 			extensionRunner: {
 				hasHandlers: (event: string) => event === "session_shutdown" && options?.onShutdown !== undefined,
 				emit: async () => {
@@ -604,6 +606,7 @@ describe("AgentSessionRuntime characterization", () => {
 	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
+		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
 		const events: RecordedSessionEvent[] = [];
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
 			pi.on("session_before_switch", (event) => {
@@ -637,8 +640,14 @@ describe("AgentSessionRuntime characterization", () => {
 		]);
 
 		events.length = 0;
-
+		const archive = sessionArchivePath(originalSessionFile!, originalSession.sessionId, 0);
+		mkdirSync(join(archive, ".."), { recursive: true });
+		const dead = `${archive}.999999.11111111-1111-4111-8111-111111111111.tmp`;
+		const live = `${archive}.${process.pid}.11111111-1111-4111-8111-111111111111.tmp`;
+		for (const path of [dead, live]) writeFileSync(path, "temp");
 		const switchResult = await runtime.switchSession(originalSessionFile!);
+		expect(existsSync(dead)).toBe(false);
+		expect(existsSync(live)).toBe(true);
 		expect(switchResult.cancelled).toBe(false);
 		await runtime.session.bindExtensions({});
 		expect(events).toEqual([

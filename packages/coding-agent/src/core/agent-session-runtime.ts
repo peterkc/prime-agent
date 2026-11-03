@@ -14,8 +14,14 @@ import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRunti
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "./session-lease.js";
+import {
+	acquireSessionLease,
+	bindSessionWriterLease,
+	canonicalSessionPath,
+	type SessionLease,
+} from "./session-lease.js";
 import { SessionManager } from "./session-manager.js";
+import { requireActiveSessionPath } from "./session-storage-paths.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
 
@@ -263,6 +269,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private bindRuntimeHost(): void {
+		bindSessionWriterLease(this._session.sessionManager, this._sessionLease);
+		this._session.sessionManager.cleanupRotationTemps(this._services.agentDir);
 		this._session.setSubagentRuntimeHost(this.subagentRuntimeHost ?? this);
 	}
 
@@ -298,6 +306,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		const previous = this._sessionLease;
 		this._sessionLease = lease;
+		bindSessionWriterLease(this._session.sessionManager, lease);
+		this._session.sessionManager.cleanupRotationTemps(this.services.agentDir);
 		previous?.release();
 	}
 
@@ -440,6 +450,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 	): Promise<{ cancelled: boolean }> {
+		requireActiveSessionPath(sessionPath);
 		return this.withReplacementBarrier(sessionPath, sessionPath, false, (start) =>
 			this.openReplacementSession(sessionPath, options, start),
 		);
@@ -543,6 +554,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		},
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const position = options?.position ?? "before";
+		if (this.session.sessionManager.getHeader()?.rotation && !this.session.sessionManager.getBranch(entryId).length)
+			throw new Error("Invalid entry ID for forking");
+		this.session.sessionManager.assertRestorableContext(entryId);
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
 		if (beforeResult.cancelled) {
 			return { cancelled: true };
@@ -550,7 +564,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		let targetLeafId: string | null;
 		let selectedText: string | undefined;
 
-		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+		const selectedEntry = this.session.sessionManager.getBranch(entryId).at(-1);
 		if (!selectedEntry) {
 			throw new Error("Invalid entry ID for forking");
 		}
@@ -672,17 +686,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		requireActiveSessionPath(inputPath);
 		const resolvedPath = resolve(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
 
 		const sessionDir = this.session.sessionManager.getSessionDir();
+		const destinationPath = join(sessionDir, basename(resolvedPath));
+		requireActiveSessionPath(destinationPath);
+		SessionManager.assertImportEvidence(resolvedPath, destinationPath);
 		if (!existsSync(sessionDir)) {
 			mkdirSync(sessionDir, { recursive: true });
 		}
-
-		const destinationPath = join(sessionDir, basename(resolvedPath));
 		return this.withReplacementBarrier(
 			resolvedPath,
 			destinationPath,

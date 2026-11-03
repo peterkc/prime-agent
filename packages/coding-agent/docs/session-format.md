@@ -12,9 +12,9 @@ The header records the working directory. Current releases keep sessions in a fl
 
 ## Deleting Sessions
 
-Sessions can be removed by deleting their `.jsonl` files under `~/.prime/agent/sessions/`.
+Use saved-session deletion to remove a transcript and its owned archives. Deleting only the `.jsonl` file by hand does not clean up archived evidence.
 
-Prime Agent also supports deleting sessions interactively from `/resume` (select a session and press `Ctrl+D`, then confirm). When available, Prime Agent uses the `trash` CLI to avoid permanent deletion.
+Prime Agent also supports deleting sessions interactively from `/resume` (select a session and press `Ctrl+D`, then confirm). When available, Prime Agent sends the transcript to the `trash` CLI. Its archives and relocation records are removed permanently. Restoring the transcript alone does not restore inherited evidence for forks.
 
 ## Session Version
 
@@ -169,12 +169,12 @@ type AgentMessage =
 
 ## Entry Base
 
-All entries (except `SessionHeader`) extend `SessionEntryBase`:
+All ordinary entries extend `SessionEntryBase`. The session header and storage-only restart records are not tree entries:
 
 ```typescript
 interface SessionEntryBase {
   type: string;
-  id: string;           // 8-char hex ID
+  id: string;           // Usually short hex; full UUID fallback/closed append, or s<n>- prefixed after rotation
   parentId: string | null;  // Parent entry ID (null for first entry)
   timestamp: string;    // ISO timestamp
 }
@@ -184,7 +184,7 @@ interface SessionEntryBase {
 
 ### SessionHeader
 
-First line of the file. Metadata only, not part of the tree (no `id`/`parentId`).
+First line of the file. Its `id` identifies the session, not a tree entry. It has no `parentId`.
 
 ```json
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project"}
@@ -195,6 +195,61 @@ For sessions with a parent (created via `/fork`, `/clone`, or `newSession({ pare
 ```json
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/original/session.jsonl"}
 ```
+
+### Segmented Headers and Restart Records
+
+Rotation keeps the active pathname and session ID. Old bytes live at `archive/<sessionId>/<segment>.jsonl` beside the active transcript. Archives are immutable evidence. Openers, writers, leases and scanners refuse or omit archive paths and symlink aliases. They are not sessions to resume or navigate.
+
+A segmented header adds `rotation`:
+
+```typescript
+interface SessionRotation {
+  version: 1;
+  segment: number; // Nonnegative current segment; an unrotated header has no rotation field
+  archives: { segment: number; bytes: number; sha256: string }[];
+  restart: { version: 1; count: number; sha256: string };
+  compactionId?: string;
+  parent?: { sessionId: string; leafId: string; segment: number };
+  accounting: { messageCount: number; lastActivityTime?: number; usage: Usage };
+}
+```
+
+`accounting.messageCount`, `accounting.lastActivityTime` and `accounting.usage` describe snapshot-time values. `accounting.usage` is not a live total: later child attribution does not rewrite it. Usage readers apply retained attribution entries to the per-assistant records instead.
+
+The header contains no per-entry maps or assistant arrays. Its complete UTF-8 line, including LF, must stay below 64 * 1024 bytes. Rotation, both fork serializers, move/recovery and rewrites enforce this before publication. Oversize refusal keeps the authoritative source and does not raise reader limits.
+
+The next `restart.count` physical lines use this storage-only envelope:
+
+```typescript
+interface RotationStateRecord {
+  type: "rotation_state";
+  version: 1;
+  segment: number;
+  index: number;
+  kind: "cut_edges" | "accounting" | "preview";
+  data: unknown;
+}
+```
+
+Records have no `id` or `parentId`. Their segment matches the header, and indices run from zero in physical order. Every serialized record line, including LF, stays below 1024 * 1024 UTF-8 bytes. Arrays split between rows, never within a row.
+
+- `cut_edges` contains `[entryId, originalParentId]` pairs only where the retained parent link changed.
+- `accounting` contains assistant rows with a stripped `entry` and an `accountingParentId`, the nearest assistant ancestor or null. Bridge rows map a cut target ID to its nearest assistant ancestor. Bridges have no usage and do not count as messages. Accounting ancestry is separate from original entry ancestry and never authorizes evidence access.
+- `preview` contains the first-message preview. There is at most one preview record.
+
+`restart.sha256` hashes the exact next `count` UTF-8 record lines with their LF bytes. A zero count uses SHA-256 of the empty byte sequence. Full sync/async/public loaders validate the complete prefix before tolerant ordinary-line parsing or repair. Missing, duplicate, malformed, conflicting or misplaced storage records fail closed. Header-only discovery, selection, deletion, move preflight and fast metadata append validate witness shape without demanding payload rows or archives. Full-open fallback validates the whole prefix.
+
+Storage rows are excluded from public parsing results, `getEntries`, both tree views, branch/leaf/index candidates, trace entry counts and model context. Catalog and disk usage readers consume complete accounting once. Raw move, fork and rewrite paths preserve the prefix or regenerate matching rows and witness when they transform it.
+
+A fork of segmented history records a source ID and leaf cutoff in `rotation.parent`. Its `s<n>-` namespace stays above the recorded inherited range. Existing entry IDs do not change. Exact reads can follow the bounded source lineage, but later source entries are not inherited. A never-rotated, self-contained fork adds neither cutoff metadata nor restart records.
+
+A segmented source move records canonical old active paths in optional `previousSessionPaths` and publishes `<oldActivePath>.relocated` records through its existing move journal. These are not sessions. Archives keep their exact bytes.
+
+Permanent source deletion removes owned archives and redirects. Forks retain active reads, appends and active-ID branch membership; inherited archive-only reads fail visibly.
+
+An inherited-only fork (no own archives) can branch again without reading its deleted source, copying active payload and retaining its recorded parent, segment and parentSession. If a fork owns archives and its upstream source is gone, branching it may fail with `Parent session evidence is unavailable` before any write. A missing own committed archive is storage corruption: non-active membership and forking can fail with the actionable archive error. Ordinary close, update and artifact-only child cleanup retain evidence.
+
+Older builds do not understand this format. Do not downgrade onto segmented sessions. Preserve all segments and reconstruct and verify a complete transcript before an approved rollback. State, lineage and path-history growth can eventually force a safe refusal instead of useful shrinkage.
 
 ### SessionMessageEntry
 
@@ -366,11 +421,10 @@ Bookkeeping entries such as child usage attribution, session lifecycle, agent st
 
 ```typescript
 import { readFileSync } from "fs";
+import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 
-const lines = readFileSync("session.jsonl", "utf8").trim().split("\n");
-
-for (const line of lines) {
-  const entry = JSON.parse(line);
+// Validates a segmented restart prefix and excludes storage-only records.
+for (const entry of parseSessionEntries(readFileSync("session.jsonl", "utf8"))) {
 
   switch (entry.type) {
     case "session":
@@ -444,9 +498,10 @@ Key methods for working with sessions programmatically.
 ### Instance Methods - Tree Navigation
 - `getLeafId()` - Current position
 - `getLeafEntry()` - Get current leaf entry
-- `getEntry(id)` - Get entry by ID
-- `getBranch(fromId?)` - Walk from entry to root
-- `getTree()` - Get full tree structure
+- `getEntry(id)` - Exact active entry first, then committed archives and bounded parent evidence. An active hit performs no archive I/O.
+- `isEntryOnBranch(id)` - Read-only logical branch membership through original archived ancestry. Check it before admitting an archived exact read. False or an error never authorizes a weaker fallback.
+- `getBranch(fromId?)` - Active-segment ancestry only; archived IDs are not navigation targets
+- `getTree()` - Active-segment tree only
 - `getChildren(parentId)` - Get direct children
 - `getLabel(id)` - Get label for entry
 - `branch(entryId)` - Move leaf to earlier entry
@@ -455,7 +510,7 @@ Key methods for working with sessions programmatically.
 
 ### Instance Methods - Context & Info
 - `buildSessionContext()` - Get messages, thinkingLevel, and model for LLM
-- `getEntries()` - All entries (excluding header)
+- `getEntries()` - Active ordinary entries only, excluding the header and storage-only records
 - `getHeader()` - Session header metadata
 - `getSessionName()` - Get display name from latest session_info entry
 - `getCwd()` - Working directory

@@ -17,7 +17,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { EventLog } from "../../core/event-log.js";
 import { canonicalSessionPath } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
-import { readFirstLineSync, readLinesAsBuffers } from "../../utils/file-lines.js";
+import { readSessionHeaderLineSync as readFirstLineSync } from "../../core/session-rotation-state.js";
+import { readLinesAsBuffers } from "../../utils/file-lines.js";
 
 /**
  * Daemon-owned RLM spawn ledger.

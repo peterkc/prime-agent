@@ -1,18 +1,21 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentFamilyCatalogEntry,
 	assertAgentFamilyReach,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
-import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
+import { getSessionArtifactPathForFile, readSessionInfo, SessionManager } from "../src/core/session-manager.js";
+import { sessionArchivePath } from "../src/core/session-storage-paths.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 interface SupervisorInternals {
@@ -95,6 +98,49 @@ function worker(workerId: string, summaries: SessionSummary[] = []): WorkerFixtu
 }
 
 describe("daemon supervisor passive subagent topology", () => {
+	it("child tombstone retains transcript and archives while deleting only runtime artifacts", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-child-archive-retention-"));
+		tempDirs.push(directory);
+		const sessions = join(directory, "sessions");
+		const parent = SessionManager.create(directory, sessions);
+		parent.flushNow();
+		const child = SessionManager.create(directory, join(sessions, "sub-12345678"));
+		child.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		child.flushNow();
+		const file = child.getSessionFile()!;
+		const bytes = readFileSync(file);
+		const archive = sessionArchivePath(file, child.getSessionId(), 0);
+		mkdirSync(dirname(archive), { recursive: true });
+		writeFileSync(archive, bytes);
+		const artifact = getSessionArtifactPathForFile(file);
+		mkdirSync(artifact, { recursive: true });
+		writeFileSync(join(artifact, "kernel"), "cache");
+		const ledger = new RlmSpawnLedger(directory, sessions);
+		await ledger.appendSpawn({
+			childId: "child",
+			parent: parent.getSessionFile()!,
+			child: file,
+			depth: 1,
+			name: "child",
+		});
+		const daemon = new AgentDaemon(join(directory, "unused.sock"), {
+			createRuntime: vi.fn(async () => {
+				throw new Error("unexpected runtime");
+			}),
+			defaultSessionConfig: { cwd: directory, agentDir: directory, sessionDir: sessions },
+		});
+		Reflect.set(daemon, "rlmSpawnLedger", () => ledger);
+		await Reflect.get(daemon, "recordRlmSubagentDeletion").call(
+			daemon,
+			{ runtime: { session: { sessionFile: parent.getSessionFile(), sessionId: parent.getSessionId() } } },
+			"child",
+		);
+		expect((await ledger.edges(true))[0]?.deleted).toBeDefined();
+		expect(readFileSync(file)).toEqual(bytes);
+		expect(readFileSync(archive)).toEqual(bytes);
+		expect(existsSync(artifact)).toBe(false);
+	});
+
 	it("finds a child summary by its displayed session ID suffix", () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-child-suffix-"));
 		tempDirs.push(directory);

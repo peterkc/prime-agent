@@ -1,4 +1,6 @@
-import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import fs, { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
@@ -14,15 +16,22 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../../src/config.js";
 import type { AgentSession } from "../../src/core/agent-session.js";
+import { AgentSessionRuntime, createAgentSessionServices } from "../../src/core/agent-session-runtime.js";
+import { collectEntriesForBranchSummary } from "../../src/core/compaction/branch-summarization.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
-import { type SessionEntry, SessionManager } from "../../src/core/session-manager.js";
+import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../../src/core/session-lease.js";
+import { SESSION_ROTATION_THRESHOLD_BYTES, type SessionEntry, SessionManager } from "../../src/core/session-manager.js";
+import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
 import { assistantMsg, userMsg } from "../utilities.js";
 import { createHarness, getMessageText, type Harness, type HarnessOptions } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
 
 type SessionCompactionInternals = {
+	_agentEventQueue: Promise<void>;
+	_unsettledRlmChildRuns: Set<{ settlement: { promise: Promise<void> } }>;
+	_rlmPendingChildUsageBatchCount: number;
 	_checkCompaction: (
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck?: boolean,
@@ -37,6 +46,7 @@ type SessionCompactionInternals = {
 		message: string,
 	) => void;
 	_schedulePostCompactionContinue: () => void;
+	_invalidatePendingAutoRefineForBranchChange: () => Promise<void>;
 	_continueAfterThresholdCompaction: boolean;
 	_pendingRequestedCompaction?: object;
 };
@@ -163,14 +173,17 @@ function setStreaming(harness: Harness, streaming: boolean): void {
 describe("AgentSession compaction", () => {
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
+	const runtimeCleanups: Array<() => Promise<void>> = [];
 
 	beforeEach(() => {
 		vi.useRealTimers();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		while (runtimeCleanups.length) await runtimeCleanups.pop()!();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 		vi.unstubAllEnvs();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
@@ -178,6 +191,36 @@ describe("AgentSession compaction", () => {
 		while (tempDirs.length > 0) {
 			const dir = tempDirs.pop();
 			if (dir) rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([true, false])("#60 holds pending child usage through the parent drain (persist=%s)", async (persist) => {
+		const parent = await createHarness({ persistSession: true }),
+			child = await createHarness({ provider: "drain-child" });
+		harnesses.push(parent, child);
+		child.setResponses([fauxAssistantMessage("done")]);
+		const assistant = createAssistant(parent),
+			drain = createDeferred();
+		parent.session.agent.state.messages.push(assistant);
+		internalsOf(parent)._agentEventQueue = drain.promise;
+		parent.session.setSubagentRuntimeHost({
+			createRlmSubagentRuntime: async () => ({ session: child.session }),
+			deleteRlmSubagentRuntime: async () => child.session.disposeAsync(),
+		});
+		try {
+			await parent.session.runRlmChild("finish before parent append");
+			await Promise.all([...internalsOf(parent)._unsettledRlmChildRuns].map((run) => run.settlement.promise));
+			expect(internalsOf(parent)._rlmPendingChildUsageBatchCount).toBe(1);
+			if (persist) parent.sessionManager.appendMessage(assistant);
+			drain.resolve();
+			await internalsOf(parent)._agentEventQueue;
+			expect(internalsOf(parent)._rlmPendingChildUsageBatchCount).toBe(0);
+			expect(
+				parent.sessionManager.getEntries().filter((entry) => entry.type === "child_usage_attributed"),
+			).toHaveLength(Number(persist));
+		} finally {
+			drain.resolve();
+			await internalsOf(parent)._agentEventQueue;
 		}
 	});
 
@@ -202,6 +245,254 @@ describe("AgentSession compaction", () => {
 		};
 	}
 
+	it.each([
+		{ mode: "manual", extension: true },
+		{ mode: "auto", extension: true },
+		{ mode: "auto", extension: true, archivedTarget: true },
+		{ mode: "skill", extension: true },
+		{ mode: "manual", extension: false },
+		{ mode: "auto", extension: false },
+		{ mode: "skill", extension: false },
+		{ mode: "manual", extension: false, customId: true },
+		{ mode: "manual", extension: true, childUsage: true },
+		{ mode: "manual", extension: true, childUsage: "late" },
+		{ mode: "manual", extension: true, childUsage: "partial" },
+	])(
+		"completes $mode compaction (extension=$extension, custom=$customId, child=$childUsage, archived=$archivedTarget)",
+		async ({ mode, extension, customId, childUsage, archivedTarget }) => {
+			const late = childUsage === "late",
+				partial = childUsage === "partial",
+				scale = partial ? 10 : 1;
+			const harness = await createHarness({
+				persistSession: true,
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: extension ? [extensionCompaction("rotation summary")] : [],
+			});
+			harness.setResponses([
+				fauxAssistantMessage("kept reply"),
+				fauxAssistantMessage("rotation summary"),
+				fauxAssistantMessage("turn summary"),
+			]);
+			harnesses.push(harness);
+			const manager = harness.sessionManager;
+			if (customId) manager.newSession({ id: "custom-sdk-id" });
+			const removed = manager.appendMessage(userMsg("x".repeat(SESSION_ROTATION_THRESHOLD_BYTES)));
+			manager.appendMessage(assistantMsg("old reply"));
+			const preBoundary = manager.appendCustomEntry("retained state", { value: 1 });
+			manager.branch(removed);
+			const offBranch = manager.appendCustomMessageEntry("retained sibling", "sibling state", false);
+			const descendant = manager.appendCustomEntry("retained descendant", {});
+			manager.branch(preBoundary);
+			const path = manager.getSessionFile()!;
+			const lease = acquireSessionLease(path, process.env[ENV_AGENT_DIR]!, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+			const services = await createAgentSessionServices({
+				cwd: harness.tempDir,
+				agentDir: process.env[ENV_AGENT_DIR]!,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				modelRegistry: harness.session.modelRegistry,
+				telemetryDisabled: true,
+				resourceLoaderOptions: { noExtensions: true },
+			});
+			const runtime = new AgentSessionRuntime(
+				harness.session,
+				services,
+				async () => {
+					throw new Error("fixture does not replace its runtime");
+				},
+				[],
+				undefined,
+				undefined,
+				undefined,
+				lease,
+			);
+			runtimeCleanups.push(async () => {
+				releaseChild.resolve();
+				await runtime.dispose();
+				services.mcpManager.dispose();
+			});
+			const childReached = createDeferred(),
+				releaseChild = createDeferred();
+			if (childUsage)
+				harness.session.subscribe((event) => {
+					if (event.type === "message_end" && event.message.role === "assistant")
+						event.message.usage.cost.total = 0.1 * scale;
+				});
+			await harness.session.prompt("kept user");
+			const parent = manager.getLeafEntry();
+			if (childUsage) {
+				const child = await createHarness({ provider: "rotation-child", tools: [bigTool] });
+				harnesses.push(child);
+				child.session.subscribe((event) => {
+					if (event.type === "message_end" && event.message.role === "assistant")
+						event.message.usage.cost.total = (event.message.stopReason === "toolUse" ? 0.2 : 0.3) * scale;
+				});
+				child.setResponses([
+					...(late ? [] : [fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" as const })]),
+					async () => {
+						childReached.resolve();
+						await releaseChild.promise;
+						if (partial) child.session.agent.state.messages.push(userMsg("new origin"));
+						return fauxAssistantMessage("done");
+					},
+				]);
+				harness.session.setSubagentRuntimeHost({
+					createRlmSubagentRuntime: async () => ({ session: child.session }),
+					deleteRlmSubagentRuntime: async () => child.session.disposeAsync(),
+				});
+				await harness.session.runRlmChild("use a tool");
+				await childReached.promise;
+			}
+			const id = manager.getSessionId();
+			const before = customId ? readFileSync(path, "utf8") : undefined;
+			const warning = customId || childUsage ? vi.spyOn(console, "error").mockImplementation(() => {}) : undefined;
+			const attempt = vi.spyOn(manager, "rotateAfterCompaction");
+			if (mode === "manual") await harness.session.compact(undefined, { skipAbort: !!childUsage });
+			else if (mode === "auto" && extension) {
+				const invalidate = vi.spyOn(internalsOf(harness), "_invalidatePendingAutoRefineForBranchChange");
+				vi.spyOn(harness.session.agent, "waitForIdle").mockImplementationOnce(async () => {
+					await internalsOf(harness)._runAutoCompaction("threshold", false);
+				});
+				await expect(harness.session.navigateTree(archivedTarget ? removed : preBoundary)).rejects.toThrow(
+					archivedTarget ? /not found/ : /archived ancestry/,
+				);
+				expect(invalidate).not.toHaveBeenCalled();
+			} else if (mode === "auto") await internalsOf(harness)._runAutoCompaction("threshold", false);
+			else {
+				setStreaming(harness, true);
+				expect(harness.session.handleCompactHostRequest("compact.run").scheduled).toBe(true);
+				setStreaming(harness, false);
+				await internalsOf(harness)._checkCompaction(createAssistant(harness));
+			}
+			expect(attempt).toHaveBeenCalledTimes(1);
+			if (childUsage) {
+				if (late) expect(manager.getHeader()?.rotation?.segment).toBe(1);
+				else {
+					expect(warning).toHaveBeenCalledWith(expect.stringContaining("child usage batch is pending"));
+					expect(manager.getHeader()?.rotation).toBeUndefined();
+				}
+				let attributionWrites = 0;
+				if (partial) {
+					const append = fs.appendFileSync;
+					vi.spyOn(fs, "appendFileSync").mockImplementation((...args) => {
+						if (args[1].toString().includes('"type":"child_usage_attributed"') && ++attributionWrites === 2)
+							throw new Error("partial attribution write");
+						append(...args);
+					});
+					syncBuiltinESMExports();
+				}
+				releaseChild.resolve();
+				await harness.session.waitForRlmQuiescence();
+				if (partial) {
+					expect(attributionWrites).toBe(2);
+					expect(harness.session.getOwnUsageSummary()?.cost).toBe(harness.faux.state.callCount);
+					return;
+				}
+				expect(SessionManager.open(path).getEntry(parent!.id)).toEqual({
+					...parent,
+					parentId: manager.getEntry(parent!.id)?.parentId,
+				});
+				if (late) manager.appendMessage(userMsg("x".repeat(SESSION_ROTATION_THRESHOLD_BYTES)));
+				manager.appendMessage(userMsg("next keep"));
+				manager.appendMessage(assistantMsg("next reply"));
+				await harness.session.compact(undefined, { skipAbort: true });
+				if (late) {
+					expect(manager.getHeader()?.rotation?.segment).toBe(2);
+					return;
+				}
+			}
+			if (customId) {
+				const compaction = manager.getEntries().find((entry) => entry.type === "compaction");
+				expect(compaction).toBeDefined();
+				expect(readFileSync(path, "utf8")).toBe(`${before}${JSON.stringify(compaction)}\n`);
+				expect(manager.getHeader()?.rotation).toBeUndefined();
+				expect(existsSync(join(manager.getSessionDir(), "archive"))).toBe(false);
+				expect(warning).toHaveBeenCalledTimes(1);
+				expect(warning).toHaveBeenCalledWith(expect.stringContaining("custom session ID"));
+				return;
+			}
+			expect(manager.getHeader()?.rotation?.segment).toBe(1);
+			expect(manager.getEntries().map((entry) => entry.id)).not.toContain(removed);
+			expect(manager.getSessionFile()).toBe(path);
+			const archive = sessionArchivePath(path, id, 0);
+			expect(existsSync(archive)).toBe(true);
+			await expect(runtime.switchSession(archive)).rejects.toThrow(/archive/);
+			await expect(runtime.importFromJsonl(archive)).rejects.toThrow(/archive/);
+			expect(runtime.session).toBe(harness.session);
+			const calls = harness.faux.state.callCount;
+			const leaf = manager.getLeafId();
+			const bytes = readFileSync(path);
+			await expect(harness.session.navigateTree(removed, { summarize: true })).rejects.toThrow(/not found/);
+			await expect(runtime.fork(removed, { position: "at" })).rejects.toThrow(/Invalid entry/);
+			expect(() => collectEntriesForBranchSummary(manager, leaf, removed)).toThrow(/not found/);
+			for (const target of [preBoundary, offBranch, descendant]) {
+				await expect(harness.session.navigateTree(target, { summarize: true })).rejects.toThrow(
+					/archived ancestry/,
+				);
+				await expect(runtime.fork(target, { position: "at" })).rejects.toThrow(/archived ancestry/);
+				expect(() => SessionManager.open(path).createBranchedSession(target)).toThrow(/archived ancestry/);
+				const uncovered = join(manager.getSessionDir(), "uncovered.jsonl");
+				const line = `${JSON.stringify(manager.getEntry(target))}\n`;
+				fs.writeFileSync(uncovered, readFileSync(path, "utf8").replace(line, "") + line);
+				expect(() =>
+					SessionManager.forkFrom(uncovered, harness.tempDir, join(harness.tempDir, "uncreated")),
+				).toThrow(/archived ancestry/);
+				expect(existsSync(join(harness.tempDir, "uncreated"))).toBe(false);
+			}
+			expect(harness.faux.state.callCount).toBe(calls);
+			expect(manager.getLeafId()).toBe(leaf);
+			expect(readFileSync(path).equals(bytes)).toBe(true);
+			await expect(harness.session.navigateTree(leaf!)).resolves.toEqual({ cancelled: false });
+			expect(() => SessionManager.open(path).createBranchedSession(leaf!)).not.toThrow();
+			expect(readFileSync(archive).length).toBeGreaterThan(SESSION_ROTATION_THRESHOLD_BYTES);
+			const cold = await SessionManager.openAsync(path);
+			expect(cold.getSessionId()).toBe(id);
+			expect(cold.getEntries()).toEqual(manager.getEntries());
+			expect(cold.buildSessionContext()).toEqual(manager.buildSessionContext());
+			const evidence = cold.getEntry(removed);
+			expect(evidence).toMatchObject({ id: removed, type: "message", message: { role: "user" } });
+			const text = getMessageText(evidence?.type === "message" ? evidence.message : undefined);
+			expect(createHash("sha256").update(text).digest("hex")).toBe(
+				createHash("sha256").update("x".repeat(SESSION_ROTATION_THRESHOLD_BYTES)).digest("hex"),
+			);
+			expect(cold.isEntryOnBranch(removed)).toBe(true);
+			const appended = cold.appendCustomEntry("after rotation", { value: 1 });
+			expect(appended).toMatch(/^s1-/);
+			expect(SessionManager.open(path).getEntry(appended)).toEqual(cold.getEntry(appended));
+			cold.branch(offBranch);
+			const coveredLabel = cold.appendLabelChange(leaf!, "covered target");
+			const omittedLabel = cold.appendLabelChange(offBranch, "omitted target");
+			const omittedChild = cold.appendMessage(userMsg("under omitted labels"));
+			const omittedCompaction = cold.appendCompaction("descendant summary", omittedChild, 1);
+			const labelChildren: string[] = [];
+			for (const target of [appended, offBranch]) {
+				cold.branch(leaf!);
+				cold.appendLabelChange(target, "different target");
+				labelChildren.push(cold.appendMessage(userMsg("under a label")));
+			}
+			cold.branch(leaf!);
+			const forkLeaf = cold.appendLabelChange(leaf!, "selected leaf");
+			const sourceBytes = readFileSync(path);
+			const fork = SessionManager.forkFrom(path, harness.tempDir, join(harness.tempDir, "covered-fork"));
+			expect(
+				fork
+					.getEntries()
+					.some((entry) =>
+						[offBranch, descendant, omittedLabel, omittedChild, omittedCompaction].includes(entry.id),
+					),
+			).toBe(false);
+			for (const child of labelChildren) expect(fork.getBranch(child)).toEqual(cold.getBranch(child));
+			expect(fork.getEntry(coveredLabel)?.parentId).toBe(leaf);
+			expect(() => fork.assertRestorableContext(coveredLabel)).not.toThrow();
+			for (const target of [preBoundary, appended, forkLeaf]) {
+				expect(fork.getEntry(target)).toEqual(cold.getEntry(target));
+				if (target === preBoundary) expect(() => fork.assertRestorableContext(target)).toThrow(/archived ancestry/);
+				else expect(() => fork.assertRestorableContext(target)).not.toThrow();
+			}
+			expect(fork.buildSessionContext()).toEqual(cold.buildSessionContext());
+			expect(readFileSync(path).equals(sourceBytes)).toBe(true);
+		},
+	);
 	it("manually compacts using an extension-provided summary", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
@@ -1268,6 +1559,66 @@ describe("AgentSession compaction regressions", () => {
 		expect(harness.faux.state.callCount).toBe(3);
 	});
 
+	it.each(["unsafe-root", "permission"])(
+		"%s rotation-temp cleanup diagnoses once without blocking runtime creation",
+		async (kind) => {
+			const harness = await createHarness({ persistSession: true });
+			harnesses.push(harness);
+			harness.sessionManager.appendMessage(userMsg("hello"));
+			harness.sessionManager.appendMessage(assistantMsg("reply"));
+			const path = harness.sessionManager.getSessionFile()!;
+			const outside = join(harness.tempDir, "outside");
+			mkdirSync(outside);
+			const archiveRoot = join(harness.sessionManager.getSessionDir(), "archive");
+			if (kind === "unsafe-root") symlinkSync(outside, archiveRoot);
+			else mkdirSync(join(archiveRoot, harness.sessionManager.getSessionId()), { recursive: true });
+			const warning = vi.spyOn(console, "error").mockImplementation(() => {});
+			const services = await createAgentSessionServices({
+				cwd: harness.tempDir,
+				agentDir: process.env[ENV_AGENT_DIR]!,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				modelRegistry: harness.session.modelRegistry,
+				telemetryDisabled: true,
+				resourceLoaderOptions: { noExtensions: true },
+			});
+			const lease = acquireSessionLease(path, services.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+			const reader =
+				kind === "permission"
+					? vi.spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+							throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
+						})
+					: undefined;
+			syncBuiltinESMExports();
+			try {
+				const runtime = new AgentSessionRuntime(
+					harness.session,
+					services,
+					async () => {
+						throw new Error("no replacement");
+					},
+					[],
+					undefined,
+					undefined,
+					undefined,
+					lease,
+				);
+				expect(runtime.session).toBe(harness.session);
+				expect(warning).toHaveBeenCalledTimes(1);
+				expect(warning).toHaveBeenCalledWith(expect.stringContaining("temp cleanup skipped"));
+				if (kind === "unsafe-root")
+					expect(() => sessionArchivePath(path, harness.sessionManager.getSessionId(), 0)).toThrow(/symlink/);
+				else expect(reader).toHaveBeenCalledTimes(1);
+				await runtime.dispose();
+			} finally {
+				reader?.mockRestore();
+				syncBuiltinESMExports();
+				lease?.release();
+				services.mcpManager.dispose();
+				warning.mockRestore();
+			}
+		},
+	);
 	it("#3688: clears branch summary state when session_before_tree cancels navigation", async () => {
 		const harness = await createHarness({
 			extensionFactories: [

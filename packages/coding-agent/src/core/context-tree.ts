@@ -4,7 +4,16 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
 import type { ContextUsage } from "./extensions/index.js";
-import { buildSessionContext, type FileEntry, loadEntriesFromBuffer, type SessionEntry } from "./session-manager.js";
+import {
+	buildSessionContext,
+	type FileEntry,
+	loadEntriesFromBuffer,
+	rotationUsageEntries,
+	type SessionEntry,
+	type SessionHeader,
+} from "./session-manager.js";
+import { restartOf } from "./session-rotation-state.js";
+import { isSessionArchivePath } from "./session-storage-paths.js";
 import { addAssistantUsage, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
 
 /** Resolves a model's context window so disk-only nodes can report utilization. */
@@ -76,20 +85,21 @@ function compactLabel(text: string, maxLength = 80): string {
 export function computeOwnAndTotalUsage(
 	branch: SessionEntry[],
 	allEntries: SessionEntry[],
+	header?: SessionHeader | null,
 ): { ownUsage: Usage; totalUsage: Usage } {
 	const totalUsage = emptyUsage();
-	const branchAssistantIds = new Set<string>();
+	const assistants = new Map(rotationUsageEntries(header, branch, allEntries).map((entry) => [entry.id, entry]));
 	for (const entry of branch) {
 		if (isAssistantEntry(entry)) {
-			branchAssistantIds.add(entry.id);
-			addAssistantUsage(totalUsage, entry.message.usage);
+			assistants.set(entry.id, entry);
 		} else if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage) {
 			addAssistantUsage(totalUsage, entry.usage);
 		}
 	}
+	for (const entry of assistants.values()) addAssistantUsage(totalUsage, entry.message.usage);
 	const ownUsage = cloneUsage(totalUsage);
 	for (const entry of allEntries) {
-		if (entry.type === "child_usage_attributed" && branchAssistantIds.has(entry.targetId)) {
+		if (entry.type === "child_usage_attributed" && assistants.has(entry.targetId)) {
 			subtractAssistantUsage(ownUsage, entry.childUsage);
 		}
 	}
@@ -152,7 +162,7 @@ function computeContextUsageFromEntries(
  * Read and parse a session file, returning the entries plus the byte count
  * read, which lets the cache verify the read was a complete snapshot.
  */
-function readSessionFile(file: string): { entries: SessionEntry[]; bytes: number } | undefined {
+function readSessionFile(file: string): { entries: SessionEntry[]; header?: SessionHeader; bytes: number } | undefined {
 	let buffer: Buffer;
 	try {
 		buffer = readFileSync(file);
@@ -162,10 +172,10 @@ function readSessionFile(file: string): { entries: SessionEntry[]; bytes: number
 		}
 		throw error;
 	}
-	const entries = loadEntriesFromBuffer(buffer).filter(
-		(entry: FileEntry): entry is SessionEntry => entry.type !== "session",
-	);
-	return { entries, bytes: buffer.length };
+	const fileEntries = loadEntriesFromBuffer(buffer);
+	const entries = fileEntries.filter((entry: FileEntry): entry is SessionEntry => entry.type !== "session");
+	const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+	return { entries, header, bytes: buffer.length };
 }
 
 /**
@@ -219,6 +229,7 @@ interface SessionFile {
 }
 
 function findSessionFile(dir: string): SessionFile | undefined {
+	if (isSessionArchivePath(dir)) return undefined;
 	let newest: { file: SessionFile; mtime: number } | undefined;
 	for (const name of readdirSync(dir)) {
 		if (!name.endsWith(".jsonl")) {
@@ -226,6 +237,7 @@ function findSessionFile(dir: string): SessionFile | undefined {
 		}
 		const path = join(dir, name);
 		try {
+			if (isSessionArchivePath(path)) continue;
 			const stats = statSync(path);
 			const mtime = stats.mtime.getTime();
 			if (!newest || mtime > newest.mtime) {
@@ -391,7 +403,7 @@ function buildContextTreeChildFromDisk(
 		return undefined;
 	}
 
-	const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, allEntries);
+	const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, allEntries, read.header);
 
 	let model: { provider: string; id: string } | undefined;
 	for (const entry of branch) {
@@ -410,12 +422,17 @@ function buildContextTreeChildFromDisk(
 		}
 	}
 
+	if (read.header?.rotation) {
+		const effective = buildSessionContext(allEntries).model;
+		if (effective) model = { provider: effective.provider, id: effective.modelId };
+		if (restartOf(read.header)?.firstMessage) label = compactLabel(restartOf(read.header)!.firstMessage);
+	}
 	const contextWindow = model ? resolveContextWindow(model.provider, model.id) : undefined;
 
 	const node: ContextTreeNode = {
 		id: basename(childSessionDir),
 		label: label || "child agent",
-		status: statusFromBranch(branch),
+		status: statusFromBranch([...rotationUsageEntries(read.header, branch, allEntries), ...branch]),
 		model,
 		ownUsage,
 		totalUsage,

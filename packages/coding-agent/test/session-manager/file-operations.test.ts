@@ -2,9 +2,12 @@ import {
 	appendFileSync,
 	chmodSync,
 	closeSync,
+	existsSync,
 	lstatSync,
 	mkdirSync,
+	mkdtempSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
@@ -15,15 +18,32 @@ import {
 	writeSync,
 } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { join, relative } from "path";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+	acquireSessionLease,
+	bindSessionWriterLease,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../../src/core/session-lease.js";
+import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
+import { assistantMsg, userMsg } from "../utilities.js";
 
-const fullReadCounter = vi.hoisted(() => ({ suffix: undefined as string | undefined, count: 0 }));
+const fullReadCounter = vi.hoisted(() => ({
+	suffix: undefined as string | undefined,
+	count: 0,
+	archiveReads: 0,
+	archiveStats: 0,
+}));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
 		...actual,
+		statSync: ((path: Parameters<typeof actual.statSync>[0], options?: never) => {
+			if (String(path).includes("/archive/")) fullReadCounter.archiveStats++;
+			return actual.statSync(path, options);
+		}) as typeof actual.statSync,
 		readFileSync: ((path: Parameters<typeof actual.readFileSync>[0], options?: never) => {
+			if (String(path).includes("/archive/")) fullReadCounter.archiveReads++;
 			// Suffix match: repair resolves the realpath (/private/var vs /var on macOS).
 			if (fullReadCounter.suffix !== undefined && String(path).endsWith(fullReadCounter.suffix)) {
 				fullReadCounter.count++;
@@ -33,14 +53,20 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-import { computeOwnAndTotalUsage } from "../../src/core/context-tree.js";
+import { findAgentTraceFiles } from "../../src/core/agent-traces.js";
+import { computeOwnAndTotalUsage, loadContextTreeChildFromDisk } from "../../src/core/context-tree.js";
 import {
+	appendCustomMessageToExistingFile,
+	appendSessionInfoToExistingFile,
+	appendSessionStateToExistingFile,
 	type FileEntry,
+	findMostRecentSessionForCwd,
 	loadEntriesFromFile,
 	loadEntriesFromFileAsync,
 	migrateSessionEntries,
 	readSessionInfo,
 	resolveSessionRlmDepth,
+	SESSION_ROTATION_THRESHOLD_BYTES,
 	SessionManager,
 } from "../../src/core/session-manager.js";
 import { sessionUsageSummaryFrom } from "../../src/core/usage.js";
@@ -818,5 +844,217 @@ describe("migrateSessionEntries", () => {
 		expect(first!.id).toBe("abc12345");
 		expect(second!.id).toBe("def67890");
 		expect(second!.parentId).toBe("abc12345");
+	});
+});
+describe("archive admission", () => {
+	it("keeps unreadable cyclic aliases absent from readonly scanners", async () => {
+		const root = mkdtempSync(join(tmpdir(), "scanner-cycle-"));
+		onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+		const a = join(root, "a");
+		const b = join(root, "b");
+		symlinkSync(b, a);
+		symlinkSync(a, b);
+		expect(await readSessionInfo(a)).toBeNull();
+		expect(findMostRecentSessionForCwd(a, root)).toBeNull();
+		expect(await SessionManager.listAll(undefined, a)).toEqual([]);
+		expect(await findAgentTraceFiles(a)).toEqual([]);
+	});
+	it.each([
+		["archive", "project", "sessions", "live.jsonl"],
+		["archive", "not-a-uuid", "x.jsonl"],
+	])("keeps ordinary paths outside the archive identity: %s", (...parts) => {
+		const root = mkdtempSync(join(tmpdir(), "ordinary-archive-name-"));
+		onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+		const path = join(root, ...parts);
+		mkdirSync(join(path, ".."), { recursive: true });
+		const header = `${JSON.stringify({ type: "session", version: 3, id: "sdk-custom-id", timestamp: "2026-11-02", cwd: root, rlmDepth: 0, opaque: { preserved: true } })}\n`;
+		writeFileSync(path, header);
+		const manager = SessionManager.open(path);
+		const id = manager.appendSessionInfo("ordinary append");
+		expect(readFileSync(path, "utf8")).toBe(`${header}${JSON.stringify(manager.getEntry(id))}\n`);
+		expect(manager.getHeader()?.rotation).toBeUndefined();
+		expect(existsSync(join(path, "..", "archive"))).toBe(false);
+	});
+	it.each(["valid", "corrupt", "missing"])(
+		"refuses %s archive files through every manager/metadata/lease admission",
+		async (kind) => {
+			const root = mkdtempSync(join(tmpdir(), "archive-admission-"));
+			onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+			const sessions = join(root, "sessions");
+			const agentDir = join(root, "agent");
+			const archiveDir = join(sessions, "archive", "019a3e10-1234-7123-8123-123456789abc");
+			const archive = join(archiveDir, "0.jsonl");
+			mkdirSync(archiveDir, { recursive: true });
+			if (kind !== "missing")
+				writeFileSync(
+					archive,
+					kind === "corrupt"
+						? '{"type":"session"'
+						: `${JSON.stringify({ type: "session", version: 3, id: "019a3e10-1234-7123-8123-123456789abc", timestamp: "2026-11-02", cwd: root })}\n`,
+				);
+			const parentAlias = join(root, "parent-alias");
+			const fileAlias = join(sessions, "alias.jsonl");
+			symlinkSync(archiveDir, parentAlias);
+			symlinkSync(archive, fileAlias);
+			const before = existsSync(archive) ? readFileSync(archive) : undefined;
+			const listing = readdirSync(archiveDir);
+			const manager = SessionManager.inMemory(root);
+			for (const path of [archive, relative(process.cwd(), archive), fileAlias, join(parentAlias, "0.jsonl")]) {
+				expect(() => SessionManager.open(path, join(root, "must-not-create"))).toThrow(/archive/);
+				await expect(SessionManager.openAsync(path)).rejects.toThrow(/archive/);
+				expect(() => manager.setSessionFile(path)).toThrow(/archive/);
+				expect(() => SessionManager.forkFrom(path, root, join(root, "forks"))).toThrow(/archive/);
+				expect(() => appendSessionInfoToExistingFile(path, "rename", agentDir)).toThrow(/archive/);
+				expect(() => appendSessionStateToExistingFile(path, { status: "crash" }, agentDir)).toThrow(/archive/);
+				expect(() =>
+					appendCustomMessageToExistingFile(path, "interruption", "notice", false, {}, agentDir),
+				).toThrow(/archive/);
+				for (const enabled of ["0", "1"])
+					expect(() => acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: enabled })).toThrow(
+						/archive/,
+					);
+				expect(await readSessionInfo(path)).toBeNull();
+			}
+			expect(() => SessionManager.create(root, archiveDir)).toThrow(/archive/);
+			expect(() => SessionManager.continueRecent(root, archiveDir)).toThrow(/archive/);
+			expect(() => manager.materializeSessionFile(archiveDir)).toThrow(/archive/);
+			const normal = join(sessions, "normal.jsonl");
+			const child = join(root, "session-artifacts", "root", "sub-deadbeef", "child.jsonl");
+			const header = `${JSON.stringify({ type: "session", version: 3, id: "normal", timestamp: "2026-11-02", cwd: root })}\n`;
+			writeFileSync(normal, header);
+			expect(() => SessionManager.forkFrom(normal, root, join(archiveDir, "must-not-create"))).toThrow(/archive/);
+			expect(existsSync(join(archiveDir, "must-not-create"))).toBe(false);
+			mkdirSync(join(child, ".."), { recursive: true });
+			writeFileSync(child, header);
+			expect(await findAgentTraceFiles(sessions)).toEqual([normal, child].sort());
+			expect(await findAgentTraceFiles(archiveDir)).toEqual([]);
+			expect(loadContextTreeChildFromDisk(archiveDir, () => 1000)).toBeUndefined();
+			await expect(SessionManager.listAll(undefined, archiveDir)).resolves.toEqual([]);
+			expect(findMostRecentSessionForCwd(archiveDir, root)).toBeNull();
+			expect(existsSync(agentDir)).toBe(false);
+			expect(existsSync(join(root, "must-not-create"))).toBe(false);
+			expect(existsSync(join(root, "forks"))).toBe(false);
+			expect(readdirSync(archiveDir)).toEqual(listing);
+			if (before) expect(readFileSync(archive).equals(before)).toBe(true);
+			else expect(existsSync(archive)).toBe(false);
+		},
+	);
+});
+function lookupFixture(directory: string, count: number) {
+	const manager = SessionManager.create(directory, join(directory, "sessions"));
+	const ids = Array.from({ length: count }, (_, i) =>
+		manager.appendMessage(i % 2 ? assistantMsg("reply") : userMsg("user")),
+	);
+	const agentDir = join(directory, "agent");
+	const lease = acquireSessionLease(manager.getSessionFile()!, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+	bindSessionWriterLease(manager, lease);
+	let keep = "";
+	onTestFinished(() => lease?.release());
+	for (let segment = 0; segment < 2; segment++) {
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "pad",
+			toolName: "fixture",
+			content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
+			isError: false,
+			timestamp: 1,
+		});
+		keep = manager.appendMessage(userMsg("keep"));
+		manager.appendMessage(assistantMsg("answer"));
+		const compact = manager.appendCompaction("summary", keep, 100);
+		expect(manager.rotateAfterCompaction(compact, agentDir).status).toBe("rotated");
+	}
+	return { path: manager.getSessionFile()!, id: manager.getSessionId(), first: ids[0], last: ids.at(-1)!, keep };
+}
+describe("bounded lookup work", () => {
+	it.each([2000, 4000])(
+		"visits relevant ancestry linearly through two segments and fork-of-fork (%i entries)",
+		(size) => {
+			const directory = mkdtempSync(join(tmpdir(), "lookup-work-"));
+			onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+			const parse = JSON.parse;
+			let visits = 0,
+				restartParses = 0;
+			const parser = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+				const value = parse(text, reviver);
+				if (value && typeof value === "object") {
+					if (value.type === "rotation_state") restartParses++;
+					if (typeof value.id === "string" && Object.hasOwn(value, "parentId")) {
+						const parent = value.parentId;
+						Object.defineProperty(value, "parentId", {
+							enumerable: true,
+							configurable: true,
+							get() {
+								visits++;
+								return parent;
+							},
+							set(v) {
+								Object.defineProperty(value, "parentId", {
+									value: v,
+									writable: true,
+								});
+							},
+						});
+					}
+				}
+				return value;
+			});
+			onTestFinished(() => parser.mockRestore());
+			const f = lookupFixture(directory, size);
+			const first = SessionManager.forkFrom(f.path, directory, join(directory, "fork1"));
+			const second = SessionManager.forkFrom(first.getSessionFile()!, directory, join(directory, "fork2"));
+			const cold = SessionManager.open(second.getSessionFile()!);
+			visits = 0;
+			restartParses = 0;
+			Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
+			expect(cold.isEntryOnBranch(f.first)).toBe(true);
+			expect(visits).toBeLessThan(size * 40);
+			expect(restartParses).toBeLessThan(30);
+			expect(fullReadCounter.archiveReads).toBe(2);
+			expect(fullReadCounter.archiveStats).toBe(2);
+			const coldWork = {
+				visits,
+				restartParses,
+				archiveReads: fullReadCounter.archiveReads,
+				archiveStats: fullReadCounter.archiveStats,
+			};
+			visits = 0;
+			restartParses = 0;
+			Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
+			expect(cold.isEntryOnBranch(f.last)).toBe(true);
+			expect(visits).toBe(0);
+			expect(restartParses).toBe(0);
+			expect(fullReadCounter.archiveReads).toBe(0);
+			expect(fullReadCounter.archiveStats).toBe(2);
+			const local = cold.appendCustomEntry("local", {});
+			expect(cold.isEntryOnBranch(local)).toBe(true);
+			cold.branch(f.keep);
+			expect(cold.isEntryOnBranch(local)).toBe(false);
+			const branch = cold.appendCustomEntry("other branch", {});
+			expect(SessionManager.open(second.getSessionFile()!).isEntryOnBranch(branch)).toBe(true);
+			const later = first.appendCustomEntry("after cutoff", {});
+			expect(cold.isEntryOnBranch(later)).toBe(false);
+			expect(cold.isEntryOnBranch(f.first)).toBe(true);
+			console.log(
+				`lookup-work size=${size} cold=${JSON.stringify(coldWork)} bound=${size * 40} warm_visits=0 archives_per_operation=2`,
+			);
+		},
+	);
+	it.each(["missing", "corrupt"])("returns active hits with no archive I/O when archives are %s", (kind) => {
+		const directory = mkdtempSync(join(tmpdir(), "active-hit-"));
+		onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+		const f = lookupFixture(directory, 20);
+		const manager = SessionManager.open(f.path);
+		const archive = sessionArchivePath(f.path, f.id, 0);
+		if (kind === "missing") rmSync(archive);
+		else writeFileSync(archive, "corrupt");
+		Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
+		expect(manager.getEntry(f.keep)?.id).toBe(f.keep);
+		expect(manager.isEntryOnBranch(f.keep)).toBe(true);
+		expect(fullReadCounter.archiveReads).toBe(0);
+		expect(fullReadCounter.archiveStats).toBe(0);
+		expect(() => manager.getEntry(f.first)).toThrow(/archive/);
+		expect(() => manager.isEntryOnBranch(f.first)).toThrow(/archive/);
+		expect(() => manager.createBranchedSession(manager.getLeafId()!)).toThrow(/archive/);
 	});
 });

@@ -6,10 +6,12 @@ import { lockSync } from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	acquireSessionLease,
+	bindSessionWriterLease,
 	canonicalSessionPath,
 	findLiveSessionCopy,
 	getWindowsProcessStartId,
 	isRenameTargetContention,
+	ownsSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
@@ -37,6 +39,27 @@ function enabledEnvironment(owner: string): NodeJS.ProcessEnv {
 }
 
 describe("session leases", () => {
+	it("an SDK object cannot borrow the runtime lease, including after replacement or release", () => {
+		const agentDir = createTempDir();
+		const path = join(agentDir, "session.jsonl");
+		const lease = acquireSessionLease(path, agentDir, enabledEnvironment("runtime"));
+		const first = {};
+		const replacement = {};
+		const sdk = {};
+		try {
+			bindSessionWriterLease(first, lease);
+			expect(ownsSessionLease(first, path, agentDir)).toBe(true);
+			expect(ownsSessionLease(sdk, path, agentDir)).toBe(false);
+			bindSessionWriterLease(replacement, lease);
+			expect(ownsSessionLease(first, path, agentDir)).toBe(false);
+			expect(ownsSessionLease(replacement, path, agentDir)).toBe(true);
+			lease?.release();
+			expect(ownsSessionLease(replacement, path, agentDir)).toBe(false);
+		} finally {
+			lease?.release();
+		}
+	});
+
 	it.each([
 		["live", process.pid, false, "valid", true],
 		["dead", 2_147_483_647, false, "valid", false],

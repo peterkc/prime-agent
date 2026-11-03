@@ -18,8 +18,8 @@ import {
 import { basename, dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
+import { readSessionHeaderLineSync as readFirstLineSync } from "./core/session-rotation-state.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "./utils/atomic-file.js";
-import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
