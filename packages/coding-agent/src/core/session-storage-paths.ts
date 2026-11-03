@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { isProcessAlive } from "../utils/child-process.js";
 
@@ -26,6 +26,27 @@ export function canonicalStoragePath(path: string, seen = new Set<string>()): st
 /** Archive identity follows the generated v7 and legacy v4 session UUIDs. Custom SDK IDs do not rotate. */
 export function isRotatableSessionId(id: string): boolean {
 	return /^[a-f0-9]{8}-[a-f0-9]{4}-[47][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id);
+}
+
+/** Only canonical UUID and legacy timestamp_UUID transcripts own an archive group. */
+export function sessionArchiveOwnerId(path: string): string | undefined {
+	const match = /(?:^|_)([a-f0-9-]{36})\.jsonl$/.exec(basename(path));
+	return match && isRotatableSessionId(match[1]) ? match[1] : undefined;
+}
+
+export function assertSessionArchiveOwnerAvailable(destinationPath: string, sessionId: string): void {
+	const destination = canonicalStoragePath(destinationPath);
+	if (sessionArchiveOwnerId(destination) !== sessionId) return;
+	for (const name of existsSync(dirname(destination)) ? readdirSync(dirname(destination)) : []) {
+		if (sessionArchiveOwnerId(name) !== sessionId) continue;
+		const existing = canonicalStoragePath(join(dirname(destination), name));
+		if (
+			dirname(existing) === dirname(destination) &&
+			sessionArchiveOwnerId(existing) === sessionId &&
+			existing !== destination
+		)
+			throw new Error(`Session archive owner already exists: ${existing}`);
+	}
 }
 
 export function isSessionArchivePath(path: string): boolean {

@@ -89,18 +89,23 @@ function sse(events: unknown[]): Response {
 		headers: { "Content-Type": "text/event-stream" },
 	});
 }
-function terminal(output: unknown[] = [], status = "completed") {
+function terminal(output: unknown[] = [], status = "completed", cached = 5) {
 	return {
 		type: `response.${status}`,
 		response: {
 			id: "resp_grok",
 			status,
 			output,
-			usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28, input_tokens_details: { cached_tokens: 5 } },
+			usage: {
+				input_tokens: 20,
+				output_tokens: 8,
+				total_tokens: 28,
+				input_tokens_details: { cached_tokens: cached },
+			},
 		},
 	};
 }
-function toolEvents(): Record<string, unknown>[] {
+function toolEvents(cached = 5): Record<string, unknown>[] {
 	return [
 		{ type: "response.created", response: { id: "resp_grok" } },
 		{ type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_grok", summary: [] } },
@@ -110,7 +115,7 @@ function toolEvents(): Record<string, unknown>[] {
 		{ type: "response.function_call_arguments.done", output_index: 1, arguments: call.arguments },
 		{ type: "response.output_item.done", output_index: 0, item: { ...reasoning, encrypted_content: undefined } },
 		{ type: "response.output_item.done", output_index: 1, item: call },
-		terminal([reasoning, call]),
+		terminal([reasoning, call], "completed", cached),
 	];
 }
 function textEvents() {
@@ -183,14 +188,19 @@ describe("xAI subscription Responses", () => {
 		expect(getSupportedThinkingLevels(getXaiSubscriptionModel(xaiFixtureModel("grok-build-0.1"))!)).toEqual([]);
 	});
 
-	it("streams interleaved thinking/tool calls and replays a complete second turn", async () => {
+	it.each([
+		[0, 20],
+		[5, 15],
+		[20, 0],
+		[25, 0],
+	])("peterkc/prime-agent#60 streams and replays usage (cached=%i)", async (cached, input) => {
 		const requests: { url: string; headers: Headers; body: Record<string, unknown> }[] = [];
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
 				const request = new Request(input, init);
 				requests.push({ url: request.url, headers: request.headers, body: JSON.parse(await request.text()) });
-				return sse(requests.length === 1 ? toolEvents() : textEvents());
+				return sse(requests.length === 1 ? toolEvents(cached) : textEvents());
 			}),
 		);
 		const context: Context = {
@@ -207,6 +217,7 @@ describe("xAI subscription Responses", () => {
 		const events = [];
 		for await (const event of stream) events.push(event);
 		const first = await stream.result();
+		expect(first.usage).toMatchObject({ input, cacheRead: cached, output: 8, totalTokens: 28 });
 		expect(first.stopReason, first.errorMessage).toBe("toolUse");
 		const thinking = first.content.find((block) => block.type === "thinking");
 		expect(thinking?.thinking).toBe("Inspect the file.");

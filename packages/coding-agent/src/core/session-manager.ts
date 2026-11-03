@@ -58,10 +58,12 @@ import {
 	withRotationRestart,
 } from "./session-rotation-state.js";
 import {
+	assertSessionArchiveOwnerAvailable,
 	canonicalStoragePath,
 	isRotatableSessionId,
 	isSessionArchivePath,
 	requireActiveSessionPath,
+	sessionArchiveOwnerId,
 	sessionArchivePath,
 } from "./session-storage-paths.js";
 import {
@@ -2899,7 +2901,7 @@ export class SessionManager {
 		try {
 			if (!this.sessionFile || !ownsSessionLease(this, this.sessionFile, agentDir)) return;
 			const rotation = rotationOf(this.getHeader());
-			if (!isRotatableSessionId(this.sessionId)) return;
+			if (sessionArchiveOwnerId(canonicalStoragePath(this.sessionFile)) !== this.sessionId) return;
 			const archiveRoot = dirname(sessionArchivePath(this.sessionFile, this.sessionId, rotation?.segment ?? 0));
 			if (!rotation && !existsSync(archiveRoot)) return;
 			const destinations = [canonicalStoragePath(this.sessionFile)];
@@ -2954,6 +2956,11 @@ export class SessionManager {
 				return { status: "skipped" };
 			if (!isRotatableSessionId(this.sessionId)) {
 				const reason = "custom session ID is not a generated v4/v7 UUID; compaction is kept without rotation";
+				console.error(`Session rotation skipped: ${reason}`);
+				return { status: "skipped", reason };
+			}
+			if (sessionArchiveOwnerId(canonicalStoragePath(this.sessionFile)) !== this.sessionId) {
+				const reason = "transcript filename is not the archive owner; compaction is kept without rotation";
 				console.error(`Session rotation skipped: ${reason}`);
 				return { status: "skipped", reason };
 			}
@@ -3646,6 +3653,7 @@ export class SessionManager {
 			if (error instanceof SyntaxError) return;
 			throw error;
 		}
+		if (header?.id) assertSessionArchiveOwnerAvailable(destinationPath, header.id);
 		if (!header?.rotation) return;
 		try {
 			const entries = loadEntriesFromFile(sourcePath);

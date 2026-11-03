@@ -19,7 +19,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { join, relative } from "path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
 	acquireSessionLease,
 	bindSessionWriterLease,
@@ -849,103 +849,94 @@ describe("migrateSessionEntries", () => {
 describe("archive admission", () => {
 	it("keeps unreadable cyclic aliases absent from readonly scanners", async () => {
 		const root = mkdtempSync(join(tmpdir(), "scanner-cycle-"));
-		try {
-			const a = join(root, "a");
-			const b = join(root, "b");
-			symlinkSync(b, a);
-			symlinkSync(a, b);
-			expect(await readSessionInfo(a)).toBeNull();
-			expect(findMostRecentSessionForCwd(a, root)).toBeNull();
-			expect(await SessionManager.listAll(undefined, a)).toEqual([]);
-			expect(await findAgentTraceFiles(a)).toEqual([]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
+		onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+		const a = join(root, "a");
+		const b = join(root, "b");
+		symlinkSync(b, a);
+		symlinkSync(a, b);
+		expect(await readSessionInfo(a)).toBeNull();
+		expect(findMostRecentSessionForCwd(a, root)).toBeNull();
+		expect(await SessionManager.listAll(undefined, a)).toEqual([]);
+		expect(await findAgentTraceFiles(a)).toEqual([]);
 	});
 	it.each([
 		["archive", "project", "sessions", "live.jsonl"],
 		["archive", "not-a-uuid", "x.jsonl"],
 	])("keeps ordinary paths outside the archive identity: %s", (...parts) => {
 		const root = mkdtempSync(join(tmpdir(), "ordinary-archive-name-"));
-		try {
-			const path = join(root, ...parts);
-			mkdirSync(join(path, ".."), { recursive: true });
-			const header = `${JSON.stringify({ type: "session", version: 3, id: "sdk-custom-id", timestamp: "2026-11-02", cwd: root, rlmDepth: 0, opaque: { preserved: true } })}\n`;
-			writeFileSync(path, header);
-			const manager = SessionManager.open(path);
-			const id = manager.appendSessionInfo("ordinary append");
-			expect(readFileSync(path, "utf8")).toBe(`${header}${JSON.stringify(manager.getEntry(id))}\n`);
-			expect(manager.getHeader()?.rotation).toBeUndefined();
-			expect(existsSync(join(path, "..", "archive"))).toBe(false);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
+		onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+		const path = join(root, ...parts);
+		mkdirSync(join(path, ".."), { recursive: true });
+		const header = `${JSON.stringify({ type: "session", version: 3, id: "sdk-custom-id", timestamp: "2026-11-02", cwd: root, rlmDepth: 0, opaque: { preserved: true } })}\n`;
+		writeFileSync(path, header);
+		const manager = SessionManager.open(path);
+		const id = manager.appendSessionInfo("ordinary append");
+		expect(readFileSync(path, "utf8")).toBe(`${header}${JSON.stringify(manager.getEntry(id))}\n`);
+		expect(manager.getHeader()?.rotation).toBeUndefined();
+		expect(existsSync(join(path, "..", "archive"))).toBe(false);
 	});
 	it.each(["valid", "corrupt", "missing"])(
 		"refuses %s archive files through every manager/metadata/lease admission",
 		async (kind) => {
 			const root = mkdtempSync(join(tmpdir(), "archive-admission-"));
-			try {
-				const sessions = join(root, "sessions");
-				const agentDir = join(root, "agent");
-				const archiveDir = join(sessions, "archive", "019a3e10-1234-7123-8123-123456789abc");
-				const archive = join(archiveDir, "0.jsonl");
-				mkdirSync(archiveDir, { recursive: true });
-				if (kind !== "missing")
-					writeFileSync(
-						archive,
-						kind === "corrupt"
-							? '{"type":"session"'
-							: `${JSON.stringify({ type: "session", version: 3, id: "019a3e10-1234-7123-8123-123456789abc", timestamp: "2026-11-02", cwd: root })}\n`,
+			onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+			const sessions = join(root, "sessions");
+			const agentDir = join(root, "agent");
+			const archiveDir = join(sessions, "archive", "019a3e10-1234-7123-8123-123456789abc");
+			const archive = join(archiveDir, "0.jsonl");
+			mkdirSync(archiveDir, { recursive: true });
+			if (kind !== "missing")
+				writeFileSync(
+					archive,
+					kind === "corrupt"
+						? '{"type":"session"'
+						: `${JSON.stringify({ type: "session", version: 3, id: "019a3e10-1234-7123-8123-123456789abc", timestamp: "2026-11-02", cwd: root })}\n`,
+				);
+			const parentAlias = join(root, "parent-alias");
+			const fileAlias = join(sessions, "alias.jsonl");
+			symlinkSync(archiveDir, parentAlias);
+			symlinkSync(archive, fileAlias);
+			const before = existsSync(archive) ? readFileSync(archive) : undefined;
+			const listing = readdirSync(archiveDir);
+			const manager = SessionManager.inMemory(root);
+			for (const path of [archive, relative(process.cwd(), archive), fileAlias, join(parentAlias, "0.jsonl")]) {
+				expect(() => SessionManager.open(path, join(root, "must-not-create"))).toThrow(/archive/);
+				await expect(SessionManager.openAsync(path)).rejects.toThrow(/archive/);
+				expect(() => manager.setSessionFile(path)).toThrow(/archive/);
+				expect(() => SessionManager.forkFrom(path, root, join(root, "forks"))).toThrow(/archive/);
+				expect(() => appendSessionInfoToExistingFile(path, "rename", agentDir)).toThrow(/archive/);
+				expect(() => appendSessionStateToExistingFile(path, { status: "crash" }, agentDir)).toThrow(/archive/);
+				expect(() =>
+					appendCustomMessageToExistingFile(path, "interruption", "notice", false, {}, agentDir),
+				).toThrow(/archive/);
+				for (const enabled of ["0", "1"])
+					expect(() => acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: enabled })).toThrow(
+						/archive/,
 					);
-				const parentAlias = join(root, "parent-alias");
-				const fileAlias = join(sessions, "alias.jsonl");
-				symlinkSync(archiveDir, parentAlias);
-				symlinkSync(archive, fileAlias);
-				const before = existsSync(archive) ? readFileSync(archive) : undefined;
-				const listing = readdirSync(archiveDir);
-				const manager = SessionManager.inMemory(root);
-				for (const path of [archive, relative(process.cwd(), archive), fileAlias, join(parentAlias, "0.jsonl")]) {
-					expect(() => SessionManager.open(path, join(root, "must-not-create"))).toThrow(/archive/);
-					await expect(SessionManager.openAsync(path)).rejects.toThrow(/archive/);
-					expect(() => manager.setSessionFile(path)).toThrow(/archive/);
-					expect(() => SessionManager.forkFrom(path, root, join(root, "forks"))).toThrow(/archive/);
-					expect(() => appendSessionInfoToExistingFile(path, "rename", agentDir)).toThrow(/archive/);
-					expect(() => appendSessionStateToExistingFile(path, { status: "crash" }, agentDir)).toThrow(/archive/);
-					expect(() =>
-						appendCustomMessageToExistingFile(path, "interruption", "notice", false, {}, agentDir),
-					).toThrow(/archive/);
-					for (const enabled of ["0", "1"])
-						expect(() => acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: enabled })).toThrow(
-							/archive/,
-						);
-					expect(await readSessionInfo(path)).toBeNull();
-				}
-				expect(() => SessionManager.create(root, archiveDir)).toThrow(/archive/);
-				expect(() => SessionManager.continueRecent(root, archiveDir)).toThrow(/archive/);
-				expect(() => manager.materializeSessionFile(archiveDir)).toThrow(/archive/);
-				const normal = join(sessions, "normal.jsonl");
-				const child = join(root, "session-artifacts", "root", "sub-deadbeef", "child.jsonl");
-				const header = `${JSON.stringify({ type: "session", version: 3, id: "normal", timestamp: "2026-11-02", cwd: root })}\n`;
-				writeFileSync(normal, header);
-				expect(() => SessionManager.forkFrom(normal, root, join(archiveDir, "must-not-create"))).toThrow(/archive/);
-				expect(existsSync(join(archiveDir, "must-not-create"))).toBe(false);
-				mkdirSync(join(child, ".."), { recursive: true });
-				writeFileSync(child, header);
-				expect(await findAgentTraceFiles(sessions)).toEqual([normal, child].sort());
-				expect(await findAgentTraceFiles(archiveDir)).toEqual([]);
-				expect(loadContextTreeChildFromDisk(archiveDir, () => 1000)).toBeUndefined();
-				await expect(SessionManager.listAll(undefined, archiveDir)).resolves.toEqual([]);
-				expect(findMostRecentSessionForCwd(archiveDir, root)).toBeNull();
-				expect(existsSync(agentDir)).toBe(false);
-				expect(existsSync(join(root, "must-not-create"))).toBe(false);
-				expect(existsSync(join(root, "forks"))).toBe(false);
-				expect(readdirSync(archiveDir)).toEqual(listing);
-				if (before) expect(readFileSync(archive).equals(before)).toBe(true);
-				else expect(existsSync(archive)).toBe(false);
-			} finally {
-				rmSync(root, { recursive: true, force: true });
+				expect(await readSessionInfo(path)).toBeNull();
 			}
+			expect(() => SessionManager.create(root, archiveDir)).toThrow(/archive/);
+			expect(() => SessionManager.continueRecent(root, archiveDir)).toThrow(/archive/);
+			expect(() => manager.materializeSessionFile(archiveDir)).toThrow(/archive/);
+			const normal = join(sessions, "normal.jsonl");
+			const child = join(root, "session-artifacts", "root", "sub-deadbeef", "child.jsonl");
+			const header = `${JSON.stringify({ type: "session", version: 3, id: "normal", timestamp: "2026-11-02", cwd: root })}\n`;
+			writeFileSync(normal, header);
+			expect(() => SessionManager.forkFrom(normal, root, join(archiveDir, "must-not-create"))).toThrow(/archive/);
+			expect(existsSync(join(archiveDir, "must-not-create"))).toBe(false);
+			mkdirSync(join(child, ".."), { recursive: true });
+			writeFileSync(child, header);
+			expect(await findAgentTraceFiles(sessions)).toEqual([normal, child].sort());
+			expect(await findAgentTraceFiles(archiveDir)).toEqual([]);
+			expect(loadContextTreeChildFromDisk(archiveDir, () => 1000)).toBeUndefined();
+			await expect(SessionManager.listAll(undefined, archiveDir)).resolves.toEqual([]);
+			expect(findMostRecentSessionForCwd(archiveDir, root)).toBeNull();
+			expect(existsSync(agentDir)).toBe(false);
+			expect(existsSync(join(root, "must-not-create"))).toBe(false);
+			expect(existsSync(join(root, "forks"))).toBe(false);
+			expect(readdirSync(archiveDir)).toEqual(listing);
+			if (before) expect(readFileSync(archive).equals(before)).toBe(true);
+			else expect(existsSync(archive)).toBe(false);
 		},
 	);
 });
@@ -958,23 +949,20 @@ function lookupFixture(directory: string, count: number) {
 	const lease = acquireSessionLease(manager.getSessionFile()!, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
 	bindSessionWriterLease(manager, lease);
 	let keep = "";
-	try {
-		for (let segment = 0; segment < 2; segment++) {
-			manager.appendMessage({
-				role: "toolResult",
-				toolCallId: "pad",
-				toolName: "fixture",
-				content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
-				isError: false,
-				timestamp: 1,
-			});
-			keep = manager.appendMessage(userMsg("keep"));
-			manager.appendMessage(assistantMsg("answer"));
-			const compact = manager.appendCompaction("summary", keep, 100);
-			expect(manager.rotateAfterCompaction(compact, agentDir).status).toBe("rotated");
-		}
-	} finally {
-		lease?.release();
+	onTestFinished(() => lease?.release());
+	for (let segment = 0; segment < 2; segment++) {
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "pad",
+			toolName: "fixture",
+			content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
+			isError: false,
+			timestamp: 1,
+		});
+		keep = manager.appendMessage(userMsg("keep"));
+		manager.appendMessage(assistantMsg("answer"));
+		const compact = manager.appendCompaction("summary", keep, 100);
+		expect(manager.rotateAfterCompaction(compact, agentDir).status).toBe("rotated");
 	}
 	return { path: manager.getSessionFile()!, id: manager.getSessionId(), first: ids[0], last: ids.at(-1)!, keep };
 }
@@ -983,6 +971,7 @@ describe("bounded lookup work", () => {
 		"visits relevant ancestry linearly through two segments and fork-of-fork (%i entries)",
 		(size) => {
 			const directory = mkdtempSync(join(tmpdir(), "lookup-work-"));
+			onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
 			const parse = JSON.parse;
 			let visits = 0,
 				restartParses = 0;
@@ -1003,8 +992,6 @@ describe("bounded lookup work", () => {
 								Object.defineProperty(value, "parentId", {
 									value: v,
 									writable: true,
-									enumerable: true,
-									configurable: true,
 								});
 							},
 						});
@@ -1012,72 +999,65 @@ describe("bounded lookup work", () => {
 				}
 				return value;
 			});
-			try {
-				const f = lookupFixture(directory, size);
-				const first = SessionManager.forkFrom(f.path, directory, join(directory, "fork1"));
-				const second = SessionManager.forkFrom(first.getSessionFile()!, directory, join(directory, "fork2"));
-				const cold = SessionManager.open(second.getSessionFile()!);
-				visits = 0;
-				restartParses = 0;
-				fullReadCounter.archiveReads = 0;
-				fullReadCounter.archiveStats = 0;
-				expect(cold.isEntryOnBranch(f.first)).toBe(true);
-				expect(visits).toBeLessThan(size * 40);
-				expect(restartParses).toBeLessThan(30);
-				expect(fullReadCounter.archiveReads).toBe(2);
-				expect(fullReadCounter.archiveStats).toBe(2);
-				const coldWork = {
-					visits,
-					restartParses,
-					archiveReads: fullReadCounter.archiveReads,
-					archiveStats: fullReadCounter.archiveStats,
-				};
-				visits = 0;
-				restartParses = 0;
-				fullReadCounter.archiveReads = 0;
-				fullReadCounter.archiveStats = 0;
-				expect(cold.isEntryOnBranch(f.last)).toBe(true);
-				expect(visits).toBe(0);
-				expect(restartParses).toBe(0);
-				expect(fullReadCounter.archiveReads).toBe(0);
-				expect(fullReadCounter.archiveStats).toBe(2);
-				const local = cold.appendCustomEntry("local", {});
-				expect(cold.isEntryOnBranch(local)).toBe(true);
-				cold.branch(f.keep);
-				expect(cold.isEntryOnBranch(local)).toBe(false);
-				const branch = cold.appendCustomEntry("other branch", {});
-				expect(SessionManager.open(second.getSessionFile()!).isEntryOnBranch(branch)).toBe(true);
-				const later = first.appendCustomEntry("after cutoff", {});
-				expect(cold.isEntryOnBranch(later)).toBe(false);
-				expect(cold.isEntryOnBranch(f.first)).toBe(true);
-				console.log(
-					`lookup-work size=${size} cold=${JSON.stringify(coldWork)} bound=${size * 40} warm_visits=0 archives_per_operation=2`,
-				);
-			} finally {
-				parser.mockRestore();
-				rmSync(directory, { recursive: true, force: true });
-			}
+			onTestFinished(() => parser.mockRestore());
+			const f = lookupFixture(directory, size);
+			const first = SessionManager.forkFrom(f.path, directory, join(directory, "fork1"));
+			const second = SessionManager.forkFrom(first.getSessionFile()!, directory, join(directory, "fork2"));
+			const cold = SessionManager.open(second.getSessionFile()!);
+			visits = 0;
+			restartParses = 0;
+			fullReadCounter.archiveReads = 0;
+			fullReadCounter.archiveStats = 0;
+			expect(cold.isEntryOnBranch(f.first)).toBe(true);
+			expect(visits).toBeLessThan(size * 40);
+			expect(restartParses).toBeLessThan(30);
+			expect(fullReadCounter.archiveReads).toBe(2);
+			expect(fullReadCounter.archiveStats).toBe(2);
+			const coldWork = {
+				visits,
+				restartParses,
+				archiveReads: fullReadCounter.archiveReads,
+				archiveStats: fullReadCounter.archiveStats,
+			};
+			visits = 0;
+			restartParses = 0;
+			fullReadCounter.archiveReads = 0;
+			fullReadCounter.archiveStats = 0;
+			expect(cold.isEntryOnBranch(f.last)).toBe(true);
+			expect(visits).toBe(0);
+			expect(restartParses).toBe(0);
+			expect(fullReadCounter.archiveReads).toBe(0);
+			expect(fullReadCounter.archiveStats).toBe(2);
+			const local = cold.appendCustomEntry("local", {});
+			expect(cold.isEntryOnBranch(local)).toBe(true);
+			cold.branch(f.keep);
+			expect(cold.isEntryOnBranch(local)).toBe(false);
+			const branch = cold.appendCustomEntry("other branch", {});
+			expect(SessionManager.open(second.getSessionFile()!).isEntryOnBranch(branch)).toBe(true);
+			const later = first.appendCustomEntry("after cutoff", {});
+			expect(cold.isEntryOnBranch(later)).toBe(false);
+			expect(cold.isEntryOnBranch(f.first)).toBe(true);
+			console.log(
+				`lookup-work size=${size} cold=${JSON.stringify(coldWork)} bound=${size * 40} warm_visits=0 archives_per_operation=2`,
+			);
 		},
 	);
 	it.each(["missing", "corrupt"])("returns active hits with no archive I/O when archives are %s", (kind) => {
 		const directory = mkdtempSync(join(tmpdir(), "active-hit-"));
-		try {
-			const f = lookupFixture(directory, 20);
-			const manager = SessionManager.open(f.path);
-			const archive = sessionArchivePath(f.path, f.id, 0);
-			if (kind === "missing") rmSync(archive);
-			else writeFileSync(archive, "corrupt");
-			fullReadCounter.archiveReads = 0;
-			fullReadCounter.archiveStats = 0;
-			expect(manager.getEntry(f.keep)?.id).toBe(f.keep);
-			expect(manager.isEntryOnBranch(f.keep)).toBe(true);
-			expect(fullReadCounter.archiveReads).toBe(0);
-			expect(fullReadCounter.archiveStats).toBe(0);
-			expect(() => manager.getEntry(f.first)).toThrow(/archive/);
-			expect(() => manager.isEntryOnBranch(f.first)).toThrow(/archive/);
-			expect(() => manager.createBranchedSession(manager.getLeafId()!)).toThrow(/archive/);
-		} finally {
-			rmSync(directory, { recursive: true, force: true });
-		}
+		onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+		const f = lookupFixture(directory, 20);
+		const manager = SessionManager.open(f.path);
+		const archive = sessionArchivePath(f.path, f.id, 0);
+		if (kind === "missing") rmSync(archive);
+		else writeFileSync(archive, "corrupt");
+		fullReadCounter.archiveReads = 0;
+		fullReadCounter.archiveStats = 0;
+		expect(manager.getEntry(f.keep)?.id).toBe(f.keep);
+		expect(manager.isEntryOnBranch(f.keep)).toBe(true);
+		expect(fullReadCounter.archiveReads).toBe(0);
+		expect(fullReadCounter.archiveStats).toBe(0);
+		expect(() => manager.getEntry(f.first)).toThrow(/archive/);
+		expect(() => manager.isEntryOnBranch(f.first)).toThrow(/archive/);
+		expect(() => manager.createBranchedSession(manager.getLeafId()!)).toThrow(/archive/);
 	});
 });

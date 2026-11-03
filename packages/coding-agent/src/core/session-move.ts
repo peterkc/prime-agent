@@ -56,11 +56,13 @@ import {
 } from "./session-rotation-state.js";
 
 import {
+	assertSessionArchiveOwnerAvailable,
 	canonicalStoragePath,
 	isDisposableSessionArchiveFile,
 	isRotatableSessionId,
 	isSessionArchivePath,
 	requireActiveSessionPath,
+	sessionArchiveOwnerId,
 	sessionArchivePath,
 } from "./session-storage-paths.js";
 
@@ -521,6 +523,10 @@ function copyArtifacts(source: string, target: string): void {
 
 function archiveMoveFor(paths: SessionMovePaths, header: SessionHeader): SessionArchiveMove | undefined {
 	if (!header.rotation?.archives.length && !header.rotation?.parent) return undefined;
+	if (sessionArchiveOwnerId(paths.sourceFile) !== header.id)
+		throw new Error(
+			"Cannot move session: transcript filename is not the archive owner; it depends on another transcript's archives",
+		);
 	loadEntriesFromBuffer(readFileSync(paths.sourceFile));
 	const source = dirname(sessionArchivePath(paths.sourceFile, paths.sessionId, 0));
 	const target = dirname(sessionArchivePath(paths.targetFile, paths.sessionId, 0));
@@ -567,6 +573,7 @@ function validateArchiveMove(journal: SessionMoveJournal): void {
 	const target = dirname(sessionArchivePath(journal.targetFile, journal.sessionId, 0));
 	if (
 		a.version !== 1 ||
+		sessionArchiveOwnerId(journal.sourceFile) !== journal.sessionId ||
 		a.source !== source ||
 		a.target !== target ||
 		dirname(a.temporary) !== dirname(target) ||
@@ -981,6 +988,7 @@ export async function relocateSession(options: {
 			throw new Error("Open the session once in its own repository first to upgrade it");
 		}
 		if ((header.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
+		assertSessionArchiveOwnerAvailable(paths.targetFile, header.id);
 		assertSessionMoveArtifacts(paths);
 		const archiveMove = archiveMoveFor(paths, header);
 		if (archiveMove) {

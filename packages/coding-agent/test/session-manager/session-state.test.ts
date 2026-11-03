@@ -8,10 +8,11 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { findAgentTraceFiles } from "../../src/core/agent-traces.js";
@@ -472,9 +473,7 @@ function rotationFixture(
 			padding,
 			compaction,
 			agentDir,
-			release() {
-				lease?.release();
-			},
+			release: () => lease?.release(),
 			bind(target: SessionManager) {
 				bindSessionWriterLease(target, lease);
 			},
@@ -486,6 +485,35 @@ function rotationFixture(
 	}
 }
 describe("rotation state", () => {
+	it("peterkc/prime-agent#60 keeps copies out of owner archives", () => {
+		const f = rotationFixture();
+		const original = readFileSync(f.path);
+		const legacy = join(f.manager.getSessionDir(), `2026-01-01_${f.manager.getSessionId()}.jsonl`);
+		symlinkSync("0-cycle.jsonl", join(f.manager.getSessionDir(), "0-cycle.jsonl"));
+		const incoming = join(f.directory, basename(f.path));
+		writeFileSync(incoming, original);
+		expect(() => SessionManager.assertImportEvidence(incoming, legacy)).toThrow(/archive owner/);
+		expect(() => SessionManager.assertImportEvidence(incoming, f.path)).not.toThrow();
+		expect(existsSync(legacy)).toBe(false);
+		expect(f.manager.rotateAfterCompaction(f.compaction, f.agentDir).status).toBe("rotated");
+		const archive = sessionArchivePath(f.path, f.manager.getSessionId(), 0);
+		const bytes = readFileSync(archive);
+		const path = join(f.manager.getSessionDir(), "session-export.jsonl");
+		writeFileSync(path, original);
+		const copy = SessionManager.open(path);
+		copy.appendCustomEntry("copy only", {});
+		const lease = acquireSessionLease(path, f.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+		onTestFinished(() => lease?.release());
+		bindSessionWriterLease(copy, lease);
+		const temporary = `${archive}.999999.11111111-1111-4111-8111-111111111111.tmp`;
+		writeFileSync(temporary, "owner temp");
+		copy.cleanupRotationTemps(f.agentDir);
+		const result = copy.rotateAfterCompaction(f.compaction, f.agentDir);
+		expect(readFileSync(archive).equals(bytes)).toBe(true);
+		expect(existsSync(temporary)).toBe(true);
+		expect(result).toMatchObject({ status: "skipped", reason: expect.stringContaining("filename") });
+	});
+
 	it("preserves an original ID named __proto__ in the persisted ancestry map", () => {
 		const fixture = rotationFixture();
 		const compaction = fixture.manager.getEntry(fixture.compaction);
@@ -644,58 +672,54 @@ describe("rotation state", () => {
 		(condition) => {
 			const fixture = rotationFixture();
 			const error = vi.spyOn(console, "error").mockImplementation(() => {});
-			try {
-				const { manager, path, agentDir } = fixture;
-				if (condition === "equal" || condition === "below") {
-					const entries = manager.getEntries();
-					const big = entries.find((entry) => entry.id === fixture.padding)!;
-					if (big.type !== "message" || (big.message.role !== "assistant" && big.message.role !== "toolResult"))
-						throw new Error("fixture assistant missing");
-					big.message.content = [];
-					manager.appendCustomEntry("padding", { value: "" });
-					const raw = `${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-					// The actual file size, not a mocked stat, exercises both sides of the limit.
-					const replaced = raw.replace(
-						'"value":""',
-						`"value":"${"x".repeat(SESSION_ROTATION_THRESHOLD_BYTES - raw.length - (condition === "below" ? 1 : 0))}"`,
-					);
-					writeFileSync(path, replaced);
-				}
-				if (condition === "unknown")
-					appendFileSync(
-						path,
-						`${JSON.stringify({ type: "future_top_level", id: "unknown", parentId: fixture.compaction, timestamp: "2026-11-02" })}\n`,
-					);
-				if (condition === "nonshrinking") {
-					const big = manager.getEntry(fixture.padding)!;
-					if (big.type !== "message" || (big.message.role !== "assistant" && big.message.role !== "toolResult"))
-						throw new Error("fixture assistant missing");
-					big.message.content = [];
-					manager.appendCustomEntry("huge_state", { value: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) });
-					writeFileSync(
-						path,
-						`${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-					);
-				}
-				if (condition.startsWith("negative")) {
-					const assistant = manager.getEntry(fixture.assistant);
-					if (assistant?.type !== "message" || assistant.message.role !== "assistant")
-						throw new Error("assistant");
-					if (condition === "negative-tokens") assistant.message.usage.input = -1;
-					else assistant.message.usage.cost.total = -1;
-					writeFileSync(path, serializeSessionEntries([manager.getHeader()!, ...manager.getEntries()]));
-				}
-				const opened = SessionManager.open(path);
-				if (condition !== "unbound") fixture.bind(opened);
-				const bytes = readFileSync(path);
-				const result = opened.rotateAfterCompaction(fixture.compaction, agentDir);
-				expect(result.status).not.toBe("rotated");
-				expect(readFileSync(path).equals(bytes)).toBe(true);
-				expect(existsSync(join(manager.getSessionDir(), "archive"))).toBe(false);
-				if (condition === "unbound") expect(error).toHaveBeenCalledWith(expect.stringContaining("lease"));
-			} finally {
-				error.mockRestore();
+			onTestFinished(() => error.mockRestore());
+			const { manager, path, agentDir } = fixture;
+			if (condition === "equal" || condition === "below") {
+				const entries = manager.getEntries();
+				const big = entries.find((entry) => entry.id === fixture.padding)!;
+				if (big.type !== "message" || (big.message.role !== "assistant" && big.message.role !== "toolResult"))
+					throw new Error("fixture assistant missing");
+				big.message.content = [];
+				manager.appendCustomEntry("padding", { value: "" });
+				const raw = `${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+				// The actual file size, not a mocked stat, exercises both sides of the limit.
+				const replaced = raw.replace(
+					'"value":""',
+					`"value":"${"x".repeat(SESSION_ROTATION_THRESHOLD_BYTES - raw.length - (condition === "below" ? 1 : 0))}"`,
+				);
+				writeFileSync(path, replaced);
 			}
+			if (condition === "unknown")
+				appendFileSync(
+					path,
+					`${JSON.stringify({ type: "future_top_level", id: "unknown", parentId: fixture.compaction, timestamp: "2026-11-02" })}\n`,
+				);
+			if (condition === "nonshrinking") {
+				const big = manager.getEntry(fixture.padding)!;
+				if (big.type !== "message" || (big.message.role !== "assistant" && big.message.role !== "toolResult"))
+					throw new Error("fixture assistant missing");
+				big.message.content = [];
+				manager.appendCustomEntry("huge_state", { value: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) });
+				writeFileSync(
+					path,
+					`${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+				);
+			}
+			if (condition.startsWith("negative")) {
+				const assistant = manager.getEntry(fixture.assistant);
+				if (assistant?.type !== "message" || assistant.message.role !== "assistant") throw new Error("assistant");
+				if (condition === "negative-tokens") assistant.message.usage.input = -1;
+				else assistant.message.usage.cost.total = -1;
+				writeFileSync(path, serializeSessionEntries([manager.getHeader()!, ...manager.getEntries()]));
+			}
+			const opened = SessionManager.open(path);
+			if (condition !== "unbound") fixture.bind(opened);
+			const bytes = readFileSync(path);
+			const result = opened.rotateAfterCompaction(fixture.compaction, agentDir);
+			expect(result.status).not.toBe("rotated");
+			expect(readFileSync(path).equals(bytes)).toBe(true);
+			expect(existsSync(join(manager.getSessionDir(), "archive"))).toBe(false);
+			if (condition === "unbound") expect(error).toHaveBeenCalledWith(expect.stringContaining("lease"));
 		},
 	);
 	it.each(["archive-before", "archive-after", "active-before", "active-after"])(
@@ -724,32 +748,27 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 			const cold = SessionManager.open(fixture.path);
 			expect(cold.getHeader()?.rotation?.segment ?? 0).toBe(fault === "active-after" ? 1 : 0);
 			const lease = acquireSessionLease(fixture.path, fixture.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
-			try {
-				bindSessionWriterLease(cold, lease);
-				cold.cleanupRotationTemps(fixture.agentDir);
-				if (fault !== "active-after") {
-					const id = cold.appendCustomEntry("after failed rotation", { saved: true });
-					const authoritative = readFileSync(fixture.path);
-					const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
-					writeFileSync(archive, Buffer.alloc(authoritative.length, 120));
-					expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
-					expect(readFileSync(archive).equals(authoritative)).toBe(true);
-					expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
-				} else {
-					expect(readFileSync(sessionArchivePath(fixture.path, cold.getSessionId(), 0)).equals(original)).toBe(
-						true,
-					);
-					const id = cold.appendCustomEntry("after commit", {});
-					const bytes = readFileSync(fixture.path);
-					expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("skipped");
-					expect(readFileSync(fixture.path).equals(bytes)).toBe(true);
-					expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
-				}
-				for (const directory of [cold.getSessionDir(), join(cold.getSessionDir(), "archive", cold.getSessionId())])
-					expect(readdirSync(directory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
-			} finally {
-				lease?.release();
+			onTestFinished(() => lease?.release());
+			bindSessionWriterLease(cold, lease);
+			cold.cleanupRotationTemps(fixture.agentDir);
+			if (fault !== "active-after") {
+				const id = cold.appendCustomEntry("after failed rotation", { saved: true });
+				const authoritative = readFileSync(fixture.path);
+				const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
+				writeFileSync(archive, Buffer.alloc(authoritative.length, 120));
+				expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
+				expect(readFileSync(archive).equals(authoritative)).toBe(true);
+				expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
+			} else {
+				expect(readFileSync(sessionArchivePath(fixture.path, cold.getSessionId(), 0)).equals(original)).toBe(true);
+				const id = cold.appendCustomEntry("after commit", {});
+				const bytes = readFileSync(fixture.path);
+				expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("skipped");
+				expect(readFileSync(fixture.path).equals(bytes)).toBe(true);
+				expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
 			}
+			for (const directory of [cold.getSessionDir(), join(cold.getSessionDir(), "archive", cold.getSessionId())])
+				expect(readdirSync(directory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 		},
 	);
 	describe("segmented writers and exact lookup", () => {
@@ -878,18 +897,15 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 				throw new Error("injected lost publication response");
 			}
 		});
-		try {
-			expect(fixture.manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe(
-				"committed-with-warning",
-			);
-			const appended = fixture.manager.appendCustomEntry("next append", {});
-			expect(fixture.manager.getEntry(appended)?.parentId).toBe("s1-after-commit");
-			expect(SessionManager.open(fixture.path).getEntries()).toEqual(fixture.manager.getEntries());
-			expect(warning).toHaveBeenCalledTimes(1);
-		} finally {
-			writer.mockRestore();
-			warning.mockRestore();
-		}
+		onTestFinished(() => warning.mockRestore());
+		onTestFinished(() => writer.mockRestore());
+		expect(fixture.manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe(
+			"committed-with-warning",
+		);
+		const appended = fixture.manager.appendCustomEntry("next append", {});
+		expect(fixture.manager.getEntry(appended)?.parentId).toBe("s1-after-commit");
+		expect(SessionManager.open(fixture.path).getEntries()).toEqual(fixture.manager.getEntries());
+		expect(warning).toHaveBeenCalledTimes(1);
 	});
 	it.each([
 		"missing",
@@ -1095,11 +1111,8 @@ describe("bounded restart records", () => {
 		expect(readFileSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 1)).equals(archive1)).toBe(true);
 		expect(next.getEntry(a0)?.id).toBe(a0);
 		const reservation = acquireSessionDeleteLeases(paths.targetFile, agentDir);
-		try {
-			expect((await deleteSessionFile(paths.targetFile)).ok).toBe(true);
-		} finally {
-			reservation.release();
-		}
+		onTestFinished(() => reservation.release());
+		expect((await deleteSessionFile(paths.targetFile)).ok).toBe(true);
 		expect(existsSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 0))).toBe(false);
 		expect(() => next.getEntry(a0)).toThrow(/unavailable/);
 		expect(computeOwnAndTotalUsage(next.getBranch(), next.getEntries(), next.getHeader())).toEqual(expected);

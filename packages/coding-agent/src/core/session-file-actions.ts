@@ -14,8 +14,8 @@ import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotati
 import {
 	canonicalStoragePath,
 	isDisposableSessionArchiveFile,
-	isRotatableSessionId,
 	isSessionArchivePath,
+	sessionArchiveOwnerId,
 	sessionArchivePath,
 } from "./session-storage-paths.js";
 
@@ -156,8 +156,9 @@ export async function removeMovedSessionFile(sessionPath: string): Promise<Delet
 }
 
 function sessionEvidencePaths(sessionPath: string, header: SessionHeader | undefined): string[] {
-	if (!header || !isRotatableSessionId(header.id)) return [];
+	if (!header) return [];
 	const path = canonicalStoragePath(sessionPath);
+	if (sessionArchiveOwnerId(path) !== header.id) return [];
 	const archive = dirname(sessionArchivePath(path, header.id, 0));
 	const previous = header.previousSessionPaths ?? [];
 	if (!Array.isArray(previous) || new Set(previous).size !== previous.length)
@@ -258,8 +259,8 @@ export async function deleteSessionFile(
 		if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	if (!header && !existsSync(sessionPath)) {
-		const id = basename(sessionPath).replace(/\.jsonl$/, "");
-		if (isRotatableSessionId(id)) {
+		const id = sessionArchiveOwnerId(canonicalStoragePath(sessionPath));
+		if (id) {
 			try {
 				const archive = dirname(sessionArchivePath(sessionPath, id, 0));
 				if (existsSync(archive))

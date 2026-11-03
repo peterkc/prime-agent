@@ -37,6 +37,7 @@ import {
 	appendSessionInfoToExistingFile,
 	appendSessionStateToExistingFile,
 	type FileEntry,
+	getSessionArtifactPathForFile,
 	loadEntriesFromFile,
 	SessionManager,
 } from "../../src/core/session-manager.js";
@@ -730,6 +731,31 @@ const paths=JSON.parse(process.argv[1]);const result=await recoverSessionMove({.
 	) as { status: string; messages: string[] };
 }
 describe("archive lifecycle", () => {
+	it.each(["plain", "segmented", "collision"])(
+		"peterkc/prime-agent#60 preserves the archive owner (%s copy)",
+		async (kind) => {
+			const f = segmentedFixture();
+			noTrash();
+			const bytes = readFileSync(f.archive);
+			const path = join(f.paths.sourceSessionDir, "session-export.jsonl");
+			writeFileSync(path, kind === "segmented" ? readFileSync(f.paths.sourceFile) : bytes);
+			expect(() => SessionManager.assertImportEvidence(path, path)).not.toThrow();
+			const paths = sessionMovePaths({ ...f.paths, sourceFile: path });
+			if (!paths.ok) throw new Error(paths.reason);
+			const legacy = join(f.paths.targetSessionDir, `2026-01-01_${f.paths.sessionId}.jsonl`);
+			if (kind === "collision") writeFileSync(legacy, bytes);
+			if (kind !== "plain") {
+				const moved = await move({ ...f, paths: paths.value });
+				expect(moved.status).toBe("rolled_back");
+				expect(moved.messages.join(" ")).toContain("archive owner");
+				expect(existsSync(paths.value.journalPath) || existsSync(paths.value.targetFile)).toBe(false);
+			}
+			if (kind === "collision") expect(readFileSync(legacy)).toEqual(bytes);
+			expect((await deleteSessionFile(path)).ok).toBe(true);
+			expect(readFileSync(f.archive)).toEqual(bytes);
+			expect(existsSync(f.paths.sourceFile)).toBe(true);
+		},
+	);
 	it.each(["archive-before", "archive-after", "active-after", "redirect-before", "redirect-after"])(
 		"recovers a fresh process at %s without changing archive bytes or later appends",
 		async (point) => {
@@ -891,14 +917,23 @@ describe("archive lifecycle", () => {
 		"finder-file",
 		"late-failure",
 		"cleanup-once",
+		"legacy-late-failure",
+		"legacy-cleanup-once",
 		"redirect",
 		"missing-redirect",
 		"live-temp",
 	])(
 		"validates evidence before saved deletion and reports %s without removing another session archive",
-		async (state) => {
-			const f = segmentedFixture();
+		async (scenario) => {
+			const state = scenario.replace(/^legacy-/, "");
+			let f = segmentedFixture();
 			noTrash();
+			if (scenario.startsWith("legacy-")) {
+				const path = join(f.paths.sourceSessionDir, `2026-01-01_${f.paths.sessionId}.jsonl`);
+				renameSync(f.paths.sourceFile, path);
+				f = { ...f, paths: { ...f.paths, sourceFile: path } };
+			}
+			const artifacts = getSessionArtifactPathForFile(f.paths.sourceFile);
 			const other = join(dirname(dirname(f.archive)), "22222222-2222-4222-8222-222222222222");
 			mkdirSync(other);
 			writeFileSync(join(other, "0.jsonl"), "other");
@@ -906,8 +941,8 @@ describe("archive lifecycle", () => {
 			if (state === "dead-temp")
 				writeFileSync(join(dirname(f.archive), "2.jsonl.999999.11111111-1111-4111-8111-111111111111.tmp"), "torn");
 			if (state === "finder-file") writeFileSync(join(dirname(f.archive), ".DS_Store"), "finder");
-			mkdirSync(f.paths.sourceArtifacts, { recursive: true });
-			writeFileSync(join(f.paths.sourceArtifacts, "keep"), "artifact");
+			mkdirSync(artifacts, { recursive: true });
+			writeFileSync(join(artifacts, "keep"), "artifact");
 			if (state === "live-temp")
 				writeFileSync(`${f.archive}.${process.pid}.11111111-1111-4111-8111-111111111111.tmp`, "live");
 			if (state === "redirect" || state === "missing-redirect") {
@@ -959,7 +994,7 @@ describe("archive lifecycle", () => {
 				state,
 			);
 			expect(removed).toBe(!kept);
-			expect(existsSync(f.paths.sourceArtifacts)).toBe(kept);
+			expect(existsSync(artifacts)).toBe(kept);
 			expect(existsSync(f.archive)).toBe(kept || state === "late-failure" || state === "cleanup-once");
 			if (state === "late-failure" || state === "cleanup-once") {
 				const retried = await deleteSessionFile(f.paths.sourceFile);
@@ -986,7 +1021,7 @@ describe("archive lifecycle", () => {
 		expect((await connection.deleteSavedSession(f.paths.sourceFile)).ok).toBe(true);
 		expect(existsSync(f.archive)).toBe(false);
 	});
-	it.each(["digest", "identity", "incomplete", "path", "version"])(
+	it.each(["digest", "identity", "incomplete", "path", "version", "owner"])(
 		"keeps both archive sets when committed recovery cannot prove %s",
 		async (kind) => {
 			const f = segmentedFixture();
@@ -996,7 +1031,15 @@ describe("archive lifecycle", () => {
 			else if (kind === "identity") journal.archiveMove.identity = "0:0";
 			else if (kind === "incomplete") delete journal.archiveMove.sourceIdentity;
 			else if (kind === "path") journal.archiveMove.source = home;
-			else journal.archiveMove.version = 2;
+			else if (kind === "owner") {
+				const paths = sessionMovePaths({
+					...f.paths,
+					sourceFile: join(f.paths.sourceSessionDir, "session-copy.jsonl"),
+				});
+				if (!paths.ok) throw new Error(paths.reason);
+				Object.assign(journal, paths.value);
+				journal.archiveMove.previousPaths = [paths.value.sourceFile];
+			} else journal.archiveMove.version = 2;
 			writeFileSync(f.paths.journalPath, JSON.stringify(journal));
 			const before = readFileSync(f.paths.journalPath);
 			expect((await recoverFresh(f)).status).toBe("pending");
