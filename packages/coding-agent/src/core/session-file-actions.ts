@@ -12,6 +12,7 @@ import {
 import { getSessionArtifactPathForFile, type SessionHeader } from "./session-manager.js";
 import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotation-state.js";
 import {
+	assertSessionArchiveOwnerAvailable,
 	canonicalStoragePath,
 	isDisposableSessionArchiveFile,
 	isSessionArchivePath,
@@ -234,7 +235,10 @@ function sessionEvidencePaths(sessionPath: string, header: SessionHeader | undef
 async function deleteSessionEvidence(sessionPath: string, header: SessionHeader | undefined): Promise<void> {
 	for (const path of sessionEvidencePaths(sessionPath, header)) {
 		if (path.endsWith(".relocated")) await unlink(path);
-		else await rm(path, { recursive: true });
+		else {
+			assertSessionArchiveOwnerAvailable(sessionPath, header!.id);
+			await rm(path, { recursive: true });
+		}
 	}
 }
 
@@ -263,12 +267,14 @@ export async function deleteSessionFile(
 		if (id) {
 			try {
 				const archive = dirname(sessionArchivePath(sessionPath, id, 0));
-				if (existsSync(archive))
+				if (existsSync(archive)) {
+					assertSessionArchiveOwnerAvailable(sessionPath, id);
 					return { ok: false, error: `Session transcript missing; inspect archive orphan: ${archive}` };
+				}
 			} catch (error) {
 				return {
 					ok: false,
-					error: `Cannot inspect archive orphan: ${error instanceof Error ? error.message : String(error)}`,
+					error: `Cannot inspect archive orphan at ${join(dirname(sessionPath), "archive", id)}: ${error instanceof Error ? error.message : String(error)}`,
 				};
 			}
 		}

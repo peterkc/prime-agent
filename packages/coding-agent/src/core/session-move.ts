@@ -284,6 +284,11 @@ export async function preflightSessionMove(
 			(!("rlmDepth" in header) || !Number.isSafeInteger(header.rlmDepth) || Number(header.rlmDepth) < 0))
 	)
 		throw new Error("Open the session once in its own repository first to upgrade it");
+	const rotation = (header as SessionHeader).rotation;
+	if ((rotation?.archives.length || rotation?.parent) && sessionArchiveOwnerId(paths.sourceFile) !== header.id)
+		throw new Error(
+			"Cannot move session: transcript filename is not the archive owner; it depends on another transcript's archives",
+		);
 	const info = await readSessionInfo(paths.sourceFile);
 	if (!info) throw new Error(`Session not found: ${paths.sourceFile}`);
 	if ((info.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");

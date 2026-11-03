@@ -42,7 +42,7 @@ import { restartOf, serializeSessionEntries, withRotationRestart } from "../../s
 import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
 import { inactiveLifecycleForSession } from "../../src/modes/daemon/daemon-session-list.js";
 import * as atomicFile from "../../src/utils/atomic-file.js";
-import { createHarness, type Harness } from "../suite/harness.js";
+import { createHarness } from "../suite/harness.js";
 import { assistantMsg, userMsg } from "../utilities.js";
 
 describe("SessionManager session state", () => {
@@ -591,79 +591,73 @@ describe("rotation state", () => {
 				manager.appendCustomEntry("rlm_max_depth_state", { maxDepth: 99 });
 				manager.branch(activeLeaf);
 			}, goalStatus === "cleared");
-			const native: Harness[] = [];
 			vi.useFakeTimers({ toFake: ["Date"] });
+			onTestFinished(() => void vi.useRealTimers());
+			const { path, compaction, agentDir } = fixture;
+			const warmNative = await createHarness({ existingSessionFile: path, models: [{ id: "changed-model" }] });
+			onTestFinished(() => warmNative.cleanup());
+			const manager = warmNative.sessionManager;
+			fixture.bind(manager);
+			const state = manager.getEntries().filter((entry) => entry.type !== "message");
+			const context = manager.buildSessionContext();
+			const before = await SessionManager.listAll(undefined, manager.getSessionDir());
+			const usage = computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries());
+			expect(manager.rotateAfterCompaction(compaction, agentDir)).toEqual({ status: "rotated", segment: 1 });
+			const cold = SessionManager.open(path);
+			expect(cold.getEntries()).toEqual(manager.getEntries());
+			expect(cold.getLeafId()).toBe(manager.getLeafId());
+			expect(cold.buildSessionContext()).toEqual(context);
+			for (const entry of state) expect({ ...cold.getEntry(entry.id), parentId: entry.parentId }).toEqual(entry);
+			expect(cold.getEntries().filter((entry) => entry.type === "custom")).toEqual(
+				manager.getEntries().filter((entry) => entry.type === "custom"),
+			);
+			expect(computeOwnAndTotalUsage(cold.getBranch(), cold.getEntries(), cold.getHeader())).toEqual(usage);
+			const after = await SessionManager.listAll(undefined, manager.getSessionDir());
+			expect(after[0].usage).toEqual({
+				inputTokens: usage.ownUsage.input + usage.ownUsage.cacheRead + usage.ownUsage.cacheWrite,
+				outputTokens: usage.ownUsage.output,
+				cost: usage.ownUsage.cost.total,
+			});
+			if (goalStatus === "cleared")
+				expect(before[0].usage?.inputTokens).toBe(1); // Known base defect: oversized assistant usage is skipped.
+			else expect(before[0].usage).toEqual(after[0].usage);
+			expect({ ...after[0], usage: undefined, allMessagesText: undefined }).toEqual({
+				...before[0],
+				usage: undefined,
+				allMessagesText: undefined,
+			});
+			expect(after[0].allMessagesText).toBe("kept last reply");
+			const next = cold.appendCustomEntry("after", { action: "delta" });
+			expect(next).toMatch(/^s1-/);
+			expect(SessionManager.open(path).getEntries()).toEqual(cold.getEntries());
+			const coldNative = await createHarness({
+				existingSessionFile: path,
+				models: [{ id: "changed-model" }],
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+			});
+			onTestFinished(() => coldNative.cleanup());
+			expect(coldNative.session.goalState).toEqual(warmNative.session.goalState);
+			expect(coldNative.session.goalState).toMatchObject({
+				status: goalStatus === "cleared" ? "idle" : goalStatus,
+				tokensUsed: goalStatus === "cleared" ? 0 : 21,
+			});
+			for (const view of [coldNative, warmNative]) expect(view.session.rlmMaxDepth).toBe(4);
+			expect(coldNative.session.getOwnUsageSummary()).toEqual(warmNative.session.getOwnUsageSummary());
+			expect(coldNative.faux.state.callCount).toBe(0);
+			coldNative.sessionManager.appendMessage(userMsg("next turn"));
+			coldNative.sessionManager.appendMessage(assistantMsg("next reply"));
+			coldNative.session.agent.state.messages = coldNative.sessionManager.buildSessionContext().messages;
+			coldNative.setResponses([assistantMsg("next summary"), assistantMsg("next turn summary")]);
+			const inputPause = coldNative.session.acquireSessionInputPause();
 			try {
-				const { path, compaction, agentDir } = fixture;
-				const warmNative = await createHarness({ existingSessionFile: path, models: [{ id: "changed-model" }] });
-				native.push(warmNative);
-				const manager = warmNative.sessionManager;
-				fixture.bind(manager);
-				const state = manager.getEntries().filter((entry) => entry.type !== "message");
-				const context = manager.buildSessionContext();
-				const before = await SessionManager.listAll(undefined, manager.getSessionDir());
-				const usage = computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries());
-				expect(manager.rotateAfterCompaction(compaction, agentDir)).toEqual({ status: "rotated", segment: 1 });
-				const cold = SessionManager.open(path);
-				expect(cold.getEntries()).toEqual(manager.getEntries());
-				expect(cold.getLeafId()).toBe(manager.getLeafId());
-				expect(cold.buildSessionContext()).toEqual(context);
-				for (const entry of state) expect({ ...cold.getEntry(entry.id), parentId: entry.parentId }).toEqual(entry);
-				expect(cold.getEntries().filter((entry) => entry.type === "custom")).toEqual(
-					manager.getEntries().filter((entry) => entry.type === "custom"),
-				);
-				expect(computeOwnAndTotalUsage(cold.getBranch(), cold.getEntries(), cold.getHeader())).toEqual(usage);
-				const after = await SessionManager.listAll(undefined, manager.getSessionDir());
-				expect(after[0].usage).toEqual({
-					inputTokens: usage.ownUsage.input + usage.ownUsage.cacheRead + usage.ownUsage.cacheWrite,
-					outputTokens: usage.ownUsage.output,
-					cost: usage.ownUsage.cost.total,
-				});
-				if (goalStatus === "cleared")
-					expect(before[0].usage?.inputTokens).toBe(1); // Known base defect: oversized assistant usage is skipped.
-				else expect(before[0].usage).toEqual(after[0].usage);
-				expect({ ...after[0], usage: undefined, allMessagesText: undefined }).toEqual({
-					...before[0],
-					usage: undefined,
-					allMessagesText: undefined,
-				});
-				expect(after[0].allMessagesText).toBe("kept last reply");
-				const next = cold.appendCustomEntry("after", { action: "delta" });
-				expect(next).toMatch(/^s1-/);
-				expect(SessionManager.open(path).getEntries()).toEqual(cold.getEntries());
-				const coldNative = await createHarness({
-					existingSessionFile: path,
-					models: [{ id: "changed-model" }],
-					settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
-				});
-				native.push(coldNative);
+				await coldNative.session.compact();
 				expect(coldNative.session.goalState).toEqual(warmNative.session.goalState);
-				expect(coldNative.session.goalState).toMatchObject({
-					status: goalStatus === "cleared" ? "idle" : goalStatus,
-					tokensUsed: goalStatus === "cleared" ? 0 : 21,
-				});
 				expect(coldNative.session.rlmMaxDepth).toBe(4);
-				expect(warmNative.session.rlmMaxDepth).toBe(4);
-				expect(coldNative.session.getOwnUsageSummary()).toEqual(warmNative.session.getOwnUsageSummary());
-				expect(coldNative.faux.state.callCount).toBe(0);
-				coldNative.sessionManager.appendMessage(userMsg("next turn"));
-				coldNative.sessionManager.appendMessage(assistantMsg("next reply"));
-				coldNative.session.agent.state.messages = coldNative.sessionManager.buildSessionContext().messages;
-				coldNative.setResponses([assistantMsg("next summary"), assistantMsg("next turn summary")]);
-				const inputPause = coldNative.session.acquireSessionInputPause();
-				try {
-					await coldNative.session.compact();
-					expect(coldNative.session.goalState).toEqual(warmNative.session.goalState);
-					expect(coldNative.session.rlmMaxDepth).toBe(4);
-					expect(coldNative.sessionManager.getEntries().at(-1)?.id).toMatch(/^s1-/);
-					expect(SessionManager.open(path).getEntries()).toEqual(coldNative.sessionManager.getEntries());
-				} finally {
-					coldNative.session.dispose();
-					inputPause.release();
-				}
+				expect(coldNative.sessionManager.getEntries().at(-1)?.id).toMatch(/^s1-/);
+				expect(SessionManager.open(path).getEntries()).toEqual(coldNative.sessionManager.getEntries());
 			} finally {
-				for (const harness of native.reverse()) harness.cleanup();
-				vi.useRealTimers();
+				coldNative.session.dispose();
+				inputPause.release();
 			}
 		},
 	);
@@ -755,7 +749,17 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 				const id = cold.appendCustomEntry("after failed rotation", { saved: true });
 				const authoritative = readFileSync(fixture.path);
 				const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
-				writeFileSync(archive, Buffer.alloc(authoritative.length, 120));
+				const differing = Buffer.alloc(authoritative.length, 120);
+				writeFileSync(archive, differing);
+				expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir)).toMatchObject({
+					status: "failed",
+					step: "archive publication",
+					reason: expect.stringContaining("Existing archive segment differs"),
+				});
+				expect(readFileSync(archive).equals(differing) && readFileSync(fixture.path).equals(authoritative)).toBe(
+					true,
+				);
+				writeFileSync(archive, authoritative);
 				expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
 				expect(readFileSync(archive).equals(authoritative)).toBe(true);
 				expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
@@ -838,8 +842,7 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 					expect(preview).toMatch(/^(漢😀)*漢?$/u);
 				}
 				if (forkKind === "forkFrom") {
-					expect(fork.getEntry(archivedLabel)).toEqual(source.getEntry(archivedLabel));
-					expect(fork.getEntry(label)).toEqual(source.getEntry(label));
+					for (const id of [archivedLabel, label]) expect(fork.getEntry(id)).toEqual(source.getEntry(id));
 					expect(fork.getEntry(label)?.parentId).toBe(first);
 					for (const target of [first, label])
 						expect(() => fork.assertRestorableContext(target)).toThrow(/archived ancestry/);

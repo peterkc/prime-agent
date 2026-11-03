@@ -1006,8 +1006,7 @@ describe("bounded lookup work", () => {
 			const cold = SessionManager.open(second.getSessionFile()!);
 			visits = 0;
 			restartParses = 0;
-			fullReadCounter.archiveReads = 0;
-			fullReadCounter.archiveStats = 0;
+			Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
 			expect(cold.isEntryOnBranch(f.first)).toBe(true);
 			expect(visits).toBeLessThan(size * 40);
 			expect(restartParses).toBeLessThan(30);
@@ -1021,8 +1020,7 @@ describe("bounded lookup work", () => {
 			};
 			visits = 0;
 			restartParses = 0;
-			fullReadCounter.archiveReads = 0;
-			fullReadCounter.archiveStats = 0;
+			Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
 			expect(cold.isEntryOnBranch(f.last)).toBe(true);
 			expect(visits).toBe(0);
 			expect(restartParses).toBe(0);
@@ -1050,8 +1048,7 @@ describe("bounded lookup work", () => {
 		const archive = sessionArchivePath(f.path, f.id, 0);
 		if (kind === "missing") rmSync(archive);
 		else writeFileSync(archive, "corrupt");
-		fullReadCounter.archiveReads = 0;
-		fullReadCounter.archiveStats = 0;
+		Object.assign(fullReadCounter, { archiveReads: 0, archiveStats: 0 });
 		expect(manager.getEntry(f.keep)?.id).toBe(f.keep);
 		expect(manager.isEntryOnBranch(f.keep)).toBe(true);
 		expect(fullReadCounter.archiveReads).toBe(0);

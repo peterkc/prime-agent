@@ -23,6 +23,8 @@ After a successful compaction, a persisted active log above 32 * 1024 * 1024 byt
 
 Archive ownership belongs to a transcript named `<sessionId>.jsonl` or legacy `<timestamp>_<sessionId>.jsonl`. An imported copy with another filename keeps its ID and can read available evidence, but never rotates or cleans the owner's archives. A move of that copy with committed evidence refuses before writing; move the owning transcript instead. Import and move refuse a second owner-name transcript for the same ID in the destination. Replacing the existing destination pathname stays allowed.
 
+Sessions at explicit filenames that do not embed their UUID, such as `--resume ./work.jsonl` or an SDK-chosen name, compact normally but do not rotate. A rotation attempt prints a skip diagnostic.
+
 Prior bytes stay in `archive/<sessionId>/<segment>.jsonl` beside the active log. Archives are read-only evidence, not sessions. Open, resume, fork, metadata writes, leases, move and delete reject archive paths, including symlink aliases. Session pickers and `/tree` show active history only. Exact entry lookup and logical branch membership can still resolve committed archived entries without adding that text to model context.
 
 The complete header stays below 64 KiB, including its newline, at every rotation, fork, move and rewrite. Cut edges, first-message preview and per-assistant accounting use versioned records directly after the header. Each record stays below 1 MiB. A count and SHA-256 witness commits the whole record prefix, including an explicit empty set. Full loaders reject missing or corrupt restart records before ordinary repair. Header-only selectors and fast metadata appends check the witness shape without loading archives.

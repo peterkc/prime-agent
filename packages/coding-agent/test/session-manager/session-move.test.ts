@@ -43,6 +43,7 @@ import {
 } from "../../src/core/session-manager.js";
 import {
 	acquireSessionMoveLeases,
+	preflightSessionMove,
 	recoverSessionMove,
 	relocateSession,
 	rollbackSessionMove,
@@ -744,6 +745,7 @@ describe("archive lifecycle", () => {
 			if (!paths.ok) throw new Error(paths.reason);
 			const legacy = join(f.paths.targetSessionDir, `2026-01-01_${f.paths.sessionId}.jsonl`);
 			if (kind === "collision") writeFileSync(legacy, bytes);
+			if (kind === "segmented") await expect(preflightSessionMove(paths.value)).rejects.toThrow(/archive owner/);
 			if (kind !== "plain") {
 				const moved = await move({ ...f, paths: paths.value });
 				expect(moved.status).toBe("rolled_back");
@@ -919,6 +921,8 @@ describe("archive lifecycle", () => {
 		"cleanup-once",
 		"legacy-late-failure",
 		"legacy-cleanup-once",
+		"owner-original",
+		"owner-backup",
 		"redirect",
 		"missing-redirect",
 		"live-temp",
@@ -933,6 +937,13 @@ describe("archive lifecycle", () => {
 				renameSync(f.paths.sourceFile, path);
 				f = { ...f, paths: { ...f.paths, sourceFile: path } };
 			}
+			const duplicate = state.startsWith("owner-");
+			if (duplicate) {
+				const path = join(f.paths.sourceSessionDir, `backup_${f.paths.sessionId}.jsonl`);
+				writeFileSync(path, readFileSync(f.paths.sourceFile));
+				if (state === "owner-backup") f = { ...f, paths: { ...f.paths, sourceFile: path } };
+			}
+			const incomplete = duplicate || ["late-failure", "cleanup-once"].includes(state);
 			const artifacts = getSessionArtifactPathForFile(f.paths.sourceFile);
 			const other = join(dirname(dirname(f.archive)), "22222222-2222-4222-8222-222222222222");
 			mkdirSync(other);
@@ -975,17 +986,18 @@ describe("archive lifecycle", () => {
 					},
 				});
 				const refused = ["cleanup-failure", "cleanup-json", "redirect", "live-temp"].includes(state);
-				expect(result.ok).toBe(!refused && !["transcript-failure", "late-failure", "cleanup-once"].includes(state));
+				expect(result.ok).toBe(!refused && state !== "transcript-failure" && !incomplete);
 				if (refused) expect(readFileSync(f.paths.sourceFile).equals(sourceBytes)).toBe(true);
 				if (!result.ok) {
 					expect(result.error).toMatch(
 						state === "transcript-failure"
 							? /unlink refused/
-							: ["late-failure", "cleanup-once"].includes(state)
+							: incomplete
 								? /transcript removed; cleanup incomplete/
 								: /Cannot delete/,
 					);
 					if (state !== "transcript-failure") expect(result.error).toContain(dirname(f.archive));
+					if (duplicate) expect(result.error).toContain("archive owner");
 				}
 			} finally {
 				reservation.release();
@@ -995,10 +1007,12 @@ describe("archive lifecycle", () => {
 			);
 			expect(removed).toBe(!kept);
 			expect(existsSync(artifacts)).toBe(kept);
-			expect(existsSync(f.archive)).toBe(kept || state === "late-failure" || state === "cleanup-once");
-			if (state === "late-failure" || state === "cleanup-once") {
+			expect(existsSync(f.archive)).toBe(kept || incomplete);
+			if (incomplete) {
+				expect(readFileSync(f.archive)).toEqual(before);
 				const retried = await deleteSessionFile(f.paths.sourceFile);
 				expect(retried).toMatchObject({ ok: false, error: expect.stringContaining(dirname(f.archive)) });
+				if (duplicate) expect(retried).toMatchObject({ error: expect.stringContaining("archive owner") });
 				expect(existsSync(f.archive)).toBe(true);
 			}
 			expect(readFileSync(join(other, "0.jsonl"), "utf8")).toBe("other");

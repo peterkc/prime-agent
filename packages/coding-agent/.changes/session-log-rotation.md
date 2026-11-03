@@ -1,4 +1,5 @@
 - Added automatic session-log rotation after successful compaction above 32 MiB, preserving the session identity, restart state and read-only access to archived entries.
 - Kept custom non-UUID SDK sessions on their existing compaction path with a visible rotation-skip diagnostic.
+- Documented that explicit filenames without the session UUID, such as `--resume ./work.jsonl` or SDK-chosen names, compact normally but do not rotate. A rotation attempt prints a skip diagnostic.
 - Kept segmented headers and restart records bounded, preserved branch-aware accounting without archive reads, and rejected archived tree and fork targets before requests.
 - Fixed archive ownership so imported copies cannot overwrite or remove another session's archived evidence.

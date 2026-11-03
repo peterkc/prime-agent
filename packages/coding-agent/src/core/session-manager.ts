@@ -3121,6 +3121,8 @@ export class SessionManager {
 				beforeRename: (temp) => {
 					chownSync(temp, metadata.uid, metadata.gid);
 					if (!readFileSync(temp).equals(original)) throw new Error("Archive bytes differ before publication");
+					if (existsSync(archivePath) && !readFileSync(archivePath).equals(original))
+						throw new Error(`Existing archive segment differs; publication refused: ${archivePath}`);
 				},
 			});
 			step = "active publication";
