@@ -850,8 +850,7 @@ describe("archive lifecycle", () => {
 			const connection = Object.create(InProcessAgentConnection.prototype) as InProcessAgentConnection;
 			Reflect.set(connection, "runtimeHost", { services: { agentDir: f.paths.agentDir } });
 			expect((await connection.deleteSavedSession(f.paths.targetFile)).ok).toBe(true);
-			expect(existsSync(`${f.paths.sourceFile}.relocated`)).toBe(false);
-			expect(existsSync(`${originalFile}.relocated`)).toBe(false);
+			for (const file of [f.paths.sourceFile, originalFile]) expect(existsSync(`${file}.relocated`)).toBe(false);
 			for (const child of [fork, nested, after]) {
 				expect(child.getEntry("kept")?.id).toBe("kept");
 				expect(() => child.getEntry("old")).toThrow(/permanent deletion/);
@@ -942,6 +941,9 @@ describe("archive lifecycle", () => {
 				const path = join(f.paths.sourceSessionDir, `backup_${f.paths.sessionId}.jsonl`);
 				writeFileSync(path, readFileSync(f.paths.sourceFile));
 				if (state === "owner-backup") f = { ...f, paths: { ...f.paths, sourceFile: path } };
+				const paths = sessionMovePaths(f.paths);
+				if (!paths.ok) throw new Error(paths.reason);
+				f = { ...f, paths: paths.value };
 			}
 			const incomplete = duplicate || ["late-failure", "cleanup-once"].includes(state);
 			const artifacts = getSessionArtifactPathForFile(f.paths.sourceFile);
@@ -968,7 +970,12 @@ describe("archive lifecycle", () => {
 				syncBuiltinESMExports();
 			}
 			if (state === "cleanup-failure") symlinkSync(other, join(dirname(f.archive), "foreign"), "dir");
-			if (state === "cleanup-failure" || state === "live-temp") expect((await move(f)).status).toBe("rolled_back");
+			if (duplicate || state === "cleanup-failure" || state === "live-temp") {
+				const moved = await move(f);
+				expect(moved.status).toBe("rolled_back");
+				if (duplicate) expect(moved.messages.join(" ")).toContain("archive owner");
+				expect(existsSync(f.paths.journalPath) || existsSync(f.paths.targetFile)).toBe(false);
+			}
 			if (state === "cleanup-once") {
 				vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("archive removal failed"));
 				syncBuiltinESMExports();
@@ -1012,7 +1019,6 @@ describe("archive lifecycle", () => {
 				expect(readFileSync(f.archive)).toEqual(before);
 				const retried = await deleteSessionFile(f.paths.sourceFile);
 				expect(retried).toMatchObject({ ok: false, error: expect.stringContaining(dirname(f.archive)) });
-				if (duplicate) expect(retried).toMatchObject({ error: expect.stringContaining("archive owner") });
 				expect(existsSync(f.archive)).toBe(true);
 			}
 			expect(readFileSync(join(other, "0.jsonl"), "utf8")).toBe("other");
@@ -1118,9 +1124,7 @@ describe("archive lifecycle", () => {
 		} finally {
 			reservation.release();
 		}
-		expect(existsSync(f.paths.sourceFile)).toBe(false);
-		expect(existsSync(f.archive)).toBe(false);
-		expect(existsSync(artifacts)).toBe(false);
+		for (const path of [f.paths.sourceFile, f.archive, artifacts]) expect(existsSync(path)).toBe(false);
 	});
 });
 describe("lifecycle and segmented header bounds", () => {
@@ -1240,9 +1244,7 @@ describe("lifecycle and segmented header bounds", () => {
 		} finally {
 			reservation.release();
 		}
-		expect(existsSync(path)).toBe(false);
-		expect(existsSync(archive)).toBe(false);
-		expect(existsSync(f.archive)).toBe(false);
+		for (const file of [path, archive, f.archive]) expect(existsSync(file)).toBe(false);
 	});
 	it.each(["callback", "artifacts"])("preserves never-rotated %s error rejection", async (kind) => {
 		const f = fixture();

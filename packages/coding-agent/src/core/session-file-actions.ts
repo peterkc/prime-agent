@@ -267,14 +267,12 @@ export async function deleteSessionFile(
 		if (id) {
 			try {
 				const archive = dirname(sessionArchivePath(sessionPath, id, 0));
-				if (existsSync(archive)) {
-					assertSessionArchiveOwnerAvailable(sessionPath, id);
+				if (existsSync(archive))
 					return { ok: false, error: `Session transcript missing; inspect archive orphan: ${archive}` };
-				}
 			} catch (error) {
 				return {
 					ok: false,
-					error: `Cannot inspect archive orphan at ${join(dirname(sessionPath), "archive", id)}: ${error instanceof Error ? error.message : String(error)}`,
+					error: `Cannot inspect archive orphan: ${error instanceof Error ? error.message : String(error)}`,
 				};
 			}
 		}

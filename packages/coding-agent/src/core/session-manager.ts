@@ -3121,7 +3121,14 @@ export class SessionManager {
 				beforeRename: (temp) => {
 					chownSync(temp, metadata.uid, metadata.gid);
 					if (!readFileSync(temp).equals(original)) throw new Error("Archive bytes differ before publication");
-					if (existsSync(archivePath) && !readFileSync(archivePath).equals(original))
+					const existing = existsSync(archivePath) ? readFileSync(archivePath) : undefined;
+					const sameHeaderPrefix =
+						existing &&
+						existing.length > headerEnd &&
+						existing.length < original.length &&
+						(originalHeader.rotation?.segment ?? 0) === archive.segment &&
+						original.subarray(0, existing.length).equals(existing);
+					if (existing && !existing.equals(original) && !sameHeaderPrefix)
 						throw new Error(`Existing archive segment differs; publication refused: ${archivePath}`);
 				},
 			});

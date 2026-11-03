@@ -716,8 +716,8 @@ describe("rotation state", () => {
 			if (condition === "unbound") expect(error).toHaveBeenCalledWith(expect.stringContaining("lease"));
 		},
 	);
-	it.each(["archive-before", "archive-after", "active-before", "active-after"])(
-		"recovers a real process interruption at %s",
+	it.each(["archive-before", "archive-after", "active-before", "active-after", "identical"])(
+		"recovers a real process interruption (%s)",
 		(fault) => {
 			const fixture = rotationFixture();
 			const original = readFileSync(fixture.path);
@@ -727,7 +727,7 @@ describe("rotation state", () => {
 			const driver = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
 import {SessionManager} from ${JSON.stringify(managerUrl)}; import {realpathSync} from 'node:fs';
 import {acquireSessionLease,bindSessionWriterLease,SESSION_LEASES_ENABLED_ENV} from ${JSON.stringify(leaseUrl)};
-const [path,agentDir,fault]=process.argv.slice(1); const manager=SessionManager.open(path);
+const [path,agentDir,point]=process.argv.slice(1); const fault=point==="identical"?"archive-after":point; const manager=SessionManager.open(path);
 const lease=acquireSessionLease(path,agentDir,{[SESSION_LEASES_ENABLED_ENV]:'1'}); bindSessionWriterLease(manager,lease);
 const rename=fs.renameSync; const active=realpathSync(path); fs.renameSync=(from,to)=>{const kind=String(to)===active?'active':'archive';
 if(fault===kind+'-before') process.exit(86); rename(from,to); if(fault===kind+'-after') process.exit(86);};
@@ -746,7 +746,8 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 			bindSessionWriterLease(cold, lease);
 			cold.cleanupRotationTemps(fixture.agentDir);
 			if (fault !== "active-after") {
-				const id = cold.appendCustomEntry("after failed rotation", { saved: true });
+				const id =
+					fault === "identical" ? fixture.compaction : cold.appendCustomEntry("after fault", { saved: true });
 				const authoritative = readFileSync(fixture.path);
 				const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
 				const differing = Buffer.alloc(authoritative.length, 120);
@@ -759,7 +760,7 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 				expect(readFileSync(archive).equals(differing) && readFileSync(fixture.path).equals(authoritative)).toBe(
 					true,
 				);
-				writeFileSync(archive, authoritative);
+				writeFileSync(archive, original);
 				expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
 				expect(readFileSync(archive).equals(authoritative)).toBe(true);
 				expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
@@ -858,8 +859,7 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 				expect(fork.isEntryOnBranch(fixture.old)).toBe(true);
 				expect(fork.getEntry(sibling)).toBeUndefined();
 				expect(fork.getEntry(later)).toBeUndefined();
-				expect(fork.isEntryOnBranch(sibling)).toBe(false);
-				expect(fork.isEntryOnBranch(later)).toBe(false);
+				for (const id of [sibling, later]) expect(fork.isEntryOnBranch(id)).toBe(false);
 				expect(fork.getHeader()?.rotation?.archives).toEqual([]);
 			},
 		);
