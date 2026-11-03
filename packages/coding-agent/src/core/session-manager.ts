@@ -79,6 +79,20 @@ export { rotationUsageEntries } from "./session-rotation-state.js";
 export const CURRENT_SESSION_VERSION = 3;
 export const SESSION_ROTATION_THRESHOLD_BYTES = 32 * 1024 * 1024;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
+const ROTATION_PREVIEW_MAX_BYTES = 64 * 1024;
+
+function rotationPreview(message: Message): string {
+	const text = extractTextContent(message);
+	let preview = "";
+	let bytes = 0;
+	for (const point of text) {
+		const size = Buffer.byteLength(JSON.stringify(point)) - 2;
+		if (bytes + size > ROTATION_PREVIEW_MAX_BYTES) break;
+		preview += point;
+		bytes += size;
+	}
+	return preview;
+}
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
@@ -3039,13 +3053,7 @@ export class SessionManager {
 				if (entry.type !== "message" || retainedIds.has(entry.id)) continue;
 				messageCount++;
 				lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
-				if (!firstMessage && entry.message.role === "user") {
-					const text = extractTextContent(entry.message);
-					firstMessage =
-						JSON.stringify(entry).length > SESSION_LIST_PARSE_MAX_LINE_CHARS
-							? text.slice(0, SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS)
-							: text;
-				}
+				if (!firstMessage && entry.message.role === "user") firstMessage = rotationPreview(entry.message);
 				if (entry.message.role === "assistant") {
 					const { api, provider, model, stopReason, timestamp, usage } = entry.message;
 					assistants.set(entry.id, {
@@ -3366,13 +3374,7 @@ export class SessionManager {
 		for (const id of [...parents.keys()].reverse()) {
 			const entry = this._entryWithEvidence(id, operation, new Set())!;
 			if (entry.type !== "message") continue;
-			if (!firstMessage && entry.message.role === "user") {
-				const text = extractTextContent(entry.message);
-				firstMessage =
-					JSON.stringify(entry).length > SESSION_LIST_PARSE_MAX_LINE_CHARS
-						? text.slice(0, SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS)
-						: text;
-			}
+			if (!firstMessage && entry.message.role === "user") firstMessage = rotationPreview(entry.message);
 			if (copied.has(id)) continue;
 			messageCount++;
 			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);

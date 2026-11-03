@@ -1,7 +1,7 @@
 import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { isProcessAlive, spawnSyncHidden } from "../utils/child-process.js";
+import { spawnSyncHidden } from "../utils/child-process.js";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
@@ -13,6 +13,7 @@ import { getSessionArtifactPathForFile, type SessionHeader } from "./session-man
 import { readSessionHeaderLineSync as readFirstLineSync } from "./session-rotation-state.js";
 import {
 	canonicalStoragePath,
+	isDisposableSessionArchiveFile,
 	isRotatableSessionId,
 	isSessionArchivePath,
 	sessionArchivePath,
@@ -208,15 +209,10 @@ function sessionEvidencePaths(sessionPath: string, header: SessionHeader | undef
 		if (!lstatSync(archive).isDirectory()) throw new Error(`Unsafe archive orphan: ${archive}`);
 		for (const name of readdirSync(archive)) {
 			const file = join(archive, name);
-			const temporary =
-				/^(0|[1-9][0-9]*)\.jsonl\.([1-9][0-9]*)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/.exec(
-					name,
-				);
-			const deadTemp =
-				temporary && Number.isSafeInteger(Number(temporary[2])) && !isProcessAlive(Number(temporary[2]));
-			if ((!/^(0|[1-9][0-9]*)\.jsonl$/.test(name) && !deadTemp && name !== ".DS_Store") || !lstatSync(file).isFile())
+			const disposable = isDisposableSessionArchiveFile(name);
+			if ((!/^(0|[1-9][0-9]*)\.jsonl$/.test(name) && !disposable) || !lstatSync(file).isFile())
 				throw new Error(`Unrecognized archive orphan: ${file}`);
-			if (deadTemp || name === ".DS_Store") continue;
+			if (disposable) continue;
 			let value: SessionHeader | null;
 			try {
 				value = JSON.parse(readFirstLineSync(file) ?? "null") as SessionHeader | null;
@@ -260,6 +256,21 @@ export async function deleteSessionFile(
 		if (value?.type === "session") header = value;
 	} catch (error) {
 		if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	if (!header && !existsSync(sessionPath)) {
+		const id = basename(sessionPath).replace(/\.jsonl$/, "");
+		if (isRotatableSessionId(id)) {
+			try {
+				const archive = dirname(sessionArchivePath(sessionPath, id, 0));
+				if (existsSync(archive))
+					return { ok: false, error: `Session transcript missing; inspect archive orphan: ${archive}` };
+			} catch (error) {
+				return {
+					ok: false,
+					error: `Cannot inspect archive orphan: ${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+		}
 	}
 	const evidenceBacked = !!header?.rotation?.archives.length || !!header?.rotation?.parent;
 	const transcript = evidenceBacked ? canonicalStoragePath(sessionPath) : sessionPath;

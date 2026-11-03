@@ -499,7 +499,7 @@ Key methods for working with sessions programmatically.
 - `getLeafId()` - Current position
 - `getLeafEntry()` - Get current leaf entry
 - `getEntry(id)` - Exact active entry first, then committed archives and bounded parent evidence. An active hit performs no archive I/O.
-- `isEntryOnBranch(id)` - Read-only logical branch membership through original archived ancestry; available on `ReadonlySessionManager`. Check it before admitting an archived exact read. False or an error never authorizes a weaker fallback.
+- `isEntryOnBranch(id)` - Read-only logical branch membership through original archived ancestry. Check it before admitting an archived exact read. False or an error never authorizes a weaker fallback.
 - `getBranch(fromId?)` - Active-segment ancestry only; archived IDs are not navigation targets
 - `getTree()` - Active-segment tree only
 - `getChildren(parentId)` - Get direct children

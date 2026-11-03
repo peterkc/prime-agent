@@ -736,12 +736,21 @@ describe("archive lifecycle", () => {
 			const f = segmentedFixture();
 			const bytes = readFileSync(f.archive);
 			const source = readFileSync(f.paths.sourceFile);
+			for (const name of [".DS_Store", "2.jsonl.999999.11111111-1111-4111-8111-111111111111.tmp"])
+				writeFileSync(join(dirname(f.archive), name), "clutter");
 			await moveCrash(f, point);
 			const committed = point.startsWith("active") || point.startsWith("redirect");
 			expect(await findAgentTraceFiles(f.paths.targetSessionDir)).toEqual(committed ? [f.paths.targetFile] : []);
 			if (committed) SessionManager.open(f.paths.targetFile).appendCustomEntry("late", { keep: true });
 			const appended = committed ? readFileSync(f.paths.targetFile) : undefined;
-			expect((await recoverFresh(f)).status).toBe(committed ? "moved" : "rolled_back");
+			const activeTarget = committed
+				? acquireSessionLease(f.paths.targetFile, f.paths.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" })
+				: undefined;
+			try {
+				expect((await recoverFresh(f)).status).toBe(committed ? "moved" : "rolled_back");
+			} finally {
+				activeTarget?.release();
+			}
 			expect(
 				readFileSync(committed ? sessionArchivePath(f.paths.targetFile, f.paths.sessionId, 0) : f.archive),
 			).toEqual(bytes);
@@ -881,6 +890,7 @@ describe("archive lifecycle", () => {
 		"dead-temp",
 		"finder-file",
 		"late-failure",
+		"cleanup-once",
 		"redirect",
 		"missing-redirect",
 		"live-temp",
@@ -912,6 +922,11 @@ describe("archive lifecycle", () => {
 				syncBuiltinESMExports();
 			}
 			if (state === "cleanup-failure") symlinkSync(other, join(dirname(f.archive), "foreign"), "dir");
+			if (state === "cleanup-failure" || state === "live-temp") expect((await move(f)).status).toBe("rolled_back");
+			if (state === "cleanup-once") {
+				vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(new Error("archive removal failed"));
+				syncBuiltinESMExports();
+			}
 			const sourceBytes = readFileSync(f.paths.sourceFile);
 			const reservation = acquireSessionDeleteLeases(f.paths.sourceFile, f.paths.agentDir);
 			let removed = false;
@@ -925,13 +940,13 @@ describe("archive lifecycle", () => {
 					},
 				});
 				const refused = ["cleanup-failure", "cleanup-json", "redirect", "live-temp"].includes(state);
-				expect(result.ok).toBe(!refused && state !== "transcript-failure" && state !== "late-failure");
+				expect(result.ok).toBe(!refused && !["transcript-failure", "late-failure", "cleanup-once"].includes(state));
 				if (refused) expect(readFileSync(f.paths.sourceFile).equals(sourceBytes)).toBe(true);
 				if (!result.ok) {
 					expect(result.error).toMatch(
 						state === "transcript-failure"
 							? /unlink refused/
-							: state === "late-failure"
+							: ["late-failure", "cleanup-once"].includes(state)
 								? /transcript removed; cleanup incomplete/
 								: /Cannot delete/,
 					);
@@ -945,7 +960,12 @@ describe("archive lifecycle", () => {
 			);
 			expect(removed).toBe(!kept);
 			expect(existsSync(f.paths.sourceArtifacts)).toBe(kept);
-			expect(existsSync(f.archive)).toBe(kept || state === "late-failure");
+			expect(existsSync(f.archive)).toBe(kept || state === "late-failure" || state === "cleanup-once");
+			if (state === "late-failure" || state === "cleanup-once") {
+				const retried = await deleteSessionFile(f.paths.sourceFile);
+				expect(retried).toMatchObject({ ok: false, error: expect.stringContaining(dirname(f.archive)) });
+				expect(existsSync(f.archive)).toBe(true);
+			}
 			expect(readFileSync(join(other, "0.jsonl"), "utf8")).toBe("other");
 		},
 	);

@@ -29,6 +29,9 @@ import { createHarness, getMessageText, type Harness, type HarnessOptions } from
 import { createDeferred } from "./scheduling.js";
 
 type SessionCompactionInternals = {
+	_agentEventQueue: Promise<void>;
+	_unsettledRlmChildRuns: Set<{ settlement: { promise: Promise<void> } }>;
+	_rlmPendingChildUsageBatchCount: number;
 	_checkCompaction: (
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck?: boolean,
@@ -170,12 +173,14 @@ function setStreaming(harness: Harness, streaming: boolean): void {
 describe("AgentSession compaction", () => {
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
+	const runtimeCleanups: Array<() => Promise<void>> = [];
 
 	beforeEach(() => {
 		vi.useRealTimers();
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		while (runtimeCleanups.length) await runtimeCleanups.pop()!();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		syncBuiltinESMExports();
@@ -186,6 +191,36 @@ describe("AgentSession compaction", () => {
 		while (tempDirs.length > 0) {
 			const dir = tempDirs.pop();
 			if (dir) rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([true, false])("#60 holds pending child usage through the parent drain (persist=%s)", async (persist) => {
+		const parent = await createHarness({ persistSession: true }),
+			child = await createHarness({ provider: "drain-child" });
+		harnesses.push(parent, child);
+		child.setResponses([fauxAssistantMessage("done")]);
+		const assistant = createAssistant(parent),
+			drain = createDeferred();
+		parent.session.agent.state.messages.push(assistant);
+		internalsOf(parent)._agentEventQueue = drain.promise;
+		parent.session.setSubagentRuntimeHost({
+			createRlmSubagentRuntime: async () => ({ session: child.session }),
+			deleteRlmSubagentRuntime: async () => child.session.disposeAsync(),
+		});
+		try {
+			await parent.session.runRlmChild("finish before parent append");
+			await Promise.all([...internalsOf(parent)._unsettledRlmChildRuns].map((run) => run.settlement.promise));
+			expect(internalsOf(parent)._rlmPendingChildUsageBatchCount).toBe(1);
+			if (persist) parent.sessionManager.appendMessage(assistant);
+			drain.resolve();
+			await internalsOf(parent)._agentEventQueue;
+			expect(internalsOf(parent)._rlmPendingChildUsageBatchCount).toBe(0);
+			expect(
+				parent.sessionManager.getEntries().filter((entry) => entry.type === "child_usage_attributed"),
+			).toHaveLength(Number(persist));
+		} finally {
+			drain.resolve();
+			await internalsOf(parent)._agentEventQueue;
 		}
 	});
 
@@ -271,7 +306,7 @@ describe("AgentSession compaction", () => {
 				undefined,
 				lease,
 			);
-			onTestFinished(async () => {
+			runtimeCleanups.push(async () => {
 				releaseChild.resolve();
 				await runtime.dispose();
 				services.mcpManager.dispose();

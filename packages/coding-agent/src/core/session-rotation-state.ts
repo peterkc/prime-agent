@@ -144,7 +144,7 @@ function validateUsage(usage: Usage): void {
 			u.cost?.cacheRead,
 			u.cost?.cacheWrite,
 			u.cost?.total,
-		].some((v) => typeof v !== "number" || !Number.isFinite(v))
+		].some((v) => typeof v !== "number" || !Number.isFinite(v) || v < 0)
 	)
 		throw new Error("Invalid rotation accounting usage");
 }
@@ -351,7 +351,11 @@ export function withRotationRestart(header: SessionHeader, state: RotationRestar
 	const hash = createHash("sha256");
 	for (const line of lines) hash.update(`${line}\n`);
 	const usage = emptyUsage();
-	for (const row of state.accounting) if (row.kind === "assistant") addAssistantUsage(usage, row.entry.message.usage);
+	for (const row of state.accounting) {
+		if (row.kind !== "assistant") continue;
+		validateAssistant(row.entry);
+		addAssistantUsage(usage, row.entry.message.usage);
+	}
 	const rotation: SessionRotation = {
 		...header.rotation,
 		accounting: { ...header.rotation.accounting, usage },

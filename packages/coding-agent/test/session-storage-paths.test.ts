@@ -14,6 +14,8 @@ describe("session storage paths", () => {
 		["/tmp/archive/project/sessions/live.jsonl", false],
 		["sessions/archive/not-a-uuid/x.jsonl", false],
 		["sessions/archive/019a3e10-1234-7123-8123-123456789abc/0.jsonl", true],
+		["sessions/ARCHIVE/019a3e10-1234-7123-8123-123456789abc/missing.jsonl", true],
+		["sessions/archive/019A3E10-1234-7123-8123-123456789ABC/missing.jsonl", true],
 		["sessions/archived/s.jsonl", false],
 		["session-artifacts/root/sub-deadbeef/archive/019a3e10-1234-7123-8123-123456789abc/0.jsonl", true],
 		["sessions/session-archive.jsonl", false],

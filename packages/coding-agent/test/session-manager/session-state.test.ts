@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { findAgentTraceFiles } from "../../src/core/agent-traces.js";
 import { computeOwnAndTotalUsage, loadContextTreeChildFromDisk } from "../../src/core/context-tree.js";
 import { acquireSessionDeleteLeases, deleteSessionFile } from "../../src/core/session-file-actions.js";
@@ -424,12 +424,16 @@ function replaceRestartRecords(lines: string[], header: SessionHeader, rows: rea
 		.digest("hex");
 	header.rotation = { ...header.rotation!, restart: { version: 1, count: rows.length, sha256 } };
 }
-function rotationFixture(setup: (manager: SessionManager) => void = () => {}, oversizedAssistant = false) {
+function rotationFixture(
+	setup: (manager: SessionManager) => void = () => {},
+	oversizedAssistant = false,
+	firstMessage = "original first preview",
+) {
 	const directory = mkdtempSync(join(tmpdir(), "rotation-state-"));
 	const manager = SessionManager.create(directory, join(directory, "sessions"));
 	let lease: ReturnType<typeof acquireSessionLease>;
 	try {
-		const old = manager.appendMessage(userMsg("original first preview"));
+		const old = manager.appendMessage(userMsg(firstMessage));
 		const assistant = manager.appendMessage(
 			assistantMsg(oversizedAssistant ? "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) : "old reply"),
 		);
@@ -455,6 +459,10 @@ function rotationFixture(setup: (manager: SessionManager) => void = () => {}, ov
 		const agentDir = join(directory, "agent");
 		lease = acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
 		bindSessionWriterLease(manager, lease);
+		onTestFinished(() => {
+			lease?.release();
+			rmSync(directory, { recursive: true, force: true });
+		});
 		return {
 			manager,
 			directory,
@@ -464,10 +472,6 @@ function rotationFixture(setup: (manager: SessionManager) => void = () => {}, ov
 			padding,
 			compaction,
 			agentDir,
-			cleanup() {
-				lease?.release();
-				rmSync(directory, { recursive: true, force: true });
-			},
 			release() {
 				lease?.release();
 			},
@@ -484,26 +488,22 @@ function rotationFixture(setup: (manager: SessionManager) => void = () => {}, ov
 describe("rotation state", () => {
 	it("preserves an original ID named __proto__ in the persisted ancestry map", () => {
 		const fixture = rotationFixture();
-		try {
-			const compaction = fixture.manager.getEntry(fixture.compaction);
-			if (compaction?.type !== "compaction") throw new Error("missing compaction");
-			writeFileSync(
-				fixture.path,
-				readFileSync(fixture.path, "utf8").replaceAll(
-					JSON.stringify(compaction.firstKeptEntryId),
-					JSON.stringify("__proto__"),
-				),
-			);
-			const manager = SessionManager.open(fixture.path);
-			fixture.bind(manager);
-			expect(manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
-			const cold = SessionManager.open(fixture.path);
-			expect(Object.hasOwn(restartOf(cold.getHeader())!.originalParents, "__proto__")).toBe(true);
-			expect(cold.getEntry("__proto__")).toMatchObject({ type: "message", id: "__proto__" });
-			expect(cold.isEntryOnBranch("__proto__")).toBe(true);
-		} finally {
-			fixture.cleanup();
-		}
+		const compaction = fixture.manager.getEntry(fixture.compaction);
+		if (compaction?.type !== "compaction") throw new Error("missing compaction");
+		writeFileSync(
+			fixture.path,
+			readFileSync(fixture.path, "utf8").replaceAll(
+				JSON.stringify(compaction.firstKeptEntryId),
+				JSON.stringify("__proto__"),
+			),
+		);
+		const manager = SessionManager.open(fixture.path);
+		fixture.bind(manager);
+		expect(manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
+		const cold = SessionManager.open(fixture.path);
+		expect(Object.hasOwn(restartOf(cold.getHeader())!.originalParents, "__proto__")).toBe(true);
+		expect(cold.getEntry("__proto__")).toMatchObject({ type: "message", id: "__proto__" });
+		expect(cold.isEntryOnBranch("__proto__")).toBe(true);
 	});
 	it.each(["active", "paused", "cleared"])(
 		"retains ordered state before the kept boundary (%s)",
@@ -636,11 +636,10 @@ describe("rotation state", () => {
 			} finally {
 				for (const harness of native.reverse()) harness.cleanup();
 				vi.useRealTimers();
-				fixture.cleanup();
 			}
 		},
 	);
-	it.each(["unbound", "equal", "below", "unknown", "nonshrinking"])(
+	it.each(["unbound", "equal", "below", "unknown", "nonshrinking", "negative-tokens", "negative-cost"])(
 		"refuses unsafe or ineligible rotation (%s)",
 		(condition) => {
 			const fixture = rotationFixture();
@@ -678,6 +677,14 @@ describe("rotation state", () => {
 						`${[manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
 					);
 				}
+				if (condition.startsWith("negative")) {
+					const assistant = manager.getEntry(fixture.assistant);
+					if (assistant?.type !== "message" || assistant.message.role !== "assistant")
+						throw new Error("assistant");
+					if (condition === "negative-tokens") assistant.message.usage.input = -1;
+					else assistant.message.usage.cost.total = -1;
+					writeFileSync(path, serializeSessionEntries([manager.getHeader()!, ...manager.getEntries()]));
+				}
 				const opened = SessionManager.open(path);
 				if (condition !== "unbound") fixture.bind(opened);
 				const bytes = readFileSync(path);
@@ -688,7 +695,6 @@ describe("rotation state", () => {
 				if (condition === "unbound") expect(error).toHaveBeenCalledWith(expect.stringContaining("lease"));
 			} finally {
 				error.mockRestore();
-				fixture.cleanup();
 			}
 		},
 	);
@@ -696,12 +702,11 @@ describe("rotation state", () => {
 		"recovers a real process interruption at %s",
 		(fault) => {
 			const fixture = rotationFixture();
-			try {
-				const original = readFileSync(fixture.path);
-				fixture.release();
-				const managerUrl = pathToFileURL(resolve("src/core/session-manager.ts")).href;
-				const leaseUrl = pathToFileURL(resolve("src/core/session-lease.ts")).href;
-				const driver = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+			const original = readFileSync(fixture.path);
+			fixture.release();
+			const managerUrl = pathToFileURL(resolve("src/core/session-manager.ts")).href;
+			const leaseUrl = pathToFileURL(resolve("src/core/session-lease.ts")).href;
+			const driver = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
 import {SessionManager} from ${JSON.stringify(managerUrl)}; import {realpathSync} from 'node:fs';
 import {acquireSessionLease,bindSessionWriterLease,SESSION_LEASES_ENABLED_ENV} from ${JSON.stringify(leaseUrl)};
 const [path,agentDir,fault]=process.argv.slice(1); const manager=SessionManager.open(path);
@@ -709,43 +714,41 @@ const lease=acquireSessionLease(path,agentDir,{[SESSION_LEASES_ENABLED_ENV]:'1'}
 const rename=fs.renameSync; const active=realpathSync(path); fs.renameSync=(from,to)=>{const kind=String(to)===active?'active':'archive';
 if(fault===kind+'-before') process.exit(86); rename(from,to); if(fault===kind+'-after') process.exit(86);};
 syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agentDir); process.exit(87);`;
-				const result = spawnSync(
-					process.execPath,
-					["--import", "tsx", "--input-type=module", "-e", driver, fixture.path, fixture.agentDir, fault],
-					{ encoding: "utf8", timeout: 15000 },
-				);
-				expect(result.error).toBeUndefined();
-				expect(result.status).toBe(86);
-				const cold = SessionManager.open(fixture.path);
-				expect(cold.getHeader()?.rotation?.segment ?? 0).toBe(fault === "active-after" ? 1 : 0);
-				const lease = acquireSessionLease(fixture.path, fixture.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
-				try {
-					bindSessionWriterLease(cold, lease);
-					cold.cleanupRotationTemps(fixture.agentDir);
-					if (fault !== "active-after") {
-						const id = cold.appendCustomEntry("after failed rotation", { saved: true });
-						const authoritative = readFileSync(fixture.path);
-						const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
-						writeFileSync(archive, Buffer.alloc(authoritative.length, 120));
-						expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
-						expect(readFileSync(archive).equals(authoritative)).toBe(true);
-						expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
-					} else {
-						expect(readFileSync(sessionArchivePath(fixture.path, cold.getSessionId(), 0)).equals(original)).toBe(
-							true,
-						);
-						const id = cold.appendCustomEntry("after commit", {});
-						const bytes = readFileSync(fixture.path);
-						expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("skipped");
-						expect(readFileSync(fixture.path).equals(bytes)).toBe(true);
-						expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
-					}
-					expect(readdirSync(cold.getSessionDir()).filter((name) => name.endsWith(".tmp"))).toEqual([]);
-				} finally {
-					lease?.release();
+			const result = spawnSync(
+				process.execPath,
+				["--import", "tsx", "--input-type=module", "-e", driver, fixture.path, fixture.agentDir, fault],
+				{ encoding: "utf8", timeout: 15000 },
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(86);
+			const cold = SessionManager.open(fixture.path);
+			expect(cold.getHeader()?.rotation?.segment ?? 0).toBe(fault === "active-after" ? 1 : 0);
+			const lease = acquireSessionLease(fixture.path, fixture.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
+			try {
+				bindSessionWriterLease(cold, lease);
+				cold.cleanupRotationTemps(fixture.agentDir);
+				if (fault !== "active-after") {
+					const id = cold.appendCustomEntry("after failed rotation", { saved: true });
+					const authoritative = readFileSync(fixture.path);
+					const archive = sessionArchivePath(fixture.path, cold.getSessionId(), 0);
+					writeFileSync(archive, Buffer.alloc(authoritative.length, 120));
+					expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
+					expect(readFileSync(archive).equals(authoritative)).toBe(true);
+					expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
+				} else {
+					expect(readFileSync(sessionArchivePath(fixture.path, cold.getSessionId(), 0)).equals(original)).toBe(
+						true,
+					);
+					const id = cold.appendCustomEntry("after commit", {});
+					const bytes = readFileSync(fixture.path);
+					expect(cold.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("skipped");
+					expect(readFileSync(fixture.path).equals(bytes)).toBe(true);
+					expect(SessionManager.open(fixture.path).getEntry(id)).toBeDefined();
 				}
+				for (const directory of [cold.getSessionDir(), join(cold.getSessionDir(), "archive", cold.getSessionId())])
+					expect(readdirSync(directory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 			} finally {
-				fixture.cleanup();
+				lease?.release();
 			}
 		},
 	);
@@ -755,111 +758,111 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 			(forkKind) => {
 				let sibling = "",
 					archivedLabel = "";
-				const fixture = rotationFixture((manager) => {
-					const entries = manager.getEntries();
-					manager.branch(entries[0].id);
-					sibling = manager.appendMessage(userMsg("sibling only"));
-					manager.appendMessage(assistantMsg("sibling reply"));
-					manager.branch(entries[1].id);
-					archivedLabel = manager.appendLabelChange(entries[0].id, "archived target");
+				const fixture = rotationFixture(
+					(manager) => {
+						const entries = manager.getEntries();
+						manager.branch(entries[0].id);
+						sibling = manager.appendMessage(userMsg("sibling only"));
+						manager.appendMessage(assistantMsg("sibling reply"));
+						manager.branch(entries[1].id);
+						archivedLabel = manager.appendLabelChange(entries[0].id, "archived target");
+					},
+					false,
+					"漢😀".repeat(200_000),
+				);
+				const { manager, agentDir, path } = fixture;
+				expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
+				const first = manager.appendCustomEntry("first segment", {});
+				const label = manager.appendLabelChange(first, "label");
+				expect(manager.branchWithSummary(first, "branch summary")).toMatch(/^s1-/);
+				manager.appendMessage({
+					role: "toolResult",
+					toolCallId: "next",
+					toolName: "fixture",
+					content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
+					isError: false,
+					timestamp: Date.now(),
 				});
-				try {
-					const { manager, agentDir, path } = fixture;
-					expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
-					const first = manager.appendCustomEntry("first segment", {});
-					const label = manager.appendLabelChange(first, "label");
-					expect(manager.branchWithSummary(first, "branch summary")).toMatch(/^s1-/);
-					manager.appendMessage({
-						role: "toolResult",
-						toolCallId: "next",
-						toolName: "fixture",
-						content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
-						isError: false,
-						timestamp: Date.now(),
-					});
-					const keep = manager.appendMessage(userMsg("next kept"));
-					manager.appendMessage(assistantMsg("next reply"));
-					const compaction = manager.appendCompaction("second summary", keep, 2000);
-					expect(manager.rotateAfterCompaction(compaction, agentDir)).toEqual({ status: "rotated", segment: 2 });
-					expect(manager.getEntry(fixture.old)?.id).toBe(fixture.old);
-					expect(manager.isEntryOnBranch(fixture.old)).toBe(true);
-					expect(manager.getEntry(sibling)?.id).toBe(sibling);
-					expect(manager.isEntryOnBranch(sibling)).toBe(false);
-					expect(manager.getEntry("missing")).toBeUndefined();
-					expect(manager.isEntryOnBranch("missing")).toBe(false);
-					expect(manager.getFlatTree().map((node) => node.entry.id)).not.toContain(fixture.old);
-					fixture.release();
-					const fast = appendCustomMessageToExistingFile(
-						path,
-						"interruption",
-						"x".repeat(300_000),
-						false,
-						{},
-						agentDir,
-					);
-					const fallback = appendSessionInfoToExistingFile(path, "closed rename", agentDir);
-					const state = appendSessionStateToExistingFile(path, { status: "crash" }, agentDir);
-					for (const id of [fast, fallback, state]) expect(id).toMatch(/^s2-/);
-					const source = SessionManager.open(path);
-					const boundary = source.getLeafId()!;
-					const fork =
-						forkKind === "forkFrom"
-							? SessionManager.forkFrom(path, fixture.directory, join(fixture.directory, "forks"))
-							: SessionManager.open(path);
-					if (forkKind === "createBranchedSession") fork.createBranchedSession(boundary);
-					if (forkKind === "forkFrom") {
-						expect(fork.getEntry(archivedLabel)).toEqual(source.getEntry(archivedLabel));
-						expect(fork.getEntry(label)).toEqual(source.getEntry(label));
-						expect(fork.getEntry(label)?.parentId).toBe(first);
-						for (const target of [first, label])
-							expect(() => fork.assertRestorableContext(target)).toThrow(/archived ancestry/);
-					}
-					expect(fork.getHeader()?.rotation?.parent).toMatchObject({
-						sessionId: source.getSessionId(),
-						leafId: boundary,
-						segment: 2,
-					});
-					expect(fork.appendCustomEntry("local fork", {})).toMatch(/^s3-/);
-					const later = source.appendMessage(userMsg("post-fork"));
-					expect(fork.getEntry(fixture.old)?.id).toBe(fixture.old);
-					expect(fork.isEntryOnBranch(fixture.old)).toBe(true);
-					expect(fork.getEntry(sibling)).toBeUndefined();
-					expect(fork.getEntry(later)).toBeUndefined();
-					expect(fork.isEntryOnBranch(sibling)).toBe(false);
-					expect(fork.isEntryOnBranch(later)).toBe(false);
-					expect(fork.getHeader()?.rotation?.archives).toEqual([]);
-				} finally {
-					fixture.cleanup();
+				const keep = manager.appendMessage(userMsg("next kept"));
+				manager.appendMessage(assistantMsg("next reply"));
+				const compaction = manager.appendCompaction("second summary", keep, 2000);
+				expect(manager.rotateAfterCompaction(compaction, agentDir)).toEqual({ status: "rotated", segment: 2 });
+				expect(manager.getEntry(fixture.old)?.id).toBe(fixture.old);
+				expect(manager.isEntryOnBranch(fixture.old)).toBe(true);
+				expect(manager.getEntry(sibling)?.id).toBe(sibling);
+				expect(manager.isEntryOnBranch(sibling)).toBe(false);
+				expect(manager.getEntry("missing")).toBeUndefined();
+				expect(manager.isEntryOnBranch("missing")).toBe(false);
+				expect(manager.getFlatTree().map((node) => node.entry.id)).not.toContain(fixture.old);
+				fixture.release();
+				const fast = appendCustomMessageToExistingFile(
+					path,
+					"interruption",
+					"x".repeat(300_000),
+					false,
+					{},
+					agentDir,
+				);
+				const fallback = appendSessionInfoToExistingFile(path, "closed rename", agentDir);
+				const state = appendSessionStateToExistingFile(path, { status: "crash" }, agentDir);
+				for (const id of [fast, fallback, state]) expect(id).toMatch(/^s2-/);
+				const source = SessionManager.open(path);
+				const boundary = source.getLeafId()!;
+				const fork =
+					forkKind === "forkFrom"
+						? SessionManager.forkFrom(path, fixture.directory, join(fixture.directory, "forks"))
+						: SessionManager.open(path);
+				if (forkKind === "createBranchedSession") fork.createBranchedSession(boundary);
+				for (const view of [manager, fork]) {
+					const preview = restartOf(view.getHeader())!.firstMessage;
+					expect(Buffer.byteLength(preview)).toBeLessThanOrEqual(64 * 1024);
+					expect(preview).toMatch(/^(漢😀)*漢?$/u);
 				}
+				if (forkKind === "forkFrom") {
+					expect(fork.getEntry(archivedLabel)).toEqual(source.getEntry(archivedLabel));
+					expect(fork.getEntry(label)).toEqual(source.getEntry(label));
+					expect(fork.getEntry(label)?.parentId).toBe(first);
+					for (const target of [first, label])
+						expect(() => fork.assertRestorableContext(target)).toThrow(/archived ancestry/);
+				}
+				expect(fork.getHeader()?.rotation?.parent).toMatchObject({
+					sessionId: source.getSessionId(),
+					leafId: boundary,
+					segment: 2,
+				});
+				expect(fork.appendCustomEntry("local fork", {})).toMatch(/^s3-/);
+				const later = source.appendMessage(userMsg("post-fork"));
+				expect(fork.getEntry(fixture.old)?.id).toBe(fixture.old);
+				expect(fork.isEntryOnBranch(fixture.old)).toBe(true);
+				expect(fork.getEntry(sibling)).toBeUndefined();
+				expect(fork.getEntry(later)).toBeUndefined();
+				expect(fork.isEntryOnBranch(sibling)).toBe(false);
+				expect(fork.isEntryOnBranch(later)).toBe(false);
+				expect(fork.getHeader()?.rotation?.archives).toEqual([]);
 			},
 		);
 	});
 	it("accounts for later child attribution to an archived assistant once in hot, cold, catalog and disk views", async () => {
 		const fixture = rotationFixture();
-		try {
-			const { manager, path, agentDir, assistant } = fixture;
-			expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
-			const original = manager.getEntry(assistant);
-			if (original?.type !== "message" || original.message.role !== "assistant")
-				throw new Error("missing assistant");
-			const child = { ...original.message.usage, input: 5, output: 5, totalTokens: 10 };
-			const aggregate = { ...original.message.usage, input: 6, output: 6, totalTokens: 12 };
-			manager.appendChildUsageAttribution(assistant, child, aggregate);
-			const cold = SessionManager.open(path);
-			for (const view of [manager, cold])
-				expect(computeOwnAndTotalUsage(view.getBranch(), view.getEntries(), view.getHeader())).toMatchObject({
-					ownUsage: { input: 2, output: 2 },
-					totalUsage: { input: 7, output: 7 },
-				});
-			expect((await readSessionInfo(path))?.usage).toMatchObject({ inputTokens: 2, outputTokens: 2 });
-			expect(loadContextTreeChildFromDisk(manager.getSessionDir(), () => 200_000)).toMatchObject({
+		const { manager, path, agentDir, assistant } = fixture;
+		expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
+		const original = manager.getEntry(assistant);
+		if (original?.type !== "message" || original.message.role !== "assistant") throw new Error("missing assistant");
+		const child = { ...original.message.usage, input: 5, output: 5, totalTokens: 10 };
+		const aggregate = { ...original.message.usage, input: 6, output: 6, totalTokens: 12 };
+		manager.appendChildUsageAttribution(assistant, child, aggregate);
+		const cold = SessionManager.open(path);
+		for (const view of [manager, cold])
+			expect(computeOwnAndTotalUsage(view.getBranch(), view.getEntries(), view.getHeader())).toMatchObject({
 				ownUsage: { input: 2, output: 2 },
 				totalUsage: { input: 7, output: 7 },
-				label: "original first preview",
 			});
-		} finally {
-			fixture.cleanup();
-		}
+		expect((await readSessionInfo(path))?.usage).toMatchObject({ inputTokens: 2, outputTokens: 2 });
+		expect(loadContextTreeChildFromDisk(manager.getSessionDir(), () => 200_000)).toMatchObject({
+			ownUsage: { input: 2, output: 2 },
+			totalUsage: { input: 7, output: 7 },
+			label: "original first preview",
+		});
 	});
 	it("retains published bytes and reconciles later appends when publication returns an error after rename", () => {
 		const fixture = rotationFixture();
@@ -886,7 +889,6 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 		} finally {
 			writer.mockRestore();
 			warning.mockRestore();
-			fixture.cleanup();
 		}
 	});
 	it.each([
@@ -905,74 +907,68 @@ syncBuiltinESMExports(); manager.rotateAfterCompaction(manager.getLeafId(),agent
 		"accounting-usage",
 	])("fails closed on committed storage corruption (%s)", (kind) => {
 		const fixture = rotationFixture();
-		try {
-			const { manager, path, agentDir } = fixture;
-			expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
-			const archive = sessionArchivePath(path, manager.getSessionId(), 0);
-			const lines = readFileSync(path, "utf8").trimEnd().split("\n");
-			const header = JSON.parse(lines[0]) as SessionHeader;
-			if (kind === "missing") rmSync(archive);
-			if (kind === "digest") {
-				const bytes = readFileSync(archive);
-				bytes[bytes.length - 2] ^= 1;
-				writeFileSync(archive, bytes);
-			}
-			if (kind === "foreign" || kind === "utf8") {
-				const archived = readFileSync(archive, "utf8").split("\n");
-				const foreign = JSON.parse(archived[0]) as SessionHeader;
-				if (kind === "foreign") foreign.id = "foreign";
-				archived[0] = JSON.stringify(foreign);
-				const bytes = Buffer.from(archived.join("\n"));
-				if (kind === "utf8") {
-					const index = bytes.indexOf("original first preview");
-					expect(index).toBeGreaterThanOrEqual(0);
-					bytes[index] = 0xff;
-				}
-				writeFileSync(archive, bytes);
-				header.rotation = {
-					...header.rotation!,
-					archives: [
-						{ segment: 0, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
-					],
-				};
-			}
-			const storage = lines.slice(1, 1 + header.rotation!.restart.count).map((line) => JSON.parse(line));
-			const assistant = storage
-				.find((row) => row.kind === "accounting")
-				.data.find((row: { kind: string }) => row.kind === "assistant").entry;
-			if (kind === "accounting-id") assistant.id = 1;
-			if (kind === "accounting-usage") assistant.message.usage.input = null;
-			if (kind === "counter") header.rotation = { ...header.rotation!, segment: -1 };
-			if (kind === "lineage") header.rotation = { ...header.rotation!, archives: [] };
-			if (kind === "version") Reflect.set(header.rotation!, "version", 2);
-			if (kind === "ancestry" || kind === "cycle")
-				storage
-					.find((row) => row.kind === "cut_edges")
-					.data.push([fixture.old, kind === "cycle" ? fixture.old : fixture.compaction]);
-			replaceRestartRecords(lines, header, storage);
-			lines[0] = JSON.stringify(header);
-			if (kind === "duplicate") lines.push(lines.at(-1)!);
-			if (kind === "conflict")
-				lines.push(
-					JSON.stringify({
-						type: "message",
-						id: fixture.old,
-						parentId: fixture.compaction,
-						timestamp: "2026-11-02",
-						message: userMsg("forged payload"),
-					}),
-				);
-			writeFileSync(path, `${lines.join("\n")}\n`);
-			const bytes = readFileSync(path);
-			expect(() => {
-				const cold = SessionManager.open(path);
-				if (kind === "cycle") cold.isEntryOnBranch(fixture.old);
-				else cold.getEntry(kind === "conflict" ? fixture.padding : fixture.old);
-			}).toThrow(/archive|lineage|duplicate|ancestry|Conflicting|rotation|UTF-8|accounting/);
-			expect(readFileSync(path).equals(bytes)).toBe(true);
-		} finally {
-			fixture.cleanup();
+		const { manager, path, agentDir } = fixture;
+		expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
+		const archive = sessionArchivePath(path, manager.getSessionId(), 0);
+		const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+		const header = JSON.parse(lines[0]) as SessionHeader;
+		if (kind === "missing") rmSync(archive);
+		if (kind === "digest") {
+			const bytes = readFileSync(archive);
+			bytes[bytes.length - 2] ^= 1;
+			writeFileSync(archive, bytes);
 		}
+		if (kind === "foreign" || kind === "utf8") {
+			const archived = readFileSync(archive, "utf8").split("\n");
+			const foreign = JSON.parse(archived[0]) as SessionHeader;
+			if (kind === "foreign") foreign.id = "foreign";
+			archived[0] = JSON.stringify(foreign);
+			const bytes = Buffer.from(archived.join("\n"));
+			if (kind === "utf8") {
+				const index = bytes.indexOf("original first preview");
+				expect(index).toBeGreaterThanOrEqual(0);
+				bytes[index] = 0xff;
+			}
+			writeFileSync(archive, bytes);
+			header.rotation = {
+				...header.rotation!,
+				archives: [{ segment: 0, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }],
+			};
+		}
+		const storage = lines.slice(1, 1 + header.rotation!.restart.count).map((line) => JSON.parse(line));
+		const assistant = storage
+			.find((row) => row.kind === "accounting")
+			.data.find((row: { kind: string }) => row.kind === "assistant").entry;
+		if (kind === "accounting-id") assistant.id = 1;
+		if (kind === "accounting-usage") assistant.message.usage.input = null;
+		if (kind === "counter") header.rotation = { ...header.rotation!, segment: -1 };
+		if (kind === "lineage") header.rotation = { ...header.rotation!, archives: [] };
+		if (kind === "version") Reflect.set(header.rotation!, "version", 2);
+		if (kind === "ancestry" || kind === "cycle")
+			storage
+				.find((row) => row.kind === "cut_edges")
+				.data.push([fixture.old, kind === "cycle" ? fixture.old : fixture.compaction]);
+		replaceRestartRecords(lines, header, storage);
+		lines[0] = JSON.stringify(header);
+		if (kind === "duplicate") lines.push(lines.at(-1)!);
+		if (kind === "conflict")
+			lines.push(
+				JSON.stringify({
+					type: "message",
+					id: fixture.old,
+					parentId: fixture.compaction,
+					timestamp: "2026-11-02",
+					message: userMsg("forged payload"),
+				}),
+			);
+		writeFileSync(path, `${lines.join("\n")}\n`);
+		const bytes = readFileSync(path);
+		expect(() => {
+			const cold = SessionManager.open(path);
+			if (kind === "cycle") cold.isEntryOnBranch(fixture.old);
+			else cold.getEntry(kind === "conflict" ? fixture.padding : fixture.old);
+		}).toThrow(/archive|lineage|duplicate|ancestry|Conflicting|rotation|UTF-8|accounting/);
+		expect(readFileSync(path).equals(bytes)).toBe(true);
 	});
 });
 describe("bounded restart records", () => {
@@ -998,131 +994,115 @@ describe("bounded restart records", () => {
 				manager.appendMessage(assistantMsg("reply"));
 			}
 		});
-		try {
-			const { manager, path, agentDir } = fixture;
-			const expected = computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries());
-			expect(expected.totalUsage.input).toBe(3032);
-			const original = readFileSync(path);
-			expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
-			for (let turn = 0; turn < 2; turn++) {
-				const lines = readFileSync(path, "utf8").trimEnd().split("\n");
-				const header = JSON.parse(lines[0]) as SessionHeader;
-				expect(Buffer.byteLength(lines[0]) + 1).toBeLessThan(65536);
-				const storage = lines.slice(1, 1 + header.rotation!.restart.count);
-				expect(storage.length).toBeGreaterThan(2);
-				for (const line of storage) expect(Buffer.byteLength(line) + 1).toBeLessThan(1024 * 1024);
-				expect(
-					createHash("sha256")
-						.update(`${storage.join("\n")}\n`)
-						.digest("hex"),
-				).toBe(header.rotation!.restart.sha256);
-				const cold = await SessionManager.openAsync(path);
-				const sync = SessionManager.open(path);
-				expect(parseSessionEntries(readFileSync(path, "utf8"))).toEqual(loadEntriesFromFile(path));
-				expect(await loadEntriesFromFileAsync(path, { streamThresholdBytes: 0 })).toEqual(
-					loadEntriesFromFile(path),
-				);
-				for (const view of [manager, cold, sync]) {
-					expect(computeOwnAndTotalUsage(view.getBranch(), view.getEntries(), view.getHeader())).toEqual(expected);
-					expect(view.getEntries().some((e) => (e as { type: string }).type === "rotation_state")).toBe(false);
-					expect(view.getFlatTree().map((n) => n.entry.id)).toEqual(view.getEntries().map((e) => e.id));
-					const state = restartOf(view.getHeader())!;
-					for (const id of Object.keys(state.originalParents))
-						expect(view.getEntry(id)?.parentId).not.toBe(state.originalParents[id]);
-					expect(state.accounting.some((r) => r.kind === "bridge")).toBe(true);
-				}
-				expect((await readSessionInfo(path))?.usage?.inputTokens).toBe(expected.ownUsage.input + 1); // catalog includes the sibling assistant too
-				expect(loadContextTreeChildFromDisk(manager.getSessionDir(), () => 200000)?.totalUsage).toEqual(
-					expected.totalUsage,
-				);
-				if (turn === 0) {
-					manager.appendMessage({
-						role: "toolResult",
-						toolCallId: "pad",
-						toolName: "fixture",
-						content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
-						isError: false,
-						timestamp: Date.now(),
-					});
-					const keep = manager.appendMessage(userMsg("next keep"));
-					const compaction = manager.appendCompaction("next summary", keep, 100);
-					expect(manager.rotateAfterCompaction(compaction, agentDir).status).toBe("rotated");
-				}
-			}
-			expect(readFileSync(sessionArchivePath(path, manager.getSessionId(), 0)).equals(original)).toBe(true);
-			for (const id of [a0, a1]) expect(manager.isEntryOnBranch(id)).toBe(true);
-			expect(manager.isEntryOnBranch(sibling)).toBe(false);
-			const row = restartOf(manager.getHeader())!.accounting.find(
-				(r) => r.kind === "assistant" && r.entry.id === a0,
-			);
-			if (row?.kind !== "assistant") throw new Error("missing accounting row");
-			manager.appendChildUsageAttribution(
-				a0,
-				{ ...row.entry.message.usage, input: 5, output: 0, totalTokens: 5 },
-				{ ...row.entry.message.usage, input: 15, totalTokens: 16 },
-			);
-			expected.totalUsage.input += 5;
-			expected.totalUsage.totalTokens += 5;
-			expect(computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries(), manager.getHeader())).toEqual(
-				expected,
-			);
-			expect(SessionManager.continueRecent(manager.getCwd(), manager.getSessionDir()).getSessionId()).toBe(
-				manager.getSessionId(),
-			);
-			expect(await findAgentTraceFiles(manager.getSessionDir())).toEqual([path]);
-			fixture.release();
-			const beforePrefix = restartOf(manager.getHeader())!.lines;
-			appendSessionInfoToExistingFile(path, "closed", agentDir);
-			appendCustomMessageToExistingFile(path, "large-tail", "x".repeat(300000), false, {}, agentDir);
-			appendSessionStateToExistingFile(path, { status: "crash" }, agentDir);
-			expect(restartOf(SessionManager.open(path).getHeader())!.lines).toEqual(beforePrefix);
-			const fork = SessionManager.forkFrom(path, fixture.directory, join(fixture.directory, "fork"));
-			const next = SessionManager.forkFrom(
-				fork.getSessionFile()!,
-				fixture.directory,
-				join(fixture.directory, "fork2"),
-			);
-			for (const view of [fork, next])
+		const { manager, path, agentDir } = fixture;
+		const expected = computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries());
+		expect(expected.totalUsage.input).toBe(3032);
+		const original = readFileSync(path);
+		expect(manager.rotateAfterCompaction(fixture.compaction, agentDir).status).toBe("rotated");
+		for (let turn = 0; turn < 2; turn++) {
+			const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+			const header = JSON.parse(lines[0]) as SessionHeader;
+			expect(Buffer.byteLength(lines[0]) + 1).toBeLessThan(65536);
+			const storage = lines.slice(1, 1 + header.rotation!.restart.count);
+			expect(storage.length).toBeGreaterThan(2);
+			for (const line of storage) expect(Buffer.byteLength(line) + 1).toBeLessThan(1024 * 1024);
+			expect(
+				createHash("sha256")
+					.update(`${storage.join("\n")}\n`)
+					.digest("hex"),
+			).toBe(header.rotation!.restart.sha256);
+			const cold = await SessionManager.openAsync(path);
+			const sync = SessionManager.open(path);
+			expect(parseSessionEntries(readFileSync(path, "utf8"))).toEqual(loadEntriesFromFile(path));
+			expect(await loadEntriesFromFileAsync(path, { streamThresholdBytes: 0 })).toEqual(loadEntriesFromFile(path));
+			for (const view of [manager, cold, sync]) {
 				expect(computeOwnAndTotalUsage(view.getBranch(), view.getEntries(), view.getHeader())).toEqual(expected);
-			const targetSessionDir = join(fixture.directory, "moved", "sessions");
-			mkdirSync(targetSessionDir, { recursive: true });
-			const { paths } = await preflightSessionMove({
-				sourceFile: path,
-				sourceSessionDir: manager.getSessionDir(),
-				targetSessionDir,
-				agentDir,
-			});
-			const archive1 = readFileSync(sessionArchivePath(path, manager.getSessionId(), 1));
-			expect(archive1.indexOf(0x0a) + 1).toBeLessThan(65536);
-			const moved = await relocateSession({
-				paths,
-				targetCwd: fixture.directory,
-				targetSocket: "fixture.sock",
-				callbacks: {
-					suspend: async () => false,
-					resume: async () => {},
-					writeMeshRecords: async () => {},
-					releaseClaim: () => {},
-					releaseLeases: () => {},
-				},
-			});
-			expect(moved.status).toBe("moved");
-			expect(readFileSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 1)).equals(archive1)).toBe(
-				true,
-			);
-			expect(next.getEntry(a0)?.id).toBe(a0);
-			const reservation = acquireSessionDeleteLeases(paths.targetFile, agentDir);
-			try {
-				expect((await deleteSessionFile(paths.targetFile)).ok).toBe(true);
-			} finally {
-				reservation.release();
+				expect(view.getEntries().some((e) => (e as { type: string }).type === "rotation_state")).toBe(false);
+				expect(view.getFlatTree().map((n) => n.entry.id)).toEqual(view.getEntries().map((e) => e.id));
+				const state = restartOf(view.getHeader())!;
+				for (const id of Object.keys(state.originalParents))
+					expect(view.getEntry(id)?.parentId).not.toBe(state.originalParents[id]);
+				expect(state.accounting.some((r) => r.kind === "bridge")).toBe(true);
 			}
-			expect(existsSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 0))).toBe(false);
-			expect(() => next.getEntry(a0)).toThrow(/unavailable/);
-			expect(computeOwnAndTotalUsage(next.getBranch(), next.getEntries(), next.getHeader())).toEqual(expected);
-		} finally {
-			fixture.cleanup();
+			expect((await readSessionInfo(path))?.usage?.inputTokens).toBe(expected.ownUsage.input + 1); // catalog includes the sibling assistant too
+			expect(loadContextTreeChildFromDisk(manager.getSessionDir(), () => 200000)?.totalUsage).toEqual(
+				expected.totalUsage,
+			);
+			if (turn === 0) {
+				manager.appendMessage({
+					role: "toolResult",
+					toolCallId: "pad",
+					toolName: "fixture",
+					content: [{ type: "text", text: "x".repeat(SESSION_ROTATION_THRESHOLD_BYTES) }],
+					isError: false,
+					timestamp: Date.now(),
+				});
+				const keep = manager.appendMessage(userMsg("next keep"));
+				const compaction = manager.appendCompaction("next summary", keep, 100);
+				expect(manager.rotateAfterCompaction(compaction, agentDir).status).toBe("rotated");
+			}
 		}
+		expect(readFileSync(sessionArchivePath(path, manager.getSessionId(), 0)).equals(original)).toBe(true);
+		for (const id of [a0, a1]) expect(manager.isEntryOnBranch(id)).toBe(true);
+		expect(manager.isEntryOnBranch(sibling)).toBe(false);
+		const row = restartOf(manager.getHeader())!.accounting.find((r) => r.kind === "assistant" && r.entry.id === a0);
+		if (row?.kind !== "assistant") throw new Error("missing accounting row");
+		manager.appendChildUsageAttribution(
+			a0,
+			{ ...row.entry.message.usage, input: 5, output: 0, totalTokens: 5 },
+			{ ...row.entry.message.usage, input: 15, totalTokens: 16 },
+		);
+		expected.totalUsage.input += 5;
+		expected.totalUsage.totalTokens += 5;
+		expect(computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries(), manager.getHeader())).toEqual(expected);
+		expect(SessionManager.continueRecent(manager.getCwd(), manager.getSessionDir()).getSessionId()).toBe(
+			manager.getSessionId(),
+		);
+		expect(await findAgentTraceFiles(manager.getSessionDir())).toEqual([path]);
+		fixture.release();
+		const beforePrefix = restartOf(manager.getHeader())!.lines;
+		appendSessionInfoToExistingFile(path, "closed", agentDir);
+		appendCustomMessageToExistingFile(path, "large-tail", "x".repeat(300000), false, {}, agentDir);
+		appendSessionStateToExistingFile(path, { status: "crash" }, agentDir);
+		expect(restartOf(SessionManager.open(path).getHeader())!.lines).toEqual(beforePrefix);
+		const fork = SessionManager.forkFrom(path, fixture.directory, join(fixture.directory, "fork"));
+		const next = SessionManager.forkFrom(fork.getSessionFile()!, fixture.directory, join(fixture.directory, "fork2"));
+		for (const view of [fork, next])
+			expect(computeOwnAndTotalUsage(view.getBranch(), view.getEntries(), view.getHeader())).toEqual(expected);
+		const targetSessionDir = join(fixture.directory, "moved", "sessions");
+		mkdirSync(targetSessionDir, { recursive: true });
+		const { paths } = await preflightSessionMove({
+			sourceFile: path,
+			sourceSessionDir: manager.getSessionDir(),
+			targetSessionDir,
+			agentDir,
+		});
+		const archive1 = readFileSync(sessionArchivePath(path, manager.getSessionId(), 1));
+		expect(archive1.indexOf(0x0a) + 1).toBeLessThan(65536);
+		const moved = await relocateSession({
+			paths,
+			targetCwd: fixture.directory,
+			targetSocket: "fixture.sock",
+			callbacks: {
+				suspend: async () => false,
+				resume: async () => {},
+				writeMeshRecords: async () => {},
+				releaseClaim: () => {},
+				releaseLeases: () => {},
+			},
+		});
+		expect(moved.status).toBe("moved");
+		expect(readFileSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 1)).equals(archive1)).toBe(true);
+		expect(next.getEntry(a0)?.id).toBe(a0);
+		const reservation = acquireSessionDeleteLeases(paths.targetFile, agentDir);
+		try {
+			expect((await deleteSessionFile(paths.targetFile)).ok).toBe(true);
+		} finally {
+			reservation.release();
+		}
+		expect(existsSync(sessionArchivePath(paths.targetFile, manager.getSessionId(), 0))).toBe(false);
+		expect(() => next.getEntry(a0)).toThrow(/unavailable/);
+		expect(computeOwnAndTotalUsage(next.getBranch(), next.getEntries(), next.getHeader())).toEqual(expected);
 	});
 	it.each([
 		"whole-prefix",
@@ -1139,125 +1119,113 @@ describe("bounded restart records", () => {
 		"witness",
 	])("rejects %s before tolerant repair on all full loaders", async (fault) => {
 		const fixture = rotationFixture();
-		try {
-			expect(fixture.manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
-			const lines = readFileSync(fixture.path, "utf8").trimEnd().split("\n");
-			const h = JSON.parse(lines[0]) as SessionHeader;
-			const n = h.rotation!.restart.count;
-			const rows = lines.slice(1, n + 1).map((line) => JSON.parse(line));
-			if (fault === "whole-prefix") lines.splice(1, n);
-			else if (fault === "chunk") lines.splice(1, 1);
-			else if (fault === "json") lines[1] = "{not-json";
-			else if (fault === "extra") lines.push(lines[1]);
-			else if (fault === "witness") Reflect.deleteProperty(h.rotation!, "restart");
-			else if (fault === "leading") {
-			} else {
-				if (fault === "duplicate") rows.push({ ...rows[0], index: n });
-				else if (fault === "bridge")
-					rows
-						.find((r) => r.kind === "accounting")
-						.data.push({ kind: "bridge", id: "foreign", accountingParentId: null });
-				else Reflect.set(rows[0], fault, fault === "kind" ? "future" : 99);
-				replaceRestartRecords(lines, h, rows);
-			}
-			lines[0] = JSON.stringify(h);
-			if (fault === "leading") lines.unshift("{}");
-			const bytes = `${lines.join("\n")}\n{torn`;
-			writeFileSync(fixture.path, bytes);
-			fixture.release();
-			const untouched = SessionManager.inMemory(fixture.directory);
-			const oldHeader = untouched.getHeader();
-			expect(() => untouched.setSessionFile(fixture.path)).toThrow();
-			expect(untouched.getSessionFile()).toBeUndefined();
-			expect(untouched.getHeader()).toBe(oldHeader);
-			expect(() => appendSessionInfoToExistingFile(fixture.path, "refused", fixture.agentDir)).toThrow();
-			expect(() => SessionManager.open(fixture.path)).toThrow();
-			await expect(SessionManager.openAsync(fixture.path)).rejects.toThrow();
-			expect(() => parseSessionEntries(bytes)).toThrow();
-			await expect(loadEntriesFromFileAsync(fixture.path, { streamThresholdBytes: 0 })).rejects.toThrow();
-			expect(await readSessionInfo(fixture.path)).toBeNull();
-			expect(() => loadContextTreeChildFromDisk(fixture.manager.getSessionDir(), () => 1000)).toThrow();
-			expect(readFileSync(fixture.path, "utf8")).toBe(bytes);
-			const fallback =
-				bytes.slice(0, -5) +
-				JSON.stringify({
-					type: "custom_message",
-					id: "large-tail",
-					parentId: fixture.compaction,
-					timestamp: "2026-01-01",
-					customType: "tail",
-					content: "x".repeat(300000),
-					display: false,
-				}) +
-				"\n";
-			writeFileSync(fixture.path, fallback);
-			expect(() => appendSessionInfoToExistingFile(fixture.path, "fallback refused", fixture.agentDir)).toThrow();
-			expect(readFileSync(fixture.path, "utf8")).toBe(fallback);
-		} finally {
-			fixture.cleanup();
+		expect(fixture.manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
+		const lines = readFileSync(fixture.path, "utf8").trimEnd().split("\n");
+		const h = JSON.parse(lines[0]) as SessionHeader;
+		const n = h.rotation!.restart.count;
+		const rows = lines.slice(1, n + 1).map((line) => JSON.parse(line));
+		if (fault === "whole-prefix") lines.splice(1, n);
+		else if (fault === "chunk") lines.splice(1, 1);
+		else if (fault === "json") lines[1] = "{not-json";
+		else if (fault === "extra") lines.push(lines[1]);
+		else if (fault === "witness") Reflect.deleteProperty(h.rotation!, "restart");
+		else if (fault === "leading") {
+		} else {
+			if (fault === "duplicate") rows.push({ ...rows[0], index: n });
+			else if (fault === "bridge")
+				rows
+					.find((r) => r.kind === "accounting")
+					.data.push({ kind: "bridge", id: "foreign", accountingParentId: null });
+			else Reflect.set(rows[0], fault, fault === "kind" ? "future" : 99);
+			replaceRestartRecords(lines, h, rows);
 		}
+		lines[0] = JSON.stringify(h);
+		if (fault === "leading") lines.unshift("{}");
+		const bytes = `${lines.join("\n")}\n{torn`;
+		writeFileSync(fixture.path, bytes);
+		fixture.release();
+		const untouched = SessionManager.inMemory(fixture.directory);
+		const oldHeader = untouched.getHeader();
+		expect(() => untouched.setSessionFile(fixture.path)).toThrow();
+		expect(untouched.getSessionFile()).toBeUndefined();
+		expect(untouched.getHeader()).toBe(oldHeader);
+		expect(() => appendSessionInfoToExistingFile(fixture.path, "refused", fixture.agentDir)).toThrow();
+		expect(() => SessionManager.open(fixture.path)).toThrow();
+		await expect(SessionManager.openAsync(fixture.path)).rejects.toThrow();
+		expect(() => parseSessionEntries(bytes)).toThrow();
+		await expect(loadEntriesFromFileAsync(fixture.path, { streamThresholdBytes: 0 })).rejects.toThrow();
+		expect(await readSessionInfo(fixture.path)).toBeNull();
+		expect(() => loadContextTreeChildFromDisk(fixture.manager.getSessionDir(), () => 1000)).toThrow();
+		expect(readFileSync(fixture.path, "utf8")).toBe(bytes);
+		const fallback =
+			bytes.slice(0, -5) +
+			JSON.stringify({
+				type: "custom_message",
+				id: "large-tail",
+				parentId: fixture.compaction,
+				timestamp: "2026-01-01",
+				customType: "tail",
+				content: "x".repeat(300000),
+				display: false,
+			}) +
+			"\n";
+		writeFileSync(fixture.path, fallback);
+		expect(() => appendSessionInfoToExistingFile(fixture.path, "fallback refused", fixture.agentDir)).toThrow();
+		expect(readFileSync(fixture.path, "utf8")).toBe(fallback);
 	});
 	it("preserves a zero-assistant null bridge without archive reads for usage", () => {
 		const fixture = rotationFixture();
-		try {
-			const entries = loadEntriesFromFile(fixture.path);
-			const removed = entries.find((entry) => entry.type === "message" && entry.id === fixture.assistant);
-			if (removed?.type !== "message") throw new Error("missing fixture message");
-			removed.message = userMsg("removed ordinary node");
-			writeFileSync(fixture.path, serializeSessionEntries(entries));
-			const manager = SessionManager.open(fixture.path);
-			fixture.bind(manager);
-			expect(manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
-			expect(restartOf(manager.getHeader())!.accounting).toEqual([
-				{ kind: "bridge", id: fixture.padding, accountingParentId: null },
-			]);
-			rmSync(sessionArchivePath(fixture.path, manager.getSessionId(), 0));
-			expect(
-				computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries(), manager.getHeader()).totalUsage.input,
-			).toBe(1);
-		} finally {
-			fixture.cleanup();
-		}
+		const entries = loadEntriesFromFile(fixture.path);
+		const removed = entries.find((entry) => entry.type === "message" && entry.id === fixture.assistant);
+		if (removed?.type !== "message") throw new Error("missing fixture message");
+		removed.message = userMsg("removed ordinary node");
+		writeFileSync(fixture.path, serializeSessionEntries(entries));
+		const manager = SessionManager.open(fixture.path);
+		fixture.bind(manager);
+		expect(manager.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("rotated");
+		expect(restartOf(manager.getHeader())!.accounting).toEqual([
+			{ kind: "bridge", id: fixture.padding, accountingParentId: null },
+		]);
+		rmSync(sessionArchivePath(fixture.path, manager.getSessionId(), 0));
+		expect(
+			computeOwnAndTotalUsage(manager.getBranch(), manager.getEntries(), manager.getHeader()).totalUsage.input,
+		).toBe(1);
 	});
 	it("accepts an explicit zero prefix and refuses an oversized archive-0 header without publication", () => {
 		const fixture = rotationFixture();
-		try {
-			const entries = loadEntriesFromFile(fixture.path);
-			const header = entries[0] as SessionHeader;
-			const empty = withRotationRestart(
-				{
-					...header,
-					rotation: {
-						version: 1,
-						segment: 0,
-						archives: [],
-						restart: { version: 1, count: 0, sha256: createHash("sha256").digest("hex") },
-						accounting: { messageCount: 0 },
-					},
+		const entries = loadEntriesFromFile(fixture.path);
+		const header = entries[0] as SessionHeader;
+		const empty = withRotationRestart(
+			{
+				...header,
+				rotation: {
+					version: 1,
+					segment: 0,
+					archives: [],
+					restart: { version: 1, count: 0, sha256: createHash("sha256").digest("hex") },
+					accounting: { messageCount: 0 },
 				},
-				{ originalParents: {}, accounting: [], firstMessage: "" },
-			);
-			const bytes = serializeSessionEntries([empty, ...entries.slice(1)]);
-			expect(parseSessionEntries(bytes).length).toBe(entries.length);
-			const zeroPath = join(fixture.directory, "zero.jsonl");
-			writeFileSync(zeroPath, bytes);
-			appendSessionInfoToExistingFile(zeroPath, "empty prefix", fixture.agentDir);
-			expect(SessionManager.open(zeroPath).getHeader()?.rotation?.restart).toEqual(empty.rotation!.restart);
-			writeFileSync(
-				fixture.path,
-				`${JSON.stringify({ ...header, opaque: "é".repeat(33000) })}\n${entries
-					.slice(1)
-					.map((e) => JSON.stringify(e))
-					.join("\n")}\n`,
-			);
-			const current = SessionManager.open(fixture.path);
-			fixture.bind(current);
-			const original = readFileSync(fixture.path);
-			expect(current.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("failed");
-			expect(readFileSync(fixture.path).equals(original)).toBe(true);
-			expect(existsSync(join(current.getSessionDir(), "archive"))).toBe(false);
-		} finally {
-			fixture.cleanup();
-		}
+			},
+			{ originalParents: {}, accounting: [], firstMessage: "" },
+		);
+		const bytes = serializeSessionEntries([empty, ...entries.slice(1)]);
+		expect(parseSessionEntries(bytes).length).toBe(entries.length);
+		const zeroPath = join(fixture.directory, "zero.jsonl");
+		writeFileSync(zeroPath, bytes);
+		appendSessionInfoToExistingFile(zeroPath, "empty prefix", fixture.agentDir);
+		expect(SessionManager.open(zeroPath).getHeader()?.rotation?.restart).toEqual(empty.rotation!.restart);
+		writeFileSync(
+			fixture.path,
+			`${JSON.stringify({ ...header, opaque: "é".repeat(33000) })}\n${entries
+				.slice(1)
+				.map((e) => JSON.stringify(e))
+				.join("\n")}\n`,
+		);
+		const current = SessionManager.open(fixture.path);
+		fixture.bind(current);
+		const original = readFileSync(fixture.path);
+		expect(current.rotateAfterCompaction(fixture.compaction, fixture.agentDir).status).toBe("failed");
+		expect(readFileSync(fixture.path).equals(original)).toBe(true);
+		expect(existsSync(join(current.getSessionDir(), "archive"))).toBe(false);
 	});
 });

@@ -1,5 +1,6 @@
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
+import { isProcessAlive } from "../utils/child-process.js";
 
 /** Resolve missing descendants too, without replacing or creating a symlink. */
 export function canonicalStoragePath(path: string, seen = new Set<string>()): string {
@@ -30,10 +31,25 @@ export function isRotatableSessionId(id: string): boolean {
 export function isSessionArchivePath(path: string): boolean {
 	for (const candidate of [resolve(path), canonicalStoragePath(path)]) {
 		const components = candidate.slice(parse(candidate).root.length).split(sep);
-		if (components.some((part, index) => part === "archive" && isRotatableSessionId(components[index + 1] ?? "")))
+		if (
+			components.some(
+				(part, index) =>
+					part.toLowerCase() === "archive" && isRotatableSessionId((components[index + 1] ?? "").toLowerCase()),
+			)
+		)
 			return true;
 	}
 	return false;
+}
+
+/** Benign archive files are removable on delete and excluded from move copies. */
+export function isDisposableSessionArchiveFile(name: string): boolean {
+	if (name === ".DS_Store") return true;
+	const temporary =
+		/^(0|[1-9][0-9]*)\.jsonl\.([1-9][0-9]*)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/.exec(
+			name,
+		);
+	return !!temporary && Number.isSafeInteger(Number(temporary[2])) && !isProcessAlive(Number(temporary[2]));
 }
 
 export function requireActiveSessionPath(path: string): void {

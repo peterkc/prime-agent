@@ -13147,7 +13147,10 @@ export class AgentSession {
 				this._rlmAssistantEntryIds.get(parentAssistantForUsage) ??
 				this._findAssistantEntryForMessage(parentAssistantForUsage)?.id;
 			if (!parentEntryIdForUsage) {
-				if (!afterParentDrain && !parentEntryDrainScheduled) {
+				if (afterParentDrain) {
+					pendingChildUsage.clear();
+					releasePendingChildUsage();
+				} else if (!parentEntryDrainScheduled) {
 					parentEntryDrainScheduled = true;
 					const flushAfterParentDrain = () => {
 						parentEntryDrainScheduled = false;
@@ -13567,7 +13570,7 @@ export class AgentSession {
 				try {
 					flushPendingChildUsageAttribution();
 				} finally {
-					releasePendingChildUsage();
+					if (!parentEntryDrainScheduled) releasePendingChildUsage();
 				}
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;

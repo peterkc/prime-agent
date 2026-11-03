@@ -57,6 +57,7 @@ import {
 
 import {
 	canonicalStoragePath,
+	isDisposableSessionArchiveFile,
 	isRotatableSessionId,
 	isSessionArchivePath,
 	requireActiveSessionPath,
@@ -547,6 +548,7 @@ function archiveFiles(root: string, sessionId: string): { name: string; sha256: 
 		throw new Error(`Unsafe session archive folder: ${root}`);
 	return readdirSync(root)
 		.sort()
+		.filter((name) => !isDisposableSessionArchiveFile(name) || !lstatSync(join(root, name)).isFile())
 		.map((name) => {
 			const file = join(root, name);
 			if (!/^(0|[1-9][0-9]*)\.jsonl$/.test(name) || !lstatSync(file).isFile())
@@ -1199,10 +1201,13 @@ export async function recoverSessionMove(options: {
 	} catch (error) {
 		return { ...unhandled, status: "pending", messages: [errorMessage(error)] };
 	}
-	let archiveLeases: { release(): void } | undefined;
+	let sourceLease: SessionLease | undefined;
 	try {
-		if (journal.archiveMove) archiveLeases = callbacks.acquireLeases(journal);
 		if (present(journal.targetFile)) {
+			if (journal.archiveMove)
+				sourceLease = acquireSessionLease(journal.sourceFile, journal.agentDir, {
+					[SESSION_LEASES_ENABLED_ENV]: "1",
+				});
 			let header: unknown;
 			try {
 				header = JSON.parse(readFirstLineSync(journal.targetFile) ?? "null");
@@ -1255,7 +1260,7 @@ export async function recoverSessionMove(options: {
 		}
 		let leases: { release(): void };
 		try {
-			leases = archiveLeases ?? callbacks.acquireLeases(journal);
+			leases = callbacks.acquireLeases(journal);
 		} catch (error) {
 			if (error instanceof SessionAlreadyActiveError) {
 				return report(journal, "skipped", [`Could not take move leases: ${errorMessage(error)}`]);
@@ -1265,13 +1270,13 @@ export async function recoverSessionMove(options: {
 		try {
 			return await rollbackSessionMove(journal, callbacks.resume);
 		} finally {
-			if (!archiveLeases) leases.release();
+			leases.release();
 		}
 	} catch (error) {
 		if (error instanceof SessionAlreadyActiveError)
 			return report(journal, "skipped", [`Could not take move leases: ${errorMessage(error)}`]);
 		return report(journal, "pending", ["Recovery is pending", errorMessage(error)]);
 	} finally {
-		archiveLeases?.release();
+		sourceLease?.release();
 	}
 }

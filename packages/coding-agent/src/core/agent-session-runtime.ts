@@ -307,6 +307,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const previous = this._sessionLease;
 		this._sessionLease = lease;
 		bindSessionWriterLease(this._session.sessionManager, lease);
+		this._session.sessionManager.cleanupRotationTemps(this.services.agentDir);
 		previous?.release();
 	}
 

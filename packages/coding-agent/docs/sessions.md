@@ -41,9 +41,9 @@ A fork of segmented history records a source ID and fork-time boundary for older
 
 **Before confirming permanent saved-session deletion:** deletion removes the source's own archives and relocation records after its transcript is removed. Forks keep their own active entries, state and archives, but inherited archive-only reads fail with a missing-source error. Deletion does not cascade to forks or retain a hidden archive copy.
 
-Deletion validates the archive folder and relocation records first. An unknown file refuses deletion and leaves the transcript intact. Recognizable dead-process temporary files and `.DS_Store` files can be removed. A later cleanup failure reports the remaining orphan path and still attempts artifact cleanup.
+For sessions with committed evidence, deletion validates the archive folder and relocation records first. An unknown file refuses deletion and leaves the transcript intact. Recognizable dead-process temporary files and `.DS_Store` files can be removed. A later cleanup failure reports the remaining orphan path and still attempts artifact cleanup.
 
-Saved deletion also attempts to remove recognizable archives and temporary files from an interrupted first rotation. If the session has no committed evidence, cleanup failures produce a diagnostic without changing the transcript delete result.
+Saved deletion also attempts to remove recognizable archives and temporary files from an interrupted first rotation. If the session has no committed evidence, cleanup failures produce a diagnostic without changing the transcript delete result. If the transcript is already missing and its archive folder remains, a retry refuses and names the orphan folder for inspection.
 
 Ordinary close, shutdown, update and child tombstoning retain archives; artifact-only child cleanup removes runtime caches, not evidence.
 
