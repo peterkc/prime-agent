@@ -79,7 +79,7 @@ if (tool === "launchctl") {
   if (args[0] === "--version") { console.log(control.versionOutput ?? "cotal-ai 0.79.0\n  adapter test 9.9.9"); process.exit(0); }
   if (args[0] === "up") {
     if (args.includes("--rotate-sys") && control.failRotate) process.exit(6);
-    if (args.includes("--rotate-sys")) writeFileSync(join(root, "rotated"), "yes");
+    if (args.includes("--rotate-sys")) { writeFileSync(join(root, "rotated"), "yes"); if (control.latePid) writeFileSync(join(cotalRoot, ".cotal", "delivery.7072696d65.pid"), "27805"); }
     writeFileSync("auth", "ready");
     writeFileSync(join(cotalRoot, ".cotal", "nats.pid"), "42");
     if (!existsSync(join(cotalRoot, ".cotal", "space.7072696d65")) || (args.includes("--rotate-sys") && !control.staleRotation)) {
@@ -145,7 +145,7 @@ async function command(name: string, ...options: string[]): Promise<void> {
 	configure({ credentialNow: now });
 	await runMeshCommand([name, "--label", "ai.prime.mesh.test", "--server", server, ...options], {
 		...clock,
-		processAlive: () => existsSync(join(mesh, ".cotal", "nats.pid")),
+		processAlive: (pid) => pid !== 42 || existsSync(join(mesh, ".cotal", "nats.pid")),
 		wait: async (ms) => {
 			now += control.notReady
 				? 30_000
@@ -788,6 +788,11 @@ describe("mesh command", () => {
 		["service", "stop ai.prime.mesh.test", 1],
 		["renew", "stop ai.prime.mesh.test.renew", 0],
 		["temporary", "stop rotation broker", 3],
+		[
+			"late-pid",
+			`(PID 27805); once it exits, restart delivery: launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`,
+			3,
+		],
 	] as const)("restores jobs and reports a failed rotation step (%s)", async (failure, step, bootstraps) => {
 		await command("install");
 		now = Date.UTC(2026, 10, 1);
@@ -796,6 +801,7 @@ describe("mesh command", () => {
 			failRestart: failure === "restart",
 			staleRotation: failure === "stale",
 			stalledBootout: ["service", "renew", "temporary"].includes(failure) ? failure : undefined,
+			latePid: failure === "late-pid",
 		});
 		rmSync(join(root, "events.jsonl"));
 		await command("rotate");
@@ -810,6 +816,7 @@ describe("mesh command", () => {
 		expect(events().some((event) => event.args[0] === "down")).toBe(false);
 		expect(existsSync(join(root, "loaded-renew"))).toBe(true);
 		expect(existsSync(join(root, "loaded"))).toBe(failure !== "restart");
+		expect(existsSync(join(mesh, "rotation-boot.plist"))).toBe(failure === "temporary");
 		expect(existsSync(join(mesh, "rotation.lock"))).toBe(false);
 		expect(output()).not.toContain(seed);
 	});

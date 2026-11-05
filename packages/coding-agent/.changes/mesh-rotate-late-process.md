@@ -1,0 +1,1 @@
+- Fixed `mesh rotate` leaving its temporary rotation plist behind when a Cotal process exits after the stop wait, which blocked every later rotation.
