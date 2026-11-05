@@ -691,12 +691,17 @@ async function rotateCredentials(options: MeshOptions, launchctl: string, runtim
 			failures.push(`${step}: ${error instanceof Error ? error.message : "failed"}`);
 		}
 		if (existsSync(temporary)) {
+			let removed = false;
 			try {
 				await bootout(launchctl, options, runtime);
-				await waitForStopped(options, runtime);
+				// Confirmed bootout means launchd cannot start this plist again. Remove it before waiting,
+				// so a slow recorded Cotal process (such as delivery) cannot block every later rotation.
 				await rm(temporary);
+				removed = true;
+				await waitForStopped(options, runtime);
 			} catch (error) {
-				failures.push(`stop rotation broker: ${error instanceof Error ? error.message : "failed"}`);
+				const stage = removed ? "temporary rotation job removed, processes still stopping" : "stop rotation broker";
+				failures.push(`${stage}: ${error instanceof Error ? error.message : "failed"}`);
 			}
 		}
 		for (const job of jobs) {

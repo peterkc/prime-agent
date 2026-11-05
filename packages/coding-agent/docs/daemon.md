@@ -165,10 +165,14 @@ anything, a service in any other launchd state, such as a pending respawn.
 It stops the renewal and service jobs, then waits for the broker port and recorded
 Cotal processes to stop. A temporary foreground launchd job boots the same service
 with `--rotate-sys` and no `KeepAlive`. After both $SYS issue times advance and their
-30-day lifetimes are verified, rotation stops that job, waits for its processes to
-exit, and restores the installed service and renewal jobs. The installed service
-plist never changes. Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon
-through `cotal down`; rotation uses launchd and waits for that daemon to exit itself.
+30-day lifetimes are verified, rotation stops that job, removes the temporary plist
+once launchd confirms the job is gone, waits for its processes to exit, and restores
+the installed service and renewal jobs. The installed service plist never changes.
+Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon through `cotal down`;
+rotation uses launchd and waits for that daemon to exit itself. If the daemon
+outlives that wait, rotation still restores both jobs and exits nonzero with
+"temporary rotation job removed, processes still stopping". The credentials are
+already renewed, and later rotations are not blocked.
 Each stop wait has a 30-second deadline; its final port probe can take one second
 more. No failed step is hidden; recovery still attempts to restore both installed
 jobs, even when a job lookup fails or is killed.
