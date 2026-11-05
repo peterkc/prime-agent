@@ -701,7 +701,12 @@ async function rotateCredentials(options: MeshOptions, launchctl: string, runtim
 				await waitForStopped(options, runtime);
 			} catch (error) {
 				const stage = removed ? "temporary rotation job removed, processes still stopping" : "stop rotation broker";
-				failures.push(`${stage}: ${error instanceof Error ? error.message : "failed"}`);
+				// The restored service reuses a still-live delivery process, and Cotal does not restart it after it exits.
+				const restart =
+					removed && serviceWasRunning
+						? `; once it exits, restart delivery: launchctl kickstart -k ${targetOf(options)}`
+						: "";
+				failures.push(`${stage}: ${error instanceof Error ? error.message : "failed"}${restart}`);
 			}
 		}
 		for (const job of jobs) {

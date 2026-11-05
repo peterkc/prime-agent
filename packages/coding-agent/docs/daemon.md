@@ -173,7 +173,10 @@ rotation uses launchd and waits for that daemon to exit itself. If the daemon
 outlives that wait, rotation still restores both jobs and exits nonzero with
 "temporary rotation job removed, processes still stopping". When every earlier
 step succeeded, the credentials are already renewed. The temporary plist is gone,
-so a later rotation can run once the process exits.
+so a later rotation can run once the process exits. The restored service reuses that
+process, and Cotal does not restart delivery after it exits; `mesh status` does not
+report this. When the service was running, the error names the restart command:
+after the process exits, run `launchctl kickstart -k gui/$UID/<label>`.
 Each stop wait has a 30-second deadline; its final port probe can take one second
 more. No failed step is hidden; recovery still attempts to restore both installed
 jobs, even when a job lookup fails or is killed.

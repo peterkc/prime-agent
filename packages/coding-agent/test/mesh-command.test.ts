@@ -788,7 +788,11 @@ describe("mesh command", () => {
 		["service", "stop ai.prime.mesh.test", 1],
 		["renew", "stop ai.prime.mesh.test.renew", 0],
 		["temporary", "stop rotation broker", 3],
-		["late-pid", "temporary rotation job removed, processes still stopping: Mesh broker or recorded", 3],
+		[
+			"late-pid",
+			`(PID 27805); once it exits, restart delivery: launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`,
+			3,
+		],
 	] as const)("restores jobs and reports a failed rotation step (%s)", async (failure, step, bootstraps) => {
 		await command("install");
 		now = Date.UTC(2026, 10, 1);
