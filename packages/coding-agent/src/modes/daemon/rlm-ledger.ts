@@ -508,6 +508,7 @@ export class RlmSpawnLedger {
 	/** Import deletion proof only. A meta-only ledger prevents legacy seeding of moved history. */
 	importMoveTombstones(records: readonly RlmLedgerDeleteRecord[]): Promise<void> {
 		return this.enqueue(() => {
+			if (!records.length && existsSync(this.path)) return;
 			const deleted = new Set<string>();
 			for (const record of this.eventLog.replaySync(parseLedgerLine)) {
 				if (record.op === "delete") deleted.add(canonicalSessionPath(record.child));

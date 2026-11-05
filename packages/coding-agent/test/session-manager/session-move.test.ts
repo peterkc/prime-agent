@@ -862,6 +862,201 @@ function assertMovedHistory(f: Awaited<ReturnType<typeof historyFixture>>) {
 }
 
 describe("moving retained child history", () => {
+	it("fork move F8 explains old stubs and supports preserving them aside before moving back", async () => {
+		const f = await historyFixture();
+		const outside = join(home, "outside");
+		mkdirSync(outside);
+		const external = SessionManager.forkFrom(f.nested, home, outside);
+		expect((await move(f)).status).toBe("moved");
+		const reverse = sessionMovePaths({
+			...f.paths,
+			sourceFile: f.paths.targetFile,
+			sourceSessionDir: f.paths.targetSessionDir,
+			targetSessionDir: f.paths.sourceSessionDir,
+		});
+		if (!reverse.ok) throw new Error(reverse.reason);
+		await expect(preflightSessionMove(reverse.value)).rejects.toThrow(/relocation stubs.*Preserve this folder aside/);
+		const saved = `${f.paths.sourceArtifacts}.preserved`;
+		renameSync(f.paths.sourceArtifacts, saved);
+		expect((await move({ ...f, paths: reverse.value })).status).toBe("moved");
+		expect(external.getEntry("old")).toEqual(f.old);
+		expect(existsSync(join(saved, "sub-completed", "sub-nested", `${basename(f.nested)}.relocated`))).toBe(true);
+	});
+	it("fork move F7 seeds other target legacy children without making moved history live", async () => {
+		const f = await historyFixture();
+		const parent = join(f.paths.targetSessionDir, "other.jsonl");
+		const artifacts = getSessionArtifactPathForFile(parent);
+		mkdirSync(artifacts, { recursive: true });
+		const child = join(artifacts, "child.jsonl");
+		writeFileSync(parent, jsonl([{ ...f.entries[0], id: "other", rlmDepth: 0 }]));
+		writeFileSync(child, jsonl([{ ...f.entries[0], id: "other-child", rlmDepth: 1, parentSession: parent }]));
+		writeFileSync(
+			join(artifacts, "rlm-subagents.jsonl"),
+			JSON.stringify({
+				type: "rlm_subagent",
+				childId: "other-child",
+				sessionName: "other",
+				sessionFile: child,
+				status: "running",
+			}),
+		);
+		expect((await move(f)).status).toBe("moved");
+		const target = new RlmSpawnLedger(
+			f.paths.agentDir,
+			f.paths.targetSessionDir,
+			createRlmLedgerRegistrySeedSource(),
+		);
+		expect((await target.liveEdges()).map((edge) => edge.child)).toEqual([child]);
+		const next = join(home, "next", "sessions");
+		mkdirSync(next, { recursive: true });
+		await expect(
+			preflightSessionMove({
+				...f.paths,
+				sourceFile: parent,
+				sourceSessionDir: f.paths.targetSessionDir,
+				targetSessionDir: next,
+			}),
+		).rejects.toThrow(/live RLM children.*other-child/);
+	});
+	it.each(["new", "changed", "existing"])(
+		"fork move F7 rolls back only its own unchanged target ledger (%s)",
+		async (kind) => {
+			const f = await historyFixture();
+			const ledger = new RlmSpawnLedger(f.paths.agentDir, f.paths.targetSessionDir);
+			if (kind === "existing") await ledger.importMoveTombstones([]);
+			const rename = fs.renameSync;
+			vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+				if (to === f.paths.sourceBackup) {
+					if (kind === "changed") writeFileSync(ledger.ledgerPath, "\n", { flag: "a" });
+					throw new Error("stop before publication");
+				}
+				return rename(from, to);
+			});
+			syncBuiltinESMExports();
+			const result = await move(f);
+			expect(result.status).toBe(kind === "changed" ? "pending" : "rolled_back");
+			expect(existsSync(ledger.ledgerPath)).toBe(kind !== "new");
+			expect(existsSync(f.paths.journalPath)).toBe(kind === "changed");
+			expect(existsSync(f.paths.sourceFile)).toBe(true);
+			expect(existsSync(f.paths.targetFile)).toBe(false);
+		},
+	);
+	it("fork move F1 keeps pending dispatch records for a childless session", async () => {
+		const f = fixture();
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact(f.paths.sessionId, f.paths.sourceArtifacts);
+		const job = await store.create({
+			sessionId: f.paths.sessionId,
+			activeSessionId: "active",
+			sessionFile: f.paths.sourceFile,
+			cwd: home,
+			prompt: "pending",
+			scheduleText: "in 1 day",
+		});
+		await store.cancel(job.id);
+		const file = join(f.paths.sourceArtifacts, "scheduled-jobs.json");
+		const state = JSON.parse(readFileSync(file, "utf8"));
+		const dispatches = [{ id: "dispatch", jobId: job.id, claimedAt: "t1", scheduledFor: "t2" }];
+		writeFileSync(file, JSON.stringify({ ...state, dispatches }));
+		expect((await move(f)).status).toBe("moved");
+		expect(JSON.parse(readFileSync(join(f.paths.targetArtifacts, "scheduled-jobs.json"), "utf8")).dispatches).toEqual(
+			dispatches,
+		);
+	});
+	it("fork move F2 preserves private rewritten metadata modes", async () => {
+		const f = await historyFixture();
+		const files = [
+			join(dirname(f.completed), "rlm-subagent.json"),
+			join(getSessionArtifactPathForFile(f.nested), "scheduled-jobs.json"),
+		];
+		for (const file of files) fs.chmodSync(file, 0o600);
+		expect((await move(f)).status).toBe("moved");
+		for (const file of files) expect(fs.statSync(f.target(file)).mode & 0o777).toBe(0o600);
+	});
+	it("fork move F3 publishes child redirects even when original cleanup is refused", async () => {
+		const f = await historyFixture();
+		const externalDir = join(home, "external");
+		mkdirSync(externalDir);
+		const external = SessionManager.forkFrom(f.nested, home, externalDir);
+		const write = f.callbacks.writeMeshRecords;
+		f.callbacks.writeMeshRecords = async (journal, writes) => {
+			await write(journal, writes);
+			writeFileSync(join(f.paths.sourceArtifacts, "late"), "new");
+		};
+		const result = await move(f);
+		expect(result.status).toBe("moved");
+		expect(result.backups.length).toBeGreaterThan(0);
+		expect(JSON.parse(readFileSync(`${f.nested}.relocated`, "utf8")).target).toBe(f.target(f.nested));
+		for (const file of [f.nested, f.childArchive]) rmSync(file);
+		expect(external.getEntry("old")).toEqual(f.old);
+		expect((await recover(f)).status).toBe("absent");
+	});
+	it("fork move F4 maps aliased operational references, including missing targets, but not external ones", async () => {
+		const f = await historyFixture();
+		const alias = join(home, "alias");
+		symlinkSync(join(home, "source"), alias, "dir");
+		const parent = join(alias, "sessions", basename(f.paths.sourceFile));
+		const entries = readEntries(f.completed);
+		entries[0] = { ...(entries[0] as SessionHeader), parentSession: parent };
+		writeFileSync(f.completed, jsonl(entries));
+		const metadata = join(dirname(f.completed), "rlm-subagent.json");
+		const record = JSON.parse(readFileSync(metadata, "utf8"));
+		const missing = join(alias, "session-artifacts", f.paths.sessionId, "missing", "deeper", "file");
+		const external = join(alias, "outside", "missing");
+		writeFileSync(metadata, JSON.stringify({ ...record, target: missing, parentSessionFile: external }));
+		expect((await move(f)).status).toBe("moved");
+		expect((readEntries(f.target(f.completed))[0] as SessionHeader).parentSession).toBe(f.paths.targetFile);
+		expect(JSON.parse(readFileSync(f.target(metadata), "utf8"))).toMatchObject({
+			target: join(f.paths.targetArtifacts, "missing", "deeper", "file"),
+			parentSessionFile: external,
+		});
+	});
+	it.each(["source", "target", "rollback"])("fork move F5 canonicalizes artifact-root aliases (%s)", async (side) => {
+		const f = await historyFixture();
+		const root = side === "target" ? f.paths.targetArtifactRoot : f.paths.sourceArtifactRoot;
+		const physical = join(home, "physical-artifacts");
+		if (existsSync(root)) renameSync(root, physical);
+		else mkdirSync(physical);
+		symlinkSync(physical, root, "dir");
+		const checked = sessionMovePaths(f.paths);
+		if (!checked.ok) throw new Error(checked.reason);
+		Object.assign(f.paths, checked.value);
+		if (side === "rollback")
+			f.callbacks.suspend = async () => {
+				throw new Error("suspend failed");
+			};
+		const result = await move(f);
+		expect(result.status).toBe(side === "rollback" ? "rolled_back" : "moved");
+		expect(existsSync(f.paths.journalPath)).toBe(false);
+		if (side !== "rollback") expect(result.backups).toEqual([]);
+		if (side !== "rollback")
+			expect(
+				readDeletedRlmChildPaths(f.paths.agentDir).has(
+					join(f.paths.targetArtifacts, "sub-deleted", basename(f.deleted)),
+				),
+			).toBe(true);
+	});
+	it("fork move F5 refuses a child symlink before writing a journal", async () => {
+		const f = fixture();
+		const outside = join(home, "outside.jsonl");
+		writeFileSync(outside, jsonl([{ ...f.entries[0], id: "child", rlmDepth: 1 }]));
+		symlinkSync(outside, join(f.paths.sourceArtifacts, "nested", "child.jsonl"));
+		await expect(preflightSessionMove(f.paths)).rejects.toThrow(/Artifact is not a regular file or folder/);
+		expect(existsSync(f.paths.journalPath)).toBe(false);
+	});
+	it.each(["registry", "unrelated-ledger"])("fork move F6 preserves childless moves with damaged %s", async (kind) => {
+		const f = fixture();
+		const file =
+			kind === "registry"
+				? join(f.paths.sourceArtifacts, "rlm-subagents.jsonl")
+				: new RlmSpawnLedger(f.paths.agentDir, join(home, "unrelated")).ledgerPath;
+		mkdirSync(dirname(file), { recursive: true });
+		writeFileSync(file, "{torn\nnull\n");
+		expect((await move(f)).status).toBe("moved");
+		expect(
+			readFileSync(kind === "registry" ? join(f.paths.targetArtifacts, "rlm-subagents.jsonl") : file, "utf8"),
+		).toBe("{torn\nnull\n");
+	});
 	it("fork move preserves completed, deleted and nested archived transcripts without creating live children", async () => {
 		const f = await historyFixture();
 		const externalDir = join(home, "external");

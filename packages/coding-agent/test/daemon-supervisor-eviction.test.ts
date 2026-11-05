@@ -50,6 +50,11 @@ interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	clients: Set<{ id: string; attachedActiveSessionIds: Set<string> }>;
 	idleEvictionFence?: Promise<void>;
+	shuttingDown: boolean;
+	clearScheduledWakeTimer(): void;
+	clearIdleEvictionTimer(): void;
+	clearHeartbeatsChangedBroadcast(): void;
+	clearRosterWatchdogTimer(): void;
 	mutationDrain: { begin(): void; end(): void };
 	catalog: { resolve: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; list?: ReturnType<typeof vi.fn> };
 	rlmSpawnLedgerInstance?: { family: ReturnType<typeof vi.fn>; liveEdges: ReturnType<typeof vi.fn> };
@@ -82,8 +87,17 @@ interface SupervisorInternals {
 }
 
 const tempDirs: string[] = [];
+const supervisors: SupervisorInternals[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+	for (const supervisor of supervisors.splice(0)) {
+		supervisor.shuttingDown = true;
+		supervisor.clearScheduledWakeTimer();
+		supervisor.clearIdleEvictionTimer();
+		supervisor.clearHeartbeatsChangedBroadcast();
+		supervisor.clearRosterWatchdogTimer();
+		await supervisor.scheduledWakeRecompute;
+	}
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
@@ -140,6 +154,7 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 		defaultSessionConfig: { agentDir: directory, cwd: directory },
 		descriptorDir: join(directory, "workers"),
 	}) as unknown as SupervisorInternals;
+	supervisors.push(supervisor);
 	supervisor.stopWorker = vi.fn(async (worker: WorkerFixture) => {
 		supervisor.workers.delete(worker.descriptor.workerId);
 	});
