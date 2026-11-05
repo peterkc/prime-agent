@@ -22,6 +22,7 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { findAgentTraceFiles } from "../../src/core/agent-traces.js";
+import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
 import {
 	acquireSessionDeleteLeases,
 	deleteSessionFile,
@@ -39,6 +40,8 @@ import {
 	type FileEntry,
 	getSessionArtifactPathForFile,
 	loadEntriesFromFile,
+	parseStoredSegment,
+	type SessionHeader,
 	SessionManager,
 } from "../../src/core/session-manager.js";
 import {
@@ -51,6 +54,7 @@ import {
 	type SessionMoveJournal,
 	type SessionMoveRecoveryCallbacks,
 	sessionMovePaths,
+	sessionMoveSize,
 	transformSessionMoveEntries,
 	verifySessionMoveCopy,
 } from "../../src/core/session-move.js";
@@ -59,6 +63,11 @@ import { sessionArchivePath } from "../../src/core/session-storage-paths.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { AgentsViewMode } from "../../src/modes/agents-view/agents-view-mode.js";
 import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
+import {
+	createRlmLedgerRegistrySeedSource,
+	RlmSpawnLedger,
+	readDeletedRlmChildPaths,
+} from "../../src/modes/daemon/rlm-ledger.js";
 import { writeFileAtomicSync } from "../../src/utils/atomic-file.js";
 import { spawnHidden } from "../../src/utils/child-process.js";
 import { assistantMsg, userMsg } from "../utilities.js";
@@ -708,10 +717,15 @@ import {relocateSession,acquireSessionMoveLeases} from ${JSON.stringify(moveUrl)
 const [paths,cwd,point]=JSON.parse(process.argv[1]); const rename=fs.renameSync;
 fs.renameSync=(from,to)=>{ const archive=to.endsWith('/archive/'+paths.sessionId);
 const active=to===paths.targetFile; const redirect=to===paths.sourceFile+'.relocated';
-const hit=point.startsWith('archive')?archive:point.startsWith('active')?active:redirect;
+const childRedirect=to.startsWith(paths.sourceArtifacts+'/')&&to.endsWith('.relocated');
+const journal=to===paths.journalPath?JSON.parse(fs.readFileSync(from,'utf8')):undefined;
+const hit=point.startsWith('journal-')?journal&&(point==='journal-verified-after'?journal.phase==='copying'&&journal.children?.every(c=>c.fileSha256):point==='journal-'+journal.phase+'-after'):
+point.startsWith('source-')?to===paths.sourceBackup:point.startsWith('artifacts-')?to===paths.targetArtifacts:
+point.startsWith('child-redirect')?childRedirect:point.startsWith('archive')?archive:point.startsWith('active')?active:redirect;
 if(hit&&point.endsWith('before'))process.exit(73); rename(from,to); if(hit&&point.endsWith('after'))process.exit(73); };
+const copy=fs.copyFileSync;fs.copyFileSync=(...args)=>{copy(...args);if(point==='copy-after')process.exit(73);};
 syncBuiltinESMExports(); const leases=acquireSessionMoveLeases(paths,paths.agentDir);
-await relocateSession({paths,targetCwd:cwd,targetSocket:'new.sock',callbacks:{suspend:async()=>true,resume:async()=>{},writeMeshRecords:async()=>{},releaseClaim:()=>{},releaseLeases:()=>leases.release()}}); process.exit(74);`;
+await relocateSession({paths,targetCwd:cwd,targetSocket:'new.sock',callbacks:{suspend:async()=>true,resume:async()=>{},writeMeshRecords:async()=>{if(point==='mesh-after')process.exit(73);},releaseClaim:()=>{},releaseLeases:()=>leases.release()}}); process.exit(74);`;
 	const child = spawnHidden(
 		process.execPath,
 		["--import", "tsx", "--input-type=module", "-e", script, JSON.stringify([f.paths, f.targetCwd, point])],
@@ -731,6 +745,305 @@ const paths=JSON.parse(process.argv[1]);const result=await recoverSessionMove({.
 		),
 	) as { status: string; messages: string[] };
 }
+async function historyFixture() {
+	const f = segmentedFixture();
+	const completedDir = join(f.paths.sourceArtifacts, "sub-completed");
+	const deletedDir = join(f.paths.sourceArtifacts, "sub-deleted");
+	const nestedDir = join(completedDir, "sub-nested");
+	const childFiles = [completedDir, deletedDir, nestedDir].map((dir, index) => {
+		mkdirSync(dir, { recursive: true });
+		const id = `22222222-2222-4222-8222-${String(index + 1).padStart(12, "0")}`;
+		return join(dir, `${id}.jsonl`);
+	});
+	const [completed, deleted, nested] = childFiles;
+	for (const [index, file] of childFiles.entries()) {
+		const id = basename(file, ".jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id,
+			timestamp: "t1",
+			cwd: home,
+			parentSession: index === 2 ? completed : f.paths.sourceFile,
+			rlmDepth: index === 2 ? 2 : 1,
+		} as const;
+		writeFileSync(
+			file,
+			jsonl([
+				header,
+				{ type: "session_info", id: "name", parentId: null, timestamp: "t2", name: `history-${index}` },
+			]),
+		);
+		writeFileSync(
+			join(dirname(file), "rlm-subagent.json"),
+			JSON.stringify({
+				type: "rlm_subagent",
+				childId: `child-${index}`,
+				sessionName: `history-${index}`,
+				sessionDir: dirname(file),
+				sessionFile: file,
+				status: index === 1 ? "deleted" : "completed",
+				createdAt: 0,
+				updatedAt: "t1",
+			}),
+		);
+	}
+	const active = parseStoredSegment(readFileSync(f.paths.sourceFile));
+	const old = parseStoredSegment(readFileSync(f.archive));
+	const nestedId = basename(nested, ".jsonl");
+	const nestedHeader = readEntries(nested)[0] as SessionHeader;
+	old[0] = { ...(old[0] as SessionHeader), ...nestedHeader };
+	const archiveBytes = Buffer.from(jsonl(old));
+	const archive = sessionArchivePath(nested, nestedId, 0);
+	mkdirSync(dirname(archive), { recursive: true });
+	writeFileSync(archive, archiveBytes);
+	const rootHeader = active[0] as SessionHeader;
+	active[0] = withRotationRestart(
+		{
+			...rootHeader,
+			...nestedHeader,
+			rotation: {
+				...rootHeader.rotation!,
+				archives: [{ segment: 0, bytes: archiveBytes.length, sha256: hash(archiveBytes) }],
+			},
+		},
+		restartOf(rootHeader)!,
+	);
+	writeFileSync(nested, jsonl(active));
+	const ledger = new RlmSpawnLedger(f.paths.agentDir, f.paths.sourceSessionDir);
+	await ledger.appendSpawn({
+		childId: "child-1",
+		child: deleted,
+		parent: f.paths.sourceFile,
+		depth: 1,
+		name: "deleted",
+	});
+	await ledger.appendDelete({ childId: "child-1", child: deleted, reason: "parent-teardown" });
+	writeFileSync(
+		join(f.paths.sourceArtifacts, "rlm-subagents.jsonl"),
+		`${JSON.stringify({ type: "rlm_subagent", childId: "child-0", sessionName: "history-0", sessionFile: completed, sessionDir: completedDir, parentSessionFile: f.paths.sourceFile, status: "completed" })}\n`,
+	);
+	const jobs = AgentCronJobStore.forSessionArtifacts();
+	jobs.registerSessionArtifact(nestedId, getSessionArtifactPathForFile(nested));
+	const job = await jobs.create({
+		sessionId: nestedId,
+		activeSessionId: nestedId,
+		sessionFile: nested,
+		cwd: home,
+		prompt: "inactive",
+		scheduleText: "in 1 day",
+	});
+	await jobs.cancel(job.id);
+	const target = (file: string) => join(f.paths.targetArtifacts, file.slice(f.paths.sourceArtifacts.length + 1));
+	return { ...f, completed, deleted, nested, childFiles, childArchive: archive, archiveBytes, target };
+}
+
+function assertMovedHistory(f: Awaited<ReturnType<typeof historyFixture>>) {
+	for (const file of f.childFiles) {
+		const header = readEntries(f.target(file))[0] as SessionHeader;
+		expect(header.cwd).toBe(f.targetCwd);
+		expect(header.parentSession).toBe(file === f.nested ? f.target(f.completed) : f.paths.targetFile);
+		const display = JSON.parse(readFileSync(join(dirname(f.target(file)), "rlm-subagent.json"), "utf8"));
+		expect(display).toMatchObject({
+			sessionFile: f.target(file),
+			sessionDir: dirname(f.target(file)),
+			status: file === f.deleted ? "deleted" : "completed",
+		});
+	}
+	expect(readFileSync(f.target(f.childArchive))).toEqual(f.archiveBytes);
+	expect(SessionManager.open(f.target(f.nested)).getEntry("old")).toEqual(f.old);
+	const legacy = JSON.parse(readFileSync(join(f.paths.targetArtifacts, "rlm-subagents.jsonl"), "utf8"));
+	expect(legacy).toMatchObject({ sessionFile: f.target(f.completed), parentSessionFile: f.paths.targetFile });
+	const jobs = AgentCronJobStore.forSessionArtifacts();
+	jobs.registerSessionArtifact(basename(f.nested, ".jsonl"), getSessionArtifactPathForFile(f.target(f.nested)));
+	expect(jobs.list()).toMatchObject([{ status: "cancelled", sessionFile: f.target(f.nested), cwd: f.targetCwd }]);
+	expect(readDeletedRlmChildPaths(f.paths.agentDir).has(f.target(f.deleted))).toBe(true);
+	expect(readDeletedRlmChildPaths(f.paths.agentDir).has(f.deleted)).toBe(true);
+}
+
+describe("moving retained child history", () => {
+	it("fork move preserves completed, deleted and nested archived transcripts without creating live children", async () => {
+		const f = await historyFixture();
+		const externalDir = join(home, "external");
+		mkdirSync(externalDir);
+		const external = SessionManager.open(SessionManager.forkFrom(f.nested, home, externalDir).getSessionFile()!);
+		const size = sessionMoveSize(f.paths);
+		expect(size.bytes).toBeGreaterThan(f.archiveBytes.length);
+		expect(size.requiredBytes).toBeGreaterThan(size.bytes);
+		expect(size.availableBytes).toBeGreaterThan(size.requiredBytes);
+		expect((await move(f)).status).toBe("moved");
+		assertMovedHistory(f);
+		expect(external.getEntry("old")).toEqual(f.old);
+		expect(await new RlmSpawnLedger(f.paths.agentDir, f.paths.targetSessionDir).liveEdges()).toEqual([]);
+		for (const file of f.childFiles) expect(existsSync(file)).toBe(false);
+		expect(JSON.parse(readFileSync(`${f.nested}.relocated`, "utf8"))).toMatchObject({ target: f.target(f.nested) });
+		expect((await recover(f)).status).toBe("absent");
+	});
+	it("fork move keeps child evidence and deletion proof through a second move", async () => {
+		const f = await historyFixture();
+		const externalDir = join(home, "outside");
+		mkdirSync(externalDir);
+		const external = SessionManager.forkFrom(f.nested, home, externalDir);
+		expect((await move(f)).status).toBe("moved");
+		const targetSessionDir = join(home, "third", "sessions");
+		mkdirSync(targetSessionDir, { recursive: true });
+		const paths = sessionMovePaths({
+			...f.paths,
+			sourceFile: f.paths.targetFile,
+			sourceSessionDir: f.paths.targetSessionDir,
+			targetSessionDir,
+		});
+		if (!paths.ok) throw new Error(paths.reason);
+		expect((await move({ ...f, paths: paths.value })).status).toBe("moved");
+		expect(external.getEntry("old")).toEqual(f.old);
+		const nested = join(paths.value.targetArtifacts, f.nested.slice(f.paths.sourceArtifacts.length + 1));
+		expect(SessionManager.open(nested).getEntry("old")).toEqual(f.old);
+		expect(
+			readDeletedRlmChildPaths(f.paths.agentDir).has(
+				join(paths.value.targetArtifacts, f.deleted.slice(f.paths.sourceArtifacts.length + 1)),
+			),
+		).toBe(true);
+	});
+	it("fork move keeps unregistered legacy history out of the target ledger seed", async () => {
+		const f = fixture();
+		const file = join(f.paths.sourceArtifacts, "nested", "history.jsonl");
+		writeFileSync(file, jsonl([{ ...f.entries[0], id: "history", parentSession: f.paths.sourceFile, rlmDepth: 1 }]));
+		writeFileSync(
+			join(f.paths.sourceArtifacts, "rlm-subagents.jsonl"),
+			`${JSON.stringify({ type: "rlm_subagent", childId: "history", sessionName: "history", sessionFile: file, sessionDir: dirname(file), status: "completed" })}\n`,
+		);
+		await new RlmSpawnLedger(f.paths.agentDir, f.paths.sourceSessionDir).importMoveTombstones([]);
+		expect((await move(f)).status).toBe("moved");
+		const target = new RlmSpawnLedger(
+			f.paths.agentDir,
+			f.paths.targetSessionDir,
+			createRlmLedgerRegistrySeedSource(),
+		);
+		expect(await target.liveEdges()).toEqual([]);
+		expect(readDeletedRlmChildPaths(f.paths.agentDir).size).toBe(0);
+	});
+	it.each([
+		"journal-suspending-after",
+		"journal-copying-after",
+		"copy-after",
+		"journal-verified-after",
+		"journal-committing-after",
+		"source-after",
+		"artifacts-after",
+		"active-after",
+		"journal-committed-after",
+		"mesh-after",
+		"child-redirect-after",
+	])("fork move recovers child history in a fresh process at %s", async (point) => {
+		const f = await historyFixture();
+		await moveCrash(f, point);
+		const published = existsSync(f.paths.targetFile);
+		expect((await recoverFresh(f)).status).toBe(published ? "moved" : "rolled_back");
+		if (published) assertMovedHistory(f);
+		else for (const file of f.childFiles) expect(existsSync(file)).toBe(true);
+		expect((await recoverFresh(f)).status).toBe("absent");
+	});
+	it.each(["escape", "duplicate", "deletion", "prefix", "archive"])(
+		"fork move keeps backups when child recovery cannot prove %s",
+		async (kind) => {
+			const f = await historyFixture();
+			await moveCrash(f, "active-after");
+			const journal = JSON.parse(readFileSync(f.paths.journalPath, "utf8")) as SessionMoveJournal;
+			if (kind === "prefix") writeFileSync(f.target(f.completed), "corrupt");
+			else if (kind === "archive") writeFileSync(f.target(f.childArchive), "corrupt");
+			else {
+				const children = journal.children!.map((child) => ({ ...child }));
+				if (kind === "escape") children[0].relative = "../outside.jsonl";
+				if (kind === "duplicate") children.push(children[0]);
+				if (kind === "deletion")
+					children.find((child) => child.deletion)!.deletion = {
+						...children.find((child) => child.deletion)!.deletion!,
+						child: f.completed,
+					};
+				writeFileSync(f.paths.journalPath, JSON.stringify({ ...journal, children }));
+			}
+			expect((await recoverFresh(f)).status).toBe("pending");
+			expect(existsSync(f.paths.journalPath)).toBe(true);
+			for (const file of f.childFiles) expect(existsSync(file)).toBe(true);
+		},
+	);
+	it.each([
+		"completed-edge",
+		"nested-edge",
+		"nested-lease",
+		"artifact-lease",
+		"target-lease",
+		"nested-job",
+		"nested-paused",
+		"target-child-id",
+		"space",
+	])("fork move refuses %s before changing original history", async (kind) => {
+		const f = await historyFixture();
+		let release = () => {};
+		try {
+			if (kind.endsWith("edge"))
+				await new RlmSpawnLedger(f.paths.agentDir, f.paths.sourceSessionDir).appendSpawn({
+					childId: "blocking",
+					child: kind === "completed-edge" ? f.completed : f.nested,
+					parent: kind === "completed-edge" ? f.paths.sourceFile : f.completed,
+					depth: kind === "completed-edge" ? 1 : 2,
+					name: "blocking",
+				});
+			if (kind.endsWith("lease")) {
+				const held =
+					kind === "nested-lease"
+						? f.nested
+						: kind === "target-lease"
+							? f.target(f.nested)
+							: join(f.paths.sourceArtifacts, "nested", "file.bin");
+				if (kind === "artifact-lease") {
+					mkdirSync(dirname(held), { recursive: true });
+					writeFileSync(held, "leased artifact");
+				}
+				const lease = acquireSessionLease(held, f.paths.agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" })!;
+				release = () => lease.release();
+			}
+			if (kind === "nested-job" || kind === "nested-paused") {
+				const nestedId = basename(f.nested, ".jsonl");
+				const store = AgentCronJobStore.forSessionArtifacts();
+				store.registerSessionArtifact(nestedId, getSessionArtifactPathForFile(f.nested));
+				const job = await store.create({
+					sessionId: nestedId,
+					activeSessionId: nestedId,
+					sessionFile: f.nested,
+					cwd: home,
+					source: "heartbeat",
+					prompt: "block",
+					scheduleText: "in 1 day",
+				});
+				if (kind === "nested-paused") await store.manageHeartbeat(nestedId, job.id, "pause");
+			}
+			if (kind === "target-child-id")
+				writeFileSync(join(f.paths.targetSessionDir, "conflict.jsonl"), readFileSync(f.completed));
+			if (kind === "space")
+				vi.spyOn(fs, "statfsSync").mockReturnValue({ bavail: 0, bsize: 4096 } as ReturnType<typeof fs.statfsSync>);
+			syncBuiltinESMExports();
+			const before = f.childFiles.map((file) => readFileSync(file));
+			const operation = kind.endsWith("lease") ? move(f) : preflightSessionMove(f.paths);
+			await expect(operation).rejects.toThrow(
+				kind.endsWith("edge")
+					? /blocking.*Completed children/
+					: kind === "space"
+						? /Not enough target space/
+						: kind === "target-child-id"
+							? /Target already holds/
+							: kind.endsWith("lease")
+								? /already active/
+								: /scheduled job/,
+			);
+			expect(f.childFiles.map((file) => readFileSync(file))).toEqual(before);
+			expect(existsSync(f.paths.targetFile)).toBe(false);
+		} finally {
+			release();
+		}
+	});
+});
+
 describe("archive lifecycle", () => {
 	it.each(["plain", "segmented", "collision"])(
 		"peterkc/prime-agent#60 preserves the archive owner (%s copy)",

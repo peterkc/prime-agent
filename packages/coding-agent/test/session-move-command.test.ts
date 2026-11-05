@@ -286,7 +286,6 @@ const refusals = [
 	["child", "RLM child"],
 	["children", "RLM children"],
 	["legacy-children", "RLM children"],
-	["artifact-child", "RLM children"],
 	["active", "scheduled job"],
 	["paused", "scheduled job"],
 	["journal", "waiting for recovery"],
@@ -332,7 +331,6 @@ async function refusal(kind: string): Promise<[string, string]> {
 						? { parentSession: "parent", rlmDepth: undefined }
 						: {},
 		);
-	if (kind === "artifact-child") session(join(f.paths.sourceArtifacts, "unregistered.data"), "child");
 	if (kind === "children" || kind === "legacy-children") {
 		const child = join(f.paths.sourceArtifacts, "child.jsonl");
 		session(child, "child");
@@ -529,7 +527,13 @@ describe("session move command", () => {
 			readOnly(before, env);
 		},
 	);
-	it("AC-28 JSON dry run has the preview fields and no side effects", async () => {
+	it("AC-28 JSON dry run counts unregistered retained history and bytes without side effects", async () => {
+		const child = join(f.paths.sourceArtifacts, "unregistered.data");
+		session(child, "child", "retained", { parentSession: f.sourceFile, rlmDepth: 1 });
+		const bytes =
+			readFileSync(f.sourceFile).length +
+			readFileSync(child).length +
+			readFileSync(join(f.paths.sourceArtifacts, "keep.txt")).length;
 		const before = tree(),
 			env = { ...process.env };
 		await run(["--dry-run", "--json"]);
@@ -540,6 +544,13 @@ describe("session move command", () => {
 			targetFile: f.paths.targetFile,
 			original: { file: f.sourceFile, artifacts: f.paths.sourceArtifacts },
 			mesh: { enrolled: true },
+			children: 1,
+			size: {
+				bytes,
+				requiredBytes: bytes + 16 * 1024 * 1024,
+				availableBytes: expect.any(Number),
+				crossFilesystem: expect.any(Boolean),
+			},
 			recheck: expect.stringContaining("no process has the session open"),
 		});
 		expect(promptYesNo).not.toHaveBeenCalled();

@@ -1,0 +1,1 @@
+- Changed session moves to carry retained child transcripts and nested archives while preserving deletion proof, leases and scheduled-job refusals.

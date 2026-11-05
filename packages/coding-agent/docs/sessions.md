@@ -55,6 +55,20 @@ Ordinary close, shutdown, update and child tombstoning retain archives; artifact
 
 Do not downgrade an older build onto rotated sessions. It does not understand segmented history. Stop writers, preserve all segments and have the operator reconstruct and verify a complete transcript before changing builds. Never replace a newer active segment with an old archive.
 
+## Moving a Closed Session
+
+Use `prime-agent move <session> <folder> --dry-run` to preview a move. The preview reports retained child transcript count, total bytes, target free space and the required space with a margin (10%, or at least 16 MiB). The real move checks space again.
+
+A move carries the closed session's artifact tree, including retained child transcripts, nested grandchildren and their archives. It updates active transcript headers and known child/job metadata to the target. Archive bytes and IDs stay unchanged. Child transcripts with no ledger edge move as history; the move does not create live children or new mesh enrollment for them. An existing non-deleted child enrollment transfers under its claim, retaining its identity and inbox.
+
+A live RLM ledger edge still blocks the move, even when the child has completed. The refusal names the child IDs. Delete those children with `rlm.delete_subagent` first. This retains their transcripts and records deletion. Moving retained transcripts carries their deletion proof to the target, so deleted children cannot re-enroll.
+
+The move refuses active sessions or workers, held leases anywhere in the transcript set, active or paused scheduled jobs anywhere in the artifact tree, pending journals, and target ID or top-level name conflicts. Close writers and cancel blocking jobs before trying again. Symlinked or special artifact files also refuse the move.
+
+Both same-filesystem and cross-filesystem moves copy, fsync and verify before publishing the parent target. The originals are removed only after publication and mesh updates. Segmented children leave small `.relocated` stubs at their old paths so external forks can still find inherited evidence. These stubs are intentional, not incomplete copies.
+
+After an interruption, the source daemon uses its move journal. Before publication, recovery rolls back its staging paths. After publication, recovery verifies the moved transcripts and archives, finishes redirects and mesh updates, and reports original backups for manual cleanup. Recovery does not recursively delete originals. Keep any reported backups until the target and inherited evidence have been checked. When cleaning up original artifact contents, preserve `.relocated` records and their directories; external forks still need them.
+
 ## Session Commands
 
 | Command | Description |

@@ -198,6 +198,90 @@ function writeJournal(f: Awaited<ReturnType<typeof fixture>>, phase: SessionMove
 	return journal;
 }
 describe("supervisor session move", () => {
+	it.each(["success", "record-failure", "foreign-claim"])(
+		"fork move transfers only an existing retained-child enrollment (%s)",
+		async (state) => {
+			const f = await fixture();
+			const id = randomUUID();
+			const source = join(f.paths.sourceArtifacts, "sub-retained", `${id}.jsonl`);
+			fs.mkdirSync(dirname(source), { recursive: true });
+			fs.writeFileSync(
+				source,
+				`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, cwd: f.root, parentSession: f.paths.sourceFile, rlmDepth: 1, timestamp: "t1" })}\n`,
+			);
+			const original = enrollment.ensureEnrollmentRecord(f.meshRoot, id, source);
+			await enrollment.publishDirectory(f.meshRoot, original, f.socket);
+			let claim: ReturnType<typeof enrollment.claimEnrollment> | undefined;
+			if (state === "foreign-claim") claim = enrollment.claimEnrollment(f.meshRoot, id, source);
+			else await harness(f.supervisor!).mesh.openSession(id, source);
+			const update = enrollment.updateEnrollmentPath;
+			if (state === "record-failure")
+				vi.spyOn(enrollment, "updateEnrollmentPath").mockImplementation(async (root, sessionId, file) => {
+					if (sessionId === id) throw new Error("child transfer refused");
+					return update(root, sessionId, file);
+				});
+			try {
+				const result = await dispatch(f);
+				if (state === "foreign-claim") {
+					expect(result).toMatchObject({
+						success: false,
+						error: expect.stringContaining("claimed by another daemon"),
+					});
+					expect(fs.existsSync(source)).toBe(true);
+					expect(fs.existsSync(f.paths.targetFile)).toBe(false);
+				} else {
+					expect(result).toMatchObject({
+						success: true,
+						data: { moved: true, recoveryPending: state === "record-failure" },
+					});
+					if (state === "record-failure") {
+						vi.mocked(enrollment.updateEnrollmentPath).mockRestore();
+						await harness(f.supervisor!).recoverSessionMoves();
+					}
+					expect(enrollment.readEnrollment(f.meshRoot, id)).toEqual({
+						...original,
+						sessionFile: join(f.paths.targetArtifacts, "sub-retained", `${id}.jsonl`),
+					});
+					expect(enrollment.readDirectory(f.meshRoot, id)).toMatchObject({ homeSocket: f.targetSocket });
+					expect(await new RlmSpawnLedger(f.root, f.targetDir).liveEdges()).toEqual([]);
+				}
+			} finally {
+				claim?.release();
+			}
+		},
+	);
+
+	it("fork move carries a deliberately deleted child without re-enrollment, including explicit reopen and restart", async () => {
+		const f = await fixture();
+		const id = randomUUID();
+		const child = join(f.paths.sourceArtifacts, "sub-deleted", `${id}.jsonl`);
+		fs.mkdirSync(dirname(child), { recursive: true });
+		fs.writeFileSync(
+			child,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, cwd: f.root, parentSession: f.paths.sourceFile, rlmDepth: 1, timestamp: "t1" })}\n`,
+		);
+		const ledger = new RlmSpawnLedger(f.root, f.sourceDir);
+		await ledger.appendSpawn({
+			childId: "deleted-child",
+			parent: f.paths.sourceFile,
+			child,
+			depth: 1,
+			name: "retained",
+		});
+		await ledger.appendDelete({ childId: "deleted-child", child, reason: "user" });
+		expect(await dispatch(f)).toMatchObject({ success: true, data: { moved: true, original: { deleted: true } } });
+		const targetChild = join(f.paths.targetArtifacts, "sub-deleted", `${id}.jsonl`);
+		expect(fs.existsSync(child)).toBe(false);
+		expect(fs.existsSync(targetChild)).toBe(true);
+		const target = await start(f.root, f.targetDir, f.targetSocket);
+		await expect(harness(target).mesh.openSession(id, targetChild)).rejects.toThrow(
+			"RLM child was deliberately deleted",
+		);
+		expect(fs.existsSync(enrollment.enrollmentPath(f.meshRoot, id))).toBe(false);
+		expect(fs.existsSync(enrollment.directoryPath(f.meshRoot, id))).toBe(false);
+		expect(await new RlmSpawnLedger(f.root, f.targetDir).liveEdges()).toEqual([]);
+	});
+
 	it.each(
 		["win32", "darwin"].flatMap((platform) =>
 			["directory", "file"].flatMap((kind) => ["relocation", "mesh"].map((scope) => ({ platform, kind, scope }))),
@@ -342,7 +426,9 @@ describe("supervisor session move", () => {
 		["child", "RLM child session"],
 		["dotted", "moves require mesh-compatible IDs"],
 		["children", "RLM children"],
-		["artifact-child", "RLM children"],
+		["artifact-child", "duplicate child session ID"],
+		["artifact-active", "currently active"],
+		["artifact-worker", "worker is recovering"],
 		["active", "active or paused scheduled job"],
 		["paused", "active or paused scheduled job"],
 		["foreign", "claimed by another daemon"],
@@ -387,6 +473,25 @@ describe("supervisor session move", () => {
 		if (state === "child")
 			fs.writeFileSync(f.paths.sourceFile, before.toString().replace('"version":', '"rlmDepth":1,"version":'));
 		if (state === "artifact-child") fs.copyFileSync(f.paths.sourceFile, join(f.paths.sourceArtifacts, "child.data"));
+		if (state === "artifact-active" || state === "artifact-worker") {
+			const child = join(f.paths.sourceArtifacts, "child.jsonl");
+			fs.writeFileSync(child, before.toString().replace(f.id, randomUUID()));
+			if (state === "artifact-active")
+				sup.roster().write({
+					agentId: "child",
+					summary: {
+						id: "child",
+						sessionId: "child",
+						activeSessionId: "child-open",
+						sessionFile: child,
+						cwd: f.root,
+					},
+				});
+			else
+				sup.workers.set("child", {
+					descriptor: { workerId: "child", lifecycle: "recovering", sessionFile: child, createCommand: {} },
+				});
+		}
 		if (state === "children") {
 			const child = join(f.paths.sourceArtifacts, "child.jsonl");
 			fs.copyFileSync(f.paths.sourceFile, child);

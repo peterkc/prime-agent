@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { Writable } from "node:stream";
 import type { CotalMessage } from "@cotal-ai/core";
 import { getLogger } from "@earendil-works/pi-ai";
@@ -67,6 +67,7 @@ import {
 	relocateSession,
 	type SessionMovePaths,
 	type SessionMoveReport,
+	sessionMoveChildFiles,
 } from "../../core/session-move.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
@@ -3284,6 +3285,7 @@ export class DaemonSupervisor {
 		if (!statSync(command.targetCwd).isDirectory() || !statSync(paths.targetSessionDir).isDirectory())
 			throw new Error("Target repository and session folder must be directories");
 		this.assertSessionMoveClosed(paths.sourceFile);
+		for (const file of sessionMoveChildFiles(paths)) this.assertSessionMoveClosed(file);
 		return { paths, info };
 	}
 
@@ -3311,6 +3313,7 @@ export class DaemonSupervisor {
 					throw error;
 				}
 				const { info } = await this.checkSessionMove(command);
+				const enrolledIds = new Set<string>();
 				let enrolled = false;
 				let meshFailure: { step: "enrollment" | "directory"; reason: string } | undefined;
 				const report = await relocateSession({
@@ -3318,18 +3321,24 @@ export class DaemonSupervisor {
 					targetCwd: command.targetCwd,
 					targetSocket: command.targetSocket,
 					callbacks: {
-						suspend: async () => {
-							enrolled = (await this.mesh?.suspendSession(info.id)) ?? false;
-							return enrolled;
+						suspend: async (endpoint) => {
+							if (endpoint.sessionId !== info.id && !this.mesh)
+								throw new Error("Cannot move an enrolled child while mesh is unavailable");
+							const suspended = (await this.mesh?.suspendSession(endpoint.sessionId)) ?? false;
+							if (suspended) {
+								enrolledIds.add(endpoint.sessionId);
+								enrolled = true;
+							}
+							return suspended;
 						},
-						resume: async () => {
-							await this.mesh?.resumeSession(info.id);
+						resume: async (endpoint) => {
+							await this.mesh?.resumeSession(endpoint.sessionId);
 						},
 						writeMeshRecords: async (journal, writes) => {
-							if (!enrolled) return;
+							if (!enrolledIds.has(journal.sessionId)) return;
 							try {
 								await this.mesh!.writeTransferRecords(
-									info.id,
+									journal.sessionId,
 									journal.targetFile,
 									journal.targetSocket,
 									writes,
@@ -3340,7 +3349,9 @@ export class DaemonSupervisor {
 								throw error;
 							}
 						},
-						releaseClaim: () => this.mesh?.releaseClaim(info.id),
+						releaseClaim: () => {
+							for (const id of enrolledIds) this.mesh?.releaseClaim(id);
+						},
 						releaseLeases: () => {
 							leases?.release();
 							leases = undefined;
@@ -3353,8 +3364,11 @@ export class DaemonSupervisor {
 						...failure(command.id, command.type, report.messages.join("; ")),
 						data: { moved: false, recovery: report, recovered },
 					};
-				const entry = this.roster().bySessionFile(paths.sourceFile);
-				if (entry) this.roster().delete(entry.agentId);
+				for (const entry of [...this.roster().values()]) {
+					const file = entry.summary.sessionFile ? canonicalSessionPath(entry.summary.sessionFile) : undefined;
+					if (file === paths.sourceFile || file?.startsWith(`${paths.sourceArtifacts}${sep}`))
+						this.roster().delete(entry.agentId);
+				}
 				this.invalidatePassiveScheduledJobs();
 				return success(command.id, command.type, {
 					sessionId: info.id,
@@ -3363,7 +3377,10 @@ export class DaemonSupervisor {
 					moved,
 					original: {
 						method: report.originalMethod,
-						deleted: !existsSync(paths.sourceBackup) && !existsSync(paths.sourceArtifacts),
+						deleted:
+							!existsSync(paths.sourceBackup) &&
+							report.backups.length === 0 &&
+							(report.originalMethod !== undefined || !existsSync(paths.sourceArtifacts)),
 						backups: report.backups,
 					},
 					mesh:

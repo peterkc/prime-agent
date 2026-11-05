@@ -15,16 +15,22 @@ import {
 	renameSync,
 	rmdirSync,
 	rmSync,
+	statfsSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { RlmSpawnLedger, readLegacyRlmSubagentRegistry } from "../modes/daemon/rlm-ledger.js";
+import {
+	type RlmLedgerDeleteRecord,
+	RlmSpawnLedger,
+	readDeletedRlmChildRecords,
+	readLegacyRlmSubagentRegistry,
+} from "../modes/daemon/rlm-ledger.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import { captureGitContext, type GitContext } from "../utils/git.js";
-import { AgentCronJobStore } from "./cron-jobs.js";
+import { AgentCronJobStore, SESSION_SCHEDULED_JOBS_FILENAME } from "./cron-jobs.js";
 import { removeMovedSessionFile, sessionArtifactFiles } from "./session-file-actions.js";
 import {
 	acquireSessionLease,
@@ -103,6 +109,17 @@ interface SessionArchiveMove {
 	readonly identity?: string;
 }
 
+interface SessionMoveChild {
+	readonly relative: string;
+	readonly sessionId: string;
+	readonly previousPaths?: readonly string[];
+	readonly archives?: readonly { readonly name: string; readonly sha256: string }[];
+	readonly deletion?: RlmLedgerDeleteRecord;
+	readonly enrolled?: true;
+	readonly fileBytes?: number;
+	readonly fileSha256?: string;
+}
+
 export interface SessionMoveJournal extends SessionMovePaths {
 	readonly version: 1;
 	readonly targetCwd: string;
@@ -116,6 +133,7 @@ export interface SessionMoveJournal extends SessionMovePaths {
 	readonly fileBytes?: number;
 	readonly fileSha256?: string;
 	readonly archiveMove?: SessionArchiveMove;
+	readonly children?: readonly SessionMoveChild[];
 }
 
 export interface SessionMoveBackup {
@@ -244,12 +262,218 @@ export function sessionMovePaths(input: SessionMoveInput): SessionMoveResult<Ses
 	}
 }
 
-function assertSessionMoveArtifacts(paths: SessionMovePaths): void {
-	if (!sessionArtifactFiles(paths.sourceArtifacts).next().done) {
-		throw new Error("Cannot move a session with RLM children in its artifact tree");
+export function sessionMoveChildFiles(paths: SessionMovePaths): string[] {
+	return [...sessionArtifactFiles(paths.sourceArtifacts)].sort();
+}
+
+async function collectMoveChildren(paths: SessionMovePaths): Promise<SessionMoveChild[]> {
+	const children: SessionMoveChild[] = [];
+	const ids = new Set([paths.sessionId]);
+	const deletions = readDeletedRlmChildRecords(paths.agentDir);
+	const childFiles = sessionMoveChildFiles(paths);
+	const files = new Set([paths.sourceFile, ...childFiles].map(canonicalSessionPath));
+	const ledger = new RlmSpawnLedger(paths.agentDir, paths.sourceSessionDir);
+	const blocking = (await ledger.liveEdges()).filter(
+		(edge) => files.has(canonicalSessionPath(edge.parent)) || files.has(canonicalSessionPath(edge.child)),
+	);
+	if (blocking.length)
+		throw new Error(
+			`Cannot move a session with live RLM children: ${blocking.map((edge) => edge.childId).join(", ")}. Completed children still block the move until deleted with rlm.delete_subagent; deletion retains their transcripts.`,
+		);
+	for (const sourceFile of childFiles) {
+		const header = readMoveEntries(sourceFile)[0] as SessionHeader;
+		if (header.version !== CURRENT_SESSION_VERSION) throw new Error(`Open child once to upgrade it: ${sourceFile}`);
+		if (!/^[A-Za-z0-9_-]+$/.test(header.id) || ids.has(header.id))
+			throw new Error(`Invalid or duplicate child session ID: ${header.id}`);
+		ids.add(header.id);
+		const childRelative = relative(paths.sourceArtifacts, sourceFile);
+		const targetFile = join(paths.targetArtifacts, childRelative);
+		const archive = archiveMoveFor({ ...paths, sessionId: header.id, sourceFile, targetFile }, header);
+		if (archive)
+			for (const path of [`${sourceFile}.relocated`, `${sourceFile}.relocated.moving`])
+				if (present(path)) throw new Error(`Move destination already exists: ${path}`);
+		const deletion = deletions.find((record) => canonicalSessionPath(record.child) === sourceFile);
+		const enrollment = join(paths.agentDir, "mesh", "enrollments", `${header.id}.json`);
+		let enrolled = false;
+		if (!deletion && present(enrollment)) {
+			const record: unknown = JSON.parse(readFileSync(enrollment, "utf8"));
+			if (
+				!record ||
+				typeof record !== "object" ||
+				!("sessionFile" in record) ||
+				typeof record.sessionFile !== "string" ||
+				canonicalSessionPath(record.sessionFile) !== sourceFile
+			)
+				throw new Error(`Child enrollment belongs to a different path: ${header.id}`);
+			enrolled = true;
+		}
+		children.push({
+			relative: childRelative,
+			sessionId: header.id,
+			...(archive ? { previousPaths: archive.previousPaths, archives: archive.files } : {}),
+			...(deletion ? { deletion } : {}),
+			...(enrolled ? { enrolled: true } : {}),
+		});
 	}
+	if (!existsSync(ledger.ledgerPath)) {
+		for (const file of files) {
+			const id =
+				file === paths.sourceFile
+					? paths.sessionId
+					: children.find((child) => join(paths.sourceArtifacts, child.relative) === file)!.sessionId;
+			const registry = join(dirname(dirname(file)), "session-artifacts", id, "rlm-subagents.jsonl");
+			const legacy = await readLegacyRlmSubagentRegistry(registry, { throwOnReadError: true });
+			const live = legacy.filter((child) => child.status !== "deleted" && existsSync(child.sessionFile));
+			if (live.length)
+				throw new Error(
+					`Cannot move a session with live RLM children: ${live.map((child) => child.childId).join(", ")}. Delete them with rlm.delete_subagent first; transcripts are retained.`,
+				);
+		}
+	}
+	return children;
+}
+
+function moveEndpoints(journal: SessionMoveJournal): SessionMoveJournal[] {
+	return [
+		journal,
+		...(journal.children ?? [])
+			.filter((child) => child.enrolled && !child.deletion)
+			.map((child) => ({
+				...journal,
+				sessionId: child.sessionId,
+				sourceFile: join(journal.sourceArtifacts, child.relative),
+				targetFile: join(journal.targetArtifacts, child.relative),
+				targetSocket: journal.targetSocket,
+			})),
+	];
+}
+
+function movedPath(path: string, paths: SessionMovePaths): string {
+	if (path === paths.sourceFile) return paths.targetFile;
+	if (path === paths.sourceArtifacts || path.startsWith(`${paths.sourceArtifacts}${sep}`))
+		return join(paths.targetArtifacts, relative(paths.sourceArtifacts, path));
+	return path;
+}
+
+function moveArtifactRewrites(journal: SessionMoveJournal, git: GitContext | undefined): Map<string, Buffer> {
+	const rewrites = new Map<string, Buffer>();
+	for (const child of journal.children ?? []) {
+		const source = join(journal.sourceArtifacts, child.relative);
+		const entries = readMoveEntries(source);
+		const header = entries[0] as SessionHeader;
+		entries[0] = {
+			...header,
+			...(header.parentSession
+				? { parentSession: movedPath(resolve(dirname(source), header.parentSession), journal) }
+				: {}),
+			...(child.previousPaths ? { previousSessionPaths: child.previousPaths } : {}),
+		};
+		rewrites.set(
+			child.relative,
+			Buffer.from(serializeSessionEntries(transformSessionMoveEntries(entries, journal.targetCwd, git))),
+		);
+	}
+	function rebaseFields(value: unknown): void {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid move metadata record");
+		const record = value as Record<string, unknown>;
+		for (const key of ["sessionFile", "sessionDir", "parentSessionFile", "target"])
+			if (typeof record[key] === "string") record[key] = movedPath(record[key], journal);
+		if (typeof record.cwd === "string") record.cwd = journal.targetCwd;
+	}
+	for (const file of artifactPaths(journal.sourceArtifacts)) {
+		const path = join(journal.sourceArtifacts, file);
+		if (basename(file) === "rlm-subagent.json" || file.endsWith(".relocated")) {
+			const record: unknown = JSON.parse(readFileSync(path, "utf8"));
+			rebaseFields(record);
+			rewrites.set(file, Buffer.from(`${JSON.stringify(record)}\n`));
+		} else if (basename(file) === "rlm-subagents.jsonl") {
+			const lines = readFileSync(path, "utf8")
+				.split("\n")
+				.filter((line) => line.trim());
+			const records = lines.map((line) => {
+				const record: unknown = JSON.parse(line);
+				rebaseFields(record);
+				return record;
+			});
+			rewrites.set(file, Buffer.from(`${records.map((record) => JSON.stringify(record)).join("\n")}\n`));
+		} else if (basename(file) === SESSION_SCHEDULED_JOBS_FILENAME) {
+			const state = JSON.parse(readFileSync(path, "utf8")) as { jobs: unknown[]; dispatches?: { job: unknown }[] };
+			if (!Array.isArray(state.jobs)) throw new Error(`Invalid scheduled jobs: ${path}`);
+			for (const job of state.jobs) rebaseFields(job);
+			for (const dispatch of state.dispatches ?? []) rebaseFields(dispatch.job);
+			rewrites.set(file, Buffer.from(`${JSON.stringify(state)}\n`));
+		}
+	}
+	return rewrites;
+}
+
+async function importMoveDeletions(journal: SessionMoveJournal): Promise<void> {
+	if (!journal.children?.length) return;
+	const sourceDeletions = readDeletedRlmChildRecords(journal.agentDir);
+	for (const child of journal.children) {
+		const deletion = child.deletion;
+		if (
+			deletion &&
+			!sourceDeletions.some(
+				(record) =>
+					record.child === deletion.child &&
+					record.childId === deletion.childId &&
+					record.reason === deletion.reason,
+			)
+		)
+			throw new Error("Original child deletion proof is missing; move remains pending");
+	}
+	const records = journal.children.flatMap((child) =>
+		child.deletion ? [{ ...child.deletion, child: join(journal.targetArtifacts, child.relative) }] : [],
+	);
+	const ledger = new RlmSpawnLedger(journal.agentDir, journal.targetSessionDir);
+	await ledger.importMoveTombstones(records);
+	fsyncPath(dirname(ledger.ledgerPath));
+	const deleted = new Set(
+		readDeletedRlmChildRecords(journal.agentDir).map((record) => canonicalSessionPath(record.child)),
+	);
+	if (records.some((record) => !deleted.has(record.child))) throw new Error("Moved child deletion proof is missing");
+}
+
+export function sessionMoveSize(paths: SessionMovePaths): {
+	bytes: number;
+	requiredBytes: number;
+	availableBytes: number;
+	crossFilesystem: boolean;
+} {
+	let bytes = statSync(paths.sourceFile).size;
+	if (present(paths.sourceArtifacts))
+		for (const file of artifactPaths(paths.sourceArtifacts))
+			bytes += statSync(join(paths.sourceArtifacts, file)).size;
+	const header = readMoveEntries(paths.sourceFile)[0] as SessionHeader;
+	const archive = archiveMoveFor(paths, header);
+	if (archive) for (const file of archive.files) bytes += statSync(join(archive.source, file.name)).size;
+	let target = paths.targetSessionDir;
+	while (!present(target)) target = dirname(target);
+	const space = statfsSync(target);
+	const availableBytes = space.bavail * space.bsize;
+	const requiredBytes = bytes + Math.max(16 * 1024 * 1024, Math.ceil(bytes / 10));
+	if (requiredBytes > availableBytes)
+		throw new Error(
+			`Not enough target space: need ${requiredBytes} bytes including margin; available ${availableBytes}`,
+		);
+	return {
+		bytes,
+		requiredBytes,
+		availableBytes,
+		crossFilesystem: statSync(paths.sourceSessionDir).dev !== statSync(target).dev,
+	};
+}
+
+function assertSessionMoveArtifacts(paths: SessionMovePaths): void {
 	const jobs = AgentCronJobStore.forSessionArtifacts();
 	jobs.registerSessionArtifact(paths.sessionId, paths.sourceArtifacts);
+	if (present(paths.sourceArtifacts)) {
+		for (const file of artifactPaths(paths.sourceArtifacts)) {
+			if (basename(file) === SESSION_SCHEDULED_JOBS_FILENAME)
+				jobs.registerSessionArtifact(file, dirname(join(paths.sourceArtifacts, file)));
+		}
+	}
 	const blockingJobs = jobs.list().filter((job) => job.status === "active" || job.status === "paused");
 	if (blockingJobs.length > 0) {
 		throw new Error(
@@ -288,20 +512,9 @@ export async function preflightSessionMove(
 	const info = await readSessionInfo(paths.sourceFile);
 	if (!info) throw new Error(`Session not found: ${paths.sourceFile}`);
 	if ((info.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
-	const ledger = new RlmSpawnLedger(paths.agentDir, paths.sourceSessionDir);
-	const edges = await ledger.liveEdges();
-	if (edges.some((edge) => canonicalSessionPath(edge.parent) === paths.sourceFile)) {
-		throw new Error("Cannot move a session with RLM children");
-	}
-	if (!existsSync(ledger.ledgerPath)) {
-		const legacy = await readLegacyRlmSubagentRegistry(join(paths.sourceArtifacts, "rlm-subagents.jsonl"), {
-			throwOnReadError: true,
-		});
-		if (legacy.some((child) => child.status !== "deleted" && existsSync(child.sessionFile))) {
-			throw new Error("Cannot move a session with RLM children");
-		}
-	}
+	const children = await collectMoveChildren(paths);
 	assertSessionMoveArtifacts(paths);
+	sessionMoveSize(paths);
 	if (present(paths.journalPath))
 		throw new Error(
 			`An earlier move of this session is waiting for recovery (${paths.journalPath}). Fix the error it reported, or restart the source daemon to finish the recovery, then try again`,
@@ -316,11 +529,101 @@ export async function preflightSessionMove(
 		if (present(path)) throw new Error(`Move destination already exists: ${path}`);
 	}
 	for (const target of await SessionManager.listAll(undefined, paths.targetSessionDir)) {
-		if (target.id === info.id) throw new Error(`Target already holds session ${info.id}`);
+		if (target.id === info.id || children.some((child) => child.sessionId === target.id))
+			throw new Error(`Target already holds session ${target.id}`);
 		if ((target.rlmDepth ?? 0) === 0 && info.name && target.name === info.name)
 			throw new Error(`Target already has a top-level session named ${info.name}`);
 	}
+	if (children.length) {
+		const targetLedger = new RlmSpawnLedger(paths.agentDir, paths.targetSessionDir);
+		for (const edge of await targetLedger.liveEdges()) {
+			const existing = await readSessionInfo(edge.child);
+			if (existing && (existing.id === info.id || children.some((child) => child.sessionId === existing.id)))
+				throw new Error(`Target already holds session ${existing.id}`);
+		}
+	}
 	return { paths, info };
+}
+
+function validateMoveChildren(journal: SessionMoveJournal): void {
+	if (journal.children === undefined) return;
+	if (!Array.isArray(journal.children)) throw new Error("Invalid move children");
+	const ids = new Set([journal.sessionId]);
+	const files = new Set<string>();
+	for (const child of journal.children) {
+		if (
+			!child ||
+			typeof child.relative !== "string" ||
+			!child.relative ||
+			typeof child.sessionId !== "string" ||
+			!child.sessionId ||
+			!/^[A-Za-z0-9_-]+$/.test(child.sessionId) ||
+			ids.has(child.sessionId) ||
+			files.has(child.relative)
+		)
+			throw new Error("Invalid or duplicate move child");
+		ids.add(child.sessionId);
+		files.add(child.relative);
+		const source = join(journal.sourceArtifacts, child.relative);
+		const target = join(journal.targetArtifacts, child.relative);
+		if (
+			relative(journal.sourceArtifacts, source) !== child.relative ||
+			child.relative.startsWith(`..${sep}`) ||
+			child.relative === ".." ||
+			canonicalStoragePath(source) !== source ||
+			canonicalStoragePath(target) !== target
+		)
+			throw new Error("Invalid move child path");
+		if (child.previousPaths !== undefined) {
+			if (
+				!Array.isArray(child.previousPaths) ||
+				child.previousPaths.at(-1) !== source ||
+				new Set(child.previousPaths).size !== child.previousPaths.length
+			)
+				throw new Error("Invalid child previous paths");
+			for (const path of child.previousPaths) {
+				if (typeof path !== "string" || resolve(path) !== path || canonicalStoragePath(path) !== path)
+					throw new Error("Invalid child previous path");
+				requireActiveSessionPath(path);
+			}
+		}
+		if (child.archives !== undefined) {
+			if (!Array.isArray(child.archives) || !child.previousPaths) throw new Error("Invalid child archives");
+			const names = new Set<string>();
+			for (const file of child.archives) {
+				if (
+					!file ||
+					!/^(0|[1-9][0-9]*)\.jsonl$/.test(file.name) ||
+					names.has(file.name) ||
+					!/^[a-f0-9]{64}$/.test(file.sha256)
+				)
+					throw new Error("Invalid child archive file");
+				names.add(file.name);
+			}
+		}
+		if (child.enrolled !== undefined && (child.enrolled !== true || child.deletion))
+			throw new Error("Invalid child enrollment state");
+		const deletion = child.deletion;
+		if (
+			deletion !== undefined &&
+			(!deletion ||
+				deletion.v !== 1 ||
+				deletion.op !== "delete" ||
+				typeof deletion.at !== "string" ||
+				typeof deletion.childId !== "string" ||
+				deletion.child !== source ||
+				!["user", "parent-teardown", "revoked", "gc"].includes(deletion.reason))
+		)
+			throw new Error("Invalid child deletion proof");
+		if (
+			(child.fileBytes !== undefined && (!Number.isSafeInteger(child.fileBytes) || child.fileBytes < 0)) ||
+			(child.fileSha256 !== undefined &&
+				(typeof child.fileSha256 !== "string" || !/^[a-f0-9]{64}$/.test(child.fileSha256))) ||
+			((journal.phase === "committing" || journal.phase === "committed") &&
+				(child.fileBytes === undefined || child.fileSha256 === undefined))
+		)
+			throw new Error("Invalid child prefix witness");
+	}
 }
 
 export function validateSessionMoveJournal(
@@ -347,6 +650,7 @@ export function validateSessionMoveJournal(
 	if (journal.journalPath !== physicalJournalPath) return failure(`Invalid journal path: ${journalPath}`);
 	try {
 		if (journal.archiveMove) validateArchiveMove(journal);
+		validateMoveChildren(journal);
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
@@ -482,20 +786,33 @@ function digest(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
-function artifactFiles(root: string, relative = ""): Map<string, string> {
-	const files = new Map<string, string>();
+function fileDigest(path: string): string {
+	const descriptor = openSync(path, "r");
+	try {
+		const hash = createHash("sha256");
+		const buffer = Buffer.alloc(64 * 1024);
+		for (let count = readSync(descriptor, buffer); count > 0; count = readSync(descriptor, buffer))
+			hash.update(buffer.subarray(0, count));
+		return hash.digest("hex");
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+function* artifactPaths(root: string, relative = ""): Generator<string> {
 	const path = join(root, relative);
 	const metadata = lstatSync(path);
 	if (metadata.isDirectory()) {
-		for (const name of readdirSync(path).sort()) {
-			for (const [child, hash] of artifactFiles(root, join(relative, name))) files.set(child, hash);
-		}
+		for (const name of readdirSync(path).sort()) yield* artifactPaths(root, join(relative, name));
 	} else if (metadata.isFile()) {
-		files.set(relative, digest(readFileSync(path)));
+		yield relative;
 	} else {
 		throw new Error(`Artifact is not a regular file or folder: ${path}`);
 	}
-	return files;
+}
+
+function artifactFiles(root: string): Map<string, string> {
+	return new Map([...artifactPaths(root)].map((file) => [file, fileDigest(join(root, file))]));
 }
 
 /** The session-file lease does not fence artifact writers. */
@@ -646,14 +963,24 @@ function moveEntries(journal: SessionMoveJournal, entries: readonly FileEntry[])
 }
 
 function publishMoveRedirect(journal: SessionMoveJournal): void {
-	if (!journal.archiveMove) return;
-	const path = `${journal.sourceFile}.relocated`;
+	if (journal.archiveMove) publishMoveRedirectFile(journal.sourceFile, journal.sessionId, journal.targetFile);
+}
+
+function publishChildMoveRedirects(journal: SessionMoveJournal): void {
+	for (const child of journal.children ?? [])
+		if (child.previousPaths) {
+			const source = join(journal.sourceArtifacts, child.relative);
+			mkdirSync(dirname(source), { recursive: true });
+			publishMoveRedirectFile(source, child.sessionId, join(journal.targetArtifacts, child.relative));
+		}
+}
+
+function publishMoveRedirectFile(sourceFile: string, sessionId: string, targetFile: string): void {
+	const path = `${sourceFile}.relocated`;
 	const temporary = `${path}.moving`;
 	if (canonicalStoragePath(path) !== path || canonicalStoragePath(temporary) !== temporary)
 		throw new Error(`Unsafe relocation record: ${path}`);
-	const bytes = Buffer.from(
-		`${JSON.stringify({ version: 1, sessionId: journal.sessionId, target: journal.targetFile })}\n`,
-	);
+	const bytes = Buffer.from(`${JSON.stringify({ version: 1, sessionId, target: targetFile })}\n`);
 	if (present(path)) {
 		if (!lstatSync(path).isFile() || !readFileSync(path).equals(bytes))
 			throw new Error(`Relocation record differs: ${path}`);
@@ -694,6 +1021,7 @@ export function verifySessionMoveCopy(
 		if (actualLeaf !== expectedLeaf) return failure("Session leaf differs");
 		if (journal.artifactsPresent) {
 			const source = artifactFiles(journal.sourceArtifacts);
+			for (const [path, bytes] of moveArtifactRewrites(journal, git)) source.set(path, digest(bytes));
 			const target = artifactFiles(journal.artifactTemporary);
 			for (const path of new Set([...source.keys(), ...target.keys()])) {
 				if (source.get(path) !== target.get(path)) return failure(`Artifact differs: ${path}`);
@@ -822,10 +1150,12 @@ export async function rollbackSessionMove(
 	} catch (error) {
 		errors.push(`${journal.sourceBackup}: ${errorMessage(error)}`);
 	}
-	try {
-		await resume?.(journal);
-	} catch (error) {
-		errors.push(`Endpoint resume: ${errorMessage(error)}`);
+	for (const endpoint of moveEndpoints(journal)) {
+		try {
+			await resume?.(endpoint);
+		} catch (error) {
+			errors.push(`Endpoint resume: ${errorMessage(error)}`);
+		}
 	}
 	if (errors.length === 0) {
 		try {
@@ -841,11 +1171,18 @@ export async function rollbackSessionMove(
 
 /** Verify the moved prefix, not entries appended after publication. */
 function verifySessionMovePrefix(journal: SessionMoveJournal): SessionMoveResult<null> {
+	return verifyMoveFilePrefix(journal.targetFile, journal);
+}
+
+function verifyMoveFilePrefix(
+	path: string,
+	journal: { readonly fileBytes?: number; readonly fileSha256?: string },
+): SessionMoveResult<null> {
 	try {
 		if (journal.fileBytes === undefined || journal.fileSha256 === undefined) {
 			return failure("Verified file length or SHA-256 is missing");
 		}
-		const descriptor = openSync(journal.targetFile, "r");
+		const descriptor = openSync(path, "r");
 		try {
 			const hash = createHash("sha256");
 			const buffer = Buffer.alloc(Math.min(journal.fileBytes, 64 * 1024));
@@ -866,6 +1203,45 @@ function verifySessionMovePrefix(journal: SessionMoveJournal): SessionMoveResult
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
+}
+
+function verifyMovedChildren(journal: SessionMoveJournal): void {
+	for (const child of journal.children ?? []) {
+		const target = join(journal.targetArtifacts, child.relative);
+		const verified = verifyMoveFilePrefix(target, child);
+		if (!verified.ok) throw new Error(`${target}: ${verified.reason}`);
+		if (child.archives?.length) {
+			const files = archiveFiles(dirname(sessionArchivePath(target, child.sessionId, 0)), child.sessionId);
+			for (const expected of child.archives)
+				if (!files.some((file) => file.name === expected.name && file.sha256 === expected.sha256))
+					throw new Error(`Moved child archive differs: ${target}/${expected.name}`);
+		}
+	}
+}
+
+/** Preserve only intentional relocation stubs in the original artifact tree. */
+function removeOriginalMoveArtifacts(journal: SessionMoveJournal): void {
+	if (!journal.children?.some((child) => child.previousPaths)) {
+		rmSync(journal.sourceArtifacts, { recursive: true });
+		return;
+	}
+	const originals = artifactFiles(journal.sourceArtifacts);
+	publishChildMoveRedirects(journal);
+	for (const [file, hash] of originals) {
+		if (file.endsWith(".relocated")) continue;
+		const path = join(journal.sourceArtifacts, file);
+		if (fileDigest(path) !== hash) throw new Error(`Original artifact changed: ${path}`);
+		unlinkSync(path);
+		fsyncPath(dirname(path));
+	}
+	function prune(path: string): void {
+		for (const name of readdirSync(path)) if (lstatSync(join(path, name)).isDirectory()) prune(join(path, name));
+		if (!readdirSync(path).length) {
+			rmdirSync(path);
+			fsyncPath(dirname(path));
+		}
+	}
+	prune(journal.sourceArtifacts);
 }
 
 /** Normal flow only. The caller still holds its pre-publication target-file lease. */
@@ -890,6 +1266,7 @@ export async function deleteSessionMoveOriginal(
 			reason = "Source artifacts changed during the move; original kept";
 		}
 		if (!reason) {
+			verifyMovedChildren(journal);
 			verifyMoveArchives(journal, true);
 			verifyMoveArchives(journal, false);
 		}
@@ -901,7 +1278,7 @@ export async function deleteSessionMoveOriginal(
 		if (!reason && artifactDigest(journal.sourceArtifacts) !== journal.artifactSha256) {
 			reason = "Source artifacts changed during original-file removal; artifacts kept";
 		}
-		if (!reason && present(journal.sourceArtifacts)) rmSync(journal.sourceArtifacts, { recursive: true });
+		if (!reason && present(journal.sourceArtifacts)) removeOriginalMoveArtifacts(journal);
 		if (!reason && journal.archiveMove) {
 			verifyMoveArchives(journal, false);
 			if (journal.archiveMove.sourceIdentity !== undefined) rmSync(journal.archiveMove.source, { recursive: true });
@@ -915,7 +1292,14 @@ export async function deleteSessionMoveOriginal(
 			paths.sourceArtifacts,
 			...(journal.archiveMove ? [journal.archiveMove.source] : []),
 		]) {
-			if (present(path)) backups.push({ path, reason });
+			if (present(path))
+				backups.push({
+					path,
+					reason:
+						path === paths.sourceArtifacts && journal.children?.some((child) => child.previousPaths)
+							? `${reason}; preserve .relocated records when cleaning up`
+							: reason,
+				});
 		}
 	}
 	return { backups, method };
@@ -928,17 +1312,28 @@ export function acquireSessionMoveLeases(paths: SessionMovePaths, agentDir: stri
 	for (const key of Object.keys(checked.value) as (keyof SessionMovePaths)[]) {
 		if (paths[key] !== checked.value[key]) throw new Error(`Invalid move path: ${key}`);
 	}
-	const leases: SessionLease[] = [];
+	const sourceChildren = [...sessionArtifactFiles(paths.sourceArtifacts, agentDir)];
 	const targets = [
-		...new Set(
-			[paths.sourceFile, paths.targetFile, paths.fileTemporary, paths.artifactTemporary].map(canonicalSessionPath),
-		),
-	].sort();
+		paths.sourceFile,
+		paths.targetFile,
+		paths.fileTemporary,
+		paths.artifactTemporary,
+		...sourceChildren.flatMap((path) => [
+			path,
+			join(paths.targetArtifacts, relative(paths.sourceArtifacts, path)),
+			join(paths.artifactTemporary, relative(paths.sourceArtifacts, path)),
+		]),
+	];
+	return acquireMoveLeases(targets, agentDir);
+}
+
+function acquireMoveLeases(targets: readonly string[], agentDir: string): { release(): void } {
+	const leases: SessionLease[] = [];
 	function release(): void {
 		for (const lease of leases.reverse()) lease.release();
 	}
 	try {
-		for (const path of targets) {
+		for (const path of [...new Set(targets.map(canonicalSessionPath))].sort()) {
 			const lease = acquireSessionLease(path, agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" });
 			if (lease) leases.push(lease);
 		}
@@ -992,6 +1387,8 @@ export async function relocateSession(options: {
 		if ((header.rlmDepth ?? 0) > 0) throw new Error("Cannot move an RLM child session");
 		assertSessionArchiveOwnerAvailable(paths.targetFile, header.id);
 		assertSessionMoveArtifacts(paths);
+		const children = await collectMoveChildren(paths);
+		sessionMoveSize(paths);
 		const archiveMove = archiveMoveFor(paths, header);
 		if (archiveMove) {
 			for (const path of [
@@ -1022,11 +1419,13 @@ export async function relocateSession(options: {
 			artifactSha256: artifactDigest(paths.sourceArtifacts),
 			createdDirectories,
 			...(archiveMove ? { archiveMove } : {}),
+			...(children.length ? { children } : {}),
 		};
 		mkdirSync(dirname(paths.journalPath), { recursive: true });
 		if (createdDirectories.includes(dirname(paths.journalPath))) fsyncPath(paths.agentDir);
 		writeJournal(journal);
 		const endpointSuspended = await callbacks.suspend(journal);
+		for (const endpoint of moveEndpoints(journal).slice(1)) await callbacks.suspend(endpoint);
 		if (artifactDigest(paths.sourceArtifacts) !== journal.artifactSha256) {
 			throw new Error("Source artifacts changed while suspending the endpoint; try the move again");
 		}
@@ -1042,7 +1441,24 @@ export async function relocateSession(options: {
 			mkdirSync(paths.targetArtifactRoot, { recursive: true });
 			if (createdDirectories.includes(paths.targetArtifactRoot)) fsyncPath(dirname(paths.targetArtifactRoot));
 			copyArtifacts(paths.sourceArtifacts, paths.artifactTemporary);
-			journal = { ...journal, artifactIdentity: artifactIdentity(paths.artifactTemporary) };
+			const rewrites = moveArtifactRewrites(journal, git);
+			for (const [file, bytes] of rewrites)
+				writeFileAtomicSync(join(paths.artifactTemporary, file), bytes.toString("utf8"), {
+					fsync: true,
+					fsyncDir: true,
+				});
+			journal = {
+				...journal,
+				artifactIdentity: artifactIdentity(paths.artifactTemporary),
+				...(journal.children
+					? {
+							children: journal.children.map((child) => {
+								const bytes = rewrites.get(child.relative)!;
+								return { ...child, fileBytes: bytes.length, fileSha256: digest(bytes) };
+							}),
+						}
+					: {}),
+			};
 			writeJournal(journal);
 		}
 		if (archiveMove?.sourceIdentity !== undefined) {
@@ -1061,6 +1477,7 @@ export async function relocateSession(options: {
 		}
 		if (archiveMove && digest(readFileSync(paths.sourceFile)) !== archiveMove.sourceFileSha256)
 			throw new Error("Source transcript changed during archive move");
+		await importMoveDeletions(journal);
 		journal = { ...journal, phase: "committing" };
 		writeJournal(journal);
 		renameAbsent(paths.sourceFile, paths.sourceBackup);
@@ -1075,7 +1492,8 @@ export async function relocateSession(options: {
 		const cleanupJournal = { ...journal };
 		verifyMoveArchives(journal, true);
 		publishMoveRedirect(journal);
-		await callbacks.writeMeshRecords(journal, { enrollment: true, directory: true });
+		for (const endpoint of moveEndpoints(journal))
+			await callbacks.writeMeshRecords(endpoint, { enrollment: true, directory: true });
 		meshRecordsWritten = true;
 		const deletion = await deleteSessionMoveOriginal(journal, paths);
 		originalMethod = deletion.method;
@@ -1211,13 +1629,17 @@ export async function recoverSessionMove(options: {
 	} catch (error) {
 		return { ...unhandled, status: "pending", messages: [errorMessage(error)] };
 	}
-	let sourceLease: SessionLease | undefined;
+	let sourceLease: { release(): void } | undefined;
 	try {
 		if (present(journal.targetFile)) {
-			if (journal.archiveMove)
-				sourceLease = acquireSessionLease(journal.sourceFile, journal.agentDir, {
-					[SESSION_LEASES_ENABLED_ENV]: "1",
-				});
+			if (journal.archiveMove || journal.children?.length)
+				sourceLease = acquireMoveLeases(
+					[
+						journal.sourceFile,
+						...(journal.children ?? []).map((child) => join(journal.sourceArtifacts, child.relative)),
+					],
+					journal.agentDir,
+				);
 			let header: unknown;
 			try {
 				header = JSON.parse(readFirstLineSync(journal.targetFile) ?? "null");
@@ -1239,16 +1661,21 @@ export async function recoverSessionMove(options: {
 			const verified = verifySessionMovePrefix(journal);
 			if (!verified.ok) return report(journal, "pending", [`${verified.reason}: ${journal.targetFile}`]);
 			verifyMoveArchives(journal, true);
+			verifyMovedChildren(journal);
+			await importMoveDeletions(journal);
 			publishMoveRedirect(journal);
-			const enrollment = (await callbacks.readEnrollmentPath(journal)) !== journal.targetFile;
-			const directory = (await callbacks.readDirectorySocket(journal)) !== journal.targetSocket;
-			if (enrollment || directory) {
-				if (!(await callbacks.acquireClaim(journal)))
-					return report(journal, "skipped", ["Enrollment claim is held elsewhere"]);
-				try {
-					await callbacks.writeMeshRecords(journal, { enrollment, directory });
-				} finally {
-					await callbacks.releaseClaim();
+			publishChildMoveRedirects(journal);
+			for (const endpoint of moveEndpoints(journal)) {
+				const enrollment = (await callbacks.readEnrollmentPath(endpoint)) !== endpoint.targetFile;
+				const directory = (await callbacks.readDirectorySocket(endpoint)) !== endpoint.targetSocket;
+				if (enrollment || directory) {
+					if (!(await callbacks.acquireClaim(endpoint)))
+						return report(journal, "skipped", ["Enrollment claim is held elsewhere"]);
+					try {
+						await callbacks.writeMeshRecords(endpoint, { enrollment, directory });
+					} finally {
+						await callbacks.releaseClaim();
+					}
 				}
 			}
 			const backups = [
@@ -1257,14 +1684,27 @@ export async function recoverSessionMove(options: {
 				...(journal.archiveMove ? [journal.archiveMove.source] : []),
 			]
 				.filter(present)
-				.map((path) => ({ path, reason: "Recovery keeps the original; delete this backup by hand" }));
+				.map((path) => ({
+					path,
+					reason:
+						path === journal.sourceArtifacts && journal.children?.some((child) => child.previousPaths)
+							? "Recovery keeps original artifact contents; remove them by hand without deleting .relocated records"
+							: "Recovery keeps the original; delete this backup by hand",
+				}));
 			// Recovery removes only its journal, not originals or remaining move files.
 			unlinkSync(journal.journalPath);
 			fsyncPath(dirname(journal.journalPath));
 			return report(
 				journal,
 				"moved",
-				["Finished published move", ...backups.map((backup) => `Backup to delete by hand: ${backup.path}`)],
+				[
+					"Finished published move",
+					...backups.map((backup) =>
+						backup.path === journal.sourceArtifacts && journal.children?.some((child) => child.previousPaths)
+							? `Backup contents to remove by hand; keep .relocated records: ${backup.path}`
+							: `Backup to delete by hand: ${backup.path}`,
+					),
+				],
 				backups,
 			);
 		}
