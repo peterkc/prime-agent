@@ -171,8 +171,9 @@ the installed service and renewal jobs. The installed service plist never change
 Cotal 0.79.0 on macOS cannot reliably stop its delivery daemon through `cotal down`;
 rotation uses launchd and waits for that daemon to exit itself. If the daemon
 outlives that wait, rotation still restores both jobs and exits nonzero with
-"temporary rotation job removed, processes still stopping". The credentials are
-already renewed, and later rotations are not blocked.
+"temporary rotation job removed, processes still stopping". When every earlier
+step succeeded, the credentials are already renewed. The temporary plist is gone,
+so a later rotation can run once the process exits.
 Each stop wait has a 30-second deadline; its final port probe can take one second
 more. No failed step is hidden; recovery still attempts to restore both installed
 jobs, even when a job lookup fails or is killed.
