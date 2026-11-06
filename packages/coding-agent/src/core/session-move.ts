@@ -136,7 +136,6 @@ export interface SessionMoveJournal extends SessionMovePaths {
 	readonly fileSha256?: string;
 	readonly archiveMove?: SessionArchiveMove;
 	readonly children?: readonly SessionMoveChild[];
-	readonly targetLedgerCreated?: { readonly sha256?: string; readonly identity?: string };
 }
 
 export interface SessionMoveBackup {
@@ -353,7 +352,12 @@ function moveEndpoints(journal: SessionMoveJournal): SessionMoveJournal[] {
 }
 
 function movedPath(path: string, paths: SessionMovePaths): string {
-	const canonical = physicalPath(path);
+	let canonical = path;
+	try {
+		canonical = physicalPath(path);
+	} catch {
+		// Stored references can outlive their filesystem ancestors.
+	}
 	if (canonical === paths.sourceFile) return paths.targetFile;
 	if (canonical === paths.sourceArtifacts || canonical.startsWith(`${paths.sourceArtifacts}${sep}`))
 		return join(paths.targetArtifacts, relative(paths.sourceArtifacts, canonical));
@@ -425,7 +429,7 @@ async function importMoveDeletions(journal: SessionMoveJournal): Promise<void> {
 			deletion &&
 			!sourceDeletions.some(
 				(record) =>
-					physicalPath(record.child) === physicalPath(deletion.child) &&
+					canonicalSessionPath(record.child) === canonicalSessionPath(deletion.child) &&
 					record.childId === deletion.childId &&
 					record.reason === deletion.reason,
 			)
@@ -451,10 +455,7 @@ async function importMoveDeletions(journal: SessionMoveJournal): Promise<void> {
 		throw new Error("Moved child deletion proof is missing");
 }
 
-async function prepareMoveDeletions(
-	journal: SessionMoveJournal,
-	save: (journal: SessionMoveJournal) => void,
-): Promise<void> {
+async function prepareMoveDeletions(journal: SessionMoveJournal): Promise<void> {
 	const children = journal.children;
 	if (!children?.length) return;
 	const ledger = new RlmSpawnLedger(journal.agentDir, journal.targetSessionDir);
@@ -464,25 +465,16 @@ async function prepareMoveDeletions(
 	}
 	const staging = `${journal.journalPath}.ledger-moving`;
 	if (present(staging)) throw new Error(`Move destination already exists: ${staging}`);
-	journal = { ...journal, targetLedgerCreated: {} };
-	save(journal);
 	const staged = new RlmSpawnLedger(staging, journal.targetSessionDir, createRlmLedgerRegistrySeedSource());
 	const records = children.flatMap((child) =>
 		child.deletion ? [{ ...child.deletion, child: join(journal.targetArtifacts, child.relative) }] : [],
 	);
 	await staged.importMoveTombstones(records);
-	journal = {
-		...journal,
-		targetLedgerCreated: { sha256: fileDigest(staged.ledgerPath), identity: artifactIdentity(staged.ledgerPath) },
-	};
-	save(journal);
 	mkdirSync(dirname(ledger.ledgerPath), { recursive: true, mode: 0o700 });
 	try {
 		linkSync(staged.ledgerPath, ledger.ledgerPath);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		journal = { ...journal, targetLedgerCreated: undefined };
-		save(journal);
 	}
 	fsyncPath(dirname(ledger.ledgerPath));
 	rmSync(staging, { recursive: true });
@@ -588,6 +580,7 @@ export async function preflightSessionMove(
 		);
 	for (const path of [
 		paths.sourceBackup,
+		`${paths.journalPath}.ledger-moving`,
 		paths.targetFile,
 		paths.fileTemporary,
 		paths.targetArtifacts,
@@ -718,19 +711,6 @@ export function validateSessionMoveJournal(
 	try {
 		if (journal.archiveMove) validateArchiveMove(journal);
 		validateMoveChildren(journal);
-		const ledger = journal.targetLedgerCreated;
-		if (
-			ledger !== undefined &&
-			(!ledger ||
-				typeof ledger !== "object" ||
-				Array.isArray(ledger) ||
-				(ledger.sha256 !== undefined &&
-					(typeof ledger.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(ledger.sha256))) ||
-				(ledger.identity !== undefined &&
-					(typeof ledger.identity !== "string" || !/^\d+:\d+$/.test(ledger.identity))) ||
-				(ledger.sha256 === undefined) !== (ledger.identity === undefined))
-		)
-			throw new Error("Invalid move ledger witness");
 	} catch (error) {
 		return failure(errorMessage(error));
 	}
@@ -1185,23 +1165,14 @@ export async function rollbackSessionMove(
 	if (present(journal.targetFile))
 		return report(journal, "pending", ["Target exists; recovery must inspect it before any rollback"]);
 	const errors: string[] = [];
-	if (journal.targetLedgerCreated) {
-		const path = new RlmSpawnLedger(journal.agentDir, journal.targetSessionDir).ledgerPath;
-		try {
-			if (present(path)) {
-				if (
-					artifactIdentity(path) !== journal.targetLedgerCreated.identity ||
-					fileDigest(path) !== journal.targetLedgerCreated.sha256
-				)
-					throw new Error("Move-created target ledger changed; keep it for recovery");
-				unlinkSync(path);
-				fsyncPath(dirname(path));
-			}
-			rmSync(`${journal.journalPath}.ledger-moving`, { recursive: true, force: true });
-			fsyncPath(dirname(journal.journalPath));
-		} catch (error) {
-			errors.push(`Target ledger: ${errorMessage(error)}`);
+	const staging = `${journal.journalPath}.ledger-moving`;
+	try {
+		if (present(staging)) {
+			rmSync(staging, { recursive: true });
+			fsyncPath(dirname(staging));
 		}
+	} catch (error) {
+		errors.push(`Target ledger staging: ${errorMessage(error)}`);
 	}
 	const a = journal.archiveMove;
 	if (a) {
@@ -1266,8 +1237,8 @@ export async function rollbackSessionMove(
 		? report(journal, "pending", ["Move failed; recovery is pending", ...errors])
 		: report(journal, "rolled_back", [
 				"Nothing moved",
-				...(!journal.targetLedgerCreated && journal.children?.some((child) => child.deletion)
-					? ["Deletion proofs may remain in the pre-existing target ledger; target transcripts were not published"]
+				...(journal.children?.length
+					? ["Any published target ledger and imported tombstones remain; target transcripts were not published"]
 					: []),
 			]);
 }
@@ -1469,6 +1440,7 @@ export async function relocateSession(options: {
 		if (!statSync(targetCwd).isDirectory()) throw new Error("Target cwd is not a directory");
 		for (const path of [
 			paths.journalPath,
+			`${paths.journalPath}.ledger-moving`,
 			paths.sourceBackup,
 			paths.targetFile,
 			paths.fileTemporary,
@@ -1581,10 +1553,7 @@ export async function relocateSession(options: {
 		}
 		if (archiveMove && digest(readFileSync(paths.sourceFile)) !== archiveMove.sourceFileSha256)
 			throw new Error("Source transcript changed during archive move");
-		await prepareMoveDeletions(journal, (updated) => {
-			journal = updated;
-			writeJournal(updated);
-		});
+		await prepareMoveDeletions(journal);
 		journal = { ...journal, phase: "committing" };
 		writeJournal(journal);
 		renameAbsent(paths.sourceFile, paths.sourceBackup);

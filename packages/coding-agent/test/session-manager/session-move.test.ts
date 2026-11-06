@@ -724,6 +724,11 @@ point.startsWith('source-')?to===paths.sourceBackup:point.startsWith('artifacts-
 point.startsWith('child-redirect')?childRedirect:point.startsWith('archive')?archive:point.startsWith('active')?active:redirect;
 if(hit&&point.endsWith('before'))process.exit(73); rename(from,to); if(hit&&point.endsWith('after'))process.exit(73); };
 const copy=fs.copyFileSync;fs.copyFileSync=(...args)=>{copy(...args);if(point==='copy-after')process.exit(73);};
+const link=fs.linkSync;fs.linkSync=(from,to)=>{
+if(point==='ledger-link-before')process.exit(73);
+if(point==='ledger-eexist-before-cleanup')fs.copyFileSync(from,to);
+link(from,to);if(point==='ledger-link-after')process.exit(73);};
+const rm=fs.rmSync;fs.rmSync=(path,...args)=>{if(point==='ledger-eexist-before-cleanup'&&path===paths.journalPath+'.ledger-moving')process.exit(73);return rm(path,...args);};
 syncBuiltinESMExports(); const leases=acquireSessionMoveLeases(paths,paths.agentDir);
 await relocateSession({paths,targetCwd:cwd,targetSocket:'new.sock',callbacks:{suspend:async()=>true,resume:async()=>{},writeMeshRecords:async()=>{if(point==='mesh-after')process.exit(73);},releaseClaim:()=>{},releaseLeases:()=>leases.release()}}); process.exit(74);`;
 	const child = spawnHidden(
@@ -918,27 +923,53 @@ describe("moving retained child history", () => {
 			}),
 		).rejects.toThrow(/live RLM children.*other-child/);
 	});
-	it.each(["new", "changed", "existing"])(
-		"fork move F7 rolls back only its own unchanged target ledger (%s)",
+	it.each(["new", "appended", "existing"])(
+		"fork move N1 rollback keeps the shared target ledger and tombstones (%s)",
 		async (kind) => {
 			const f = await historyFixture();
 			const ledger = new RlmSpawnLedger(f.paths.agentDir, f.paths.targetSessionDir);
 			if (kind === "existing") await ledger.importMoveTombstones([]);
+			const other = join(home, "other.jsonl");
+			const append = { v: 1, op: "delete", at: "t3", childId: "other", child: other, reason: "user" };
+			let sharedBytes: Buffer | undefined;
 			const rename = fs.renameSync;
 			vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
 				if (to === f.paths.sourceBackup) {
-					if (kind === "changed") writeFileSync(ledger.ledgerPath, "\n", { flag: "a" });
+					if (kind === "appended") writeFileSync(ledger.ledgerPath, `${JSON.stringify(append)}\n`, { flag: "a" });
+					sharedBytes = readFileSync(ledger.ledgerPath);
 					throw new Error("stop before publication");
 				}
 				return rename(from, to);
 			});
 			syncBuiltinESMExports();
 			const result = await move(f);
-			expect(result.status).toBe(kind === "changed" ? "pending" : "rolled_back");
-			expect(existsSync(ledger.ledgerPath)).toBe(kind !== "new");
-			expect(existsSync(f.paths.journalPath)).toBe(kind === "changed");
+			expect(result.status).toBe("rolled_back");
+			expect(readFileSync(ledger.ledgerPath)).toEqual(sharedBytes);
+			expect(result.messages.join(" ")).toContain("target ledger and imported tombstones remain");
+			expect(readDeletedRlmChildPaths(f.paths.agentDir).has(f.target(f.deleted))).toBe(true);
+			if (kind === "appended") expect(readDeletedRlmChildPaths(f.paths.agentDir).has(append.child)).toBe(true);
+			expect(existsSync(`${f.paths.journalPath}.ledger-moving`)).toBe(false);
+			expect((await recover(f)).status).toBe("absent");
 			expect(existsSync(f.paths.sourceFile)).toBe(true);
 			expect(existsSync(f.paths.targetFile)).toBe(false);
+		},
+	);
+	it.each(["move", "recovery"])(
+		"fork move N2 tolerates unrelated stale stored and deletion paths during %s",
+		async (kind) => {
+			const f = await historyFixture();
+			const stale = join(home, "stale", "missing.jsonl");
+			writeFileSync(dirname(stale), "not a directory");
+			const metadata = join(dirname(f.completed), "rlm-subagent.json");
+			writeFileSync(metadata, JSON.stringify({ ...JSON.parse(readFileSync(metadata, "utf8")), target: stale }));
+			if (kind === "recovery") await moveCrash(f, "active-after");
+			const ledger = new RlmSpawnLedger(f.paths.agentDir, f.paths.sourceSessionDir).ledgerPath;
+			const record = { v: 1, op: "delete", at: "t3", childId: "stale", child: stale, reason: "user" };
+			writeFileSync(ledger, readFileSync(ledger, "utf8").replace("\n", `\n${JSON.stringify(record)}\n`));
+			expect((kind === "recovery" ? await recoverFresh(f) : await move(f)).status).toBe("moved");
+			assertMovedHistory(f);
+			expect(JSON.parse(readFileSync(f.target(metadata), "utf8")).target).toBe(stale);
+			expect((await recoverFresh(f)).status).toBe("absent");
 		},
 	);
 	it("fork move F1 keeps pending dispatch records for a childless session", async () => {
@@ -1122,6 +1153,9 @@ describe("moving retained child history", () => {
 		"journal-copying-after",
 		"copy-after",
 		"journal-verified-after",
+		"ledger-link-before",
+		"ledger-link-after",
+		"ledger-eexist-before-cleanup",
 		"journal-committing-after",
 		"source-after",
 		"artifacts-after",
@@ -1132,11 +1166,20 @@ describe("moving retained child history", () => {
 	])("fork move recovers child history in a fresh process at %s", async (point) => {
 		const f = await historyFixture();
 		await moveCrash(f, point);
+		const ledger = new RlmSpawnLedger(f.paths.agentDir, f.paths.targetSessionDir).ledgerPath;
+		const shared = existsSync(ledger) ? readFileSync(ledger) : undefined;
+		expect(existsSync(`${f.paths.journalPath}.ledger-moving`)).toBe(point.startsWith("ledger-"));
 		const published = existsSync(f.paths.targetFile);
 		expect((await recoverFresh(f)).status).toBe(published ? "moved" : "rolled_back");
 		if (published) assertMovedHistory(f);
 		else for (const file of f.childFiles) expect(existsSync(file)).toBe(true);
+		expect(existsSync(`${f.paths.journalPath}.ledger-moving`)).toBe(false);
+		expect(existsSync(ledger) ? readFileSync(ledger) : undefined).toEqual(shared);
 		expect((await recoverFresh(f)).status).toBe("absent");
+		if (point.startsWith("ledger-")) {
+			expect((await move(f)).status).toBe("moved");
+			assertMovedHistory(f);
+		}
 	});
 	it.each(["escape", "duplicate", "deletion", "prefix", "archive"])(
 		"fork move keeps backups when child recovery cannot prove %s",
@@ -1171,6 +1214,7 @@ describe("moving retained child history", () => {
 		"nested-job",
 		"nested-paused",
 		"target-child-id",
+		"ledger-staging",
 		"space",
 	])("fork move refuses %s before changing original history", async (kind) => {
 		const f = await historyFixture();
@@ -1215,6 +1259,11 @@ describe("moving retained child history", () => {
 			}
 			if (kind === "target-child-id")
 				writeFileSync(join(f.paths.targetSessionDir, "conflict.jsonl"), readFileSync(f.completed));
+			const staging = `${f.paths.journalPath}.ledger-moving`;
+			if (kind === "ledger-staging") {
+				mkdirSync(dirname(staging), { recursive: true });
+				writeFileSync(staging, "keep");
+			}
 			if (kind === "space")
 				vi.spyOn(fs, "statfsSync").mockReturnValue({ bavail: 0, bsize: 4096 } as ReturnType<typeof fs.statfsSync>);
 			syncBuiltinESMExports();
@@ -1225,12 +1274,20 @@ describe("moving retained child history", () => {
 					? /blocking.*Completed children/
 					: kind === "space"
 						? /Not enough target space/
-						: kind === "target-child-id"
-							? /Target already holds/
-							: kind.endsWith("lease")
-								? /already active/
-								: /scheduled job/,
+						: kind === "ledger-staging"
+							? /Move destination already exists/
+							: kind === "target-child-id"
+								? /Target already holds/
+								: kind.endsWith("lease")
+									? /already active/
+									: /scheduled job/,
 			);
+			if (kind === "ledger-staging") {
+				expect((await move(f)).status).toBe("rolled_back");
+				expect(readFileSync(staging, "utf8")).toBe("keep");
+				expect(existsSync(f.paths.journalPath)).toBe(false);
+				expect(existsSync(f.paths.sourceFile)).toBe(true);
+			}
 			expect(f.childFiles.map((file) => readFileSync(file))).toEqual(before);
 			expect(existsSync(f.paths.targetFile)).toBe(false);
 		} finally {
