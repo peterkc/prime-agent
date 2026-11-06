@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll } from "vitest";
+import { afterAll, vi } from "vitest";
 
 // A run started from a daemon session inherits that session's daemon wiring and its real agent folder.
 // Drop the wiring, and give each test file its own empty agent folder. The names are literal: importing
@@ -14,4 +14,4 @@ delete process.env.PRIME_AGENT_CODING_AGENT_SESSION_DIR; // legacy name, still r
 delete process.env.PRIME_AGENT_KERNEL_OWNER_PID;
 const agentDir = mkdtempSync(join(tmpdir(), "prime-agent-test-home-"));
 process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
-afterAll(() => rmSync(agentDir, { recursive: true, force: true }));
+afterAll(() => vi.dynamicImportSettled().then(() => rmSync(agentDir, { recursive: true, force: true })));
