@@ -1,0 +1,3 @@
+- Fixed mesh status and doctor to detect a stopped delivery process and show the service restart command.
+- Fixed mesh rotation recovery hints to name delivery restarts only for a live delivery process.
+- Fixed mesh install to refuse a declared `prime-agent.sh` from a checkout other than the running CLI's.
