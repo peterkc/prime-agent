@@ -27,6 +27,7 @@ import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessage,
+	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	createAgentMessageHostHandlers,
 } from "../src/core/agent-messages.js";
@@ -905,6 +906,8 @@ describe("daemon mode helpers", () => {
 			["sibling", "sibling", "running", "tool"],
 			["child", "grandchild", "idle", "idle"],
 		]);
+		await expect(observe.getAgent("sibling")).resolves.toMatchObject({ agent: { activeSessionId: "sibling" } });
+		await expect(observe.recentMessages({ target: "sibling" })).resolves.toHaveProperty("agent.activity", "tool");
 		await expect(observe.getAgent("cousin")).rejects.toThrow(
 			"Agent reach is limited to parent, siblings, and children",
 		);
@@ -916,7 +919,14 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
-	it("resolves a duplicate session name to the only family-reachable agent", async () => {
+	it.each([
+		["helper", false],
+		["remote", false],
+		["session-peer", false],
+		["peer", false],
+		["unknown", false],
+		["remote", true],
+	] as const)("resolves family observation targets (%s, child: %s)", async (target, child) => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-resolution.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
@@ -925,8 +935,11 @@ describe("daemon mode helpers", () => {
 		const familyHelper = makeAgentFamilyState("family-helper", "helper", observer.state);
 		const otherRoot = makeAgentFamilyState("other-root", "other-root");
 		const unrelatedHelper = makeAgentFamilyState("unrelated-helper", "helper", otherRoot.state);
+		const remote = makeAgentFamilyState("peer", "remote");
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
+			listSupervisorAgentPeers(): Promise<AgentSessionMessageAgentSummary[]>;
+			createAgentMessageAgentSummary(state: ActiveSessionState): AgentSessionMessageAgentSummary;
 			createAgentMessageController(
 				getCurrentState: () => ActiveSessionState | undefined,
 			): AgentSessionMessageController;
@@ -936,7 +949,17 @@ describe("daemon mode helpers", () => {
 			internals.sessions.set(fixture.state.activeSessionId, fixture.state);
 		}
 
-		const observe = internals.createAgentObserveController(() => observer.state);
+		internals.listSupervisorAgentPeers = async () => [internals.createAgentMessageAgentSummary(remote.state)];
+		const observe = internals.createAgentObserveController(() => (child ? familyHelper.state : observer.state));
+		if (target !== "helper") {
+			const error =
+				target === "unknown" || child
+					? `Unknown active session: ${target}`
+					: `Agent observation unavailable for ${target}: root sibling is listed by the supervisor but has no live session in this worker. Cross-worker observation is not supported.`;
+			await expect(observe.getAgent(target)).rejects.toThrow(error);
+			await expect(observe.recentMessages({ target })).rejects.toThrow(error);
+			return;
+		}
 		await expect(observe.getAgent("helper")).resolves.toMatchObject({
 			agent: { activeSessionId: familyHelper.state.activeSessionId },
 		});

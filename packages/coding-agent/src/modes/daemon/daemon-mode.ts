@@ -6311,7 +6311,31 @@ export class AgentDaemon {
 			}
 		}
 		const passive = await this.findPassiveRlmSubagent(target);
-		if (!passive) return this.getOrHydrateBoundSessionState(target);
+		if (!passive) {
+			try {
+				return await this.getOrHydrateBoundSessionState(target);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== `Unknown active session: ${target}`) throw error;
+				const family = await this.createAgentFamily(currentState);
+				const residentSessionIds = new Set(
+					[...this.sessions.values()].map((state) => state.runtime.session.sessionId),
+				);
+				const peer = family.find(
+					({ relationship, entry }) =>
+						relationship === "sibling" &&
+						entry.depth === 0 &&
+						entry.activeSessionId !== undefined &&
+						!residentSessionIds.has(entry.id) &&
+						(entry.name === target || entry.id === target || entry.activeSessionId === target),
+				);
+				if (peer) {
+					throw new Error(
+						`Agent observation unavailable for ${target}: root sibling is listed by the supervisor but has no live session in this worker. Cross-worker observation is not supported.`,
+					);
+				}
+				throw error;
+			}
+		}
 		assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.passiveAgentFamilyEntry(passive));
 		return this.hydratePassiveRlmSubagent(passive);
 	}

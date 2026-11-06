@@ -1,0 +1,1 @@
+- Fixed agent observation errors for root siblings running in another worker to explain that cross-worker observation is not supported.
