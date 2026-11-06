@@ -116,6 +116,8 @@ every three weeks. Its command output goes to `<mesh home>/rotation.log`; broker
 boot output stays in `service.log`. The job uses the managed native installation's
 upgrade-stable launcher when available, else the launcher named by
 `PRIME_AGENT_LAUNCHER_PATH`, which `prime-agent.sh` sets for a source checkout.
+A declared launcher's resolved directory must contain the running CLI's resolved
+entrypoint; install refuses a launcher from another installation before writing mesh files.
 Otherwise, install requires the absolute `prime-agent` entry on `PATH` to resolve
 to the running CLI. It keeps that entry, not its resolved symlink target, so an
 upgrade can replace the target. A shadowing installation on `PATH` is refused
@@ -142,7 +144,11 @@ scheduled. The error names `rotation.log` and `rotation.lock` for investigation.
   check is listed as left and does not fail status. A missing renewal or rotation
   agent fails status; reinstall the mesh to add it. A leftover temporary rotation
   plist also fails status. An unreadable $SYS credential is reported by filename;
-  status finishes broker, store and session diagnostics before failing.
+  status finishes broker, store and session diagnostics before failing. When the service
+  is running, status also requires a `delivery.*.pid` record under `<mesh home>/.cotal`
+  that names a live process. Missing, dead or unreadable delivery records fail after
+  those diagnostics and name `launchctl kickstart -k gui/$UID/<label>` for recovery.
+  This delivery check does not run for a service stopped with `mesh stop`.
 - `prime-agent mesh doctor` checks the exact CLI version first, then ledger and status
   health, then Cotal auth. A failed version check still stops before ledger diagnosis;
   use `mesh status` for that offline check. An unhealthy check sets exit code 1.
@@ -174,9 +180,13 @@ outlives that wait, rotation still restores both jobs and exits nonzero with
 "temporary rotation job removed, processes still stopping". When every earlier
 step succeeded, the credentials are already renewed. The temporary plist is gone,
 so a later rotation can run once the process exits. The restored service reuses that
-process, and Cotal does not restart delivery after it exits; `mesh status` does not
-report this. When the service was running, the error names the restart command:
-after the process exits, run `launchctl kickstart -k gui/$UID/<label>`.
+process, and Cotal does not restart delivery after it exits. Status and doctor detect
+the missing delivery process even when the broker still serves. When a live delivery
+PID record causes the cleanup timeout and the service was running, the error names
+the restart command: after the process exits, run
+`launchctl kickstart -k gui/$UID/<label>`. A port-only timeout, a live broker PID
+without live delivery, an unreadable PID record or a retained temporary plist
+does not add this hint.
 Each stop wait has a 30-second deadline; its final port probe can take one second
 more. No failed step is hidden; recovery still attempts to restore both installed
 jobs, even when a job lookup fails or is killed.

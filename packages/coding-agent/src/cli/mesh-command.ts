@@ -3,7 +3,7 @@ import { constants, existsSync } from "node:fs";
 import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, isBunBinary } from "../config.js";
@@ -359,9 +359,9 @@ function processAlive(pid: number): boolean {
 	}
 }
 
-async function liveRootProcess(options: MeshOptions, runtime: MeshRuntime): Promise<string | undefined> {
+async function liveRootProcess(options: MeshOptions, runtime: MeshRuntime, prefix = ""): Promise<string | undefined> {
 	const directory = join(options.meshHome, ".cotal");
-	for (const file of (await readdir(directory)).filter((name) => name.endsWith(".pid"))) {
+	for (const file of (await readdir(directory)).filter((name) => name.startsWith(prefix) && name.endsWith(".pid"))) {
 		let raw: string;
 		try {
 			raw = (await readFile(join(directory, file), "utf8")).trim();
@@ -375,6 +375,15 @@ async function liveRootProcess(options: MeshOptions, runtime: MeshRuntime): Prom
 		if ((runtime.processAlive ?? processAlive)(pid)) return `${join(directory, file)} (PID ${pid})`;
 	}
 	return undefined;
+}
+
+class CotalStopTimeout extends Error {
+	constructor(
+		message: string,
+		readonly deliveryStillLive: boolean,
+	) {
+		super(message);
+	}
 }
 
 async function waitForStopped(options: MeshOptions, runtime: MeshRuntime): Promise<void> {
@@ -392,8 +401,10 @@ async function waitForStopped(options: MeshOptions, runtime: MeshRuntime): Promi
 		if (remaining <= 0) break;
 		await runtime.wait(Math.min(250, remaining));
 	}
-	throw new Error(
+	const delivery = await liveRootProcess(options, runtime, "delivery.");
+	throw new CotalStopTimeout(
 		`Mesh broker or recorded Cotal processes did not stop within 30 seconds${liveProcess ? `; live Cotal pid record ${liveProcess}` : ""}`,
+		delivery !== undefined,
 	);
 }
 
@@ -441,8 +452,8 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 	await requireCotalVersion(cotal, options);
 	// A managed native install or a wrapper such as prime-agent.sh names its own upgrade-stable launcher.
 	const declared = process.env[PRIME_AGENT_LAUNCHER_PATH_ENV];
-	const launcher =
-		(isBunBinary ? getNativeInstallation() : undefined)?.launcher ?? (declared ? resolve(declared) : undefined);
+	const nativeLauncher = (isBunBinary ? getNativeInstallation() : undefined)?.launcher;
+	const launcher = nativeLauncher ?? (declared ? resolve(declared) : undefined);
 	const primeAgent = launcher ?? (await executable(APP_NAME));
 	if (launcher) {
 		// launchd cannot run a directory, which passes the X_OK check; stat follows symlinks.
@@ -451,6 +462,20 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 			await access(launcher, constants.X_OK);
 		} catch (error) {
 			throw new Error(`${APP_NAME} launcher ${launcher} is not an executable file`, { cause: error });
+		}
+		if (!nativeLauncher) {
+			try {
+				const current = process.argv[1];
+				if (!current) throw new Error("CLI entrypoint is missing");
+				const entry = relative(dirname(await realpath(launcher)), await realpath(current));
+				if (entry === ".." || entry.startsWith(`..${sep}`) || isAbsolute(entry))
+					throw new Error("CLI entrypoint is outside launcher directory");
+			} catch (error) {
+				throw new Error(
+					`${PRIME_AGENT_LAUNCHER_PATH_ENV} launcher does not contain the running CLI in its resolved directory`,
+					{ cause: error },
+				);
+			}
 		}
 	} else {
 		try {
@@ -703,7 +728,7 @@ async function rotateCredentials(options: MeshOptions, launchctl: string, runtim
 				const stage = removed ? "temporary rotation job removed, processes still stopping" : "stop rotation broker";
 				// The restored service reuses a still-live delivery process, and Cotal does not restart it after it exits.
 				const restart =
-					removed && serviceWasRunning
+					removed && serviceWasRunning && error instanceof CotalStopTimeout && error.deliveryStillLive
 						? `; once it exits, restart delivery: launchctl kickstart -k ${targetOf(options)}`
 						: "";
 				failures.push(`${stage}: ${error instanceof Error ? error.message : "failed"}${restart}`);
@@ -901,6 +926,17 @@ async function status(
 				? "absent"
 				: "unavailable on this platform";
 	console.log(`Launchd: ${state}`);
+	let deliveryUnavailable = false;
+	if (state === "running") {
+		try {
+			const delivery = await liveRootProcess(options, runtime, "delivery.");
+			deliveryUnavailable = delivery === undefined;
+			console.log(`Delivery: ${delivery ? "running" : "not running"}`);
+		} catch (error) {
+			console.log(error instanceof Error ? error.message : "Cannot check Cotal delivery process");
+			deliveryUnavailable = true;
+		}
+	}
 	const lastExitCode =
 		job?.code === 0 ? /^\s*last exit code = (-?\d+)(?:: [^\r\n]+)?\s*$/m.exec(job.stdout)?.[1] : undefined;
 	if (lastExitCode !== undefined) console.log(`Launchd last exit code: ${lastExitCode}`);
@@ -1018,6 +1054,8 @@ async function status(
 		throw new Error(
 			`Mesh $SYS credential rotation is over 26 hours overdue; inspect ${join(options.meshHome, "rotation.log")} and ${join(options.meshHome, "rotation.lock")}`,
 		);
+	if (deliveryUnavailable)
+		throw new Error(`Mesh delivery process is unavailable; restart delivery: launchctl kickstart -k ${target}`);
 	if (credentialsUnavailable) throw new Error("Mesh $SYS credential lifetimes are unavailable");
 	if (countUnavailable) throw new Error("Mesh session counts are unavailable");
 	if (versionUnavailable) throw new Error("Mesh CLI version is unavailable");

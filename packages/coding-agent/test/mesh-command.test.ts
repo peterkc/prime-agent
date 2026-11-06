@@ -79,9 +79,15 @@ if (tool === "launchctl") {
   if (args[0] === "--version") { console.log(control.versionOutput ?? "cotal-ai 0.79.0\n  adapter test 9.9.9"); process.exit(0); }
   if (args[0] === "up") {
     if (args.includes("--rotate-sys") && control.failRotate) process.exit(6);
-    if (args.includes("--rotate-sys")) { writeFileSync(join(root, "rotated"), "yes"); if (control.latePid) writeFileSync(join(cotalRoot, ".cotal", "delivery.7072696d65.pid"), "27805"); }
+    if (args.includes("--rotate-sys")) writeFileSync(join(root, "rotated"), "yes");
     writeFileSync("auth", "ready");
     writeFileSync(join(cotalRoot, ".cotal", "nats.pid"), "42");
+    const delivery = join(cotalRoot, ".cotal", "delivery.7072696d65.pid");
+    if (!existsSync(delivery)) writeFileSync(delivery, String(control.deliveryPid));
+    if (args.includes("--rotate-sys") && control.latePid) {
+      if (control.latePid === "unreadable") { unlinkSync(delivery); mkdirSync(delivery); }
+      else { if (control.latePid === "nats") unlinkSync(delivery); writeFileSync(control.latePid === "nats" ? join(cotalRoot, ".cotal", "nats.pid") : delivery, "27805"); }
+    }
     if (!existsSync(join(cotalRoot, ".cotal", "space.7072696d65")) || (args.includes("--rotate-sys") && !control.staleRotation)) {
       const dir = join(cotalRoot, ".cotal", "space.7072696d65"); mkdirSync(dir, { recursive: true });
       const iat = Math.floor((control.credentialNow ?? 0) / 1000);
@@ -126,7 +132,7 @@ const clock = {
 	},
 };
 function configure(values: Record<string, unknown> = {}): void {
-	control = { seed, ...control, ...values };
+	control = { seed, deliveryPid: process.pid, ...control, ...values };
 	writeFileSync(join(root, "control.json"), JSON.stringify(control));
 }
 function events(): Event[] {
@@ -145,7 +151,7 @@ async function command(name: string, ...options: string[]): Promise<void> {
 	configure({ credentialNow: now });
 	await runMeshCommand([name, "--label", "ai.prime.mesh.test", "--server", server, ...options], {
 		...clock,
-		processAlive: (pid) => pid !== 42 || existsSync(join(mesh, ".cotal", "nats.pid")),
+		processAlive: (pid) => (pid !== 42 && pid !== process.pid) || existsSync(join(mesh, ".cotal", "nats.pid")),
 		wait: async (ms) => {
 			now += control.notReady
 				? 30_000
@@ -158,7 +164,8 @@ async function command(name: string, ...options: string[]): Promise<void> {
 				process.emit(control.signal as NodeJS.Signals, control.signal as NodeJS.Signals);
 				configure({ signal: undefined });
 			}
-			if (name === "rotate" && !control.holdPid) rmSync(join(mesh, ".cotal", "nats.pid"), { force: true });
+			const keepPid = control.holdPid || (control.latePid === "nats" && existsSync(join(root, "rotated")));
+			if (name === "rotate" && !keepPid) rmSync(join(mesh, ".cotal", "nats.pid"), { force: true });
 			if (control.cleanupFailure) writeFileSync(join(mesh, "rotation.lock", "leftover"), "retained");
 			configure({ credentialNow: now });
 		},
@@ -242,6 +249,7 @@ describe("mesh command", () => {
 			mkdirSync(join(mesh, ".cotal"), { recursive: true });
 			writeFileSync(join(mesh, "mesh.json"), JSON.stringify({ space: "prime", server }));
 			for (const job of ["loaded", "loaded-renew", "loaded-rotate"]) writeFileSync(join(root, job), "yes");
+			writeFileSync(join(mesh, ".cotal", "delivery.7072696d65.pid"), "27805");
 			mkdirSync(join(mesh, ".cotal", "space.7072696d65"), { recursive: true });
 			for (const file of ["membership-observer.creds", "connection-evictor.creds"]) credentials(0, file);
 		}
@@ -581,6 +589,20 @@ describe("mesh command", () => {
 		expect(output()).not.toContain(seed);
 	});
 
+	it.each(["missing", "dead", "live", "stopped"])("pi-sbmfy delivery health (%s)", async (state) => {
+		await command("install");
+		if (state === "missing" || state === "stopped") rmSync(join(mesh, ".cotal", "delivery.7072696d65.pid"));
+		if (state === "dead") rmSync(join(mesh, ".cotal", "nats.pid"));
+		if (state === "stopped") await command("stop");
+		for (const name of ["status", "doctor"]) {
+			await command(name);
+			const failed = state !== "live" && state !== "stopped";
+			expect(process.exitCode).toBe(failed ? 1 : undefined);
+			expect(output().includes(`launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`)).toBe(failed);
+			expect(output()).toContain("Enrolled sessions: 0");
+		}
+	});
+
 	it("fails status for an install without the credential renewal job", async () => {
 		await command("install");
 		rmSync(join(root, "loaded-renew"));
@@ -788,11 +810,9 @@ describe("mesh command", () => {
 		["service", "stop ai.prime.mesh.test", 1],
 		["renew", "stop ai.prime.mesh.test.renew", 0],
 		["temporary", "stop rotation broker", 3],
-		[
-			"late-pid",
-			`(PID 27805); once it exits, restart delivery: launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`,
-			3,
-		],
+		["late-nats", "processes still stopping", 3],
+		["late-unreadable", "Cannot read Cotal pid record", 3],
+		["late-pid", "temporary rotation job removed, processes still stopping", 3],
 	] as const)("restores jobs and reports a failed rotation step (%s)", async (failure, step, bootstraps) => {
 		await command("install");
 		now = Date.UTC(2026, 10, 1);
@@ -801,12 +821,13 @@ describe("mesh command", () => {
 			failRestart: failure === "restart",
 			staleRotation: failure === "stale",
 			stalledBootout: ["service", "renew", "temporary"].includes(failure) ? failure : undefined,
-			latePid: failure === "late-pid",
+			latePid: failure === "late-pid" ? true : failure.startsWith("late-") ? failure.slice(5) : undefined,
 		});
 		rmSync(join(root, "events.jsonl"));
 		await command("rotate");
 		expect(process.exitCode).toBe(1);
 		expect(output()).toContain(step);
+		expect(output().includes("once it exits, restart delivery")).toBe(failure === "late-pid");
 		expect(events().filter((event) => event.args[0] === "bootstrap")).toHaveLength(bootstraps);
 		if (failure === "temporary") {
 			await command("status");
@@ -855,6 +876,7 @@ describe("mesh command", () => {
 
 	it.each(["pid", "port"])("refuses a second boot while the broker %s stays live", async (held) => {
 		await command("install");
+		if (held === "pid") rmSync(join(mesh, ".cotal", "delivery.7072696d65.pid"));
 		const socket = createServer();
 		try {
 			if (held === "port")
@@ -970,27 +992,32 @@ describe("mesh command", () => {
 		expect(process.listeners(signal)).toEqual(listeners);
 	});
 
-	it.each([false, true])("PR 52 keeps a stopped service stopped after rotation (failure=%s)", async (failRotate) => {
+	it.each([false, true, "late-pid"])("PR 52 keeps a stopped service stopped (%s)", async (failRotate) => {
 		await command("install");
 		await command("stop");
 		now = Date.UTC(2026, 10, 1);
-		configure({ failRotate });
+		configure({ failRotate: failRotate === true, latePid: failRotate === "late-pid" });
 		await command("rotate");
 		expect(process.exitCode).toBe(failRotate ? 1 : undefined);
+		expect(output()).not.toContain("once it exits, restart delivery");
 		await command("status");
 		expect(output()).toContain("Launchd: not running");
 		if (!failRotate) expect(output()).toContain("Mesh credentials rotated");
 	});
 
-	it.each([0o700, 0o600, "directory"] as const)("PR 52 pins an executable declared launcher (%s)", async (mode) => {
-		const launcher = join(root, "prime-agent.sh");
-		if (mode === "directory") mkdirSync(launcher);
-		else writeFileSync(launcher, fakeTool, { mode });
-		process.argv[1] = process.execPath;
+	it.each([0o700, 0o600, "directory", "foreign"] as const)("pi-1bv1d pins a declared launcher (%s)", async (mode) => {
+		const launcher = join(root, "bin", "prime-agent.sh");
+		const target = join(root, "prime-agent.sh");
+		if (mode === "directory") mkdirSync(target);
+		else writeFileSync(target, fakeTool, { mode: mode === "foreign" ? 0o700 : mode });
+		symlinkSync(target, launcher);
+		if (mode === "foreign") process.argv[1] = process.execPath;
 		vi.stubEnv(PRIME_AGENT_LAUNCHER_PATH_ENV, launcher);
 		await command("install");
 		const job = mode === 0o700 ? readFileSync(plist.replace(".plist", ".rotate.plist"), "utf8") : output();
-		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : "is not an executable file");
+		const expected = mode === "foreign" ? "does not contain the running CLI" : "is not an executable file";
+		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : expected);
+		expect(existsSync(mesh)).toBe(mode === 0o700);
 	});
 
 	it("preserves the rotation error when lock cleanup also fails", async () => {

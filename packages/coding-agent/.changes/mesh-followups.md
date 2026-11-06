@@ -1,0 +1,3 @@
+- Fixed mesh status and doctor to detect a stopped delivery process and show the service restart command.
+- Fixed mesh rotation recovery hints to name delivery restarts only for a live delivery process.
+- Fixed mesh install to reject a declared launcher outside the running CLI installation.
