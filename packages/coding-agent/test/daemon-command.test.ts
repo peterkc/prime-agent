@@ -157,6 +157,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 	return { ...original, spawn: spawnMock.mockSpawn as never };
 });
 
+import { getCommandSpec } from "../src/cli/command-registry.js";
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
@@ -332,6 +333,15 @@ describe("daemon command", () => {
 
 		expect(daemonClientMock.instances[0]?.requests[0]).toMatchObject(expected);
 	});
+
+	it.each(getCommandSpec(["send"])!.options!.map((o) => o.split(" ")))(
+		"send accepts listed %s",
+		async (flag, value) => {
+			const argv = ["send", flag, ...(value === "<agent>" ? ["planner"] : []), "worker", "hello"];
+			await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", ...argv]);
+			expect(daemonClientMock.instances[0]?.requests[0]).toMatchObject({ type: "send_message", message: "hello" });
+		},
+	);
 
 	// Rejected argv must never reach the daemon: a half-parsed command would run the wrong thing.
 	it.each([
