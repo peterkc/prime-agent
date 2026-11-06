@@ -589,10 +589,11 @@ describe("mesh command", () => {
 		expect(output()).not.toContain(seed);
 	});
 
-	it.each(["missing", "dead", "live", "stopped"])("pi-sbmfy delivery health (%s)", async (state) => {
+	it.each(["missing", "dead", "live", "stopped", "malformed"])("pi-sbmfy delivery health (%s)", async (state) => {
 		await command("install");
 		if (state === "missing" || state === "stopped") rmSync(join(mesh, ".cotal", "delivery.7072696d65.pid"));
 		if (state === "dead") rmSync(join(mesh, ".cotal", "nats.pid"));
+		if (state === "malformed") writeFileSync(join(mesh, ".cotal", "delivery.7072696d65.pid"), "x");
 		if (state === "stopped") await command("stop");
 		for (const name of ["status", "doctor"]) {
 			await command(name);
@@ -600,6 +601,7 @@ describe("mesh command", () => {
 			expect(process.exitCode).toBe(failed ? 1 : undefined);
 			expect(output().includes(`launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`)).toBe(failed);
 			expect(output()).toContain("Enrolled sessions: 0");
+			expect(output()).not.toContain("refusing to boot");
 		}
 	});
 
@@ -1005,19 +1007,20 @@ describe("mesh command", () => {
 		if (!failRotate) expect(output()).toContain("Mesh credentials rotated");
 	});
 
-	it.each([0o700, 0o600, "directory", "foreign"] as const)("pi-1bv1d pins a declared launcher (%s)", async (mode) => {
-		const launcher = join(root, "bin", "prime-agent.sh");
-		const target = join(root, "prime-agent.sh");
-		if (mode === "directory") mkdirSync(target);
-		else writeFileSync(target, fakeTool, { mode: mode === "foreign" ? 0o700 : mode });
-		symlinkSync(target, launcher);
-		if (mode === "foreign") process.argv[1] = process.execPath;
+	it.each([0o700, 0o600, "dir", "foreign", "wt", "shim"] as const)("PR 52 declared launcher (%s)", async (mode) => {
+		const launcher = join(root, mode === "shim" ? "pnpm-shim" : "prime-agent.sh");
+		if (mode === "dir") mkdirSync(launcher);
+		else writeFileSync(launcher, fakeTool, { mode: mode === 0o600 ? mode : 0o700 });
+		if (mode === "foreign" || mode === "shim") process.argv[1] = process.execPath;
+		if (mode === "wt") process.argv[1] = join(root, "bin", "prime-agent.sh");
+		if (mode === "wt") writeFileSync(process.argv[1], "");
 		vi.stubEnv(PRIME_AGENT_LAUNCHER_PATH_ENV, launcher);
 		await command("install");
-		const job = mode === 0o700 ? readFileSync(plist.replace(".plist", ".rotate.plist"), "utf8") : output();
-		const expected = mode === "foreign" ? "does not contain the running CLI" : "is not an executable file";
-		expect(job).toContain(mode === 0o700 ? `<string>${launcher}</string>` : expected);
-		expect(existsSync(mesh)).toBe(mode === 0o700);
+		const pinned = mode === 0o700 || mode === "shim";
+		const job = pinned ? readFileSync(plist.replace(".plist", ".rotate.plist"), "utf8") : output();
+		const refused = mode === "foreign" || mode === "wt" ? "not the checkout of the" : "not an executable file";
+		expect(job).toContain(pinned ? `<string>${launcher}</string>` : refused);
+		expect(existsSync(mesh)).toBe(pinned);
 	});
 
 	it("preserves the rotation error when lock cleanup also fails", async () => {

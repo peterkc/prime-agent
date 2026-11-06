@@ -116,8 +116,10 @@ every three weeks. Its command output goes to `<mesh home>/rotation.log`; broker
 boot output stays in `service.log`. The job uses the managed native installation's
 upgrade-stable launcher when available, else the launcher named by
 `PRIME_AGENT_LAUNCHER_PATH`, which `prime-agent.sh` sets for a source checkout.
-A declared launcher's resolved directory must contain the running CLI's resolved
-entrypoint; install refuses a launcher from another installation before writing mesh files.
+`prime-agent.sh` exports that variable to every child shell, so a declared
+`prime-agent.sh` must be the checkout nearest the running CLI: install refuses
+another checkout's script, such as the main checkout's from a worktree, before
+writing mesh files. Other declared wrappers are used as given.
 Otherwise, install requires the absolute `prime-agent` entry on `PATH` to resolve
 to the running CLI. It keeps that entry, not its resolved symlink target, so an
 upgrade can replace the target. A shadowing installation on `PATH` is refused

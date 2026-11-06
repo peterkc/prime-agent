@@ -3,7 +3,7 @@ import { constants, existsSync } from "node:fs";
 import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, isBunBinary } from "../config.js";
@@ -371,7 +371,7 @@ async function liveRootProcess(options: MeshOptions, runtime: MeshRuntime, prefi
 		}
 		const pid = Number(raw);
 		if (!/^\d+$/.test(raw) || !Number.isInteger(pid) || pid < 1 || pid > 0x7fffffff)
-			throw new Error(`Invalid Cotal pid record ${file}; refusing to boot another broker`);
+			throw new Error(`Invalid Cotal pid record ${file}`);
 		if ((runtime.processAlive ?? processAlive)(pid)) return `${join(directory, file)} (PID ${pid})`;
 	}
 	return undefined;
@@ -463,19 +463,17 @@ async function install(options: MeshOptions, launchctl: string, target: string, 
 		} catch (error) {
 			throw new Error(`${APP_NAME} launcher ${launcher} is not an executable file`, { cause: error });
 		}
-		if (!nativeLauncher) {
-			try {
-				const current = process.argv[1];
-				if (!current) throw new Error("CLI entrypoint is missing");
-				const entry = relative(dirname(await realpath(launcher)), await realpath(current));
-				if (entry === ".." || entry.startsWith(`..${sep}`) || isAbsolute(entry))
-					throw new Error("CLI entrypoint is outside launcher directory");
-			} catch (error) {
+		// prime-agent.sh exports its path to every child shell, so a declared checkout
+		// launcher must be the checkout nearest the running CLI. Other wrappers are trusted.
+		const resolved = await realpath(launcher);
+		if (!nativeLauncher && basename(resolved) === "prime-agent.sh") {
+			const current = isBunBinary ? process.execPath : process.argv[1];
+			let folder = current ? dirname(await realpath(current)) : "/";
+			while (!existsSync(join(folder, "prime-agent.sh")) && dirname(folder) !== folder) folder = dirname(folder);
+			if (folder !== dirname(resolved))
 				throw new Error(
-					`${PRIME_AGENT_LAUNCHER_PATH_ENV} launcher does not contain the running CLI in its resolved directory`,
-					{ cause: error },
+					`${PRIME_AGENT_LAUNCHER_PATH_ENV} launcher ${launcher} is not the checkout of the running CLI`,
 				);
-			}
 		}
 	} else {
 		try {
