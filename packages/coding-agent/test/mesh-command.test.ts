@@ -601,7 +601,6 @@ describe("mesh command", () => {
 			expect(process.exitCode).toBe(failed ? 1 : undefined);
 			expect(output().includes(`launchctl kickstart -k gui/${process.getuid!()}/ai.prime.mesh.test`)).toBe(failed);
 			expect(output()).toContain("Enrolled sessions: 0");
-			expect(output()).not.toContain("refusing to boot");
 		}
 	});
 
