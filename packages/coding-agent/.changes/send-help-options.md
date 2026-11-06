@@ -1,0 +1,1 @@
+- Fixed `prime-agent send --help` listing `--steer` and `--follow-up`, which `send` rejects.
