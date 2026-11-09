@@ -3,8 +3,7 @@ import { constants } from "node:fs";
 import { access, lstat, readFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { canonicalSessionPath } from "../core/session-lease.js";
-import { readDirectoryAsync } from "../modes/daemon/cotal/enrollment.js";
-import { directoryPath, enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
+import { directoryPath, enrollmentPath, readDirectoryAsync } from "../modes/daemon/cotal/mesh-shared.js";
 
 interface MeshToolOptions {
 	readonly meshHome: string;

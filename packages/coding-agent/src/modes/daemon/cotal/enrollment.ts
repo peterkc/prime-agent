@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	CotalEndpoint,
@@ -31,22 +31,23 @@ import {
 	type EnrollmentRecord,
 	enrollmentPath,
 	type GateWatcherRecord,
+	type MeshDirectoryEntry,
 	type MeshIdentityRecord,
+	parseDirectoryEntry,
 	redactMeshError,
 } from "./mesh-shared.js";
 
-export { directoryPath, type EnrollmentRecord, enrollmentPath, redactMeshError } from "./mesh-shared.js";
+export {
+	directoryPath,
+	type EnrollmentRecord,
+	enrollmentPath,
+	type MeshDirectoryEntry,
+	redactMeshError,
+} from "./mesh-shared.js";
 
 export interface MeshConfiguration {
 	readonly space: string;
 	readonly server: string;
-}
-
-export interface MeshDirectoryEntry {
-	readonly sessionId: string;
-	readonly name: string;
-	readonly principal: string;
-	readonly homeSocket: string;
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -463,40 +464,6 @@ export function readDirectory(meshRoot: string, sessionId: string): MeshDirector
 	const path = directoryPath(meshRoot, sessionId);
 	if (!existsSync(path)) return undefined;
 	return parseDirectoryEntry(path, sessionId, readJson(path));
-}
-
-export async function readDirectoryAsync(meshRoot: string, sessionId: string): Promise<MeshDirectoryEntry | undefined> {
-	const path = directoryPath(meshRoot, sessionId);
-	let value: unknown;
-	try {
-		value = JSON.parse(await readFile(path, "utf8"));
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw new Error(`Mesh directory ${path}: cannot read valid JSON`);
-	}
-	return parseDirectoryEntry(path, sessionId, value);
-}
-
-export function parseMeshPrincipalKey(key: string): { owner: string; actor: string } | null {
-	const dot = key.indexOf(".");
-	if (dot <= 0 || dot >= key.length - 1) return null;
-	const owner = key.slice(0, dot);
-	const actor = key.slice(dot + 1);
-	if (!/^[A-Za-z0-9_]+$/.test(owner) || !/^[A-Za-z0-9_]+$/.test(actor)) return null;
-	return { owner, actor };
-}
-
-function parseDirectoryEntry(path: string, sessionId: string, input: unknown): MeshDirectoryEntry {
-	const value = object(input);
-	if (
-		value?.sessionId !== sessionId ||
-		typeof value.name !== "string" ||
-		typeof value.principal !== "string" ||
-		!parseMeshPrincipalKey(value.principal) ||
-		typeof value.homeSocket !== "string"
-	)
-		throw new Error(`Mesh directory ${path}: invalid entry`);
-	return { sessionId, name: value.name, principal: value.principal, homeSocket: value.homeSocket };
 }
 
 export function homeEnrollments(

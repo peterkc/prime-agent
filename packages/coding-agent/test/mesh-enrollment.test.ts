@@ -34,10 +34,8 @@ import {
 	ensureEnrollmentRecord,
 	ensureGateWatcherRecord,
 	gateWatcherPath,
-	parseMeshPrincipalKey,
 	publishDirectory,
 	readDirectory,
-	readDirectoryAsync,
 	readEnrollment,
 	readGateWatcherRecord,
 	readSigner,
@@ -48,7 +46,12 @@ import {
 	withDirectoryLock,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
-import { MeshNotStoredError, MeshStorageUnknownError } from "../src/modes/daemon/cotal/mesh-shared.js";
+import {
+	MeshNotStoredError,
+	MeshStorageUnknownError,
+	parseMeshPrincipalKey,
+	readDirectoryAsync,
+} from "../src/modes/daemon/cotal/mesh-shared.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import * as rlmLedger from "../src/modes/daemon/rlm-ledger.js";
