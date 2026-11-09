@@ -59,10 +59,13 @@ Other lifecycle commands are:
 prime-agent agents                  # Open the agents view
 prime-agent rename <agent> <name>   # Give an agent a stable readable name
 prime-agent stop <agent>            # Stop one agent
+prime-agent delete <agent>          # Delete a closed saved session
 prime-agent status                  # Inspect background services
 prime-agent doctor [--fix]          # Diagnose or repair service state
 prime-agent shutdown [--force]      # Stop all agents and services
 ```
+
+`prime-agent delete <agent>` matches saved top-level sessions by exact name, full ID, or an ID prefix of at least 8 characters. The 12-character ID shown by `list` is the end of the ID, not an accepted prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts for the session and its descendants and requires a reachable daemon. The CLI infers the daemon's mesh directory from its own agent directory. The check assumes the CLI and daemon share an agent directory; when PRIME_AGENT_CODING_AGENT_DIR resolves to a non-default directory or --daemon-socket (including --socket) is used, absent mesh enrollment refuses deletion. The mesh check runs before deletion and is not atomic with it; a message that arrives in between is lost. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
 
 Workers persist transcripts as JSONL and store feature-specific state under the session artifact directory. A worker or supervisor restart can recover session state and schedules and rehydrate retained completed RLM children without treating a terminal client as the owner of the work.
 

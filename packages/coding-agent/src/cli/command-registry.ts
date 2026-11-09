@@ -44,6 +44,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Stop an agent",
 	},
 	{
+		path: ["delete"],
+		usage: "delete <agent> [--json]",
+		summary: "Delete a saved top-level session",
+		description:
+			"Match a saved session by exact name, full ID, or an ID prefix of at least 8 characters. The 12-character ID shown by list is the end of the ID, not an accepted prefix. Stop it first if it is running. Refuses unacknowledged mesh messages or unreadable mesh counts for the session and its descendants. The CLI infers the daemon's mesh directory from its own agent directory. The check assumes the CLI and daemon share an agent directory; when PRIME_AGENT_CODING_AGENT_DIR resolves to a non-default directory or --daemon-socket (including --socket) is used, absent mesh enrollment refuses deletion. The mesh check runs before deletion and is not atomic with it; a message that arrives in between is lost. Requires a reachable daemon. The daemon removes the transcript and its artifacts, cancels scheduled jobs and removes mesh enrollment.",
+	},
+	{
 		path: ["rename"],
 		usage: "rename <agent> <name> [--json]",
 		summary: "Rename an agent",

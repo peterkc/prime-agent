@@ -1,6 +1,7 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { type MeshDirectoryEntry, readDirectory, readDirectoryAsync } from "./enrollment.js";
+import { readDirectory } from "./enrollment.js";
+import { type MeshDirectoryEntry, readDirectoryAsync } from "./mesh-shared.js";
 
 export interface MeshAddress {
 	readonly space: string;

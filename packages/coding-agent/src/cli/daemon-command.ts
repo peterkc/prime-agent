@@ -1,9 +1,9 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { expandTildePath } from "../config.js";
+import { expandTildePath, getAgentDir, getDefaultAgentDir } from "../config.js";
 import {
 	type AgentSessionMessageReceipt,
 	assertDirectAgentMessageTarget,
@@ -12,8 +12,12 @@ import {
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
+import { sessionArtifactFiles } from "../core/session-file-actions.js";
+import { canonicalSessionPath } from "../core/session-lease.js";
+import { getSessionArtifactPathForFile, readSessionInfo } from "../core/session-manager.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { redactMeshError } from "../modes/daemon/cotal/mesh-shared.js";
+import { resolveCatalogSessionMatch } from "../modes/daemon/daemon-catalog-process.js";
 import {
 	DaemonClient,
 	type DaemonClientMessageListener,
@@ -29,11 +33,13 @@ import {
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { deleteDaemonSavedSession, listDaemonSavedSessions } from "../modes/daemon/saved-session-catalog.js";
 import { spawnHidden } from "../utils/child-process.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
+import { sessionPendingForDelete } from "./mesh-cotal.js";
 import { repositoryDaemon } from "./repository-daemon.js";
 import { formatSessionsTable } from "./sessions-table-format.js";
 
@@ -43,6 +49,7 @@ interface ParsedDaemonClientCommand {
 	json: boolean;
 	positionals: string[];
 	repositoryRouted: boolean;
+	socketOverridden?: boolean;
 }
 
 const DAEMON_CLIENT_COMMANDS = new Set([
@@ -54,6 +61,7 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"attach",
 	"detach",
 	"kill",
+	"delete",
 	"rename",
 	"prompt",
 	"send",
@@ -319,6 +327,7 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 		json,
 		positionals,
 		repositoryRouted: repository !== undefined,
+		socketOverridden: socketPath !== undefined,
 	};
 }
 
@@ -382,6 +391,9 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 					{ type: "kill", activeSessionId: requireActiveSessionId(parsed.positionals) },
 					parsed.json,
 				);
+				return;
+			case "delete":
+				await runDelete(client, parsed);
 				return;
 			case "rename":
 				await runRename(client, parsed.positionals, parsed.json);
@@ -1021,6 +1033,64 @@ function parseSessionsArgs(args: string[]): { all: boolean } {
 		throw new Error(`Unknown sessions option: ${arg}`);
 	}
 	return { all };
+}
+
+async function runDelete(client: DaemonClient, parsed: ParsedDaemonClientCommand): Promise<void> {
+	const selector = requireActiveSessionId(parsed.positionals);
+	const context = { cwd: process.cwd() };
+	const sessions = await listDaemonSavedSessions(client, context, "all");
+	const roots = sessions
+		.filter((session) => (session.rlmDepth ?? 0) === 0)
+		.map((session) => ({ ...session, rlmDepth: 0 }));
+	const session = resolveCatalogSessionMatch(roots, selector);
+	if (!session) throw new Error(`No session found matching '${selector}'; use a longer ID prefix or the session name`);
+	if (selector.length < 8 && selector !== session.id && selector !== session.name) {
+		throw new Error(
+			"Use an ID prefix of at least 8 characters, the full ID, or the session name. The 12-character ID shown by list is the end of the ID and is not accepted as a prefix.",
+		);
+	}
+	const live = await getLiveSessions(client);
+	if (
+		live.some(
+			(row) =>
+				row.activeSessionId !== undefined &&
+				(row.sessionId === session.id ||
+					(row.sessionFile !== undefined &&
+						canonicalSessionPath(row.sessionFile) === canonicalSessionPath(session.path))),
+		)
+	) {
+		throw new Error(`Cannot delete ${session.name ?? session.id}: stop it first`);
+	}
+	const agentDir = getAgentDir();
+	const overridden =
+		parsed.socketOverridden || canonicalSessionPath(agentDir) !== canonicalSessionPath(getDefaultAgentDir());
+	let family: string[];
+	try {
+		family = [
+			session.path,
+			...sessionArtifactFiles(getSessionArtifactPathForFile(session.path), undefined, { strict: true }),
+		];
+	} catch (error) {
+		throw new Error(`Cannot enumerate deletion transcripts for ${session.name ?? session.id}: ${String(error)}`);
+	}
+	for (const path of family) {
+		let label = path;
+		try {
+			const member = await readSessionInfo(path);
+			if (!member) throw new Error("session transcript is unreadable");
+			label = member.name ?? member.id;
+			const pending = await sessionPendingForDelete(join(agentDir, "mesh"), member.id, path);
+			if (pending === undefined && overridden)
+				throw new Error("mesh enrollment is absent with an overridden agent directory or daemon socket");
+			if (pending !== undefined && pending > 0) throw new Error(`${pending} unacknowledged mesh messages`);
+		} catch (error) {
+			throw new Error(`Cannot delete ${label}: ${error instanceof Error ? error.message : error}`);
+		}
+	}
+	const result = await deleteDaemonSavedSession(client, context, session.path);
+	if (!result.ok) throw new Error(result.error);
+	if (parsed.json) printJson({ ...result, sessionId: session.id, name: session.name, sessionPath: session.path });
+	else console.log(`Deleted ${session.name ?? "(unnamed)"} (${session.id}) via ${result.method}: ${session.path}`);
 }
 
 async function runCreate(client: DaemonClient, args: string[], json: boolean): Promise<void> {

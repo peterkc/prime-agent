@@ -114,6 +114,9 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "stop":
 			if (!requireOperandCount(args.slice(1), 1, 1, "stop")) return HANDLED;
 			return runInternalAgentCommand("kill", args.slice(1));
+		case "delete":
+			if (!requireOperandCount(args.slice(1), 1, 1, "delete")) return HANDLED;
+			return runInternalAgentCommand("delete", args.slice(1));
 		case "rename":
 			if (!requireOperandCount(args.slice(1), 2, undefined, "rename")) return HANDLED;
 			return runInternalAgentCommand("rename", args.slice(1));

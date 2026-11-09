@@ -36,7 +36,6 @@ import {
 	gateWatcherPath,
 	publishDirectory,
 	readDirectory,
-	readDirectoryAsync,
 	readEnrollment,
 	readGateWatcherRecord,
 	readSigner,
@@ -47,7 +46,12 @@ import {
 	withDirectoryLock,
 } from "../src/modes/daemon/cotal/enrollment.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
-import { MeshNotStoredError, MeshStorageUnknownError } from "../src/modes/daemon/cotal/mesh-shared.js";
+import {
+	MeshNotStoredError,
+	MeshStorageUnknownError,
+	parseMeshPrincipalKey,
+	readDirectoryAsync,
+} from "../src/modes/daemon/cotal/mesh-shared.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import * as rlmLedger from "../src/modes/daemon/rlm-ledger.js";
@@ -1128,6 +1132,14 @@ describe("mesh enrollment", () => {
 			claim.release();
 		}
 	});
+
+	it.each(
+		"local.user|A0_.b9_||owner|.a|local.|local.*|local.>|local.a.b|local.a-b|a-b.user|local.a/b|local. a|local.a\n|local.é".split(
+			"|",
+		),
+	)("peterkc/prime-agent#66 keeps principal %j in parity with Cotal", (key) =>
+		expect(parseMeshPrincipalKey(key)).toEqual(core.parsePrincipalKey(key)),
+	);
 
 	it.each(["owner", "local.*", "local.a.b", "local.a-b", ".a", "local."])(
 		"rejects malformed directory principal %s",

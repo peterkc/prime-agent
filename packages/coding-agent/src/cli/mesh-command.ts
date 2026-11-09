@@ -1,15 +1,22 @@
-import { execFile } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { access, chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, isBunBinary } from "../config.js";
 import { PRIME_AGENT_LAUNCHER_PATH_ENV } from "../modes/daemon/daemon-runtime-identity.js";
 import { readRlmLedgerHealth } from "../modes/daemon/rlm-ledger.js";
 import { getNativeInstallation } from "../utils/native-installation.js";
+import {
+	absolutePathEntries,
+	executable,
+	meshConfig,
+	meshSessionPending,
+	runTool,
+	type ToolResult,
+} from "./mesh-cotal.js";
 
 type MeshCommand = "install" | "uninstall" | "start" | "stop" | "status" | "doctor" | "rotate";
 interface MeshOptions {
@@ -26,10 +33,6 @@ interface MeshRuntime {
 	readonly now: () => number;
 	readonly wait: (ms: number) => Promise<unknown>;
 	readonly processAlive?: (pid: number) => boolean;
-}
-interface ToolResult {
-	readonly code: number;
-	readonly stdout: string;
 }
 const defaultRuntime: MeshRuntime = { platform: process.platform, now: Date.now, wait: setTimeout };
 
@@ -106,44 +109,6 @@ function parseOptions(args: readonly string[]): MeshOptions {
 		port,
 		plist: join(homedir(), "Library", "LaunchAgents", `${label}.plist`),
 	};
-}
-
-function absolutePathEntries(): string[] {
-	return (process.env.PATH ?? "").split(delimiter).filter(isAbsolute);
-}
-
-async function executable(name: string): Promise<string> {
-	for (const directory of absolutePathEntries()) {
-		const path = resolve(directory, name);
-		try {
-			await access(path, constants.X_OK);
-			if ((await lstat(path)).isDirectory()) continue;
-			return path;
-		} catch {
-			/* Try the next PATH entry. */
-		}
-	}
-	throw new Error(`${name} is missing from PATH`);
-}
-
-function runTool(path: string, args: readonly string[], options: MeshOptions, timeout = 5000): Promise<ToolResult> {
-	return new Promise((resolveResult, reject) => {
-		execFile(
-			path,
-			[...args],
-			{
-				cwd: options.meshHome,
-				env: { ...process.env, COTAL_HOME: join(options.meshHome, "home"), COTAL_SKIP_CONNECTOR_SEED: "1" },
-				timeout,
-				maxBuffer: 1024 * 1024,
-			},
-			(error, stdout) => {
-				if (!error) resolveResult({ code: 0, stdout });
-				else if (typeof error.code === "number" && !error.killed) resolveResult({ code: error.code, stdout });
-				else reject(new Error(`${path.endsWith("/cotal") ? "cotal" : "launchctl"} ${args[0]} could not complete`));
-			},
-		);
-	});
 }
 
 function requireSuccess(result: ToolResult, step: string): void {
@@ -546,23 +511,6 @@ interface SystemCredential {
 	readonly exp: number;
 }
 
-async function meshConfig(options: MeshOptions): Promise<{ readonly space: string; readonly server: string }> {
-	const config = await readJson(join(options.meshHome, "mesh.json"));
-	if (
-		!config ||
-		typeof config !== "object" ||
-		!("space" in config) ||
-		!("server" in config) ||
-		typeof config.space !== "string" ||
-		!config.space ||
-		typeof config.server !== "string" ||
-		!config.server
-	) {
-		throw new Error("Mesh configuration needs space and server strings");
-	}
-	return { space: config.space, server: config.server };
-}
-
 const SYSTEM_CREDENTIAL_FILES = ["membership-observer.creds", "connection-evictor.creds"] as const;
 
 async function systemCredential(options: MeshOptions, space: string, file: string): Promise<SystemCredential> {
@@ -803,56 +751,6 @@ async function storeBytes(path: string): Promise<number> {
 	return bytes;
 }
 
-function pendingCount(stdout: string): number {
-	let value: unknown;
-	try {
-		value = JSON.parse(stdout.split(/\r?\n/, 1)[0]!);
-	} catch {
-		throw new Error("cotal deliver pending returned invalid counts");
-	}
-	if (
-		!value ||
-		typeof value !== "object" ||
-		!("pending" in value) ||
-		!("ackPending" in value) ||
-		typeof value.pending !== "number" ||
-		typeof value.ackPending !== "number" ||
-		!Number.isSafeInteger(value.pending) ||
-		!Number.isSafeInteger(value.ackPending) ||
-		value.pending < 0 ||
-		value.ackPending < 0 ||
-		!Number.isSafeInteger(value.pending + value.ackPending)
-	)
-		throw new Error("cotal deliver pending returned invalid counts");
-	return value.pending + value.ackPending;
-}
-
-/** True when nothing is at the path; a dangling symlink is still something there. */
-async function absent(path: string): Promise<boolean> {
-	return lstat(path).then(
-		() => false,
-		(error: NodeJS.ErrnoException) => error.code === "ENOENT",
-	);
-}
-
-/** Returns undefined for a missing file only when allowMissing is set; JSON never parses to undefined. */
-async function readJson(path: string, allowMissing = false): Promise<unknown> {
-	let text: string;
-	try {
-		text = await readFile(path, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !(await absent(path)))
-			throw new Error(`Mesh file ${path}: unreadable`);
-		if (allowMissing) return undefined;
-		throw new Error(`Mesh file ${path}: missing`);
-	}
-	try {
-		return JSON.parse(text);
-	} catch {
-		throw new Error(`Mesh file ${path}: unreadable JSON`);
-	}
-}
-
 async function inboxConsumerCounts(meshHome: string, space: string): Promise<readonly number[]> {
 	const store = join(meshHome, ".cotal", "nats", "jetstream");
 	if (!existsSync(store)) return [0, 0];
@@ -984,62 +882,17 @@ async function status(
 		console.log(`${stream}: ${consumers[index]} consumers / 1000`);
 	for (const file of records) {
 		const sessionId = file.slice(0, -5);
-		const path = join(enrollments, file);
-		const record = await readJson(path, true);
-		// A session can unenroll after the listing above; that is not a mesh fault.
-		if (record === undefined) {
+		const pending = await meshSessionPending(cotal, options, config, sessionId);
+		if (pending.status === "left") {
 			console.log(`Session ${sessionId}: left during the check`);
 			continue;
 		}
-		if (
-			!/^[A-Za-z0-9_-]+$/.test(sessionId) ||
-			!record ||
-			typeof record !== "object" ||
-			!("sessionId" in record) ||
-			record.sessionId !== sessionId ||
-			!("identity" in record) ||
-			!record.identity ||
-			typeof record.identity !== "object" ||
-			!("id" in record.identity) ||
-			typeof record.identity.id !== "string" ||
-			!/^[A-Za-z0-9_]+$/.test(record.identity.id) ||
-			!("lifecycleUid" in record) ||
-			typeof record.lifecycleUid !== "string" ||
-			!/^[a-z0-9]{26,32}$/.test(record.lifecycleUid)
-		) {
-			throw new Error(`Mesh enrollment ${file}: unreadable record`);
-		}
-		// Cotal 0.79.0 dmDurable("local", id, uid).
-		const durable = `dm_local-${record.identity.id}-${record.lifecycleUid}`;
-		const pending = await runTool(
-			cotal,
-			[
-				"deliver",
-				"pending",
-				sessionId,
-				"--space",
-				config.space,
-				"--server",
-				config.server,
-				"--root",
-				options.meshHome,
-				"--durable",
-				durable,
-				"--json",
-			],
-			options,
-		);
-		// Recheck after either result: a count for a session that has left is stale.
-		if (await absent(path)) {
-			console.log(`Session ${sessionId}: left during the check`);
-			continue;
-		}
-		if (pending.code !== 0) {
+		if (pending.status === "unavailable") {
 			console.log(`Session ${sessionId}: count unavailable`);
 			countUnavailable = true;
 			continue;
 		}
-		console.log(`Session ${sessionId}: ${pendingCount(pending.stdout)} unacknowledged`);
+		console.log(`Session ${sessionId}: ${pending.count} unacknowledged`);
 	}
 	if (job && job.code !== 0) throw new Error("Mesh launchd service is absent or inaccessible");
 	if (renewal && renewal.code !== 0) throw new Error("Mesh credential renewal job is absent; reinstall the mesh");

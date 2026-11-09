@@ -528,6 +528,11 @@ export function getAgentDir(): string {
 	if (envDir) {
 		return expandTildePath(envDir);
 	}
+	return getDefaultAgentDir();
+}
+
+/** Get the default agent directory without the environment override. */
+export function getDefaultAgentDir(): string {
 	return join(homedir(), CONFIG_DIR_NAME);
 }
 

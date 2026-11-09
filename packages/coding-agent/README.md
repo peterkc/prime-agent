@@ -525,6 +525,7 @@ prime-agent list [--all]                   # List active or saved agents
 prime-agent sessions [--all] [--json]     # Show agent status, activity, and usage
 prime-agent attach <agent>                 # Attach the interactive UI
 prime-agent stop <agent>                   # Stop one agent
+prime-agent delete <agent>                 # Delete a closed saved session
 prime-agent rename <agent> <name>          # Rename an agent
 prime-agent send <agent> <message>         # Send an agent-to-agent message
 prime-agent notify [--daemon-socket <path>] [--json] <session> -- <message>  # Send one mesh message as gate-watcher
@@ -532,6 +533,8 @@ prime-agent status                         # Show background service status
 prime-agent doctor [--fix]                 # Inspect or safely clean up background services
 prime-agent shutdown [--force]             # Stop every agent, worker, and background service
 ```
+
+`prime-agent delete <agent>` matches saved top-level sessions by exact name, full ID, or an ID prefix of at least 8 characters. The 12-character ID shown by `list` is the end of the ID, not an accepted prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts for the session and its descendants and requires a reachable daemon. The CLI infers the daemon's mesh directory from its own agent directory. The check assumes the CLI and daemon share an agent directory; when PRIME_AGENT_CODING_AGENT_DIR resolves to a non-default directory or --daemon-socket (including --socket) is used, absent mesh enrollment refuses deletion. The mesh check runs before deletion and is not atomic with it; a message that arrives in between is lost. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
 
 `prime-agent send` is refused in Cotal mode and has no mesh path. In Cotal mode, scripts use `prime-agent notify` for a one-way message from the `gate-watcher` sender. See [Mesh Agent Messaging](docs/daemon.md#mesh-agent-messaging).
 
