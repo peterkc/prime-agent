@@ -592,6 +592,8 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 				mkdirSync(path, { recursive: true });
 				new SemanticEdgeRecorder({ ledgerPath: join(path, "semantic-edges.jsonl"), sessionId: id });
 			}
+			writeFileSync(join(artifacts, "kernel.snapshot"), Buffer.from([0xff, 0x00, 0x7b]));
+			writeFileSync(join(artifacts, "state.lock"), "");
 			writeJson(join(artifacts, "rlm-subagents.jsonl"), {
 				type: "rlm_subagent",
 				childId: "sub-child",
