@@ -329,10 +329,19 @@ export function readRlmLedgerHealth(agentDir: string): RlmLedgerFailure[] {
 	return failures;
 }
 
-const deletedChildCache = new Map<string, { snapshot: string; paths: ReadonlySet<string> }>();
+const deletedChildCache = new Map<
+	string,
+	{ snapshot: string; paths: ReadonlySet<string>; records: readonly RlmLedgerDeleteRecord[] }
+>();
 
 /** Read committed deletion intent across all session folders, never joining records by childId. */
 export function readDeletedRlmChildPaths(agentDir: string): ReadonlySet<string> {
+	readDeletedRlmChildRecords(agentDir);
+	return new Set(deletedChildCache.get(join(agentDir, RLM_LEDGER_DIR))?.paths ?? []);
+}
+
+/** Keep the original deletion identity and reason when relocating retained transcripts. */
+export function readDeletedRlmChildRecords(agentDir: string): readonly RlmLedgerDeleteRecord[] {
 	const directory = join(agentDir, RLM_LEDGER_DIR);
 	let files: string[];
 	try {
@@ -341,7 +350,7 @@ export function readDeletedRlmChildPaths(agentDir: string): ReadonlySet<string> 
 			.sort();
 	} catch (error) {
 		deletedChildCache.delete(directory);
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw new Error(`RLM ledger ${directory}: ${String(error)}`, { cause: error });
 	}
 	try {
@@ -359,24 +368,26 @@ export function readDeletedRlmChildPaths(agentDir: string): ReadonlySet<string> 
 		});
 		const snapshot = JSON.stringify(stats);
 		const cached = deletedChildCache.get(directory);
-		if (cached?.snapshot === snapshot) return new Set(cached.paths);
+		if (cached?.snapshot === snapshot) return cached.records;
+		const records: RlmLedgerDeleteRecord[] = [];
 		const paths = new Set<string>();
 		for (const file of files) {
 			const path = join(directory, file);
 			try {
 				const log = new EventLog(path, { maxBytes: RLM_LEDGER_MAX_BYTES, maxRecords: RLM_LEDGER_MAX_RECORDS });
-				const deleted = new Set<string>();
+				const deleted = new Map<string, RlmLedgerDeleteRecord>();
 				for (const record of log.replaySync(parseLedgerLine, { missingFileThrows: true })) {
-					if (record.op === "delete") deleted.add(canonicalSessionPath(record.child));
+					if (record.op === "delete") deleted.set(canonicalSessionPath(record.child), record);
 					else if (record.op === "spawn") deleted.delete(canonicalSessionPath(record.child));
 				}
-				for (const child of deleted) paths.add(child);
+				records.push(...deleted.values());
+				for (const path of deleted.keys()) paths.add(path);
 			} catch (error) {
 				throw new Error(`RLM ledger ${path}: ${String(error)}`, { cause: error });
 			}
 		}
-		deletedChildCache.set(directory, { snapshot, paths });
-		return new Set(paths);
+		deletedChildCache.set(directory, { snapshot, records, paths });
+		return records;
 	} catch (error) {
 		deletedChildCache.delete(directory);
 		throw error;
@@ -491,6 +502,24 @@ export class RlmSpawnLedger {
 				child: canonicalSessionPath(input.child),
 				reason: input.reason,
 			});
+		});
+	}
+
+	/** Import deletion proof only. A meta-only ledger prevents legacy seeding of moved history. */
+	importMoveTombstones(records: readonly RlmLedgerDeleteRecord[]): Promise<void> {
+		return this.enqueue(() => {
+			if (!records.length && existsSync(this.path)) return;
+			const deleted = new Set<string>();
+			for (const record of this.eventLog.replaySync(parseLedgerLine)) {
+				if (record.op === "delete") deleted.add(canonicalSessionPath(record.child));
+				else if (record.op === "spawn") deleted.delete(canonicalSessionPath(record.child));
+			}
+			const missing = records.filter((record) => !deleted.has(canonicalSessionPath(record.child)));
+			this.eventLog.appendSync(missing, {
+				durable: true,
+				onCreate: () => [{ v: 1, op: "meta", at: nowIso(), sessionsDir: this.canonicalSessionsDir }],
+			});
+			this.edgeCache = undefined;
 		});
 	}
 

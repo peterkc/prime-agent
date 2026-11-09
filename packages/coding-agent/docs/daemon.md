@@ -325,6 +325,19 @@ An ordinary roster removal, a session swap or an unbound queued child is not pro
 The retained transcript cannot re-enroll even on explicit reopen, so that session
 cannot send or receive agent messages in Cotal mode. There is no clear-on-open rule.
 
+A closed parent can move with retained child transcripts after all live RLM ledger
+edges are deleted. Completion alone does not delete an edge. The move names blocking
+child IDs and retains the lease and scheduled-job refusals across the whole tree.
+Before publishing any moved child path, it durably copies that path's deletion proof
+to the target session folder's ledger. Source tombstones remain in place. Deleted
+children stay deleted after a move, including explicit reopen and daemon restart.
+Transcripts without ledger edges move only as history; no edge or enrollment is
+created for them. Existing non-deleted child enrollments transfer under their claims,
+without changing identity or inbox. The parent's existing mesh identity and inbox
+follow its move.
+See [Moving a Closed Session](sessions.md#moving-a-closed-session) for preview,
+space requirements, archive redirects and interruption recovery.
+
 Saved-session deletion in either transport acquires the canonical session-file lease
 before any removal or child tombstone. It also reserves saved child transcripts and
 other session files under that session's artifact directory. A live lease anywhere in

@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { APP_NAME, expandTildePath, getAgentDir, getSessionsDir } from "../config.js";
 import { canonicalSessionPath } from "../core/session-lease.js";
 import { SessionManager } from "../core/session-manager.js";
-import { preflightSessionMove } from "../core/session-move.js";
+import { preflightSessionMove, sessionMoveChildFiles, sessionMoveSize } from "../core/session-move.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
 import { resolveCatalogSessionMatch } from "../modes/daemon/daemon-catalog-process.js";
@@ -287,6 +287,8 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 				dryRun: true,
 				original: { file: paths.sourceFile, artifacts: paths.sourceArtifacts },
 				mesh: { enrolled: present(enrollmentPath(join(agentDir, "mesh"), info.id)) },
+				children: sessionMoveChildFiles(paths).length,
+				size: sessionMoveSize(paths),
 				recheck,
 				meshHosting,
 			};
@@ -294,7 +296,11 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			else {
 				console.log(`Would move ${info.name ?? "(unnamed)"} (${info.id}) to ${paths.targetFile}`);
 				console.log(
-					`Would delete original file: ${paths.sourceFile} and artifact folder: ${paths.sourceArtifacts}`,
+					`Would delete original file: ${paths.sourceFile} and artifact folder: ${paths.sourceArtifacts} (archive relocation stubs can remain)`,
+				);
+				console.log(`Retained child transcripts: ${preview.children}; total bytes: ${preview.size.bytes}`);
+				console.log(
+					`Copy and verify (${preview.size.crossFilesystem ? "cross-filesystem" : "same-filesystem"}); target free bytes: ${preview.size.availableBytes}; required with margin: ${preview.size.requiredBytes}`,
 				);
 				console.log(`Mesh: ${preview.mesh.enrolled ? "enrolled" : "not enrolled"}`);
 				console.log(`${openCommand}\n${meshHosting}\n${recheck}`);
@@ -307,7 +313,9 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			const print = options.json ? console.error : console.log;
 			print(`Source session file: ${paths.sourceFile}\nTarget session file: ${paths.targetFile}`);
 			print(`The original session file goes to the Trash, or is unlinked if trash is missing: ${paths.sourceFile}`);
-			print(`The original artifact folder is removed: ${paths.sourceArtifacts}`);
+			print(
+				`The original artifact folder is removed unless archive relocation stubs must remain: ${paths.sourceArtifacts}`,
+			);
 			if (!(await promptYesNo(`Move ${info.name ?? info.id} (${info.id}) to ${targetCwd}?`)))
 				throw new Error("Session move declined");
 		}
@@ -371,7 +379,10 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 				console.log(
 					`Original file ${reply.original.method === "trash" ? "trashed" : "unlinked"}: ${paths.sourceBackup}`,
 				);
-			if (reply.original.deleted) console.log(`Original artifact folder removed: ${paths.sourceArtifacts}`);
+			if (reply.original.deleted)
+				console.log(
+					`Original artifact contents removed; archive relocation stubs can remain: ${paths.sourceArtifacts}`,
+				);
 			for (const backup of reply.original.backups) console.log(`Kept ${backup.path}: ${backup.reason}`);
 			if (!reply.original.deleted && reply.original.backups.length === 0)
 				console.log(
