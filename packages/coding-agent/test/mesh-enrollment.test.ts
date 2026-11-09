@@ -34,6 +34,7 @@ import {
 	ensureEnrollmentRecord,
 	ensureGateWatcherRecord,
 	gateWatcherPath,
+	parseMeshPrincipalKey,
 	publishDirectory,
 	readDirectory,
 	readDirectoryAsync,
@@ -1128,6 +1129,14 @@ describe("mesh enrollment", () => {
 			claim.release();
 		}
 	});
+
+	it.each(
+		"local.user|A0_.b9_||owner|.a|local.|local.*|local.>|local.a.b|local.a-b|a-b.user|local.a/b|local. a|local.a\n|local.é".split(
+			"|",
+		),
+	)("peterkc/prime-agent#66 keeps principal %j in parity with Cotal", (key) =>
+		expect(parseMeshPrincipalKey(key)).toEqual(core.parsePrincipalKey(key)),
+	);
 
 	it.each(["owner", "local.*", "local.a.b", "local.a-b", ".a", "local."])(
 		"rejects malformed directory principal %s",

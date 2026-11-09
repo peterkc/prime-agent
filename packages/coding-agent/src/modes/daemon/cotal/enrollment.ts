@@ -10,7 +10,6 @@ import {
 	mintLifecycleUid,
 	mkSecretDir,
 	newIdentity,
-	parsePrincipalKey,
 	provisionAgent,
 	type SpaceAuth,
 	writeSecretFileCreateOnly,
@@ -478,13 +477,22 @@ export async function readDirectoryAsync(meshRoot: string, sessionId: string): P
 	return parseDirectoryEntry(path, sessionId, value);
 }
 
+export function parseMeshPrincipalKey(key: string): { owner: string; actor: string } | null {
+	const dot = key.indexOf(".");
+	if (dot <= 0 || dot >= key.length - 1) return null;
+	const owner = key.slice(0, dot);
+	const actor = key.slice(dot + 1);
+	if (!/^[A-Za-z0-9_]+$/.test(owner) || !/^[A-Za-z0-9_]+$/.test(actor)) return null;
+	return { owner, actor };
+}
+
 function parseDirectoryEntry(path: string, sessionId: string, input: unknown): MeshDirectoryEntry {
 	const value = object(input);
 	if (
 		value?.sessionId !== sessionId ||
 		typeof value.name !== "string" ||
 		typeof value.principal !== "string" ||
-		!parsePrincipalKey(value.principal) ||
+		!parseMeshPrincipalKey(value.principal) ||
 		typeof value.homeSocket !== "string"
 	)
 		throw new Error(`Mesh directory ${path}: invalid entry`);
