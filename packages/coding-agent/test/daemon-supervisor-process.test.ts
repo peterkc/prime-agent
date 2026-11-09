@@ -2203,8 +2203,8 @@ async function meshFixture(realBroker = false) {
 				const finish = (error?: Error) => {
 					child.stderr?.off("data", data);
 					child.off("exit", exited);
-					child.off("error", reject);
-					if (error) reject(error);
+					child.off("error", finish);
+					if (error) reject(new Error("nats-server >= 2.12 required on PATH", { cause: error }));
 					else resolveReady();
 				};
 				const data = (chunk: Buffer) => {
@@ -2214,7 +2214,7 @@ async function meshFixture(realBroker = false) {
 				const exited = () => finish(new Error(`Private broker exited: ${output}`));
 				child.stderr?.on("data", data);
 				child.once("exit", exited);
-				child.once("error", reject);
+				child.once("error", finish);
 			});
 			await setupSpaceStreams({ servers: url, space: "prime", creds: setupCreds });
 			return child;

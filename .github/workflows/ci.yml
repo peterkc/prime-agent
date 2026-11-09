@@ -173,6 +173,15 @@ jobs:
           python3 -m pip install --user uv
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Install NATS server for process smoke
+        if: matrix.name == 'coding-agent process smoke'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSLO https://github.com/nats-io/nats-server/releases/download/v2.15.2/nats-server-v2.15.2-linux-amd64.tar.gz
+          echo "67cb8e10bc6f0c4b47f75a728529a20953dbae2a4f9a4a52ae8517d65ae303ff  nats-server-v2.15.2-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf nats-server-v2.15.2-linux-amd64.tar.gz
+          echo "$RUNNER_TEMP/nats-server-v2.15.2-linux-amd64" >> "$GITHUB_PATH"
+
       - name: Test
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }}
