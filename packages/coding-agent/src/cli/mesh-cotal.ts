@@ -196,12 +196,12 @@ export async function sessionPendingForDelete(
 	meshHome: string,
 	sessionId: string,
 	sessionFile: string,
-): Promise<number> {
+): Promise<number | undefined> {
 	const enrollment = enrollmentPath(meshHome, sessionId);
 	const directory = directoryPath(meshHome, sessionId);
 	if (await absent(enrollment)) {
 		if (!(await absent(directory))) throw new Error(`Session ${sessionId}: mesh enrollment is missing`);
-		return 0;
+		return undefined;
 	}
 	const before = await readFile(enrollment, "utf8");
 	const record = await readJson(enrollment);

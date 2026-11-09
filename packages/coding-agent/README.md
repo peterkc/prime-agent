@@ -534,7 +534,7 @@ prime-agent doctor [--fix]                 # Inspect or safely clean up backgrou
 prime-agent shutdown [--force]             # Stop every agent, worker, and background service
 ```
 
-`prime-agent delete <agent>` matches saved top-level sessions by name or ID prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts and requires a reachable daemon. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
+`prime-agent delete <agent>` matches saved top-level sessions by name or ID prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts for the session and its descendants and requires a reachable daemon. The check assumes the CLI and daemon share an agent directory; with PRIME_AGENT_CODING_AGENT_DIR or --daemon-socket (including --socket), absent mesh enrollment refuses deletion. The mesh check runs before deletion and is not atomic with it; a message that arrives in between is lost. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
 
 `prime-agent send` is refused in Cotal mode and has no mesh path. In Cotal mode, scripts use `prime-agent notify` for a one-way message from the `gate-watcher` sender. See [Mesh Agent Messaging](docs/daemon.md#mesh-agent-messaging).
 

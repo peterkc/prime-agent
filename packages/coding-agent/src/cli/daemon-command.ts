@@ -1,9 +1,9 @@
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { expandTildePath, getAgentDir } from "../config.js";
+import { ENV_AGENT_DIR, expandTildePath, getAgentDir } from "../config.js";
 import {
 	type AgentSessionMessageReceipt,
 	assertDirectAgentMessageTarget,
@@ -47,6 +47,7 @@ interface ParsedDaemonClientCommand {
 	json: boolean;
 	positionals: string[];
 	repositoryRouted: boolean;
+	socketOverridden?: boolean;
 }
 
 const DAEMON_CLIENT_COMMANDS = new Set([
@@ -324,6 +325,7 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 		json,
 		positionals,
 		repositoryRouted: repository !== undefined,
+		socketOverridden: socketPath !== undefined,
 	};
 }
 
@@ -389,7 +391,7 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				);
 				return;
 			case "delete":
-				await runDelete(client, parsed.positionals, parsed.json);
+				await runDelete(client, parsed);
 				return;
 			case "rename":
 				await runRename(client, parsed.positionals, parsed.json);
@@ -1031,8 +1033,8 @@ function parseSessionsArgs(args: string[]): { all: boolean } {
 	return { all };
 }
 
-async function runDelete(client: DaemonClient, args: string[], json: boolean): Promise<void> {
-	const selector = requireActiveSessionId(args);
+async function runDelete(client: DaemonClient, parsed: ParsedDaemonClientCommand): Promise<void> {
+	const selector = requireActiveSessionId(parsed.positionals);
 	const context = { cwd: process.cwd() };
 	const sessions = await listDaemonSavedSessions(client, context, "all");
 	const roots = sessions
@@ -1052,12 +1054,37 @@ async function runDelete(client: DaemonClient, args: string[], json: boolean): P
 	) {
 		throw new Error(`Cannot delete ${session.name ?? session.id}: stop it first`);
 	}
-	const pending = await sessionPendingForDelete(join(getAgentDir(), "mesh"), session.id, session.path);
-	if (pending > 0)
-		throw new Error(`Cannot delete ${session.name ?? session.id}: ${pending} unacknowledged mesh messages`);
+	const familyPaths = new Set([canonicalSessionPath(session.path)]);
+	const family: typeof sessions = [session];
+	// Catalog rows need not be in parent-first order.
+	for (let index = 0; index < family.length; index++) {
+		for (const candidate of sessions) {
+			const path = canonicalSessionPath(candidate.path);
+			if (
+				!familyPaths.has(path) &&
+				candidate.parentSessionPath &&
+				familyPaths.has(canonicalSessionPath(resolve(dirname(candidate.path), candidate.parentSessionPath)))
+			) {
+				familyPaths.add(path);
+				family.push(candidate);
+			}
+		}
+	}
+	for (const member of family) {
+		try {
+			const pending = await sessionPendingForDelete(join(getAgentDir(), "mesh"), member.id, member.path);
+			if (pending === undefined && (parsed.socketOverridden || process.env[ENV_AGENT_DIR]))
+				throw new Error("mesh enrollment is absent with an overridden agent directory or daemon socket");
+			if (pending !== undefined && pending > 0) throw new Error(`${pending} unacknowledged mesh messages`);
+		} catch (error) {
+			throw new Error(
+				`Cannot delete ${member.name ?? member.id}: ${error instanceof Error ? error.message : error}`,
+			);
+		}
+	}
 	const result = await deleteDaemonSavedSession(client, context, session.path);
 	if (!result.ok) throw new Error(result.error);
-	if (json) printJson({ ...result, sessionId: session.id, name: session.name, sessionPath: session.path });
+	if (parsed.json) printJson({ ...result, sessionId: session.id, name: session.name, sessionPath: session.path });
 	else console.log(`Deleted ${session.name ?? "(unnamed)"} (${session.id}) via ${result.method}: ${session.path}`);
 }
 
