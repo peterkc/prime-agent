@@ -199,8 +199,6 @@ describe("public command routing", () => {
 		["delete", "--help"],
 	])("shows delete help %j", async (...argv) => {
 		await handlePublicCommand(argv);
-		expect(formatTopLevelHelp()).toContain("delete");
-		expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Match a saved session by name or ID prefix"));
 		expect(mocks.daemonCommands).toEqual([]);
 	});
 

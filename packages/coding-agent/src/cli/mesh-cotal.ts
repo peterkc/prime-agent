@@ -101,7 +101,7 @@ function pendingCount(stdout: string): number {
 }
 
 /** True when nothing is at the path; a dangling symlink is still something there. */
-export async function absent(path: string): Promise<boolean> {
+async function absent(path: string): Promise<boolean> {
 	return lstat(path).then(
 		() => false,
 		(error: NodeJS.ErrnoException) => error.code === "ENOENT",
@@ -126,7 +126,7 @@ async function readJson(path: string, allowMissing = false): Promise<unknown> {
 	}
 }
 
-export type MeshSessionPending =
+type MeshSessionPending =
 	| { readonly status: "left" }
 	| { readonly status: "unavailable" }
 	| { readonly status: "count"; readonly count: number };
@@ -140,7 +140,7 @@ export async function meshSessionPending(
 	const file = `${sessionId}.json`;
 	const path = join(options.meshHome, "enrollments", file);
 	const record = await readJson(path, true);
-	// A session can unenroll after the listing above; that is not a mesh fault.
+	// A session can unenroll before this read; that is not a mesh fault.
 	if (record === undefined) {
 		return { status: "left" };
 	}

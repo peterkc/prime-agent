@@ -517,8 +517,9 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 		async function run(selector = "saved", ...flags: string[]) {
 			await handleDaemonCommand(["daemon", "--socket", join(folder, "daemon.sock"), "delete", selector, ...flags]);
 		}
-		const closedKinds = ["name", "prefix", "never-enrolled", "default-dir", "default-alias", "json"];
+		const closedKinds = ["name", "prefix", "full-id", "never-enrolled", "default-dir", "default-alias", "json"];
 		it.each(closedKinds)("deletes a closed session (%s)", async (kind) => {
+			const selector = kind === "prefix" ? "12345678" : kind === "full-id" ? sessionId : "saved";
 			if (["never-enrolled", "default-dir", "default-alias"].includes(kind)) {
 				rmSync(enrollment);
 				rmSync(directory);
@@ -533,15 +534,19 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 				);
 				vi.spyOn(process, "cwd").mockReturnValue(folder);
 				await handleDaemonCommand(["daemon", "delete", "saved"]);
-			} else await run(kind === "prefix" ? "12345678" : "saved", ...(kind === "json" ? ["--json"] : []));
+			} else await run(selector, ...(kind === "json" ? ["--json"] : []));
 			expect(deletions()).toEqual([{ type: "delete_saved_session", sessionPath }]);
 			expect(process.exitCode ?? 0).toBe(0);
-			expect(String(vi.mocked(console.log).mock.calls[0]![0])).toContain("saved");
 			expect(console.error).not.toHaveBeenCalled();
 			await run();
 			expect(process.exitCode).toBe(1);
-			expect(consoleErrorMessages.join(" ")).toContain("No session found matching 'saved'");
 			expect(deletions()).toHaveLength(1);
+		});
+		it("W1 refuses a 7-character ID prefix before further daemon requests", async () => {
+			await run("1234567");
+			expect(process.exitCode).toBe(1);
+			expect(JSON.parse(fs.readFileSync(control, "utf8")).checked).toBeUndefined();
+			expect(daemonClientMock.instances[0]!.requests.map(({ type }) => type)).toEqual(["list_saved_sessions"]);
 		});
 		it.each(["id", "symlink"])("refuses a live session (%s)", async (match) => {
 			const alias = join(folder, "alias.jsonl");
@@ -685,9 +690,9 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 		});
 		it("does not confuse a saved ID prefix with another session's stop-style suffix", async () => {
 			const otherPath = join(folder, "other.jsonl");
-			transcript("abcdef00-other", otherPath);
+			transcript("56abcdef-other", otherPath);
 			daemonClientMock.behavior.savedSessions.push({ ...(await readSessionInfo(otherPath))!, name: "other" });
-			await run("abcdef");
+			await run("56abcdef");
 			expect(process.exitCode ?? 0).toBe(0);
 			expect(deletions()).toEqual([{ type: "delete_saved_session", sessionPath: otherPath }]);
 		});

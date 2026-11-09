@@ -1044,6 +1044,11 @@ async function runDelete(client: DaemonClient, parsed: ParsedDaemonClientCommand
 		.map((session) => ({ ...session, rlmDepth: 0 }));
 	const session = resolveCatalogSessionMatch(roots, selector);
 	if (!session) throw new Error(`No session found matching '${selector}'; use a longer ID prefix or the session name`);
+	if (selector.length < 8 && selector !== session.id && selector !== session.name) {
+		throw new Error(
+			"Use an ID prefix of at least 8 characters, the full ID, or the session name. The 12-character ID shown by list is the end of the ID and is not accepted as a prefix.",
+		);
+	}
 	const live = await getLiveSessions(client);
 	if (
 		live.some(
