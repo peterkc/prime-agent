@@ -176,7 +176,7 @@ const spawnMock = vi.hoisted(() => {
 	};
 });
 
-vi.mock("node:fs", { spy: true });
+vi.mock("node:fs", async (original) => ({ ...(await original<typeof fs>()) }));
 
 vi.mock("node:child_process", async (importOriginal) => {
 	const original = (await importOriginal()) as Record<string, unknown>;
