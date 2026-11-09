@@ -1,0 +1,1 @@
+- Added `prime-agent delete <agent>` to delete saved top-level sessions by name or ID prefix, with checks for running sessions and unacknowledged mesh messages.

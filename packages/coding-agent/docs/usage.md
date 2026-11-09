@@ -111,6 +111,8 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 Normal interactive sessions are persistent agents backed by isolated worker processes. Closing the TUI detaches the client; use `prime-agent agents`, `prime-agent list`, or `prime-agent attach <agent>` to find and reattach to running work. `prime-agent stop <agent>` stops one root agent, while `prime-agent shutdown` stops all workers and the local supervisor.
 
+`prime-agent delete <agent>` matches saved top-level sessions by name or ID prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts and requires a reachable daemon. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
+
 Within a session, the model can delegate through the `rlm` object already available in the Python REPL:
 
 ```python
@@ -177,6 +179,7 @@ prime-agent list [--all]
 prime-agent sessions [--all] [--json]
 prime-agent attach <agent>
 prime-agent stop <agent>
+prime-agent delete <agent> [--json]
 prime-agent rename <agent> <name>
 prime-agent send <agent> <message>
 prime-agent notify [--daemon-socket <path>] [--json] <session> -- <message>

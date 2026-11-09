@@ -2,6 +2,9 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, lstat, readFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { canonicalSessionPath } from "../core/session-lease.js";
+import { readDirectoryAsync } from "../modes/daemon/cotal/enrollment.js";
+import { directoryPath, enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
 
 interface MeshToolOptions {
 	readonly meshHome: string;
@@ -187,4 +190,37 @@ export async function meshSessionPending(
 		return { status: "unavailable" };
 	}
 	return { status: "count", count: pendingCount(pending.stdout) };
+}
+
+export async function sessionPendingForDelete(
+	meshHome: string,
+	sessionId: string,
+	sessionFile: string,
+): Promise<number> {
+	const enrollment = enrollmentPath(meshHome, sessionId);
+	const directory = directoryPath(meshHome, sessionId);
+	if (await absent(enrollment)) {
+		if (!(await absent(directory))) throw new Error(`Session ${sessionId}: mesh enrollment is missing`);
+		return 0;
+	}
+	const before = await readFile(enrollment, "utf8");
+	const record = await readJson(enrollment);
+	if (
+		!record ||
+		typeof record !== "object" ||
+		!("sessionFile" in record) ||
+		typeof record.sessionFile !== "string" ||
+		canonicalSessionPath(record.sessionFile) !== canonicalSessionPath(sessionFile)
+	)
+		throw new Error(`Session ${sessionId}: mesh enrollment does not match the saved session`);
+	const directoryBefore = (await absent(directory)) ? undefined : await readFile(directory, "utf8");
+	if (directoryBefore !== undefined && !(await readDirectoryAsync(meshHome, sessionId)))
+		throw new Error(`Session ${sessionId}: mesh directory entry disappeared`);
+	const options = { meshHome };
+	const pending = await meshSessionPending(await executable("cotal"), options, await meshConfig(options), sessionId);
+	if (pending.status !== "count") throw new Error(`Session ${sessionId}: mesh count unavailable (${pending.status})`);
+	const directoryAfter = (await absent(directory)) ? undefined : await readFile(directory, "utf8");
+	if ((await readFile(enrollment, "utf8")) !== before || directoryAfter !== directoryBefore)
+		throw new Error(`Session ${sessionId}: mesh state changed during the count`);
+	return pending.count;
 }

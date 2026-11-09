@@ -44,6 +44,13 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Stop an agent",
 	},
 	{
+		path: ["delete"],
+		usage: "delete <agent> [--json]",
+		summary: "Delete a saved top-level session",
+		description:
+			"Match a saved session by name or ID prefix. Stop it first if it is running. Refuses unacknowledged mesh messages or unreadable mesh counts. Requires a reachable daemon. The daemon removes the transcript and its artifacts, cancels scheduled jobs and removes mesh enrollment.",
+	},
+	{
 		path: ["rename"],
 		usage: "rename <agent> <name> [--json]",
 		summary: "Rename an agent",

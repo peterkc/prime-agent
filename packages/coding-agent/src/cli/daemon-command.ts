@@ -1,9 +1,9 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { expandTildePath } from "../config.js";
+import { expandTildePath, getAgentDir } from "../config.js";
 import {
 	type AgentSessionMessageReceipt,
 	assertDirectAgentMessageTarget,
@@ -12,8 +12,10 @@ import {
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
+import { canonicalSessionPath } from "../core/session-lease.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { redactMeshError } from "../modes/daemon/cotal/mesh-shared.js";
+import { resolveCatalogSessionMatch } from "../modes/daemon/daemon-catalog-process.js";
 import {
 	DaemonClient,
 	type DaemonClientMessageListener,
@@ -29,11 +31,13 @@ import {
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { deleteDaemonSavedSession, listDaemonSavedSessions } from "../modes/daemon/saved-session-catalog.js";
 import { spawnHidden } from "../utils/child-process.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
+import { sessionPendingForDelete } from "./mesh-cotal.js";
 import { repositoryDaemon } from "./repository-daemon.js";
 import { formatSessionsTable } from "./sessions-table-format.js";
 
@@ -54,6 +58,7 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"attach",
 	"detach",
 	"kill",
+	"delete",
 	"rename",
 	"prompt",
 	"send",
@@ -382,6 +387,9 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 					{ type: "kill", activeSessionId: requireActiveSessionId(parsed.positionals) },
 					parsed.json,
 				);
+				return;
+			case "delete":
+				await runDelete(client, parsed.positionals, parsed.json);
 				return;
 			case "rename":
 				await runRename(client, parsed.positionals, parsed.json);
@@ -1021,6 +1029,36 @@ function parseSessionsArgs(args: string[]): { all: boolean } {
 		throw new Error(`Unknown sessions option: ${arg}`);
 	}
 	return { all };
+}
+
+async function runDelete(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const selector = requireActiveSessionId(args);
+	const context = { cwd: process.cwd() };
+	const sessions = await listDaemonSavedSessions(client, context, "all");
+	const roots = sessions
+		.filter((session) => (session.rlmDepth ?? 0) === 0)
+		.map((session) => ({ ...session, rlmDepth: 0 }));
+	const session = resolveCatalogSessionMatch(roots, selector);
+	if (!session) throw new Error(`No session found matching '${selector}'`);
+	const live = await getLiveSessions(client);
+	if (
+		live.some(
+			(row) =>
+				row.activeSessionId !== undefined &&
+				(row.sessionId === session.id ||
+					(row.sessionFile !== undefined &&
+						canonicalSessionPath(row.sessionFile) === canonicalSessionPath(session.path))),
+		)
+	) {
+		throw new Error(`Cannot delete ${session.name ?? session.id}: stop it first`);
+	}
+	const pending = await sessionPendingForDelete(join(getAgentDir(), "mesh"), session.id, session.path);
+	if (pending > 0)
+		throw new Error(`Cannot delete ${session.name ?? session.id}: ${pending} unacknowledged mesh messages`);
+	const result = await deleteDaemonSavedSession(client, context, session.path);
+	if (!result.ok) throw new Error(result.error);
+	if (json) printJson({ ...result, sessionId: session.id, name: session.name, sessionPath: session.path });
+	else console.log(`Deleted ${session.name ?? "(unnamed)"} (${session.id}) via ${result.method}: ${session.path}`);
 }
 
 async function runCreate(client: DaemonClient, args: string[], json: boolean): Promise<void> {

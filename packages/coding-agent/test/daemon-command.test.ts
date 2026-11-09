@@ -1,9 +1,10 @@
 import * as cp from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repositoryDaemon } from "../src/cli/repository-daemon.js";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { DaemonCommandNotSentError } from "../src/modes/daemon/daemon-client.js";
 
 const daemonClientMock = vi.hoisted(() => {
@@ -37,6 +38,9 @@ const daemonClientMock = vi.hoisted(() => {
 		emitStaleAgentEndOnAttach: false,
 		connectFails: false,
 		sessions: [] as Array<Record<string, unknown>>,
+		savedSessions: [] as Array<Record<string, unknown>>,
+		deleteError: undefined as string | undefined,
+		deleteResult: { ok: true, method: "trash" } as { ok: boolean; method?: string; error?: string },
 		/** Optional live-session summary returned by the mocked create request. */
 		createdSession: undefined as Record<string, unknown> | undefined,
 		notifyCapable: true,
@@ -79,6 +83,22 @@ const daemonClientMock = vi.hoisted(() => {
 			}
 			if (command.type === "list") {
 				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
+			}
+			if (command.type === "list_saved_sessions")
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { sessions: behavior.savedSessions },
+				};
+			if (command.type === "delete_saved_session") {
+				if (behavior.deleteError)
+					return { type: "response", command: command.type, success: false, error: behavior.deleteError };
+				if (behavior.deleteResult.ok)
+					behavior.savedSessions = behavior.savedSessions.filter(
+						(session) => session.path !== command.sessionPath,
+					);
+				return { type: "response", command: command.type, success: true, data: behavior.deleteResult };
 			}
 			if (command.type === "create" && behavior.createdSession !== undefined) {
 				return { type: "response", command: command.type, success: true, data: behavior.createdSession };
@@ -367,6 +387,9 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
 		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
+		daemonClientMock.behavior.savedSessions = [];
+		daemonClientMock.behavior.deleteError = undefined;
+		daemonClientMock.behavior.deleteResult = { ok: true, method: "trash" };
 		daemonClientMock.behavior.createdSession = undefined;
 		daemonClientMock.behavior.notifyCapable = true;
 		daemonClientMock.behavior.notifyData = undefined;
@@ -419,6 +442,196 @@ describe("daemon command", () => {
 			process.env = env;
 			rmSync(temp, { recursive: true, force: true });
 		}
+	});
+
+	describe("saved-session delete", () => {
+		const sessionId = "12345678-1234-1234-1234-123456abcdef";
+		let folder: string;
+		let sessionPath: string;
+		let enrollment: string;
+		let directory: string;
+		let control: string;
+		beforeEach(() => {
+			folder = mkdtempSync(join(tmpdir(), "delete-"));
+			const meshHome = join(folder, "mesh");
+			for (const part of ["enrollments", "directory", "bin"]) mkdirSync(join(meshHome, part), { recursive: true });
+			sessionPath = join(folder, "saved.jsonl");
+			writeFileSync(sessionPath, "saved transcript");
+			enrollment = join(meshHome, "enrollments", `${sessionId}.json`);
+			directory = join(meshHome, "directory", `${sessionId}.json`);
+			writeFileSync(
+				directory,
+				JSON.stringify({ sessionId, name: "saved", principal: "local.test", homeSocket: "home" }),
+			);
+			writeFileSync(
+				enrollment,
+				JSON.stringify({
+					sessionId,
+					sessionFile: sessionPath,
+					identity: { id: "test" },
+					lifecycleUid: "a".repeat(26),
+				}),
+			);
+			writeFileSync(
+				join(meshHome, "mesh.json"),
+				JSON.stringify({ space: "prime", server: "nats://127.0.0.1:4222" }),
+			);
+			control = join(folder, "control.json");
+			writeFileSync(control, JSON.stringify({ pending: 0, ackPending: 0 }));
+			writeFileSync(
+				join(meshHome, "bin", "cotal"),
+				`#!${process.execPath}
+const { readFileSync, writeFileSync, unlinkSync } = require("node:fs");
+const config = JSON.parse(readFileSync(${JSON.stringify(control)}, "utf8"));
+if (config.change) writeFileSync(${JSON.stringify(enrollment)}, "{}");
+if (config.leave) unlinkSync(${JSON.stringify(enrollment)});
+if (config.directory) writeFileSync(${JSON.stringify(directory)}, "{}");
+if (config.fail) process.exit(1);
+console.log(config.invalid ? "bad counts" : JSON.stringify(config));
+`,
+				{ mode: 0o700 },
+			);
+			vi.stubEnv(ENV_AGENT_DIR, folder);
+			vi.stubEnv("PATH", join(meshHome, "bin"));
+			daemonClientMock.behavior.savedSessions = [
+				{
+					path: sessionPath,
+					id: sessionId,
+					name: "saved",
+					cwd: folder,
+					created: "2026-01-01",
+					modified: "2026-01-01",
+					messageCount: 1,
+					firstMessage: "hello",
+					allMessagesText: "hello",
+				},
+			];
+		});
+		afterEach(() => {
+			vi.unstubAllEnvs();
+			rmSync(folder, { recursive: true, force: true });
+		});
+		function deletions() {
+			return daemonClientMock.instances
+				.flatMap((client) => client.requests)
+				.filter((command) => command.type === "delete_saved_session");
+		}
+		async function run(selector = "saved", ...flags: string[]) {
+			await handleDaemonCommand(["daemon", "--socket", join(folder, "daemon.sock"), "delete", selector, ...flags]);
+		}
+		it.each(["name", "prefix", "never-enrolled", "json"])("deletes a closed session (%s)", async (kind) => {
+			if (kind === "never-enrolled") {
+				rmSync(enrollment);
+				rmSync(directory);
+				rmSync(join(folder, "mesh", "bin", "cotal"));
+			}
+			await run(kind === "prefix" ? "12345678" : "saved", ...(kind === "json" ? ["--json"] : []));
+			expect(deletions()).toEqual([{ type: "delete_saved_session", sessionPath }]);
+			expect(process.exitCode ?? 0).toBe(0);
+			expect(String(vi.mocked(console.log).mock.calls[0]![0])).toContain("saved");
+			expect(console.error).not.toHaveBeenCalled();
+			await run();
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toContain("No session found matching 'saved'");
+			expect(deletions()).toHaveLength(1);
+		});
+		it.each(["id", "symlink"])("refuses a live session (%s)", async (match) => {
+			const alias = join(folder, "alias.jsonl");
+			symlinkSync(sessionPath, alias);
+			daemonClientMock.behavior.sessions = [
+				{ ...makeSessionSummary("active", match === "id" ? sessionId : "other", "saved"), sessionFile: alias },
+			];
+			await run();
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toContain("stop it first");
+			expect(deletions()).toEqual([]);
+		});
+		it.each([
+			[3, 2],
+			[0, 5],
+			[5, 0],
+		])("refuses %i pending plus %i ackPending", async (pending, ackPending) => {
+			writeFileSync(control, JSON.stringify({ pending, ackPending }));
+			await run();
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toContain("5 unacknowledged mesh messages");
+			expect(deletions()).toEqual([]);
+		});
+		it.each(["unknown", "ambiguous", "suffix", "child"])("uses saved catalog resolution (%s)", async (kind) => {
+			const saved = daemonClientMock.behavior.savedSessions[0]!;
+			if (kind === "ambiguous") daemonClientMock.behavior.savedSessions.push({ ...saved, id: "12345678-other" });
+			if (kind === "child") saved.rlmDepth = 1;
+			await run(kind === "unknown" ? "missing" : kind === "suffix" ? "abcdef" : "saved");
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toContain(
+				kind === "ambiguous" ? 'Ambiguous session selector "saved"' : "No session found matching",
+			);
+			expect(deletions()).toEqual([]);
+		});
+		it("does not confuse a saved ID prefix with another session's stop-style suffix", async () => {
+			const otherPath = join(folder, "other.jsonl");
+			daemonClientMock.behavior.savedSessions.push({
+				...daemonClientMock.behavior.savedSessions[0]!,
+				id: "abcdef00-other",
+				name: "other",
+				path: otherPath,
+			});
+			await run("abcdef");
+			expect(process.exitCode ?? 0).toBe(0);
+			expect(deletions()).toEqual([{ type: "delete_saved_session", sessionPath: otherPath }]);
+		});
+		it.each(["active-refusal", "unreachable", "file-failure"])("shows daemon failure (%s)", async (kind) => {
+			if (kind === "active-refusal")
+				daemonClientMock.behavior.deleteError = "Cannot delete the currently active session";
+			if (kind === "unreachable") daemonClientMock.behavior.connectFails = true;
+			if (kind === "file-failure")
+				daemonClientMock.behavior.deleteResult = { ok: false, error: "delete permission denied" };
+			await run();
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toContain(
+				kind === "unreachable"
+					? "mock connect failed"
+					: kind === "file-failure"
+						? "delete permission denied"
+						: "Cannot delete the currently active session",
+			);
+			expect(console.log).not.toHaveBeenCalled();
+			expect(deletions()).toHaveLength(kind === "unreachable" ? 0 : 1);
+		});
+		it.each([
+			"fail",
+			"invalid",
+			"change",
+			"leave",
+			"directory",
+			"dangling",
+			"missing-enrollment",
+			"bad-enrollment",
+			"bad-config",
+			"bad-directory",
+			"dangling-directory",
+		])("refuses unreadable or changing mesh state (%s)", async (kind) => {
+			writeFileSync(control, JSON.stringify({ pending: 0, ackPending: 0, [kind]: true }));
+			if (kind === "dangling") {
+				rmSync(enrollment);
+				symlinkSync(join(folder, "missing"), enrollment);
+			}
+			if (kind === "missing-enrollment") {
+				rmSync(enrollment);
+				writeFileSync(directory, "{}");
+			}
+			if (kind === "bad-enrollment") writeFileSync(enrollment, "{bad");
+			if (kind === "bad-directory") writeFileSync(directory, "{bad");
+			if (kind === "dangling-directory") {
+				rmSync(directory);
+				symlinkSync(join(folder, "missing"), directory);
+			}
+			if (kind === "bad-config") writeFileSync(join(folder, "mesh", "mesh.json"), "{}");
+			await run();
+			expect(process.exitCode).toBe(1);
+			expect(consoleErrorMessages.join(" ")).toMatch(/mesh|Mesh|counts|ENOENT/);
+			expect(deletions()).toEqual([]);
+		});
 	});
 
 	it("ignores stale agent_end events before a daemon prompt starts", async () => {

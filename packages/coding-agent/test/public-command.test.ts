@@ -155,6 +155,10 @@ describe("public command routing", () => {
 			["daemon", "kill", "worker", "--daemon-socket", "/tmp/custom-daemon.sock"],
 		],
 		[
+			["delete", "saved", "--json"],
+			["daemon", "delete", "saved", "--json"],
+		],
+		[
 			["rename", "worker", "reviewer", "--daemon-socket", "/tmp/custom-daemon.sock"],
 			["daemon", "rename", "worker", "reviewer", "--daemon-socket", "/tmp/custom-daemon.sock"],
 		],
@@ -181,6 +185,22 @@ describe("public command routing", () => {
 	])("rejects %j instead of starting a session", async (argv) => {
 		await expect(handlePublicCommand(argv)).resolves.toMatchObject({ handled: true });
 		expect(process.exitCode).toBe(1);
+		expect(mocks.daemonCommands).toEqual([]);
+	});
+
+	it.each([[], ["one", "two"]])("rejects delete operands %j with stop-style usage", async (...operands) => {
+		await handlePublicCommand(["delete", ...operands]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Usage: prime-agent delete <agent> [--json]"));
+		expect(mocks.daemonCommands).toEqual([]);
+	});
+	it.each([
+		["help", "delete"],
+		["delete", "--help"],
+	])("shows delete help %j", async (...argv) => {
+		await handlePublicCommand(argv);
+		expect(formatTopLevelHelp()).toContain("delete");
+		expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Match a saved session by name or ID prefix"));
 		expect(mocks.daemonCommands).toEqual([]);
 	});
 

@@ -525,6 +525,7 @@ prime-agent list [--all]                   # List active or saved agents
 prime-agent sessions [--all] [--json]     # Show agent status, activity, and usage
 prime-agent attach <agent>                 # Attach the interactive UI
 prime-agent stop <agent>                   # Stop one agent
+prime-agent delete <agent>                 # Delete a closed saved session
 prime-agent rename <agent> <name>          # Rename an agent
 prime-agent send <agent> <message>         # Send an agent-to-agent message
 prime-agent notify [--daemon-socket <path>] [--json] <session> -- <message>  # Send one mesh message as gate-watcher
@@ -532,6 +533,8 @@ prime-agent status                         # Show background service status
 prime-agent doctor [--fix]                 # Inspect or safely clean up background services
 prime-agent shutdown [--force]             # Stop every agent, worker, and background service
 ```
+
+`prime-agent delete <agent>` matches saved top-level sessions by name or ID prefix. Stop a running session first. Deletion refuses unacknowledged mesh messages or unreadable mesh counts and requires a reachable daemon. The daemon removes the transcript and artifacts, cancels scheduled jobs, and removes mesh enrollment.
 
 `prime-agent send` is refused in Cotal mode and has no mesh path. In Cotal mode, scripts use `prime-agent notify` for a one-way message from the `gate-watcher` sender. See [Mesh Agent Messaging](docs/daemon.md#mesh-agent-messaging).
 
