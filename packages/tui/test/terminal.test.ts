@@ -467,3 +467,67 @@ it("keeps notification write rejections from escaping ProcessTerminal", async (t
 	await setImmediate();
 	assert.equal(write.mock.callCount(), 1);
 });
+
+describe("ProcessTerminal keyboard protocol ownership", () => {
+	for (const [name, actions, pushes] of [
+		["normal quit", ["reply"], 1],
+		["duplicate replies during continued session", ["reply", "reply"], 1],
+		["repeated fullscreen switches", ["reply", "alt", "alt", "main", "main", "alt", "drain"], 4],
+		["main-screen reply before fullscreen quit", ["reply", "alt", "drain"], 2],
+		["alternate-screen reply before inline quit", ["alt", "reply", "main"], 2],
+		["alternate-screen quit without drain", ["alt", "reply"], 1],
+		["drain then stop", ["reply", "drain"], 1],
+		["no Kitty support", ["drain"], 0],
+		["modifyOtherKeys fallback", ["fallback", "drain"], 0],
+		["stop and restart", ["reply", "stop", "start", "reply"], 2],
+		["preserved-screen reattach", ["alt", "reply", "handoff", "reply", "drain"], 2],
+	] as const) {
+		it(`restores keyboard stacks after ${name}`, async (t) => {
+			const fixture = nativeTerminal(t, "0");
+			let terminal = fixture.terminal;
+			const { writes, inputs } = fixture;
+			t.after(() => terminal.stop());
+			for (const action of actions) {
+				if (action === "reply") process.stdin.emit("data", "\x1b[?0u");
+				if (action === "alt") terminal.enterAltScreen();
+				if (action === "main") terminal.leaveAltScreen();
+				if (action === "fallback") t.mock.timers.tick(150);
+				if (action === "stop") terminal.stop();
+				if (action === "start") terminal.start((text) => inputs.push(text), ignoreInput);
+				if (action === "handoff") {
+					terminal.stop({ preserveAltScreen: true });
+					terminal = new ProcessTerminal();
+					terminal.start((text) => inputs.push(text), ignoreInput);
+				}
+				if (action === "drain") {
+					await terminal.drainInput(0);
+					const drainedWrites = writes.length;
+					t.mock.timers.tick(150);
+					process.stdin.emit("data", "\x1b[?0u");
+					assert.equal(writes.length, drainedWrites);
+				}
+			}
+			process.stdin.emit("data", "x");
+			terminal.stop();
+			let screen = 0;
+			const stacks = [0, 0];
+			for (const write of writes) {
+				if (write === "\x1b[?1049h") screen = 1;
+				if (write === "\x1b[?1049l") screen = 0;
+				if (write === "\x1b[>7u") stacks[screen]++;
+				if (write === "\x1b[<u") assert.ok(stacks[screen]-- > 0, "pop must own a push on this screen");
+			}
+			assert.deepEqual(stacks, [0, 0]);
+			assert.equal(writes.filter((write) => write === "\x1b[>7u").length, pushes);
+			assert.equal(
+				writes.filter((write) => write === "\x1b[>4;2m").length,
+				(actions as readonly string[]).includes("fallback") ? 1 : 0,
+			);
+			assert.equal(
+				writes.filter((write) => write === "\x1b[>4;0m").length,
+				(actions as readonly string[]).includes("fallback") ? 1 : 0,
+			);
+			assert.deepEqual(inputs, ["x"]);
+		});
+	}
+});

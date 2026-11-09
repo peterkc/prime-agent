@@ -1,0 +1,1 @@
+- Fixed keyboard protocol state leaking into the shell after leaving fullscreen or quitting.
