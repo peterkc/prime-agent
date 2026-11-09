@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repositoryDaemon } from "../src/cli/repository-daemon.js";
 import { ENV_AGENT_DIR, getDefaultAgentDir } from "../src/config.js";
+import { SemanticEdgeRecorder } from "../src/core/semantic-edges.js";
 import { getSessionArtifactPathForFile, readSessionInfo } from "../src/core/session-manager.js";
 import { DaemonCommandNotSentError } from "../src/modes/daemon/daemon-client.js";
 import { RlmSpawnLedger, withPassiveRlmDescendantInfos } from "../src/modes/daemon/rlm-ledger.js";
@@ -464,22 +465,17 @@ describe("daemon command", () => {
 			transcript(sessionId, sessionPath);
 			enrollment = join(meshHome, "enrollments", `${sessionId}.json`);
 			directory = join(meshHome, "directory", `${sessionId}.json`);
-			writeFileSync(
-				directory,
-				JSON.stringify({ sessionId, name: "saved", principal: "local.test", homeSocket: "home" }),
-			);
-			enroll(sessionId, sessionPath);
-			writeFileSync(
-				join(meshHome, "mesh.json"),
-				JSON.stringify({ space: "prime", server: "nats://127.0.0.1:4222" }),
-			);
+			writeJson(directory, { sessionId, name: "saved", principal: "local.test", homeSocket: "home" });
+			writeJson(join(meshHome, "mesh.json"), { space: "prime", server: "nats://127.0.0.1:4222" });
 			control = join(folder, "control.json");
-			writeFileSync(control, JSON.stringify({ pending: 0, ackPending: 0 }));
+			writeJson(control, { pending: 0, ackPending: 0 });
 			writeFileSync(
 				join(meshHome, "bin", "cotal"),
 				`#!${process.execPath}
 const { readFileSync, writeFileSync, unlinkSync } = require("node:fs");
 const settings = JSON.parse(readFileSync(${JSON.stringify(control)}, "utf8"));
+settings.checked = [...(settings.checked ?? []), process.argv[4]];
+writeFileSync(${JSON.stringify(control)}, JSON.stringify(settings));
 const config = settings.sessions?.[process.argv[4]] ?? settings;
 if (config.change) writeFileSync(${JSON.stringify(enrollment)}, "{}");
 if (config.leave) unlinkSync(${JSON.stringify(enrollment)});
@@ -498,19 +494,20 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			rmSync(folder, { recursive: true, force: true });
 		});
 		function enroll(id: string, path: string) {
-			writeFileSync(
-				join(folder, "mesh", "enrollments", `${id}.json`),
-				JSON.stringify({
-					sessionId: id,
-					sessionFile: path,
-					identity: { id: "test" },
-					lifecycleUid: "a".repeat(26),
-				}),
-			);
+			writeJson(join(folder, "mesh", "enrollments", `${id}.json`), {
+				sessionId: id,
+				sessionFile: path,
+				identity: { id: "test" },
+				lifecycleUid: "a".repeat(26),
+			});
+		}
+		function writeJson(path: string, value: unknown) {
+			writeFileSync(path, `${JSON.stringify(value)}\n`);
 		}
 		function transcript(id: string, path: string) {
 			mkdirSync(join(path, ".."), { recursive: true });
-			writeFileSync(path, JSON.stringify({ type: "session", version: 3, id, cwd: folder, timestamp: "2026-01-01" }));
+			writeJson(path, { type: "session", version: 3, id, cwd: folder, timestamp: "2026-01-01" });
+			enroll(id, path);
 		}
 		function deletions() {
 			return daemonClientMock.instances
@@ -562,7 +559,7 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			[0, 5],
 			[5, 0],
 		])("refuses %i pending plus %i ackPending", async (pending, ackPending) => {
-			writeFileSync(control, JSON.stringify({ pending, ackPending }));
+			writeJson(control, { pending, ackPending });
 			await run();
 			expect(process.exitCode).toBe(1);
 			expect(consoleErrorMessages.join(" ")).toContain("5 unacknowledged mesh messages");
@@ -577,6 +574,7 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			"ledger-error",
 			"unlisted",
 			"malformed",
+			"empty",
 			"dangling",
 			"directory-error",
 		])("checks deletion transcripts, not catalog descendants (%s)", async (kind) => {
@@ -586,10 +584,26 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 				path: join(kind === "unrelated" ? folder : artifacts, "sub-child", "child.jsonl"),
 			};
 			const grandchild = { id: "grandchild", path: join(child.path, "..", "nested", "grandchild.jsonl") };
-			for (const member of [child, grandchild]) {
-				transcript(member.id, member.path);
-				enroll(member.id, member.path);
+			for (const member of [child, grandchild]) transcript(member.id, member.path);
+			for (const [path, id] of [
+				[artifacts, sessionId],
+				[join(child.path, ".."), child.id],
+			]) {
+				mkdirSync(path, { recursive: true });
+				new SemanticEdgeRecorder({ ledgerPath: join(path, "semantic-edges.jsonl"), sessionId: id });
 			}
+			writeJson(join(artifacts, "rlm-subagents.jsonl"), {
+				type: "rlm_subagent",
+				childId: "sub-child",
+				sessionName: "child",
+				sessionDir: join(child.path, ".."),
+				sessionFile: child.path,
+				parentSessionId: sessionId,
+				parentSessionFile: sessionPath,
+				status: "completed",
+				createdAt: 1,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			});
 			const saved = { ...(await readSessionInfo(sessionPath))!, name: "saved" };
 			if (kind === "ledger-error") {
 				const ledger = new RlmSpawnLedger(folder, folder);
@@ -605,7 +619,7 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 				}));
 				daemonClientMock.behavior.savedSessions.push(...rows);
 			}
-			if (kind === "malformed") writeFileSync(child.path, "{broken");
+			if (kind === "malformed" || kind === "empty") writeFileSync(child.path, kind === "empty" ? "" : "{broken");
 			if (kind === "dangling") {
 				rmSync(child.path);
 				symlinkSync(join(folder, "missing"), child.path);
@@ -615,17 +629,14 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 					throw new Error("artifact listing denied");
 				});
 			const blocked = kind === "grandchild" ? "grandchild" : "child";
-			writeFileSync(
-				control,
-				JSON.stringify({
-					pending: 0,
-					ackPending: 0,
-					sessions: {
-						[blocked]: { pending: kind === "zero" ? 0 : 1, ackPending: 0, fail: kind === "unreadable" },
-					},
-				}),
-			);
+			writeJson(control, {
+				pending: 0,
+				ackPending: 0,
+				sessions: { [blocked]: { pending: kind === "zero" ? 0 : 1, ackPending: 0, fail: kind === "unreadable" } },
+			});
 			await run();
+			const checked = JSON.parse(fs.readFileSync(control, "utf8")).checked;
+			if (kind === "zero") expect(checked.sort()).toEqual([sessionId, "child", "grandchild"]);
 			const refused = kind !== "zero" && kind !== "unrelated";
 			expect(process.exitCode ?? 0).toBe(refused ? 1 : 0);
 			expect(deletions()).toEqual(refused ? [] : [{ type: "delete_saved_session", sessionPath }]);
@@ -633,7 +644,7 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 				expect(consoleErrorMessages.join(" ")).toContain(
 					kind === "directory-error"
 						? "Cannot enumerate"
-						: kind === "malformed" || kind === "dangling"
+						: kind === "malformed" || kind === "empty" || kind === "dangling"
 							? child.path
 							: `Cannot delete ${blocked}:`,
 				);
@@ -674,7 +685,6 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			const otherPath = join(folder, "other.jsonl");
 			transcript("abcdef00-other", otherPath);
 			daemonClientMock.behavior.savedSessions.push({ ...(await readSessionInfo(otherPath))!, name: "other" });
-			enroll("abcdef00-other", otherPath);
 			await run("abcdef");
 			expect(process.exitCode ?? 0).toBe(0);
 			expect(deletions()).toEqual([{ type: "delete_saved_session", sessionPath: otherPath }]);
@@ -710,7 +720,7 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			"bad-directory",
 			"dangling-directory",
 		])("refuses unreadable or changing mesh state (%s)", async (kind) => {
-			writeFileSync(control, JSON.stringify({ pending: 0, ackPending: 0, [kind]: true }));
+			writeJson(control, { pending: 0, ackPending: 0, [kind]: true });
 			if (kind === "dangling") {
 				rmSync(enrollment);
 				symlinkSync(join(folder, "missing"), enrollment);
