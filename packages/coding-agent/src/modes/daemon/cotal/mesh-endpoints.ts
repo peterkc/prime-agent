@@ -1194,9 +1194,9 @@ export class MeshEndpoints {
 
 	private async preparePolicy(session: SessionEndpoint, item: QueuedDelivery): Promise<void> {
 		try {
-			item.canWait = agentMessageCanWait(meshMessagePayload(item.message));
-			if (item.canWait && this.options.canWait)
-				item.canWait = await this.options.canWait(session.record, item.message);
+			const canWait = agentMessageCanWait(meshMessagePayload(item.message));
+			item.canWait =
+				canWait && this.options.canWait ? await this.options.canWait(session.record, item.message) : canWait;
 		} catch {
 			// Invalid payloads keep the existing permanent-error path in deliver().
 			item.canWait = false;
@@ -1237,7 +1237,9 @@ export class MeshEndpoints {
 			this.sessions.get(session.record.sessionId) !== session
 		)
 			return;
-		const steer = session.queue.findIndex((item) => item.canWait === false);
+		// An unresolved family lookup is a FIFO barrier, not a held follow-up.
+		const candidate = session.queue.findIndex((item) => item.canWait !== true);
+		const steer = session.queue[candidate]?.canWait === false ? candidate : -1;
 		if (steer < 0 && (session.runActive || session.queue[0]?.canWait !== true)) return;
 		const [item] = session.queue.splice(steer < 0 ? 0 : steer, 1);
 		if (!item) return;
@@ -1317,7 +1319,7 @@ export class MeshEndpoints {
 				session.queue.unshift(item);
 				return;
 			}
-			admitted();
+			if (item.canWait === true) admitted();
 			await persisted;
 		} catch (error) {
 			if (session.state === "closed" || (pending && this.pending.get(message.id) !== pending)) return;

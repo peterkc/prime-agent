@@ -1606,7 +1606,7 @@ export class AgentSession {
 	private _meshFollowUpPending = false;
 	private _goalContinuationAwaitsMesh = false;
 	private _meshGoalResume?: Promise<void>;
-	private _abortNoteFailure?: Error;
+	private _pendingStopNote?: Promise<void>;
 
 	setMeshFollowUpPending(pending: boolean): void {
 		this._meshFollowUpPending = pending;
@@ -1629,6 +1629,11 @@ export class AgentSession {
 			)
 				return;
 			this._goalContinuationAwaitsMesh = false;
+			if (this._hasUnsettledRlmQuiescenceWork() || this._hasLiveBackgroundBashHandles()) {
+				this._goalContinuationAwaitsRlmWork = true;
+				return;
+			}
+			this._goalContinuationAwaitsRlmWork = false;
 			this._ensureGoalRuntimeActive();
 			this._setGoalState({ ...this._goalState, continuationsUsed: this._goalState.continuationsUsed + 1 });
 			const message = createGoalContextMessage(this._goalState, "continuation");
@@ -2931,6 +2936,12 @@ export class AgentSession {
 		// Keep the deferral while admission is paused or the pump is suspended
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this._meshFollowUpPending) {
+			this._goalContinuationAwaitsRlmWork = false;
+			this._goalContinuationAwaitsMesh = true;
+			this._resumeGoalAfterMeshIdle();
+			return;
+		}
 		const goalBeforeResume = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
@@ -5902,7 +5913,7 @@ export class AgentSession {
 	}
 
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
-		if (this._abortNoteFailure) throw this._abortNoteFailure;
+		if (this._pendingStopNote) await this._pendingStopNote;
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		if (
@@ -5913,7 +5924,6 @@ export class AgentSession {
 			this._resumeSessionInputAdmission();
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
-			if (this._abortNoteFailure) throw this._abortNoteFailure;
 			if (customMessage && this._replacingAgentMessageIds.has(customMessage.details.id))
 				throw new Error(`Agent message ${customMessage.details.id} is held for session replacement`);
 			options?.admissionCommitted?.();
@@ -7396,6 +7406,7 @@ export class AgentSession {
 	}
 
 	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+		if (this._pendingStopNote) await this._pendingStopNote;
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -8526,6 +8537,7 @@ export class AgentSession {
 	}
 
 	requestAbort(options: { userStop?: boolean } = {}): void {
+		const userStop = options.userStop === true && this.isSessionActive;
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -8553,21 +8565,30 @@ export class AgentSession {
 		this._refineAbortController?.abort();
 		this.agent.abort();
 		this._goalContinuationAwaitsMesh = false;
-		if (options.userStop !== false) {
-			this._abortNoteFailure = new Error("The stop note was not persisted; agent messages cannot be admitted");
-			const note: CustomMessage = {
-				role: "custom",
-				customType: "agent_stop",
-				display: true,
-				timestamp: Date.now(),
-				content:
-					"The user stopped the previous work. Do not restart that work because of a later agent message or FYI. Follow later user instructions.",
-			};
-			this.sessionManager.appendCustomMessageEntryWithRollback(note.customType, note.content, note.display);
-			this.agent.state.messages.push(note);
-			this._abortNoteFailure = undefined;
-			this._emit({ type: "message_start", message: note });
-			this._emit({ type: "message_end", message: note });
+		if (userStop && !this._pendingStopNote) {
+			this._pendingStopNote = this.agent
+				.waitForIdle()
+				.then(() => this._agentEventQueue)
+				.then(() => {
+					const note: CustomMessage = {
+						role: "custom",
+						customType: "agent_stop",
+						display: true,
+						timestamp: Date.now(),
+						content:
+							"The user stopped the previous work. Do not restart that work because of a later agent message or FYI. Follow later user instructions.",
+					};
+					this.sessionManager.appendCustomMessageEntryWithRollback(note.customType, note.content, note.display);
+					this.agent.state.messages.push(note);
+					this._emit({ type: "message_start", message: note });
+					this._emit({ type: "message_end", message: note });
+				})
+				.catch((error: unknown) => {
+					console.warn(`Warning: Could not persist user stop note: ${this._asError(error).message}`);
+				})
+				.finally(() => {
+					this._pendingStopNote = undefined;
+				});
 		}
 	}
 
@@ -8584,6 +8605,7 @@ export class AgentSession {
 			await Promise.allSettled([
 				this.agent.waitForIdle(),
 				this._agentEventQueue,
+				...(this._pendingStopNote ? [this._pendingStopNote] : []),
 				...(compactionOperation ? [compactionOperation] : []),
 				...(branchSummaryOperation ? [branchSummaryOperation] : []),
 			]);
@@ -8617,11 +8639,11 @@ export class AgentSession {
 			this._sessionInputAdmissionPauses.size === 0 &&
 			this._queuedWorkPauses.size === 0;
 		if (queuedSteering.length === 0 || !canResume) {
-			this.requestAbort();
+			this.requestAbort({ userStop: true });
 			return false;
 		}
 		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
-		this.requestAbort();
+		this.requestAbort({ userStop: true });
 		this.resumeQueuedWork();
 		return true;
 	}

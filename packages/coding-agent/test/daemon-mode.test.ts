@@ -54,6 +54,7 @@ import {
 	SessionManager,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
@@ -4477,6 +4478,7 @@ describe("mesh worker persistence", () => {
 	) {
 		const started = createDeferred();
 		const release = createDeferred();
+		const aborted = createDeferred();
 		const live = await createHarness({
 			persistSession: true,
 			...options,
@@ -4486,8 +4488,10 @@ describe("mesh worker persistence", () => {
 							name: "wait",
 							label: "wait",
 							description: "fixture boundary",
+							abortResultGraceMs: 1000,
 							parameters: Type.Object({}),
-							execute: async () => {
+							execute: async (_id, _params, signal) => {
+								signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
 								started.resolve();
 								await release.promise;
 								return { content: [{ type: "text", text: "released" }], details: {} };
@@ -4513,7 +4517,7 @@ describe("mesh worker persistence", () => {
 				sender: { sessionName: "peer" },
 				...command,
 			});
-		return { live, h, state, started, release, receive };
+		return { live, h, state, started, release, aborted, receive };
 	}
 
 	it.each(["supported", "unsupported", "parent", "child", "reply"] as const)(
@@ -4585,6 +4589,49 @@ describe("mesh worker persistence", () => {
 			} finally {
 				released.resolve();
 				await running;
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["isCompacting", "isRetrying", "isBashRunning", "queuedActionCount", "active"] as const)(
+		"defers a marked offer without streaming during %s",
+		async (busy) => {
+			const { live, h, receive } = await liveFixture();
+			const busyState =
+				busy === "active"
+					? vi.spyOn(live.session, "getSessionActionSnapshot").mockReturnValue({
+							queuedCount: 0,
+							steering: [],
+							followUps: [],
+							active: { kind: "turn", phase: "preparing", label: "work" },
+						})
+					: vi.spyOn(live.session, busy, "get").mockReturnValue(busy === "queuedActionCount" ? 1 : true);
+			const command = {
+				message: "nonstreaming FYI",
+				canWait: true,
+				cotal: { id: "nonstreaming", deliveryCount: 1, attemptToken: "first" },
+			};
+			live.setResponses([fauxAssistantMessage("follow-up complete")]);
+			try {
+				expect(live.session.isStreaming).toBe(false);
+				await receive(command);
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+				expect(h.socket.listenerCount("close")).toBe(0);
+				expect(live.session.unfinishedActionCount).toBe(0);
+				busyState.mockRestore();
+				await receive({ ...command, cotal: { ...command.cotal, attemptToken: "idle" } });
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_nonstreaming");
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "nonstreaming",
+					attemptToken: "idle",
+				});
+			} finally {
+				busyState.mockRestore();
 				live.cleanup();
 			}
 		},
@@ -4786,145 +4833,290 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["idle", "in-run", "restart", "update", "failed"] as const)(
-		"persists one actual-abort note before the next serialized provider input (%s)",
-		async (mode) => {
-			const { live, h, state, started, release, receive } = await liveFixture({}, true);
-			let reopened: Awaited<ReturnType<typeof createHarness>> | undefined;
-			let running: Promise<void> | undefined;
-			try {
-				if (mode === "in-run") {
-					live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
-					running = live.session.prompt("work to abort");
-					await started.promise;
-				}
-				if (mode === "failed")
-					vi.spyOn(live.sessionManager, "appendCustomMessageEntryWithRollback").mockImplementationOnce(() => {
-						throw new Error("stop note write failed");
-					});
-				if (mode === "update") live.session.abortForUpdateRestart();
-				else
-					await h.internals.handleLine(
-						h.client,
-						JSON.stringify({ id: "abort", type: "abort", activeSessionId: "target" }),
-					);
-				release.resolve();
-				await running;
-				const notes = live.sessionManager
-					.getEntries()
-					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop");
-				expect(notes).toHaveLength(mode === "update" || mode === "failed" ? 0 : 1);
-				if (mode === "failed") {
-					await expect(
-						receive({
-							message: "must not overtake the failed note",
-							canWait: true,
-							cotal: { id: "failed-note", deliveryCount: 1, attemptToken: "failed" },
-						}),
-					).rejects.toThrow("stop note was not persisted");
-					expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(
-						0,
-					);
-					return;
-				}
-				if (mode === "update") return;
-				expect(readFileSync(live.session.sessionFile!, "utf8")).toContain('"customType":"agent_stop"');
-				if (mode === "restart") {
-					reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
-					state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
-				}
-				const target = reopened ?? live;
-				let nextContext: Context | undefined;
-				target.setResponses([
-					(context) => {
-						nextContext = context;
-						return fauxAssistantMessage("follow-up complete");
-					},
-				]);
-				await receive({
-					message: "held after abort",
-					canWait: true,
-					cotal: { id: "after-abort", deliveryCount: 2, attemptToken: "next" },
-				});
-				await target.session.waitForAgentMessagePromptCompletion("agentmsg_after-abort");
-				expect(nextContext).toBeDefined();
-				let serialized = "";
-				const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
-					serialized = String(options?.body);
-					return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
-				});
-				try {
-					const model: Model<"openai-responses"> = {
-						...target.getModel(),
-						api: "openai-responses",
-						provider: "openai",
-						baseUrl: "https://fixture.invalid/v1",
-					};
-					await streamOpenAIResponses(model, nextContext!, { apiKey: "fixture-key" }).result();
-				} finally {
-					fetch.mockRestore();
-				}
-				const input = JSON.stringify(JSON.parse(serialized).input);
-				expect(input.split("The user stopped the previous work.")).toHaveLength(2);
-				expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held after abort"));
-				expect(h.frames()).toContainEqual({
-					type: "agent_message_persisted",
-					cotalId: "after-abort",
-					attemptToken: "next",
-				});
-			} finally {
-				release.resolve();
-				await running;
-				reopened?.cleanup();
-				live.cleanup();
-			}
-		},
-	);
-
-	it("still cancels child runs when a user-stop note cannot be persisted", async () => {
-		const live = await createHarness();
-		const cancellation = vi.spyOn(
-			live.session as unknown as { _cancelActiveRlmChildRuns(reason: string): void },
-			"_cancelActiveRlmChildRuns",
-		);
-		const append = vi
-			.spyOn(live.sessionManager, "appendCustomMessageEntryWithRollback")
-			.mockImplementationOnce(() => {
-				throw new Error("stop note write failed");
-			});
+	it.each([
+		"idle",
+		"in-run",
+		"restart",
+		"update",
+		"failed",
+		"abort-clear",
+		"connection",
+		"connection-clear",
+		"kill",
+	] as const)("records only active user stops before the next serialized provider input (%s)", async (mode) => {
+		const { live, h, state, started, release, aborted, receive } = await liveFixture({}, true);
+		const warning = vi.spyOn(console, "warn");
+		const active = mode !== "idle" && mode !== "update";
+		let reopened: Awaited<ReturnType<typeof createHarness>> | undefined;
+		let running: Promise<void> | undefined;
 		try {
-			await expect(live.session.abort()).rejects.toThrow("stop note write failed");
-			expect(cancellation).toHaveBeenCalledExactlyOnceWith("Parent session aborted");
+			if (active) {
+				live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+				running = live.session.prompt("work to abort");
+				await started.promise;
+			}
+			if (mode === "failed")
+				vi.spyOn(live.sessionManager, "flushNow").mockImplementationOnce(() => {
+					throw new Error("stop note write failed");
+				});
+			if (mode === "kill")
+				state.runtime = {
+					...state.runtime,
+					dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+				} as ActiveSessionState["runtime"];
+			let stopping: Promise<void> | undefined;
+			if (mode === "update") live.session.abortForUpdateRestart();
+			else if (mode === "connection" || mode === "connection-clear") {
+				const connection = new InProcessAgentConnection({
+					session: live.session,
+					setRebindSession: () => {},
+				} as unknown as AgentSessionRuntime);
+				stopping = mode === "connection" ? connection.abort() : connection.abortAndClearQueue().then(() => {});
+			} else
+				stopping = h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "abort",
+						type: mode === "kill" ? "kill" : mode === "abort-clear" ? "abort_and_clear_queue" : "abort",
+						activeSessionId: "target",
+					}),
+				);
+			if (active) {
+				await aborted.promise;
+				expect(
+					live.session.messages.filter(
+						(message) => message.role === "custom" && message.customType === "agent_stop",
+					),
+				).toHaveLength(0);
+			}
+			release.resolve();
+			await stopping;
+			await running;
+			await live.session.abort();
+			const notes = live.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop");
+			const hasNote = active && mode !== "failed";
+			expect(notes).toHaveLength(hasNote ? 1 : 0);
+			if (mode === "failed") expect(warning).toHaveBeenCalledWith(expect.stringContaining("stop note write failed"));
+			if (mode === "update" || mode === "kill") return;
+			if (hasNote) expect(readFileSync(live.session.sessionFile!, "utf8")).toContain('"customType":"agent_stop"');
+			if (mode === "restart") {
+				reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+				state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+			}
+			const target = reopened ?? live;
+			let nextContext: Context | undefined;
+			target.setResponses([
+				(context) => {
+					nextContext = context;
+					return fauxAssistantMessage("follow-up complete");
+				},
+			]);
+			await receive({
+				message: "held after abort",
+				canWait: true,
+				cotal: { id: "after-abort", deliveryCount: 2, attemptToken: "next" },
+			});
+			await target.session.waitForAgentMessagePromptCompletion("agentmsg_after-abort");
+			expect(nextContext).toBeDefined();
+			let serialized = "";
+			const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+				serialized = String(options?.body);
+				return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+			});
+			try {
+				const model: Model<"openai-responses"> = {
+					...target.getModel(),
+					api: "openai-responses",
+					provider: "openai",
+					baseUrl: "https://fixture.invalid/v1",
+				};
+				await streamOpenAIResponses(model, nextContext!, { apiKey: "fixture-key" }).result();
+			} finally {
+				fetch.mockRestore();
+			}
+			const input = JSON.stringify(JSON.parse(serialized).input);
+			expect(input.split("The user stopped the previous work.")).toHaveLength(hasNote ? 2 : 1);
+			if (hasNote) expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held after abort"));
+			if (active) {
+				expect(input).toContain("released");
+				expect(input).not.toContain("No result provided");
+				if (hasNote) expect(input.indexOf("released")).toBeLessThan(input.indexOf("The user stopped"));
+			}
+			expect(h.frames()).toContainEqual({
+				type: "agent_message_persisted",
+				cotalId: "after-abort",
+				attemptToken: "next",
+			});
 		} finally {
-			append.mockRestore();
-			cancellation.mockRestore();
+			release.resolve();
+			await running;
+			reopened?.cleanup();
+			warning.mockRestore();
 			live.cleanup();
 		}
 	});
 
-	it.each(["shutdown", "replaced"] as const)(
-		"does not label lifecycle teardown as a user stop (%s)",
-		async (reason) => {
-			const { live, h, state } = await liveFixture();
+	it("logs stop-note flush failure and still resumes queued user work", async () => {
+		const { live, started, release } = await liveFixture({}, true);
+		const warning = vi.spyOn(console, "warn");
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("queued work complete"),
+		]);
+		const running = live.session.prompt("work to stop");
+		try {
+			await started.promise;
+			await live.session.steer("queued user work");
+			vi.spyOn(live.sessionManager, "flushNow").mockImplementationOnce(() => {
+				throw new Error("stop note write failed");
+			});
+			expect(live.session.abortAndSendQueued()).toBe(true);
+			release.resolve();
+			await running;
+			await live.session.waitForIdle();
+			expect(warning).toHaveBeenCalledWith(expect.stringContaining("stop note write failed"));
+			expect(live.eventsOfType("agent_end")).toHaveLength(2);
+			expect(live.session.messages).toContainEqual(
+				expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "queued work complete" }] }),
+			);
+		} finally {
+			release.resolve();
+			await running;
+			warning.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["default-abort", "extension-abort", "dispose", "archive"] as const)(
+		"does not record a user stop for %s",
+		async (mode) => {
+			let abortExtension: (() => void) | undefined;
+			const { live, h, state, started, release, aborted } = await liveFixture(
+				{
+					extensionFactories: [
+						(pi) => {
+							pi.on("agent_start", (_event, ctx) => {
+								abortExtension = () => ctx.abort();
+							});
+						},
+					],
+				},
+				true,
+			);
 			state.runtime = {
 				...state.runtime,
-				session: live.session,
-				dispose: async () => live.session.disposeAsync(),
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
 			} as ActiveSessionState["runtime"];
-			live.setResponses([fauxAssistantMessage("seeded")]);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("finished"),
+			]);
+			const running = live.session.prompt("active work");
+			const settled = Promise.allSettled([running]);
 			try {
-				await live.session.prompt("retained context");
-				await (
-					h.internals as unknown as {
-						closeSession(state: ActiveSessionState, reason: "shutdown" | "replaced"): Promise<void>;
-					}
-				).closeSession(state, reason);
+				await started.promise;
+				let stopping: Promise<void> | undefined;
+				if (mode === "archive") {
+					Object.assign(h.internals, { fencePeerTransports: () => {}, shutdown: async () => {} });
+					stopping = h.internals.handleLine(
+						h.client,
+						JSON.stringify({ id: "archive", type: "worker_archive_and_shutdown" }),
+					);
+				} else if (mode === "extension-abort") {
+					expect(abortExtension).toBeDefined();
+					abortExtension!();
+				} else if (mode === "dispose") await live.session.disposeAsync({ kernelSnapshot: false });
+				else stopping = live.session.abort();
+				if (mode !== "dispose") await aborted.promise;
+				release.resolve();
+				await stopping;
+				await settled;
 				expect(
 					live.sessionManager
 						.getEntries()
 						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
 				).toHaveLength(0);
 			} finally {
+				release.resolve();
+				await settled;
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["cancel", "delete", "goal-mesh"] as const)("keeps RLM %s separate from user stops", async (mode) => {
+		const child = await liveFixture({}, true);
+		child.live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+		const parent = await createHarness({
+			initialGoal: mode === "goal-mesh" ? { objective: "wait for the child" } : undefined,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.live.session }),
+				deleteRlmSubagentRuntime: async () => child.live.session.disposeAsync({ kernelSnapshot: false }),
+			},
+		});
+		parent.setResponses([fauxAssistantMessage("waiting"), fauxAssistantMessage("child settled")]);
+		try {
+			const spawned = await parent.session.runRlmChild("child work", { name: "fixture-child" });
+			await child.started.promise;
+			if (mode === "goal-mesh") {
+				parent.session.setMeshFollowUpPending(true);
+				await parent.session.prompt("wait for child");
+				parent.session.setMeshFollowUpPending(false);
+				await (parent.session as unknown as { _meshGoalResume?: Promise<void> })._meshGoalResume;
+				expect(parent.eventsOfType("agent_end")).toHaveLength(1);
+				expect(parent.session.goalState.continuationsUsed).toBe(0);
+				await parent.session.prompt("/goal pause");
+			}
+			if (mode === "delete") await parent.session.deleteRlmSubagent(spawned.rlm_child_id);
+			else expect(parent.session.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
+			child.release.resolve();
+			await parent.session.waitForRlmQuiescence();
+			expect(
+				child.live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+			).toHaveLength(0);
+		} finally {
+			child.release.resolve();
+			parent.cleanup();
+			child.live.cleanup();
+		}
+	});
+
+	it.each(["shutdown", "replaced", "killed", "update"] as const)(
+		"does not label lifecycle teardown as a user stop (%s)",
+		async (reason) => {
+			const { live, h, state, started, aborted, release } = await liveFixture({}, true);
+			state.runtime = {
+				...state.runtime,
+				session: live.session,
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+			} as ActiveSessionState["runtime"];
+			live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+			const running = live.session.prompt("active work");
+			try {
+				await started.promise;
+				const closing = (
+					h.internals as unknown as {
+						closeSession(
+							state: ActiveSessionState,
+							reason: "shutdown" | "replaced" | "killed" | "update",
+						): Promise<void>;
+					}
+				).closeSession(state, reason);
+				await aborted.promise;
+				release.resolve();
+				await closing;
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+				).toHaveLength(0);
+			} finally {
+				release.resolve();
+				await running;
 				live.cleanup();
 			}
 		},
@@ -6271,7 +6463,7 @@ describe("mesh worker persistence", () => {
 	});
 
 	it.each(["killed", "completed"] as const)(
-		"settles an unwritten own entry after close, including the actual-abort flush (%s)",
+		"reports closed for an existing unwritten own entry (%s)",
 		async (reason) => {
 			const h = harness();
 			await h.authenticate("cotal");
@@ -6312,22 +6504,9 @@ describe("mesh worker persistence", () => {
 				)
 					.closeSession(state, reason)
 					.catch(() => undefined);
-				expect(
-					h
-						.frames()
-						.filter(
-							(frame) => frame.type === "agent_message_dropped" || frame.type === "agent_message_persisted",
-						),
-				).toEqual([
-					reason === "killed"
-						? { type: "agent_message_persisted", cotalId: "buffered", attemptToken: "attempt" }
-						: { type: "agent_message_dropped", cotalId: "buffered", attemptToken: "attempt", reason: "closed" },
+				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual([
+					{ type: "agent_message_dropped", cotalId: "buffered", attemptToken: "attempt", reason: "closed" },
 				]);
-				expect(
-					live.sessionManager
-						.getEntries()
-						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
-				).toHaveLength(reason === "killed" ? 1 : 0);
 			} finally {
 				archive.mockRestore();
 				live.cleanup();

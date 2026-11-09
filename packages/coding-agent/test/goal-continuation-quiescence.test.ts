@@ -4,6 +4,12 @@ import { AgentSession } from "../src/core/agent-session.js";
 type Harness = {
 	_goalState: { status: string; objective?: string; continuationsUsed: number };
 	_goalContinuationAwaitsRlmWork: boolean;
+	_meshFollowUpPending: boolean;
+	_goalContinuationAwaitsMesh: boolean;
+	_meshGoalResume?: Promise<void>;
+	agent: { waitForIdle(): Promise<void> };
+	_agentEventQueue: Promise<void>;
+	_resumeGoalAfterMeshIdle(): void;
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -25,10 +31,23 @@ const maybeResume = Reflect.get(AgentSession.prototype, "_maybeResumeGoalContinu
 	this: Harness,
 ) => void;
 
+const resumeMesh = Reflect.get(AgentSession.prototype, "_resumeGoalAfterMeshIdle") as (this: Harness) => void;
+const setMeshPending = Reflect.get(AgentSession.prototype, "setMeshFollowUpPending") as (
+	this: Harness,
+	pending: boolean,
+) => void;
+
 function harness(overrides: Partial<Harness> = {}): Harness {
 	return {
 		_goalState: { status: "active", objective: "ship it", continuationsUsed: 0 },
 		_goalContinuationAwaitsRlmWork: false,
+		_meshFollowUpPending: false,
+		_goalContinuationAwaitsMesh: false,
+		agent: { waitForIdle: async () => {} },
+		_agentEventQueue: Promise.resolve(),
+		_resumeGoalAfterMeshIdle() {
+			resumeMesh.call(this);
+		},
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -52,6 +71,30 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 const context = { message: { role: "assistant", stopReason: "stop" }, context: {} };
 
 describe("goal continuation vs unsettled subagent work", () => {
+	it.each([
+		["_hasUnsettledRlmQuiescenceWork", false],
+		["_hasUnsettledRlmQuiescenceWork", true],
+		["_hasLiveBackgroundBashHandles", false],
+		["_hasLiveBackgroundBashHandles", true],
+	] as const)("holds Mesh-idle goal continuation for %s (new mail: %s)", async (work, newMail) => {
+		const mode = harness({ _meshFollowUpPending: true, _goalContinuationAwaitsMesh: true, [work]: () => true });
+		setMeshPending.call(mode, false);
+		await mode._meshGoalResume;
+		expect(mode._admitSessionInput).not.toHaveBeenCalled();
+		expect(mode._goalState.continuationsUsed).toBe(0);
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(true);
+		mode[work] = () => false;
+		if (newMail) setMeshPending.call(mode, true);
+		maybeResume.call(mode);
+		if (newMail) {
+			expect(mode._admitSessionInput).not.toHaveBeenCalled();
+			setMeshPending.call(mode, false);
+			await mode._meshGoalResume;
+		}
+		expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
+		expect(mode._goalState.continuationsUsed).toBe(1);
+	});
+
 	it("defers the continuation while descendant work is unsettled", async () => {
 		const mode = harness({ _hasUnsettledRlmQuiescenceWork: () => true });
 		await expect(getGoalContinuation.call(mode, context)).resolves.toEqual([]);

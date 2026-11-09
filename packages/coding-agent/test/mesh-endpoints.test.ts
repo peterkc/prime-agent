@@ -86,6 +86,7 @@ async function fixture(
 		bind(recipient);
 		return undefined;
 	},
+	canWait?: MeshEndpointOptions["canWait"],
 ) {
 	const root = mkdtempSync(join(tmpdir(), "prime-mesh-endpoints-"));
 	roots.push(root);
@@ -98,7 +99,7 @@ async function fixture(
 	}
 	const log = vi.fn();
 	const handoffSpy = vi.fn(handoff);
-	const mesh = new MeshEndpoints({ meshRoot: root, homeSocket: "home", log, handoff: handoffSpy });
+	const mesh = new MeshEndpoints({ meshRoot: root, homeSocket: "home", log, handoff: handoffSpy, canWait });
 	meshes.push(mesh);
 	await mesh.enroll("a", join(root, "a.json"));
 	await mesh.enroll("b", join(root, "b.json"));
@@ -619,6 +620,29 @@ describe("mesh endpoints", () => {
 		},
 	);
 
+	it("keeps an unresolved parent/child lookup ahead of later unmarked steers", async () => {
+		let resolvePolicy!: (canWait: boolean) => void;
+		const policy = new Promise<boolean>((resolve) => {
+			resolvePolicy = resolve;
+		});
+		const { mesh, target, handoff } = await fixture(undefined, () => policy);
+		const first = delivery("parent-first");
+		first.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+		const second = delivery("unmarked-second");
+		target.emit("message", first.message, first.delivery, { kind: "dm" });
+		target.emit("message", second.message, second.delivery, { kind: "dm" });
+		expect(handoff).not.toHaveBeenCalled();
+		resolvePolicy(false);
+		await policy;
+		expect(handoff.mock.calls.map((call) => call[1].id)).toEqual(["parent-first"]);
+		mesh.confirmPersisted(first.message.id, recipient, attempt(mesh, first.message.id));
+		await settled(mesh, "b");
+		expect(handoff.mock.calls.map((call) => call[1].id)).toEqual(["parent-first", "unmarked-second"]);
+		mesh.confirmPersisted(second.message.id, recipient, attempt(mesh, second.message.id));
+		await settled(mesh, "b");
+		expect([first.ack.mock.calls.length, second.ack.mock.calls.length]).toEqual([1, 1]);
+	});
+
 	it("keeps 25 follow-ups outside admission and lets a reply pass before FIFO idle delivery", async () => {
 		vi.useFakeTimers();
 		const offered: string[] = [];
@@ -639,7 +663,6 @@ describe("mesh endpoints", () => {
 		reply.message.replyTo = "original";
 		reply.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
 		target.emit("message", reply.message, reply.delivery, { kind: "dm" });
-		await settled(mesh, "b");
 		expect(offered).toEqual(["reply"]);
 		expect(reply.ack).not.toHaveBeenCalled();
 		mesh.confirmPersisted("reply", recipient, attempt(mesh, "reply"));
@@ -672,7 +695,6 @@ describe("mesh endpoints", () => {
 		expect(item.ack).not.toHaveBeenCalled();
 		expect(item.working).toHaveBeenCalledTimes(5);
 		mesh.setRunActive("b", true);
-		await settled(mesh, "b");
 		expect(handoff).toHaveBeenCalledTimes(2);
 		mesh.confirmPersisted("capacity", recipient, attempt(mesh, "capacity"));
 		await settled(mesh, "b");
@@ -785,29 +807,54 @@ describe("mesh endpoints", () => {
 		expect(source.unicastAttributed).toHaveBeenCalledTimes(1);
 	});
 
-	it("serializes offers, not persistence, and acknowledges only each matching attempt", async () => {
+	it("answers acceptance without ack, holds FIFO order and renews both messages until their own persistence frames", async () => {
 		vi.useFakeTimers();
-		const { mesh, target, handoff } = await fixture();
-		const items = [delivery("first"), delivery("second", 2)];
-		for (const item of items) target.emit("message", item.message, item.delivery, { kind: "dm" });
+		const early = delivery("early");
+		Endpoint.onStart = (endpoint) => {
+			if (endpoint.options.card?.id === "b") endpoint.emit("message", early.message, early.delivery, { kind: "dm" });
+		};
+		const { mesh, target, handoff, log } = await fixture();
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(early.ack).not.toHaveBeenCalled();
+		mesh.confirmPersisted("early", recipient, attempt(mesh, "early"));
+		await settled(mesh, "b");
+		expect(early.ack).toHaveBeenCalledTimes(1);
+		handoff.mockClear();
+		const first = delivery("first");
+		const second = delivery("second", 2);
+		target.emit("message", first.message, first.delivery, { kind: "dm" });
+		target.emit("message", second.message, second.delivery, { kind: "dm" });
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(first.ack).not.toHaveBeenCalled();
+		expect(second.ack).not.toHaveBeenCalled();
 		await vi.advanceTimersByTimeAsync(1000);
-		expect(handoff.mock.calls.map((call) => call[1].id)).toEqual(["first", "second"]);
-		for (const item of items) {
-			expect(item.ack).not.toHaveBeenCalled();
-			expect(item.working).toHaveBeenCalledTimes(2);
-		}
+		expect(first.working).toHaveBeenCalledTimes(2);
+		expect(second.working).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(log.mock.calls).toEqual([
+			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
+		]);
+		expect(first.working).toHaveBeenCalledTimes(7);
+		expect(second.ack).not.toHaveBeenCalled();
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
 		mesh.confirmPersisted("first", {}, attempt(mesh, "first"));
-		mesh.confirmPersisted("first", recipient, attempt(mesh, "second"));
-		expect(items[0]!.ack).not.toHaveBeenCalled();
-		for (const item of [...items].reverse()) {
-			mesh.confirmPersisted(item.message.id, recipient, attempt(mesh, item.message.id));
-			mesh.confirmPersisted(item.message.id, recipient, attempt(mesh, item.message.id));
-		}
-		await vi.advanceTimersByTimeAsync(6000);
-		for (const item of items) {
-			expect(item.ack).toHaveBeenCalledTimes(1);
-			expect(item.working).toHaveBeenCalledTimes(2);
-		}
+		expect(first.ack).not.toHaveBeenCalled();
+		mesh.confirmPersisted("first", recipient, attempt(mesh, "first"));
+		await settled(mesh, "b");
+		expect(first.ack).toHaveBeenCalledTimes(1);
+		expect(handoff).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(log.mock.calls).toEqual([
+			["Mesh session b, Cotal ID first, delivery count 1: persistence still pending; queued behind 1"],
+			["Mesh session b, Cotal ID second, delivery count 2: persistence still pending; queued behind 0"],
+		]);
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
+		await settled(mesh, "b");
+		expect(second.ack).toHaveBeenCalledTimes(1);
+		mesh.confirmPersisted("second", recipient, attempt(mesh, "second"));
+		expect(second.ack).toHaveBeenCalledTimes(1);
+		expect(handoff.mock.calls[1]![2]).toBe(2);
 	});
 
 	it.each(["cleared", "closed", "other"] as const)(

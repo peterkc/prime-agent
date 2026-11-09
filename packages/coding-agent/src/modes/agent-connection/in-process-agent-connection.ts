@@ -239,7 +239,7 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
 		const queue = this.session.clearQueue();
-		this.session.requestAbort();
+		this.session.requestAbort({ userStop: true });
 		return queue;
 	}
 
@@ -437,7 +437,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		this.session.requestAbort();
+		this.session.requestAbort({ userStop: true });
 	}
 
 	async abortAndSendQueued(): Promise<void> {

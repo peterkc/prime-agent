@@ -4535,6 +4535,7 @@ export class AgentDaemon {
 
 			case "kill": {
 				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.requestAbort({ userStop: true });
 				await this.closeSession(state, "killed");
 				return success(command.id, "kill");
 			}
@@ -4892,7 +4893,7 @@ export class AgentDaemon {
 
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.requestAbort();
+				state.runtime.session.requestAbort({ userStop: true });
 				return success(command.id, "abort");
 			}
 
@@ -5246,7 +5247,7 @@ export class AgentDaemon {
 			case "abort_and_clear_queue": {
 				const state = this.getSessionState(command.activeSessionId);
 				const queue = state.runtime.session.clearQueue();
-				state.runtime.session.requestAbort();
+				state.runtime.session.requestAbort({ userStop: true });
 				return success(command.id, "abort_and_clear_queue", queue);
 			}
 
