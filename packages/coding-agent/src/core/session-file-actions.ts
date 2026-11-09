@@ -20,8 +20,15 @@ import {
 	sessionArchivePath,
 } from "./session-storage-paths.js";
 
-/** Session headers in artifact files, plus already-leased files when deleting. */
-export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: string): Generator<string> {
+/**
+ * Session headers in artifact files, plus already-leased files when deleting.
+ * Strict callers also inspect unreadable .jsonl candidates and receive I/O failures.
+ */
+export function* sessionArtifactFiles(
+	artifactDirectory: string,
+	agentDir?: string,
+	options: { readonly strict?: boolean } = {},
+): Generator<string> {
 	const directories = [artifactDirectory];
 	while (directories.length > 0) {
 		const directory = directories.pop()!;
@@ -32,7 +39,8 @@ export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: stri
 			if (isSessionArchivePath(directory)) continue;
 			entries = readdirSync(directory, { withFileTypes: true });
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT" && (!options.strict || directory === artifactDirectory))
+				continue;
 			throw error;
 		}
 		for (const entry of entries) {
@@ -46,9 +54,15 @@ export function* sessionArtifactFiles(artifactDirectory: string, agentDir?: stri
 				try {
 					if (isSessionArchivePath(path)) continue;
 					if (entry.isSymbolicLink() && !statSync(path).isFile()) continue;
+					if (options.strict && path.endsWith(".jsonl")) {
+						yield path;
+						continue;
+					}
 					const header = JSON.parse(readFirstLineSync(path) ?? "null") as { type?: unknown } | null;
 					if (header?.type !== "session") continue;
-				} catch {
+				} catch (error) {
+					if (options.strict && !(error instanceof SyntaxError))
+						throw new Error(`Cannot read session artifact ${path}: ${String(error)}`, { cause: error });
 					// No existing lease: a failed probe identifies no owner to protect.
 					continue;
 				}

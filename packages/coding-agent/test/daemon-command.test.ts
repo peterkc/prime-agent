@@ -1,11 +1,14 @@
 import * as cp from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repositoryDaemon } from "../src/cli/repository-daemon.js";
-import { ENV_AGENT_DIR } from "../src/config.js";
+import { ENV_AGENT_DIR, getDefaultAgentDir } from "../src/config.js";
+import { getSessionArtifactPathForFile, readSessionInfo } from "../src/core/session-manager.js";
 import { DaemonCommandNotSentError } from "../src/modes/daemon/daemon-client.js";
+import { RlmSpawnLedger, withPassiveRlmDescendantInfos } from "../src/modes/daemon/rlm-ledger.js";
 
 const daemonClientMock = vi.hoisted(() => {
 	type Listener = (message: { type: string; activeSessionId?: string; event?: { type: string } }) => void;
@@ -171,6 +174,8 @@ const spawnMock = vi.hoisted(() => {
 		},
 	};
 });
+
+vi.mock("node:fs", { spy: true });
 
 vi.mock("node:child_process", async (importOriginal) => {
 	const original = (await importOriginal()) as Record<string, unknown>;
@@ -451,27 +456,19 @@ describe("daemon command", () => {
 		let enrollment: string;
 		let directory: string;
 		let control: string;
-		beforeEach(() => {
+		beforeEach(async () => {
 			folder = mkdtempSync(join(tmpdir(), "delete-"));
 			const meshHome = join(folder, "mesh");
 			for (const part of ["enrollments", "directory", "bin"]) mkdirSync(join(meshHome, part), { recursive: true });
-			sessionPath = join(folder, "saved.jsonl");
-			writeFileSync(sessionPath, "saved transcript");
+			sessionPath = join(folder, "sessions", `${sessionId}.jsonl`);
+			transcript(sessionId, sessionPath);
 			enrollment = join(meshHome, "enrollments", `${sessionId}.json`);
 			directory = join(meshHome, "directory", `${sessionId}.json`);
 			writeFileSync(
 				directory,
 				JSON.stringify({ sessionId, name: "saved", principal: "local.test", homeSocket: "home" }),
 			);
-			writeFileSync(
-				enrollment,
-				JSON.stringify({
-					sessionId,
-					sessionFile: sessionPath,
-					identity: { id: "test" },
-					lifecycleUid: "a".repeat(26),
-				}),
-			);
+			enroll(sessionId, sessionPath);
 			writeFileSync(
 				join(meshHome, "mesh.json"),
 				JSON.stringify({ space: "prime", server: "nats://127.0.0.1:4222" }),
@@ -494,30 +491,26 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			);
 			vi.stubEnv(ENV_AGENT_DIR, folder);
 			vi.stubEnv("PATH", join(meshHome, "bin"));
-			daemonClientMock.behavior.savedSessions = [
-				{
-					path: sessionPath,
-					id: sessionId,
-					name: "saved",
-					cwd: folder,
-					created: "2026-01-01",
-					modified: "2026-01-01",
-					messageCount: 1,
-					firstMessage: "hello",
-					allMessagesText: "hello",
-				},
-			];
+			daemonClientMock.behavior.savedSessions = [{ ...(await readSessionInfo(sessionPath))!, name: "saved" }];
 		});
 		afterEach(() => {
 			vi.unstubAllEnvs();
 			rmSync(folder, { recursive: true, force: true });
 		});
 		function enroll(id: string, path: string) {
-			const record = JSON.parse(readFileSync(enrollment, "utf8"));
 			writeFileSync(
 				join(folder, "mesh", "enrollments", `${id}.json`),
-				JSON.stringify({ ...record, sessionId: id, sessionFile: path }),
+				JSON.stringify({
+					sessionId: id,
+					sessionFile: path,
+					identity: { id: "test" },
+					lifecycleUid: "a".repeat(26),
+				}),
 			);
+		}
+		function transcript(id: string, path: string) {
+			mkdirSync(join(path, ".."), { recursive: true });
+			writeFileSync(path, JSON.stringify({ type: "session", version: 3, id, cwd: folder, timestamp: "2026-01-01" }));
 		}
 		function deletions() {
 			return daemonClientMock.instances
@@ -527,15 +520,20 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 		async function run(selector = "saved", ...flags: string[]) {
 			await handleDaemonCommand(["daemon", "--socket", join(folder, "daemon.sock"), "delete", selector, ...flags]);
 		}
-		it.each(["name", "prefix", "never-enrolled", "json"])("deletes a closed session (%s)", async (kind) => {
-			if (kind === "never-enrolled") {
+		const closedKinds = ["name", "prefix", "never-enrolled", "default-dir", "default-alias", "json"];
+		it.each(closedKinds)("deletes a closed session (%s)", async (kind) => {
+			if (["never-enrolled", "default-dir", "default-alias"].includes(kind)) {
 				rmSync(enrollment);
 				rmSync(directory);
 				rmSync(join(folder, "mesh", "bin", "cotal"));
-			}
-			if (kind === "never-enrolled") {
 				vi.stubEnv("HOME", folder);
-				vi.stubEnv(ENV_AGENT_DIR, "");
+				mkdirSync(getDefaultAgentDir(), { recursive: true });
+				const alias = join(folder, "default-alias");
+				symlinkSync(getDefaultAgentDir(), alias);
+				vi.stubEnv(
+					ENV_AGENT_DIR,
+					kind === "never-enrolled" ? "" : kind === "default-dir" ? getDefaultAgentDir() : alias,
+				);
 				vi.spyOn(process, "cwd").mockReturnValue(folder);
 				await handleDaemonCommand(["daemon", "delete", "saved"]);
 			} else await run(kind === "prefix" ? "12345678" : "saved", ...(kind === "json" ? ["--json"] : []));
@@ -570,52 +568,76 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 			expect(consoleErrorMessages.join(" ")).toContain("5 unacknowledged mesh messages");
 			expect(deletions()).toEqual([]);
 		});
-		it.each(["pending", "unreadable", "grandchild", "zero", "unrelated"])(
-			"checks descendant mesh queues (%s)",
-			async (kind) => {
-				const saved = daemonClientMock.behavior.savedSessions[0]!;
-				const alias = join(folder, "parent-alias.jsonl");
-				symlinkSync(sessionPath, alias);
-				const child = {
+		it.each([
+			"pending",
+			"unreadable",
+			"grandchild",
+			"zero",
+			"unrelated",
+			"ledger-error",
+			"unlisted",
+			"malformed",
+			"dangling",
+			"directory-error",
+		])("checks deletion transcripts, not catalog descendants (%s)", async (kind) => {
+			const artifacts = getSessionArtifactPathForFile(sessionPath);
+			const child = {
+				id: "child",
+				path: join(kind === "unrelated" ? folder : artifacts, "sub-child", "child.jsonl"),
+			};
+			const grandchild = { id: "grandchild", path: join(child.path, "..", "nested", "grandchild.jsonl") };
+			for (const member of [child, grandchild]) {
+				transcript(member.id, member.path);
+				enroll(member.id, member.path);
+			}
+			const saved = { ...(await readSessionInfo(sessionPath))!, name: "saved" };
+			if (kind === "ledger-error") {
+				const ledger = new RlmSpawnLedger(folder, folder);
+				vi.spyOn(ledger, "liveEdges").mockRejectedValue(new Error("ledger read failed"));
+				const rows = await withPassiveRlmDescendantInfos([saved], ledger);
+				daemonClientMock.behavior.savedSessions = rows.map((row) => ({ ...row }));
+			} else if (kind !== "unlisted") {
+				const rows = [grandchild, child, child].map((member) => ({
 					...saved,
-					id: "child",
-					name: "child",
-					path: join(folder, "child.jsonl"),
-					parentSessionPath: alias,
+					...member,
+					parentSessionPath: sessionPath,
 					rlmDepth: 1,
-				};
-				const grandchild = {
-					...child,
-					id: "grandchild",
-					name: "grandchild",
-					path: join(folder, "grandchild.jsonl"),
-					parentSessionPath: child.path,
-					rlmDepth: 2,
-				};
-				for (const member of [child, grandchild]) {
-					writeFileSync(member.path, "closed child transcript");
-					enroll(member.id, member.path);
-				}
-				if (kind === "unrelated") child.parentSessionPath = join(folder, "other-root.jsonl");
-				daemonClientMock.behavior.savedSessions.push(grandchild, child, { ...child });
-				const blocked = kind === "grandchild" ? "grandchild" : "child";
-				writeFileSync(
-					control,
-					JSON.stringify({
-						pending: 0,
-						ackPending: 0,
-						sessions: {
-							[blocked]: { pending: kind === "zero" ? 0 : 1, ackPending: 0, fail: kind === "unreadable" },
-						},
-					}),
+				}));
+				daemonClientMock.behavior.savedSessions.push(...rows);
+			}
+			if (kind === "malformed") writeFileSync(child.path, "{broken");
+			if (kind === "dangling") {
+				rmSync(child.path);
+				symlinkSync(join(folder, "missing"), child.path);
+			}
+			if (kind === "directory-error")
+				vi.spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+					throw new Error("artifact listing denied");
+				});
+			const blocked = kind === "grandchild" ? "grandchild" : "child";
+			writeFileSync(
+				control,
+				JSON.stringify({
+					pending: 0,
+					ackPending: 0,
+					sessions: {
+						[blocked]: { pending: kind === "zero" ? 0 : 1, ackPending: 0, fail: kind === "unreadable" },
+					},
+				}),
+			);
+			await run();
+			const refused = kind !== "zero" && kind !== "unrelated";
+			expect(process.exitCode ?? 0).toBe(refused ? 1 : 0);
+			expect(deletions()).toEqual(refused ? [] : [{ type: "delete_saved_session", sessionPath }]);
+			if (refused)
+				expect(consoleErrorMessages.join(" ")).toContain(
+					kind === "directory-error"
+						? "Cannot enumerate"
+						: kind === "malformed" || kind === "dangling"
+							? child.path
+							: `Cannot delete ${blocked}:`,
 				);
-				await run();
-				const refused = kind !== "zero" && kind !== "unrelated";
-				expect(process.exitCode ?? 0).toBe(refused ? 1 : 0);
-				expect(deletions()).toEqual(refused ? [] : [{ type: "delete_saved_session", sessionPath }]);
-				if (refused) expect(consoleErrorMessages.join(" ")).toContain(`Cannot delete ${blocked}:`);
-			},
-		);
+		});
 		it.each(["agent-dir", "socket", "socket-alias"])(
 			"refuses absent enrollment with an override (%s)",
 			async (kind) => {
@@ -650,12 +672,8 @@ console.log(config.invalid ? "bad counts" : JSON.stringify(config));
 		});
 		it("does not confuse a saved ID prefix with another session's stop-style suffix", async () => {
 			const otherPath = join(folder, "other.jsonl");
-			daemonClientMock.behavior.savedSessions.push({
-				...daemonClientMock.behavior.savedSessions[0]!,
-				id: "abcdef00-other",
-				name: "other",
-				path: otherPath,
-			});
+			transcript("abcdef00-other", otherPath);
+			daemonClientMock.behavior.savedSessions.push({ ...(await readSessionInfo(otherPath))!, name: "other" });
 			enroll("abcdef00-other", otherPath);
 			await run("abcdef");
 			expect(process.exitCode ?? 0).toBe(0);
