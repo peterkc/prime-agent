@@ -333,6 +333,7 @@ export async function removeEnrollment(
 	sessionId: string,
 	deletedPath: string,
 	ledgerProof?: boolean,
+	beforeRemove?: (record: EnrollmentRecord) => void,
 ): Promise<"absent" | "mismatch" | EnrollmentRecord> {
 	return withDirectoryLock(meshRoot, sessionId, async () => {
 		const path = enrollmentPath(meshRoot, sessionId);
@@ -344,6 +345,7 @@ export async function removeEnrollment(
 				lstatSync(record.sessionFile, { throwIfNoEntry: false }) !== undefined)
 		)
 			return "mismatch";
+		beforeRemove?.(record);
 		await rm(directoryPath(meshRoot, sessionId), { force: true });
 		await rm(path, { force: true });
 		return record;

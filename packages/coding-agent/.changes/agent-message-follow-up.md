@@ -1,0 +1,2 @@
+- Added opt-in wait-safe agent messages that start follow-up runs when idle, while linked replies and direct parent-child traffic still steer. Native and older receivers retain steering delivery.
+- Added a durable stop note before messages delivered after an abort.

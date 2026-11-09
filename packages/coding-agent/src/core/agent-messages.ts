@@ -20,7 +20,33 @@ export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY = 3;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 
-/** Legacy daemon wire input accepted and ignored for compatibility. */
+export const AGENT_MESSAGE_CAN_WAIT_HEADER = "[prime-agent-message v1 can_wait=true]";
+
+export interface AgentMessageSchedulingOptions {
+	canWait?: boolean;
+	replyTo?: string;
+}
+
+export function parseAgentMessageScheduling(input: {
+	canWait?: unknown;
+	replyTo?: unknown;
+}): AgentMessageSchedulingOptions {
+	if (input.canWait !== undefined && typeof input.canWait !== "boolean")
+		throw new Error("agent_message.send can_wait must be a boolean");
+	if (
+		input.replyTo !== undefined &&
+		(typeof input.replyTo !== "string" ||
+			!/^[A-Za-z0-9_-]+$/.test(input.replyTo) ||
+			input.replyTo === AGENT_MESSAGE_ID_PREFIX)
+	)
+		throw new Error("agent_message.send reply_to must be a nonempty message ID");
+	return {
+		...(input.canWait !== undefined ? { canWait: input.canWait as boolean } : {}),
+		...(input.replyTo !== undefined ? { replyTo: input.replyTo as string } : {}),
+	};
+}
+
+/** Legacy native scheduling input; unsupported receivers retain steer delivery. */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued" | "stored";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
@@ -120,7 +146,16 @@ export interface AgentSessionNameAvailabilityInput extends AgentSessionNameScope
 	ignoreSessionIds?: string[];
 }
 
-export interface AgentSessionMessagePayload {
+export class AgentMessageRunActiveError extends Error {}
+
+export function agentMessageCanWait(
+	options: AgentMessageSchedulingOptions,
+	relationship?: AgentFamilyRelationship,
+): boolean {
+	return options.canWait === true && !options.replyTo && relationship !== "parent" && relationship !== "child";
+}
+
+export interface AgentSessionMessagePayload extends AgentMessageSchedulingOptions {
 	id: string;
 	source: typeof AGENT_MESSAGE_SOURCE;
 	message: string;
@@ -128,10 +163,14 @@ export interface AgentSessionMessagePayload {
 	/** Sender relationship from the receiver's point of view. */
 	fromRelationship?: AgentFamilyRelationship;
 	possiblyRepeated?: boolean;
+	publishedAt?: number;
+	deliveryMode?: "steer" | "follow_up";
 	target: AgentSessionMessageEndpoint;
 }
 
-export interface AgentSessionMessageDetails {
+export interface AgentSessionMessageDetails extends AgentMessageSchedulingOptions {
+	publishedAt?: number;
+	deliveryMode?: "steer" | "follow_up";
 	id: string;
 	message: string;
 	from?: AgentSessionMessageSender;
@@ -160,10 +199,11 @@ export interface AgentSessionMessageReceipt {
 	deliveredAt?: string;
 	/** Present only for queued messages: when it was placed behind current work. */
 	queuedAt?: string;
-	deliveryMode?: "steer";
+	deliveryMode?: "steer" | "follow_up";
+	schedulingFallback?: "steer";
 }
 
-export interface AgentSessionMessageSendInput {
+export interface AgentSessionMessageSendInput extends AgentMessageSchedulingOptions {
 	target: string;
 	message: string;
 	receiverRole?: AgentFamilyRelationship;
@@ -379,7 +419,7 @@ export function assertAgentMessageQueueCapacity(
 
 /**
  * Parses the message id out of the pre-bracket-grammar header that persisted
- * transcripts still contain; current prompts keep the id in details only.
+ * transcripts still contain; current prompts use customType/details for detection.
  */
 export function parseAgentSessionMessagePromptId(text: string): string | undefined {
 	const lines = text.split("\n");
@@ -413,7 +453,7 @@ export function createAgentSessionMessagePrompt(payload: AgentSessionMessagePayl
 		) || "unknown";
 	const sender = payload.fromRelationship ? `${payload.fromRelationship}:${senderName}` : senderName;
 	const repeat = payload.possiblyRepeated ? "Possibly repeated agent message.\n\n" : "";
-	return `[agent-message from ${sender}]\n\n${repeat}${payload.message}`;
+	return `[agent-message from ${sender}]\nMessage id: ${sanitizeMessageHeaderValue(payload.id)}\n\n${repeat}${payload.message}`;
 }
 
 export function createAgentSessionMessage(
@@ -431,6 +471,10 @@ export function createAgentSessionMessage(
 			from: payload.from,
 			fromRelationship: payload.fromRelationship,
 			target: payload.target,
+			...(payload.canWait !== undefined ? { canWait: payload.canWait } : {}),
+			...(payload.replyTo !== undefined ? { replyTo: payload.replyTo } : {}),
+			...(payload.publishedAt !== undefined ? { publishedAt: payload.publishedAt } : {}),
+			...(payload.deliveryMode !== undefined ? { deliveryMode: payload.deliveryMode } : {}),
 		},
 		timestamp,
 	};
@@ -473,7 +517,10 @@ export function createAgentSessionMessageReceipt(
 		message: payload.message,
 		deliveryStatus: status,
 		...(status === "delivered" ? { deliveredAt: at } : status === "queued" ? { queuedAt: at } : {}),
-		deliveryMode: "steer",
+		deliveryMode: payload.deliveryMode ?? "steer",
+		...(payload.canWait === true && payload.deliveryMode !== "follow_up"
+			? { schedulingFallback: "steer" as const }
+			: {}),
 	};
 }
 
@@ -561,6 +608,7 @@ export function createAgentMessageHostHandlers(
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
 			}
+			const scheduling = parseAgentMessageScheduling({ canWait: payload.can_wait, replyTo: payload.reply_to });
 			let target: string;
 			if (typeof payload.target === "string") {
 				if (payload.target !== "all") {
@@ -577,6 +625,7 @@ export function createAgentMessageHostHandlers(
 						controller.sendAgentMessage({
 							target: member.entry.id,
 							message: payload.message as string,
+							...scheduling,
 							receiverRole: member.relationship,
 						}),
 					),
@@ -597,6 +646,7 @@ export function createAgentMessageHostHandlers(
 				return (await controller.sendAgentMessage({
 					target: payload.receiver_name.trim(),
 					message: payload.message,
+					...scheduling,
 					targetKind: "name",
 				})) as unknown as Record<string, unknown>;
 			} else {
@@ -636,6 +686,7 @@ export function createAgentMessageHostHandlers(
 			return (await controller.sendAgentMessage({
 				target,
 				message: payload.message,
+				...scheduling,
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
 			})) as unknown as Record<string, unknown>;
 		},

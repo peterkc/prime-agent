@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { normalizeAgentSessionMessage } from "../../../core/agent-messages.js";
+import {
+	AGENT_MESSAGE_CAN_WAIT_HEADER,
+	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
+} from "../../../core/agent-messages.js";
 
 function sessionKey(sessionId: string): string {
 	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
@@ -111,7 +115,7 @@ export class MeshTransferRecordError extends Error {
 /** Only payload-validation failures are permanent; residency and I/O failures may recover. */
 export class InvalidMeshPayloadError extends Error {}
 
-export function meshMessageText(message: unknown): string {
+export function meshMessagePayload(message: unknown): { text: string; canWait: boolean; replyTo?: string } {
 	if (!message || typeof message !== "object") throw new InvalidMeshPayloadError("Malformed mesh payload");
 	const value = message as Record<string, unknown>;
 	const from = value.from as Record<string, unknown> | undefined;
@@ -134,9 +138,40 @@ export function meshMessageText(message: unknown): string {
 		)
 	)
 		throw new InvalidMeshPayloadError("Unsupported mesh payload shape");
+	const parts = value.parts as { kind: "text"; text: string }[];
+	let text: string;
 	try {
-		return normalizeAgentSessionMessage(value.parts.map((part: { text: string }) => part.text).join("\n"));
+		text = normalizeAgentSessionMessage(parts.map((part) => part.text).join("\n"));
 	} catch {
 		throw new InvalidMeshPayloadError("Mesh text is empty or exceeds the agent message limit");
 	}
+	let replyTo: string | undefined;
+	try {
+		replyTo = parseAgentMessageScheduling({ replyTo: value.replyTo }).replyTo;
+	} catch {
+		return { text, canWait: false };
+	}
+	const marked = parts.length >= 2 && parts[0]?.text === AGENT_MESSAGE_CAN_WAIT_HEADER;
+	let body = text;
+	if (marked) {
+		try {
+			body = normalizeAgentSessionMessage(
+				parts
+					.slice(1)
+					.map((part) => part.text)
+					.join("\n"),
+			);
+		} catch {
+			throw new InvalidMeshPayloadError("Mesh text is empty or exceeds the agent message limit");
+		}
+	}
+	return {
+		text: body,
+		canWait: marked,
+		...(replyTo !== undefined ? { replyTo } : {}),
+	};
+}
+
+export function meshMessageText(message: unknown): string {
+	return meshMessagePayload(message).text;
 }

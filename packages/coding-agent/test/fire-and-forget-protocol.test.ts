@@ -13,8 +13,8 @@ describe("fire-and-forget agent protocol", () => {
 			fromRelationship: "child",
 			target: endpoint,
 		});
-		expect(prompt).toBe("[agent-message from child:worker]\n\nfinished");
-		// The id lives in message details now; the text-level parser only serves legacy transcripts.
+		expect(prompt).toBe("[agent-message from child:worker]\nMessage id: agentmsg_reply\n\nfinished");
+		// The visible ID is for reply links; only details identify a current message.
 		expect(parseAgentSessionMessagePromptId(prompt)).toBeUndefined();
 	});
 

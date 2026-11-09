@@ -20,9 +20,10 @@ import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { CotalEndpoint, createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { type Api, type Context, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { streamOpenAIResponses } from "../../ai/src/providers/openai-responses.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
@@ -449,7 +450,7 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("Unknown active session: deleted-child");
-		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue");
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue", {});
 	});
 
 	it("reports queued status when a direct accept races into the queue", async () => {
@@ -4452,7 +4453,7 @@ describe("mesh worker persistence", () => {
 			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
 				.push(Buffer.concat(written))
 				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
-		const authenticate = (mode?: string) =>
+		const authenticate = (mode?: string, capabilities = ["mesh_follow_up"]) =>
 			internals.handleLine(
 				client,
 				JSON.stringify({
@@ -4463,10 +4464,471 @@ describe("mesh worker persistence", () => {
 					supervisorPid: process.pid,
 					supervisorSocketPath: join(root, "supervisor.sock"),
 					...(mode ? { agentMessageTransport: mode } : {}),
+					capabilities,
 				}),
 			);
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
+
+	async function liveFixture(
+		options: Parameters<typeof createHarness>[0] = {},
+		hold = false,
+		capabilities = ["mesh_follow_up"],
+	) {
+		const started = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			...options,
+			tools: hold
+				? [
+						{
+							name: "wait",
+							label: "wait",
+							description: "fixture boundary",
+							parameters: Type.Object({}),
+							execute: async () => {
+								started.resolve();
+								await release.promise;
+								return { content: [{ type: "text", text: "released" }], details: {} };
+							},
+						},
+					]
+				: options.tools,
+		});
+		const h = harness();
+		await h.authenticate("cotal", capabilities);
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		const receive = (
+			command: Omit<
+				Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+				"type" | "targetActiveSessionId" | "sender"
+			>,
+		) =>
+			h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: "target",
+				sender: { sessionName: "peer" },
+				...command,
+			});
+		return { live, h, state, started, release, receive };
+	}
+
+	it.each(["supported", "unsupported", "parent", "child", "reply"] as const)(
+		"defers supported busy follow-ups, with safe control and old-peer overrides (%s)",
+		async (policy) => {
+			const {
+				live,
+				h,
+				started,
+				release: released,
+				receive,
+			} = await liveFixture({}, true, policy === "unsupported" ? [] : ["mesh_follow_up"]);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("original complete"),
+				fauxAssistantMessage("follow-up complete"),
+			]);
+			const running = live.session.prompt("original work");
+			try {
+				await started.promise;
+				const listeners = h.socket.listenerCount("close");
+				const command = {
+					message: "routine update",
+					canWait: true,
+					...(policy === "reply" ? { replyTo: "original" } : {}),
+					...(policy === "parent" || policy === "child" ? { fromRelationship: policy } : {}),
+					cotal: { id: "held", deliveryCount: 1, attemptToken: "first" },
+				} as const;
+				await receive(command);
+				if (policy !== "supported") {
+					expect(h.frames().at(-1)).toMatchObject({
+						success: true,
+						data: { deliveryStatus: "queued", deliveryMode: "steer", schedulingFallback: "steer" },
+					});
+					expect(live.session.queuedActionCount).toBe(1);
+					released.resolve();
+					await running;
+					expect(h.frames()).toContainEqual({
+						type: "agent_message_persisted",
+						cotalId: "held",
+						attemptToken: "first",
+					});
+					return;
+				}
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+				expect(h.socket.listenerCount("close")).toBe(listeners);
+				expect(live.session.queuedActionCount).toBe(0);
+				expect(JSON.stringify(live.session.messages)).not.toContain("routine update");
+				released.resolve();
+				await running;
+				await receive({
+					...command,
+					cotal: { ...command.cotal, attemptToken: "second" },
+				});
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_held");
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "held",
+					attemptToken: "second",
+				});
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+				).toHaveLength(1);
+			} finally {
+				released.resolve();
+				await running;
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["busy", "replacement"] as const)("revalidates a marked offer at atomic admission (%s)", async (race) => {
+		const { live, h, state, receive } = await liveFixture();
+		const fence = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const observers = vi.spyOn(live.sessionManager, "onPersist");
+		const entered = createDeferred();
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const admission = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const accepting = originalAccept(text, options);
+			entered.resolve();
+			return accepting;
+		});
+		const accepting = receive({
+			message: "race FYI",
+			canWait: true,
+			cotal: { id: "race", deliveryCount: 1, attemptToken: "race-attempt" },
+		});
+		const result = race === "replacement" ? expect(accepting).rejects.toThrow("Target session changed") : accepting;
+		try {
+			await entered.promise;
+			expect(live.session.hasPendingAdmissionWaiters).toBe(true);
+			if (race === "busy") Object.assign(live.session.agent.state, { isStreaming: true });
+			else
+				state.runtime = { ...state.runtime, session: Object.create(live.session) } as ActiveSessionState["runtime"];
+			fence.resolve();
+			await result;
+			if (race === "busy")
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+			expect(observers).not.toHaveBeenCalled();
+			expect(live.session.queuedActionCount).toBe(0);
+			expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+		} finally {
+			Object.assign(live.session.agent.state, { isStreaming: false });
+			fence.resolve();
+			await Promise.allSettled([accepting]);
+			observers.mockRestore();
+			admission.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["complete", "disconnect", "dispose"] as const)(
+		"bounds 19 pending socket observers and cleans every attempt (%s)",
+		async (ending) => {
+			const { live, h, started: entered, release, receive } = await liveFixture({}, true);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("complete"),
+			]);
+			const running = live.session.prompt("original");
+			const warnings: Error[] = [];
+			const onWarning = (warning: Error) => warnings.push(warning);
+			process.on("warning", onWarning);
+			try {
+				await entered.promise;
+				for (let index = 0; index < 19; index++)
+					await receive({
+						message: `steer ${index}`,
+						cotal: { id: `observer-${index}`, deliveryCount: 1, attemptToken: `attempt-${index}` },
+					});
+				expect(h.socket.listenerCount("close")).toBe(1);
+				await expect(
+					receive({
+						message: "overflow",
+						cotal: { id: "overflow", deliveryCount: 1, attemptToken: "overflow" },
+					}),
+				).rejects.toThrow("Target session has too many pending messages: 20 unfinished, limit is 20");
+				if (ending === "disconnect") {
+					h.socket.destroyed = true;
+					h.socket.emit("close");
+				}
+				if (ending === "dispose") live.session.dispose();
+				release.resolve();
+				await running;
+				await live.session.waitForSessionInputIdle();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(h.socket.listenerCount("close")).toBe(0);
+				expect(warnings.filter((warning) => warning.name === "MaxListenersExceededWarning")).toEqual([]);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(
+					ending === "complete" ? 19 : 0,
+				);
+			} finally {
+				release.resolve();
+				await running;
+				process.off("warning", onWarning);
+				live.cleanup();
+			}
+		},
+	);
+
+	it("negotiates transient goal hints and rejects stale revisions and changed targets", async () => {
+		const { live, h, state } = await liveFixture();
+		const update = vi.spyOn(live.session, "setMeshFollowUpPending");
+		const command = {
+			type: "worker_mesh_follow_up_state",
+			targetActiveSessionId: "target",
+			sessionId: live.session.sessionId,
+			pending: true,
+			revision: 3,
+		};
+		try {
+			for (const change of [
+				{},
+				{ pending: false, revision: 2 },
+				{ pending: false, revision: 4 },
+				{ sessionId: "replaced", pending: true, revision: 5 },
+			])
+				await h.internals.handleLine(h.client, JSON.stringify({ ...command, ...change }));
+			expect(update.mock.calls).toEqual([[true], [false]]);
+			expect(h.frames().at(-1)).toMatchObject({ success: false, error: "Mesh follow-up target changed" });
+			const older = harness();
+			older.internals.sessions.set("target", state);
+			await older.authenticate("cotal", []);
+			await older.internals.handleLine(older.client, JSON.stringify({ ...command, revision: 6 }));
+			expect(older.frames().at(-1)).toMatchObject({ success: false, error: "Unsupported mesh follow-up state" });
+			expect(update.mock.calls).toEqual([[true], [false], [false]]);
+		} finally {
+			update.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["drained", "deleted", "explicit-start", "resume-error"] as const)(
+		"gives held follow-ups the goal boundary and resumes after %s state",
+		async (outcome) => {
+			let live: Awaited<ReturnType<typeof createHarness>>;
+			const fixture = await liveFixture({
+				tools: [
+					{
+						name: "ipython",
+						label: "ipython",
+						description: "faux completion",
+						parameters: Type.Object({}),
+						execute: async () => {
+							live.session.handleGoalHostRequest("goal.complete");
+							return { content: [{ type: "text", text: "complete" }], details: {} };
+						},
+					},
+				],
+			});
+			live = fixture.live;
+			const { receive } = fixture;
+			const complete = createDeferred();
+			const deliver = outcome === "drained" || outcome === "explicit-start";
+			live.session.subscribe((event) => {
+				if (event.type === "goal_update" && (event.goal.status === "complete" || event.goal.status === "error"))
+					complete.resolve();
+			});
+			live.session.setMeshFollowUpPending(true);
+			live.setResponses([
+				fauxAssistantMessage("original final"),
+				...(outcome === "explicit-start" ? [fauxAssistantMessage("explicit user final")] : []),
+				...(deliver ? [fauxAssistantMessage("FYI final")] : []),
+				...(outcome === "resume-error"
+					? []
+					: [
+							fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+							fauxAssistantMessage("goal complete"),
+						]),
+			]);
+			try {
+				await live.session.prompt("/goal bounded fixture goal");
+				expect(live.eventsOfType("agent_end")).toHaveLength(1);
+				expect(live.session.goalState.continuationsUsed).toBe(0);
+				if (outcome === "explicit-start") await live.session.prompt("explicit user start");
+				if (outcome === "resume-error")
+					vi.spyOn(
+						live.session as unknown as { _ensureGoalRuntimeActive(): void },
+						"_ensureGoalRuntimeActive",
+					).mockImplementationOnce(() => {
+						throw new Error("fixture continuation failed");
+					});
+				if (deliver) {
+					await receive({
+						message: "held FYI",
+						canWait: true,
+						cotal: { id: "goal-held", deliveryCount: 1, attemptToken: "goal-attempt" },
+					});
+				}
+				live.session.setMeshFollowUpPending(false);
+				await complete.promise;
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.goalState.status).toBe(outcome === "resume-error" ? "error" : "complete");
+				expect(live.getPendingResponseCount()).toBe(0);
+				if (outcome === "resume-error")
+					expect(live.session.goalState.lastError).toBe("fixture continuation failed");
+				else expect(live.eventsOfType("agent_end").length).toBeGreaterThan(1);
+			} finally {
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["idle", "in-run", "restart", "update", "failed"] as const)(
+		"persists one actual-abort note before the next serialized provider input (%s)",
+		async (mode) => {
+			const { live, h, state, started, release, receive } = await liveFixture({}, true);
+			let reopened: Awaited<ReturnType<typeof createHarness>> | undefined;
+			let running: Promise<void> | undefined;
+			try {
+				if (mode === "in-run") {
+					live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+					running = live.session.prompt("work to abort");
+					await started.promise;
+				}
+				if (mode === "failed")
+					vi.spyOn(live.sessionManager, "appendCustomMessageEntryWithRollback").mockImplementationOnce(() => {
+						throw new Error("stop note write failed");
+					});
+				if (mode === "update") live.session.abortForUpdateRestart();
+				else
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({ id: "abort", type: "abort", activeSessionId: "target" }),
+					);
+				release.resolve();
+				await running;
+				const notes = live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop");
+				expect(notes).toHaveLength(mode === "update" || mode === "failed" ? 0 : 1);
+				if (mode === "failed") {
+					await expect(
+						receive({
+							message: "must not overtake the failed note",
+							canWait: true,
+							cotal: { id: "failed-note", deliveryCount: 1, attemptToken: "failed" },
+						}),
+					).rejects.toThrow("stop note was not persisted");
+					expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(
+						0,
+					);
+					return;
+				}
+				if (mode === "update") return;
+				expect(readFileSync(live.session.sessionFile!, "utf8")).toContain('"customType":"agent_stop"');
+				if (mode === "restart") {
+					reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+					state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+				}
+				const target = reopened ?? live;
+				let nextContext: Context | undefined;
+				target.setResponses([
+					(context) => {
+						nextContext = context;
+						return fauxAssistantMessage("follow-up complete");
+					},
+				]);
+				await receive({
+					message: "held after abort",
+					canWait: true,
+					cotal: { id: "after-abort", deliveryCount: 2, attemptToken: "next" },
+				});
+				await target.session.waitForAgentMessagePromptCompletion("agentmsg_after-abort");
+				expect(nextContext).toBeDefined();
+				let serialized = "";
+				const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+					serialized = String(options?.body);
+					return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+				});
+				try {
+					const model: Model<"openai-responses"> = {
+						...target.getModel(),
+						api: "openai-responses",
+						provider: "openai",
+						baseUrl: "https://fixture.invalid/v1",
+					};
+					await streamOpenAIResponses(model, nextContext!, { apiKey: "fixture-key" }).result();
+				} finally {
+					fetch.mockRestore();
+				}
+				const input = JSON.stringify(JSON.parse(serialized).input);
+				expect(input.split("The user stopped the previous work.")).toHaveLength(2);
+				expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held after abort"));
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "after-abort",
+					attemptToken: "next",
+				});
+			} finally {
+				release.resolve();
+				await running;
+				reopened?.cleanup();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("still cancels child runs when a user-stop note cannot be persisted", async () => {
+		const live = await createHarness();
+		const cancellation = vi.spyOn(
+			live.session as unknown as { _cancelActiveRlmChildRuns(reason: string): void },
+			"_cancelActiveRlmChildRuns",
+		);
+		const append = vi
+			.spyOn(live.sessionManager, "appendCustomMessageEntryWithRollback")
+			.mockImplementationOnce(() => {
+				throw new Error("stop note write failed");
+			});
+		try {
+			await expect(live.session.abort()).rejects.toThrow("stop note write failed");
+			expect(cancellation).toHaveBeenCalledExactlyOnceWith("Parent session aborted");
+		} finally {
+			append.mockRestore();
+			cancellation.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["shutdown", "replaced"] as const)(
+		"does not label lifecycle teardown as a user stop (%s)",
+		async (reason) => {
+			const { live, h, state } = await liveFixture();
+			state.runtime = {
+				...state.runtime,
+				session: live.session,
+				dispose: async () => live.session.disposeAsync(),
+			} as ActiveSessionState["runtime"];
+			live.setResponses([fauxAssistantMessage("seeded")]);
+			try {
+				await live.session.prompt("retained context");
+				await (
+					h.internals as unknown as {
+						closeSession(state: ActiveSessionState, reason: "shutdown" | "replaced"): Promise<void>;
+					}
+				).closeSession(state, reason);
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+				).toHaveLength(0);
+			} finally {
+				live.cleanup();
+			}
+		},
+	);
 
 	it.each([false, true])("AC-35 shares admission across supervisor sockets (reject: %s)", async (reject) => {
 		const h = harness();
@@ -5411,6 +5873,8 @@ describe("mesh worker persistence", () => {
 				cleanupSupervisorResources(): Promise<void>;
 			};
 			sup.mesh = {
+				setRunActive: vi.fn(),
+				hasQueuedFollowUps: () => false,
 				enqueueEnrollment: async (id: string, file: string) => {
 					enrolledId = id;
 					enrolledInfo = await readSessionInfo(file);
@@ -5807,7 +6271,7 @@ describe("mesh worker persistence", () => {
 	});
 
 	it.each(["killed", "completed"] as const)(
-		"reports closed for an existing unwritten own entry (%s)",
+		"settles an unwritten own entry after close, including the actual-abort flush (%s)",
 		async (reason) => {
 			const h = harness();
 			await h.authenticate("cotal");
@@ -5848,9 +6312,22 @@ describe("mesh worker persistence", () => {
 				)
 					.closeSession(state, reason)
 					.catch(() => undefined);
-				expect(h.frames().filter((frame) => frame.type === "agent_message_dropped")).toEqual([
-					{ type: "agent_message_dropped", cotalId: "buffered", attemptToken: "attempt", reason: "closed" },
+				expect(
+					h
+						.frames()
+						.filter(
+							(frame) => frame.type === "agent_message_dropped" || frame.type === "agent_message_persisted",
+						),
+				).toEqual([
+					reason === "killed"
+						? { type: "agent_message_persisted", cotalId: "buffered", attemptToken: "attempt" }
+						: { type: "agent_message_dropped", cotalId: "buffered", attemptToken: "attempt", reason: "closed" },
 				]);
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+				).toHaveLength(reason === "killed" ? 1 : 0);
 			} finally {
 				archive.mockRestore();
 				live.cleanup();

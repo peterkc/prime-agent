@@ -42,6 +42,8 @@ export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
 
 export const DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY = "mesh_replacement";
 
+export const DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY = "mesh_follow_up";
+
 export type DaemonWorkerPersistenceOutbound =
 	| { type: "agent_message_persisted"; cotalId: string; attemptToken: string }
 	| { type: "agent_message_dropped"; cotalId: string; attemptToken: string; reason: "cleared" | "closed" | "other" };
@@ -150,7 +152,18 @@ export type DaemonWorkerCommand =
 			sender: AgentSessionMessageSender;
 			fromRelationship?: AgentFamilyRelationship;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			canWait?: boolean;
+			replyTo?: string;
+			publishedAt?: number;
 			cotal?: { id: string; deliveryCount: number; attemptToken: string };
+	  }
+	| {
+			id?: string;
+			type: "worker_mesh_follow_up_state";
+			targetActiveSessionId: string;
+			sessionId: string;
+			pending: boolean;
+			revision: number;
 	  }
 	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }

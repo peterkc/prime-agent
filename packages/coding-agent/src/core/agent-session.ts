@@ -63,6 +63,7 @@ import {
 	isAgentSessionMessageId,
 	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
 	parseAgentSessionMessagePromptId,
 	startsAgentRun,
 } from "./agent-messages.js";
@@ -1602,6 +1603,61 @@ export class AgentSession {
 	private _goalContinuationAwaitsRlmWork = false;
 	private _goalAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _goalAbortInProgress = false;
+	private _meshFollowUpPending = false;
+	private _goalContinuationAwaitsMesh = false;
+	private _meshGoalResume?: Promise<void>;
+	private _abortNoteFailure?: Error;
+
+	setMeshFollowUpPending(pending: boolean): void {
+		this._meshFollowUpPending = pending;
+		if (!pending && this._goalContinuationAwaitsMesh) this._resumeGoalAfterMeshIdle();
+	}
+
+	private _resumeGoalAfterMeshIdle(): void {
+		if (this._meshGoalResume) return;
+		this._meshGoalResume = (async () => {
+			await this.agent.waitForIdle();
+			await this._agentEventQueue;
+			if (
+				this._meshFollowUpPending ||
+				!this._goalContinuationAwaitsMesh ||
+				this._disposed ||
+				this._disposing ||
+				this._sessionInputPumpSuspended ||
+				this._sessionInputAdmissionPauses.size > 0 ||
+				this._goalState.status !== "active"
+			)
+				return;
+			this._goalContinuationAwaitsMesh = false;
+			this._ensureGoalRuntimeActive();
+			this._setGoalState({ ...this._goalState, continuationsUsed: this._goalState.continuationsUsed + 1 });
+			const message = createGoalContextMessage(this._goalState, "continuation");
+			const normalized = normalizeMessageContent(message.content);
+			this._admitSessionInput(
+				this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+					message,
+					resumeIfIdle: true,
+				}),
+			);
+		})()
+			.catch((error: unknown) => {
+				this._goalContinuationAwaitsMesh = false;
+				this._finishGoalWithError(this._asError(error).message);
+			})
+			.finally(() => {
+				this._meshGoalResume = undefined;
+				if (
+					!this._meshFollowUpPending &&
+					this._goalContinuationAwaitsMesh &&
+					!this._disposed &&
+					!this._disposing &&
+					!this._sessionInputPumpSuspended &&
+					this._sessionInputAdmissionPauses.size === 0 &&
+					this._goalState.status === "active"
+				)
+					this._resumeGoalAfterMeshIdle();
+			});
+	}
 	private _autonomousState: AutonomousRuntimeState;
 	private _autonomousContinuationSuppressionDepth = 0;
 	private _autonomousContinuationSuppressedMessages = new WeakSet<AgentMessage>();
@@ -4279,6 +4335,7 @@ export class AgentSession {
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					...parseAgentMessageScheduling({ canWait: payload.canWait, replyTo: payload.replyTo }),
 					...(payload.targetKind === "name" ? { targetKind: "name" } : {}),
 					...(payload.receiverRole === "parent" ||
 					payload.receiverRole === "sibling" ||
@@ -4416,6 +4473,12 @@ export class AgentSession {
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const goalSnapshot = this._goalState;
 		const goalAccountingStartedAt = this._goalAccountingStartedAt;
+		if (this._goalState.status === "active" && this._meshFollowUpPending) {
+			this._goalContinuationAwaitsMesh = true;
+			this._resumeGoalAfterMeshIdle();
+			return [];
+		}
+		this._goalContinuationAwaitsMesh = false;
 		const goalMessages = await this._getGoalContinuationMessages(context, signal);
 		if (goalMessages.length > 0 || signal?.aborted) {
 			if (goalMessages.length > 0 && this._sessionInputArrivalEpoch !== arrivalEpoch) {
@@ -5839,10 +5902,18 @@ export class AgentSession {
 	}
 
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._abortNoteFailure) throw this._abortNoteFailure;
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
+		if (
+			customMessage?.details.deliveryMode === "follow_up" &&
+			!this.isStreaming &&
+			!this._sessionInputSuspendedForUpdateRestart
+		)
+			this._resumeSessionInputAdmission();
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
+			if (this._abortNoteFailure) throw this._abortNoteFailure;
 			if (customMessage && this._replacingAgentMessageIds.has(customMessage.details.id))
 				throw new Error(`Agent message ${customMessage.details.id} is held for session replacement`);
 			options?.admissionCommitted?.();
@@ -8454,7 +8525,7 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	requestAbort(): void {
+	requestAbort(options: { userStop?: boolean } = {}): void {
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -8481,13 +8552,33 @@ export class AgentSession {
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
 		this.agent.abort();
+		this._goalContinuationAwaitsMesh = false;
+		if (options.userStop !== false) {
+			this._abortNoteFailure = new Error("The stop note was not persisted; agent messages cannot be admitted");
+			const note: CustomMessage = {
+				role: "custom",
+				customType: "agent_stop",
+				display: true,
+				timestamp: Date.now(),
+				content:
+					"The user stopped the previous work. Do not restart that work because of a later agent message or FYI. Follow later user instructions.",
+			};
+			this.sessionManager.appendCustomMessageEntryWithRollback(note.customType, note.content, note.display);
+			this.agent.state.messages.push(note);
+			this._abortNoteFailure = undefined;
+			this._emit({ type: "message_start", message: note });
+			this._emit({ type: "message_end", message: note });
+		}
 	}
 
-	async abort(): Promise<void> {
+	async abort(options: { userStop?: boolean } = {}): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
-		this.requestAbort();
-		this._cancelActiveRlmChildRuns("Parent session aborted");
+		try {
+			this.requestAbort(options);
+		} finally {
+			this._cancelActiveRlmChildRuns("Parent session aborted");
+		}
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
 			await Promise.allSettled([
@@ -9032,7 +9123,7 @@ export class AgentSession {
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		if (!options.skipAbort) await this.abort({ userStop: false });
 		let didCompact = false;
 		const compactionAbort = new AbortController();
 		this._compactionAbortController = compactionAbort;
@@ -11415,6 +11506,8 @@ export class AgentSession {
 							message: input.message,
 							receiverRole: input.receiverRole,
 							targetKind: input.targetKind,
+							...(input.canWait !== undefined ? { canWait: input.canWait } : {}),
+							...(input.replyTo !== undefined ? { replyTo: input.replyTo } : {}),
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";

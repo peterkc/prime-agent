@@ -8,6 +8,7 @@ import {
 	getApiProvider,
 	registerFauxProvider,
 } from "../../../ai/src/index.js";
+import { AgentSession } from "../../src/core/agent-session.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { canonicalSessionPath, getProcessStartId, type SessionLease } from "../../src/core/session-lease.js";
 import { main } from "../../src/main.js";
@@ -22,6 +23,7 @@ import { AgentDaemon } from "../../src/modes/daemon/daemon-mode.js";
 import { DaemonSupervisor } from "../../src/modes/daemon/daemon-supervisor.js";
 import { isDaemonWorkerProcess } from "../../src/modes/daemon/daemon-worker-protocol.js";
 import { writeFileAtomicSync } from "../../src/utils/atomic-file.js";
+import { useRealBroker } from "./mesh-real-broker.js";
 
 const agentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR!;
 const socketPath = process.argv.includes("--daemon-socket")
@@ -115,9 +117,18 @@ for (const factory of ["create", "inMemory"] as const) {
 		return registry;
 	}) as typeof original;
 }
+const acquirePause = AgentSession.prototype.acquireQueuedWorkPause;
+AgentSession.prototype.acquireQueuedWorkPause = function () {
+	const pause = acquirePause.call(this);
+	if (existsSync(join(agentDir, `observe-pause-${this.sessionId}`)))
+		writeFileAtomicSync(join(agentDir, `pause-held-${this.sessionId}`), "held");
+	return pause;
+};
+let heldOnce = false;
 const response: FauxResponseFactory = async (_context, options) => {
 	const path = join(agentDir, "hold-turn");
-	if (existsSync(path)) {
+	if (existsSync(path) && (!existsSync(join(agentDir, "hold-once")) || !heldOnce)) {
+		heldOnce = true;
 		writeFileAtomicSync(join(agentDir, "turn-held"), "held");
 		await new Promise<void>((resolve) => {
 			let watcher: ReturnType<typeof watch> | undefined;
@@ -194,7 +205,7 @@ CotalEndpoint.prototype.stop = async () => undefined;
 CotalEndpoint.prototype.provisionDmInbox = async () => undefined;
 CotalEndpoint.prototype.provisionDlvInbox = async () => undefined;
 CotalEndpoint.prototype.reissueAcl = async () => undefined;
-CotalEndpoint.prototype.unicastAttributed = async function (principal, text) {
+CotalEndpoint.prototype.unicastAttributed = async function (principal, text, options) {
 	const meshRoot = join(agentDir, "mesh");
 	const target = readdirSync(join(meshRoot, "directory"))
 		.filter((name) => name.endsWith(".json"))
@@ -207,7 +218,8 @@ CotalEndpoint.prototype.unicastAttributed = async function (principal, text) {
 		space: "prime",
 		from: { id: this.card.id, name: this.card.name },
 		to: principal,
-		parts: [{ kind: "text", text }],
+		parts: options?.parts ?? [{ kind: "text", text }],
+		replyTo: options?.replyTo,
 	};
 	mkdirSync(mailbox, { recursive: true });
 	writeFileAtomicSync(join(mailbox, `${message.id}.json`), JSON.stringify({ target: target.sessionId, message }));
@@ -323,7 +335,7 @@ const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSe
 					appendFileSync(join(agentDir, "cleanup-order.jsonl"), `${JSON.stringify({ type: "stop", id })}\n`);
 					signal("endpoint-stopped", id);
 				},
-				unicastAttributed: async (principal, text) => {
+				unicastAttributed: async (principal, text, options) => {
 					const target = readdirSync(join(meshRoot, "directory"))
 						.filter((name) => name.endsWith(".json"))
 						.map((name) => readDirectory(meshRoot, name.slice(0, -5)))
@@ -335,7 +347,8 @@ const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSe
 						space: "prime",
 						from: { id: directory.principal, name: directory.name },
 						to: principal,
-						parts: [{ kind: "text", text }],
+						parts: options?.parts ?? [{ kind: "text", text }],
+						replyTo: options?.replyTo,
 					} as CotalMessage;
 					const targetPid = this.sessions.has(target.sessionId)
 						? undefined
@@ -367,19 +380,39 @@ const productionStart = (MeshEndpoints.prototype as unknown as StubMesh).startSe
 	}
 };
 
+const heldPrototype = MeshEndpoints.prototype as unknown as {
+	notifyFollowUpState(session: {
+		queue: Array<{ canWait?: boolean; message: CotalMessage }>;
+		current?: unknown;
+		runActive?: boolean;
+	}): void;
+};
+const notifyFollowUpState = heldPrototype.notifyFollowUpState;
+heldPrototype.notifyFollowUpState = function (session) {
+	notifyFollowUpState.call(this, session);
+	if (session.runActive && !session.current)
+		for (const item of session.queue) if (item.canWait) signal("held", item.message.id);
+};
+
 const supervisorMesh = DaemonSupervisor.prototype as unknown as {
-	handoffMeshMessage(...args: unknown[]): Promise<void>;
+	handoffMeshMessage(...args: unknown[]): Promise<{ status: "deferred"; reason: "run_active" } | undefined>;
 };
 const productionHandoff = supervisorMesh.handoffMeshMessage;
 supervisorMesh.handoffMeshMessage = async function (...args) {
 	try {
-		await productionHandoff.apply(this, args);
+		const outcome = await productionHandoff.apply(this, args);
+		if (outcome?.status === "deferred") {
+			signal("deferred", (args[1] as CotalMessage).id);
+			return outcome;
+		}
 	} catch (error) {
 		signal("handoff-refused", (args[1] as CotalMessage).id);
 		throw error;
 	}
 	signal("accepted", (args[1] as CotalMessage).id);
 };
+
+if (process.env.PRIME_MESH_TEST_REAL_BROKER === "1") useRealBroker(agentDir, signal);
 
 if (isDaemonWorkerProcess()) await main([...process.argv.slice(2), "--offline"]);
 else {
