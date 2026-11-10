@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
@@ -609,6 +610,8 @@ class ReplTest(unittest.TestCase):
                     "def bump(n):",
                     "    return n + 1",
                     "sock = socket.socket()",
+                    f"with open({os.path.join(tmp, 'target')!r}, 'w') as fh:",
+                    "    fh.write('keep')",
                 ]
             )
             self.assertEqual(one(self.repl.execute("s1", setup), "done")["status"], "ok")
@@ -616,15 +619,18 @@ class ReplTest(unittest.TestCase):
             done = one(self.repl.until_done("s2"), "done")
             self.assertEqual(done["status"], "ok")
             self.assertEqual(sorted(done["saved"]), ["bump", "socket", "x"])
-            self.assertEqual([s["name"] for s in done["skipped"]], ["sock"])
+            self.assertEqual([s["name"] for s in done["skipped"]],
+                             ["sock", "fh"])
             self.assertNotIn("asyncio", done["saved"])
             self.assertEqual(
-                sorted(os.listdir(tmp)), ["kernel-state.dill", "kernel-state.json"]
+                sorted(os.listdir(tmp)),
+                ["kernel-state.dill", "kernel-state.json", "target"]
             )  # no temp files survive a successful commit
             with open(manifest_path) as fh:
                 manifest = json.load(fh)
             self.assertEqual(manifest["version"], 1)
             self.assertEqual(manifest["savedNames"], done["saved"])
+            self.assertEqual(manifest["skipped"], done["skipped"])
             self.assertEqual(manifest["bytes"], done["bytes"])
             self.assertIn("pythonVersion", manifest)
             self.assertIn("timestamp", manifest)
@@ -639,6 +645,7 @@ class ReplTest(unittest.TestCase):
             events = fresh.execute("r2", "bump(x)")
             self.assertEqual(one(events, "result")["text"], "42")
             self.assertEqual(fresh.shutdown(), 0)
+            self.assertEqual(Path(tmp, "target").read_bytes(), b"keep")
 
     def test_restore_skips_ipython_injected_names(self):
         import dill
@@ -692,6 +699,18 @@ class ReplTest(unittest.TestCase):
         self.repl.send({"type": "snapshot", "id": rid + "1", "path": os.path.join(tmp, "s.dill"), "manifest_path": os.path.join(tmp, "s.json")})
         self.repl.send({"type": "restore", "id": rid + "2", "path": os.path.join(tmp, "s.dill")})
         self.assertEqual(one(self.repl.until_done(rid + "2"), "done")["status"], "ok")
+
+    def test_memory_streams_and_io_classes_roundtrip(self):
+        cases = [("bytes", "io.BytesIO(b'keep')", "x.getvalue()", "b'keep'"),
+                 ("text", "io.StringIO('keep')", "x.getvalue()", "'keep'"),
+                 ("class", "io.BytesIO", "x is io.BytesIO", "True")]
+        for name, value, probe, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                self._snapshot_restore(name, f"import io\nx = {value}", tmp)
+                restored = json.loads(self.repl.raw_lines[-1])["restored"]
+                self.assertIn("x", restored)
+                events = self.repl.execute(name + "check", probe)
+                self.assertEqual(one(events, "result")["text"], expected)
 
     def test_restore_rebuilt_partial_keeps_attributes_and_args_pr2471(self):
         code = (
@@ -2086,11 +2105,10 @@ class RestoreApplyShieldTest(unittest.TestCase):
                 signal.raise_signal(signal.SIGINT)
 
     def test_sigint_during_staging_leaves_namespace_unchanged(self):
-        import dill
-
+        from rlm import repl
         from rlm.repl import _restore_state
 
-        real_loads = dill.loads
+        real_loads = repl._load_snapshot_value
         calls = {"n": 0}
 
         def loads_then_sigint(blob):
@@ -2103,7 +2121,8 @@ class RestoreApplyShieldTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_snapshot(tmp, {"a": 1, "b": 2})
             ns = {"a": "old", "unrelated": "keep"}
-            with mock.patch.object(dill, "loads", loads_then_sigint):
+            with mock.patch.object(repl, "_load_snapshot_value",
+                                   loads_then_sigint):
                 with self.assertRaises(KeyboardInterrupt):
                     _restore_state(ns, path)
         # The old namespace is byte-identical: no partial old/new mixture.
@@ -2209,25 +2228,19 @@ class RestoreApplyShieldTest(unittest.TestCase):
 
 class SnapshotTempCleanupTest(unittest.TestCase):
     def test_keyboard_interrupt_during_payload_write_removes_temp_file(self):
-        from unittest import mock as unittest_mock
-
         sys.path.insert(0, SRC)
         self.addCleanup(sys.path.remove, SRC)
-        import dill
-
         from rlm.repl import _snapshot_state
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
-
-            real_dump = dill.dump
 
             def interrupted_dump(value, fh):
                 # Interrupt mid-dump, after partial bytes landed in the staged temp.
                 fh.write(b"partial")
                 raise KeyboardInterrupt
 
-            with unittest_mock.patch.object(dill, "dump", interrupted_dump):
+            with mock.patch("rlm.repl._dump_snapshot_value", interrupted_dump):
                 with self.assertRaises(KeyboardInterrupt):
                     _snapshot_state(
                         {"x": 1},
@@ -2305,6 +2318,52 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
             sorted(os.listdir(directory or self.dir)),
             ["kernel-state.dill", "kernel-state.json"],
         )
+
+    def test_file_handles_never_restore_or_truncate(self):
+        import dill
+        from rlm.repl import _restore_state as restore
+
+        target = Path(self.dir, "target")
+        for mode in ("w", "r", "a"):
+            with self.subTest(mode=mode):
+                target.write_bytes(b"keep")
+                handle = self.enterContext(open(target, mode))
+                if mode == "w":
+                    handle.write("keep")
+                    handle.close()
+                source = {"fh": handle, "nested": [handle, {"fh": handle}]}
+                blobs = {key: dill.dumps(val) for key, val in source.items()}
+                snap = self._snap({**source, "kept": "_create_filehandle"})
+                self.assertEqual(snap["saved"], ["kept"])
+                self.assertEqual({s["name"] for s in snap["skipped"]},
+                                 {"fh", "nested"})
+                ns = {}
+                self.assertEqual((restore(ns, self.path)["restored"], ns),
+                                 (["kept"], {"kept": "_create_filehandle"}))
+                for framed in (False, True):
+                    if framed:
+                        with mock.patch("rlm.repl._dump_snapshot_value",
+                                        dill.dump):
+                            self._snap(source)
+                    else:
+                        with open(self.path, "wb") as out:
+                            dill.dump(blobs, out)
+                    ns = {}
+                    restored = restore(ns, self.path)
+                    self.assertEqual(target.read_bytes(), b"keep")
+                    self.assertEqual(ns, {})
+                    self.assertEqual({f["name"] for f in restored["failed"]},
+                                     {"fh", "nested"})
+                    target.unlink()
+                    restore({}, self.path)
+                    self.assertFalse(target.exists())
+                    target.write_bytes(b"keep")
+
+    def test_snapshot_skips_wrapped_files(self):
+        with tempfile.TemporaryFile() as wrapped:
+            snap = self._snap({"wrapped": wrapped})
+        self.assertEqual(snap["saved"], [])
+        self.assertEqual([s["name"] for s in snap["skipped"]], ["wrapped"])
 
     def test_complete_payload_respects_aggregate_size_cap(self):
         name = "x" * 10_000
@@ -2521,15 +2580,16 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
         import dill
 
         from rlm.repl import _SNAPSHOT_MAGIC
+        from rlm import repl
 
-        real_dump = dill.dump
+        real_dump = repl._dump_snapshot_value
         dumped: list[object] = []
 
         def counting_dump(value, writer):
             dumped.append(value)
             return real_dump(value, writer)
 
-        with mock.patch.object(dill, "dump", counting_dump):
+        with mock.patch.object(repl, "_dump_snapshot_value", counting_dump):
             result = self._snap({"a": 1, "b": 2, "c": 3})
         self.assertEqual(result["saved"], ["a", "b", "c"])
         self.assertEqual(dumped, [1, 2, 3])

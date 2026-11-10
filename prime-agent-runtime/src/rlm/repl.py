@@ -711,6 +711,37 @@ def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
     return records
 
 
+def _dump_snapshot_value(value: Any, writer: Any) -> None:
+    import dill
+
+    class SnapshotPickler(dill.Pickler):
+        def persistent_id(self, obj):
+            # Inspect every dependency, including handles inside containers,
+            # closures and attributes. Closed handles are unsafe too.
+            if obj is dill._dill._create_filehandle:
+                raise TypeError("file and stream objects are not saved")
+            return None
+
+    SnapshotPickler(writer, protocol=dill.settings["protocol"]).dump(value)
+
+
+def _load_snapshot_value(blob: bytes) -> Any:
+    import dill
+
+    class SnapshotUnpickler(dill.Unpickler):
+        def find_class(self, module, name):
+            # dill reopens even closed handles in their original mode. Reject
+            # the constructor before it can run, including in old snapshots.
+            if (
+                module in {"dill._dill", "dill.dill"}
+                and name == "_create_filehandle"
+            ):
+                raise ValueError("file and stream objects are not restored")
+            return super().find_class(module, name)
+
+    return SnapshotUnpickler(io.BytesIO(blob)).load()
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
@@ -790,7 +821,7 @@ def _snapshot_state(
                     limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, budget)
                     buffer = io.BytesIO()
                     try:
-                        dill.dump(value, _CappedWriter(buffer, limit))
+                        _dump_snapshot_value(value, _CappedWriter(buffer, limit))
                         blob = buffer.getvalue()
                     except _SnapshotSizeLimitExceeded:
                         if not prune_oversized and budget < max_variable_bytes:
@@ -981,7 +1012,7 @@ def _restore_state(
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
-                payload = dill.load(fh)
+                payload = _load_snapshot_value(fh.read())
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -993,7 +1024,7 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = dill.loads(blob)
+            staged[name] = _load_snapshot_value(blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     # Revive every staged name before parking: a failure must never abort the
