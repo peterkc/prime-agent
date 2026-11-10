@@ -27,6 +27,7 @@ import { streamOpenAIResponses } from "../../ai/src/providers/openai-responses.j
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	AGENT_MESSAGE_CAN_WAIT_HEADER,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -4633,6 +4634,159 @@ describe("mesh worker persistence", () => {
 			} finally {
 				busyState.mockRestore();
 				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["preflight", "commit", "busy-flush"] as const)(
+		"F14 releases a held offer after busy and idle coalesce (%s)",
+		async (phase) => {
+			const { live, h, state, receive } = await liveFixture();
+			Object.assign(state.runtime, { diagnostics: [] });
+			const worker = h.internals as unknown as {
+				clients: Set<DaemonSocketClient>;
+				observeRosterEvent(state: ActiveSessionState, message: unknown): void;
+				flushRoster(): void;
+			};
+			Reflect.deleteProperty(h.internals, "scheduleRosterFlush");
+			worker.clients.add(h.client);
+			const brokerMocks = (["start", "stop", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map(
+				(method) => vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			);
+			const meshRoot = join(live.tempDir, "mesh");
+			mkdirSync(meshRoot);
+			writeFileSync(join(meshRoot, "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+			writeFileSync(join(meshRoot, "signer.json"), JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))), {
+				mode: 0o600,
+			});
+			const mesh = new MeshEndpoints({
+				meshRoot,
+				homeSocket: "home",
+				log: vi.fn(),
+				handoff: async (_record, _message, count, bind, _open, token) => {
+					bind(h.client);
+					await receive({
+						message: "coalesced FYI",
+						canWait: true,
+						cotal: { id: "coalesced", deliveryCount: count, attemptToken: token },
+					});
+					const response = h
+						.frames()
+						.filter((frame) => frame.command === "worker_deliver_message")
+						.at(-1);
+					return response.data.status === "deferred" ? response.data : undefined;
+				},
+			});
+			const supervisor = new DaemonSupervisor(join(h.root, "supervisor.sock"), {
+				defaultSessionConfig: { agentDir: h.root, cwd: h.root },
+			});
+			const sup = supervisor as unknown as {
+				mesh: MeshEndpoints;
+				writeRosterEntry(entry: unknown, worker: undefined, status: undefined, enroll: boolean): unknown;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			sup.mesh = mesh;
+			const write = h.socket.write;
+			h.socket.write = (data) => {
+				const accepted = write(data);
+				const frame = h.frames().at(-1);
+				if (frame?.type === "roster_delta")
+					for (const entry of frame.entries) sup.writeRosterEntry(entry, undefined, undefined, false);
+				if (frame?.type === "agent_message_persisted")
+					mesh.confirmPersisted(frame.cotalId, h.client, frame.attemptToken);
+				return accepted;
+			};
+			const busy = vi.spyOn(live.session, "isCompacting", "get").mockReturnValue(false);
+			const event = (type: string) => worker.observeRosterEvent(state, { type: "session_event", event: { type } });
+			const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+			const admission = vi
+				.spyOn(live.session, "acceptAgentMessagePrompt")
+				.mockImplementationOnce((text, options) => {
+					if (phase === "commit") {
+						busy.mockReturnValue(true);
+						event("compaction_start");
+					}
+					return originalAccept(text, options);
+				});
+			try {
+				live.sessionManager.flushNow();
+				await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+				const holder = (
+					mesh as unknown as {
+						sessions: Map<string, { endpoint: CotalEndpoint; handoff?: Promise<void>; queue: unknown[] }>;
+					}
+				).sessions.get(live.session.sessionId)!;
+				const endpoint = holder.endpoint;
+				vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+				event("compaction_end");
+				await vi.advanceTimersByTimeAsync(0);
+				const baseline = h.frames().filter((frame) => frame.type === "roster_delta");
+				expect(baseline).toHaveLength(1);
+				busy.mockReturnValue(true);
+				event("compaction_start");
+				busy.mockReturnValue(false);
+				event("compaction_end");
+				await vi.advanceTimersByTimeAsync(250);
+				expect(h.frames().filter((frame) => frame.type === "roster_delta")).toHaveLength(1);
+				if (phase !== "commit") {
+					busy.mockReturnValue(true);
+					event("compaction_start");
+				}
+				const ack = vi.fn();
+				live.setResponses([fauxAssistantMessage("follow-up complete")]);
+				endpoint.emit(
+					"message",
+					{
+						id: "coalesced",
+						ts: 0,
+						space: "prime",
+						from: { id: "local.peer", name: "peer" },
+						to: "local.recipient",
+						parts: [
+							{ kind: "text", text: AGENT_MESSAGE_CAN_WAIT_HEADER },
+							{ kind: "text", text: "coalesced FYI" },
+						],
+					},
+					{ durable: true, ack, nak: vi.fn() },
+					{ kind: "dm" },
+				);
+				await holder.handoff;
+				expect(
+					h
+						.frames()
+						.filter((frame) => frame.command === "worker_deliver_message")
+						.at(-1)?.data.status,
+				).toBe("deferred");
+				if (phase === "busy-flush") {
+					await vi.advanceTimersByTimeAsync(250);
+					await holder.handoff;
+					expect(holder.queue).toHaveLength(1);
+					expect(ack).not.toHaveBeenCalled();
+				}
+				busy.mockReturnValue(false);
+				event("compaction_end");
+				await vi.advanceTimersByTimeAsync(250);
+				expect(holder.queue).toHaveLength(0);
+				await holder.handoff;
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+				expect(ack).toHaveBeenCalledTimes(1);
+				expect(live.session.messages).toContainEqual(
+					expect.objectContaining({
+						customType: "agent_message",
+						details: expect.objectContaining({ message: "coalesced FYI", deliveryMode: "follow_up" }),
+					}),
+				);
+				worker.flushRoster();
+				const frames = h.frames().length;
+				worker.flushRoster();
+				expect(h.frames()).toHaveLength(frames);
+			} finally {
+				busy.mockRestore();
+				admission.mockRestore();
+				vi.useRealTimers();
+				await sup.cleanupSupervisorResources();
+				live.cleanup();
+				for (const mock of brokerMocks) mock.mockRestore();
 			}
 		},
 	);

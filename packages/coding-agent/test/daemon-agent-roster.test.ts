@@ -84,6 +84,7 @@ function makeWorkerReporter(connected = true): WorkerReporterFixture {
 		},
 		rosterFlushScheduled: false,
 		rosterDirtyAgentIds: new Set<string>(),
+		meshDeferredOffers: new WeakSet(),
 		shuttingDown: false,
 		hasAuthenticatedSupervisorClient: () => connection.connected,
 		broadcastRosterFrame: (message: DaemonWorkerRosterOutbound) => {

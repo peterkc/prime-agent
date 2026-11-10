@@ -523,6 +523,7 @@ export class AgentDaemon {
 	private readonly sameIdReplacements = new WeakSet<AgentSession>();
 	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
 	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
+	private readonly meshDeferredOffers = new WeakSet<AgentSession>();
 	private readonly meshAdmissions = new WeakMap<
 		AgentSession,
 		Map<string, Promise<{ status: AgentSessionMessageDeliveryStatus }>>
@@ -6830,6 +6831,8 @@ export class AgentDaemon {
 			payload.deliveryMode === "follow_up" &&
 			this.meshRecipientBusy(recipientSession)
 		) {
+			this.meshDeferredOffers.add(recipientSession);
+			this.scheduleRosterFlush(target);
 			this.writeWorkerSuccess(client, command, { status: "deferred", reason: "run_active" });
 			return;
 		}
@@ -6968,6 +6971,8 @@ export class AgentDaemon {
 		} catch (error) {
 			if (error instanceof AgentMessageRunActiveError) {
 				cleanup();
+				this.meshDeferredOffers.add(recipientSession);
+				this.scheduleRosterFlush(target);
 				this.writeWorkerSuccess(client, command, { status: "deferred", reason: "run_active" });
 				return;
 			}
@@ -8098,7 +8103,11 @@ export class AgentDaemon {
 			const agentId = this.rosterAgentIdForState(state);
 			const summary = composedSummaries.get(agentId);
 			if (summary !== undefined) {
-				if (reporter.lastComposedSource.get(agentId) === summary) {
+				const deferralReleased =
+					this.meshDeferredOffers.has(state.runtime.session) && !this.meshRecipientBusy(state.runtime.session);
+				if (deferralReleased) this.meshDeferredOffers.delete(state.runtime.session);
+				// A busy/idle pulse can leave the memoized summary unchanged; its release must still reach the supervisor.
+				if (reporter.lastComposedSource.get(agentId) === summary && !deferralReleased) {
 					const entry = reporter.lastComposed.get(agentId);
 					if (entry) {
 						entries.set(agentId, entry);
@@ -8106,7 +8115,12 @@ export class AgentDaemon {
 						continue;
 					}
 				}
-				entries.set(agentId, workerRosterEntryFromSummary(summary));
+				const meshDeferralRelease =
+					(reporter.lastComposed.get(agentId)?.meshDeferralRelease ?? 0) + (deferralReleased ? 1 : 0);
+				entries.set(agentId, {
+					...workerRosterEntryFromSummary(summary),
+					...(meshDeferralRelease > 0 ? { meshDeferralRelease } : {}),
+				});
 				composedSources.set(agentId, summary);
 				continue;
 			}
