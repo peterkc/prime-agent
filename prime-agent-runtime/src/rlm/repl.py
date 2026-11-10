@@ -718,10 +718,7 @@ def _dump_snapshot_value(value: Any, writer: Any) -> None:
         def persistent_id(self, obj):
             # Inspect every dependency, including handles inside containers,
             # closures and attributes. Closed handles are unsafe too.
-            if (
-                isinstance(obj, io.IOBase)
-                or obj is dill._dill._create_filehandle
-            ):
+            if obj is dill._dill._create_filehandle:
                 raise TypeError("file and stream objects are not saved")
             return None
 
@@ -740,10 +737,7 @@ def _load_snapshot_value(blob: bytes) -> Any:
                 and name == "_create_filehandle"
             ):
                 raise ValueError("file and stream objects are not restored")
-            value = super().find_class(module, name)
-            if isinstance(value, type) and issubclass(value, io.IOBase):
-                raise ValueError("file and stream objects are not restored")
-            return value
+            return super().find_class(module, name)
 
     return SnapshotUnpickler(io.BytesIO(blob)).load()
 
