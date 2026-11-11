@@ -18,7 +18,14 @@ import {
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
+import {
+	createSpaceAuth,
+	mintCreds,
+	newIdentity,
+	serverConfig,
+	setupSpaceStreams,
+	stripSpaceAuth,
+} from "@cotal-ai/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
@@ -2158,24 +2165,68 @@ function meshPath(path: string, signal: AbortSignal): Promise<void> {
 	});
 }
 
-async function meshFixture() {
+async function meshFixture(realBroker = false) {
 	const root = tempDir();
 	const agentDir = join(root, "agent");
 	mkdirSync(join(agentDir, "mesh"), { recursive: true });
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessageTransport: "cotal" }));
 	writeFileSync(join(agentDir, "mesh", "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
-	writeFileSync(
-		join(agentDir, "mesh", "signer.json"),
-		JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))),
-		{ mode: 0o600 },
-	);
+	const auth = await createSpaceAuth("prime");
+	writeFileSync(join(agentDir, "mesh", "signer.json"), JSON.stringify(stripSpaceAuth(auth)), { mode: 0o600 });
+	let startBroker: (() => Promise<ChildProcess>) | undefined;
+	if (realBroker) {
+		const setupCreds = await mintCreds(auth, newIdentity(), "provisioner");
+		const reservation = createServer();
+		reservation.listen(0, "127.0.0.1");
+		await once(reservation, "listening");
+		const address = reservation.address();
+		if (!address || typeof address === "string") throw new Error("Missing private broker port");
+		await new Promise<void>((resolveClose) => reservation.close(() => resolveClose()));
+		const url = `nats://127.0.0.1:${address.port}`;
+		writeFileSync(join(agentDir, "mesh", "mesh.json"), JSON.stringify({ space: "prime", server: url }));
+		const brokerConfig = join(root, "nats.conf");
+		writeFileSync(
+			brokerConfig,
+			serverConfig(auth, [auth], {
+				port: address.port,
+				host: "127.0.0.1",
+				storeDir: join(root, "broker"),
+				transport: { kind: "plaintext" },
+			}),
+			{ mode: 0o600 },
+		);
+		startBroker = async () => {
+			const child = spawn("nats-server", ["-c", brokerConfig], { stdio: ["ignore", "pipe", "pipe"] });
+			children.add(child);
+			await new Promise<void>((resolveReady, reject) => {
+				let output = "";
+				const finish = (error?: Error) => {
+					child.stderr?.off("data", data);
+					child.off("exit", exited);
+					child.off("error", finish);
+					if (error) reject(new Error("nats-server >= 2.12 required on PATH", { cause: error }));
+					else resolveReady();
+				};
+				const data = (chunk: Buffer) => {
+					output += chunk.toString();
+					if (output.includes("Server is ready")) finish();
+				};
+				const exited = () => finish(new Error(`Private broker exited: ${output}`));
+				child.stderr?.on("data", data);
+				child.once("exit", exited);
+				child.once("error", finish);
+			});
+			await setupSpaceStreams({ servers: url, space: "prime", creds: setupCreds });
+			return child;
+		};
+	}
 	const start = async (socket: string, sessionDir?: string) => {
 		const child = spawnSupervisor(
 			agentDir,
 			socket,
 			root,
 			[],
-			{ PRIME_MESH_TEST_SESSION_DIR: sessionDir },
+			{ PRIME_MESH_TEST_SESSION_DIR: sessionDir, PRIME_MESH_TEST_REAL_BROKER: realBroker ? "1" : undefined },
 			resolve(__dirname, "fixtures/mesh-supervisor.ts"),
 		);
 		await meshSignal(child, "ready");
@@ -2195,10 +2246,246 @@ async function meshFixture() {
 		await meshSignal(owner.child, "endpoint", summary.sessionId);
 		return summary;
 	};
-	return { root, agentDir, start, request, create };
+	return { root, agentDir, start, startBroker, request, create };
 }
 
 describe("mesh supervisor compatibility", () => {
+	it.each(["drain", "crash"] as const)(
+		"delivers real marked mesh traffic with reply precedence and private broker recovery (%s)",
+		async (mode) => {
+			const f = await meshFixture(true);
+			const { root, agentDir } = f;
+			const socket = join(root, "real.sock");
+			const cleanup = new AbortController();
+			let broker = await f.startBroker!();
+			let holder = await f.start(socket);
+			try {
+				const target = await f.create(holder, "recipient");
+				if (!target.workerPid || !target.sessionFile || !target.sessionId)
+					throw new Error("Missing real worker identity");
+				const recordPath = join(agentDir, "mesh", "enrollments", `${target.sessionId}.json`);
+				const directory = join(agentDir, "mesh", "directory", `${target.sessionId}.json`);
+				const original = readFileSync(recordPath, "utf8");
+				const principal = JSON.parse(readFileSync(directory, "utf8")).principal as string;
+				writeFileSync(join(agentDir, "hold-turn"), "held");
+				await holder.client.request({
+					type: "prompt",
+					activeSessionId: target.activeSessionId ?? target.id,
+					message: "original work",
+				});
+				await meshPath(join(agentDir, "turn-held"), cleanup.signal);
+				const source = await f.create(holder, "sender");
+				const publish = async (message: string, replyTo?: string) => {
+					const result = await f.request(holder.client, {
+						type: "mesh_send",
+						fromActiveSessionId: source.activeSessionId ?? source.id,
+						targetSessionId: target.sessionId!,
+						message,
+						canWait: true,
+						...(replyTo ? { replyTo } : {}),
+					});
+					const id = (result as { cotalId: string }).cotalId;
+					await meshSignal(holder.child, "received", id);
+					return id;
+				};
+				const ids: string[] = [];
+				for (let index = 0; index < (mode === "crash" ? 3 : 25); index++) ids.push(await publish(`held ${index}`));
+				if (mode === "crash") await meshSignal(holder.child, "renewed", ids[0]);
+				for (const id of ids) expect(readFileSync(target.sessionFile, "utf8")).not.toContain(`agentmsg_${id}`);
+				let replyId: string | undefined;
+				if (mode === "crash") {
+					holder.client.close();
+					holder.child.kill("SIGKILL");
+					await waitForExit(holder.child);
+					process.kill(target.workerPid, "SIGKILL");
+					await waitForProcessGone(target.workerPid);
+					broker.kill("SIGKILL");
+					await waitForExit(broker);
+					rmSync(join(agentDir, "hold-turn"));
+					broker = await f.startBroker!();
+					holder = await f.start(socket);
+				} else {
+					await holder.client.request({
+						type: "agent_messages_clear",
+						activeSessionId: target.activeSessionId ?? target.id,
+					});
+					replyId = await publish("reply passes the held traffic", `agentmsg_${ids[0]}`);
+					await meshSignal(holder.child, "accepted", replyId);
+					const status = await holder.client.request({
+						type: "get_state",
+						activeSessionId: target.activeSessionId ?? target.id,
+					});
+					expect(status).toMatchObject({ success: true, data: { unfinishedActionCount: 2 } });
+					rmSync(join(agentDir, "hold-turn"));
+					await meshSignal(holder.child, "persisted", replyId);
+				}
+				for (const id of ids) await meshSignal(holder.child, "persisted", id);
+				const allEvidence = readFileSync(join(agentDir, "ack-disk.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line) as { id: string; count: number; deliveryCount: number });
+				if (replyId) expect(allEvidence.map((entry) => entry.id)).toEqual([replyId, ...ids]);
+				const evidence = allEvidence.filter((entry) => ids.includes(entry.id));
+				const recovered = readFileSync(join(agentDir, "arrivals.jsonl"), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line) as { id: string; pid: number })
+					.filter((entry) => entry.pid === holder.child.pid && ids.includes(entry.id))
+					.map((entry) => entry.id);
+				expect(evidence.map((entry) => entry.id).sort()).toEqual([...ids].sort());
+				expect(evidence.map((entry) => entry.id)).toEqual(recovered);
+				expect(evidence.map((entry) => entry.count)).toEqual(ids.map(() => 1));
+				if (mode === "crash") expect(evidence.every((entry) => entry.deliveryCount > 1)).toBe(true);
+				expect(readFileSync(recordPath, "utf8")).toBe(original);
+				expect(JSON.parse(readFileSync(directory, "utf8")).principal).toBe(principal);
+			} finally {
+				cleanup.abort();
+				holder.client.close();
+			}
+		},
+		// test-policy: allow explicit-test-timeout -- Real broker recovery includes the documented 60 s acknowledgement deadline after a working renewal; readiness and persistence use concrete events.
+		120_000,
+	);
+
+	it.each(["reload", "compact", "history", "worker", "update"] as const)(
+		"retains marked custody through real runtime lifecycle (%s)",
+		async (ending) => {
+			const f = await meshFixture();
+			writeFileSync(
+				join(f.agentDir, "settings.json"),
+				JSON.stringify({ agentMessageTransport: "cotal", compaction: { keepRecentTokens: 1 } }),
+			);
+			const socket = join(f.root, "lifecycle.sock");
+			let holder = await f.start(socket);
+			const cleanup = new AbortController();
+			try {
+				let sender = await f.create(holder, "sender");
+				await f.request(holder.client, {
+					type: "prompt",
+					activeSessionId: sender.activeSessionId!,
+					message: "sender context",
+				});
+				await f.request(holder.client, { type: "wait_for_idle", activeSessionId: sender.activeSessionId! });
+				let target = await f.create(holder, "target");
+				const sessionId = target.sessionId!;
+				const recordPath = join(f.agentDir, "mesh", "enrollments", `${sessionId}.json`);
+				const original = readFileSync(recordPath, "utf8");
+				await f.request(holder.client, {
+					type: "prompt",
+					activeSessionId: target.activeSessionId!,
+					message: "seed context",
+				});
+				await f.request(holder.client, { type: "wait_for_idle", activeSessionId: target.activeSessionId! });
+				const history = readFileSync(target.sessionFile!, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line))
+					.find((entry) => entry.type === "message" && entry.message.role === "assistant").id as string;
+				writeFileSync(join(f.agentDir, "hold-once"), "held");
+				writeFileSync(join(f.agentDir, "hold-turn"), "held");
+				await f.request(holder.client, {
+					type: "prompt",
+					activeSessionId: target.activeSessionId!,
+					message: "original held work",
+				});
+				await meshPath(join(f.agentDir, "turn-held"), cleanup.signal);
+				const stored = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: sessionId,
+					message: "lifecycle FYI",
+					canWait: true,
+				})) as { cotalId: string };
+				await meshSignal(holder.child, "held", stored.cotalId);
+				expect(readFileSync(target.sessionFile!, "utf8")).not.toContain(stored.cotalId);
+				if (ending === "worker" || ending === "update") {
+					if (ending === "worker") {
+						process.kill(target.workerPid!, "SIGKILL");
+						await waitForProcessGone(target.workerPid!);
+						await meshSignal(holder.child, "worker-failed", String(target.workerPid));
+					} else {
+						await f.request(holder.client, { type: "prepare_update_restart" });
+						holder.client.close();
+						holder.child.kill("SIGKILL");
+						await waitForExit(holder.child);
+					}
+					rmSync(join(f.agentDir, "hold-turn"));
+					if (ending === "update") {
+						holder = await f.start(socket);
+						sender = requireSummary(
+							await f.request(holder.client, {
+								type: "create",
+								sessionPath: sender.sessionFile!,
+								launchEnv: {},
+							}),
+						);
+						if (sender.workerPid) workerPids.add(sender.workerPid);
+					}
+					if (ending === "update") {
+						target = requireSummary(
+							await f.request(holder.client, {
+								type: "create",
+								sessionPath: target.sessionFile!,
+								launchEnv: {},
+							}),
+						);
+						if (target.workerPid) workerPids.add(target.workerPid);
+					}
+				} else if (ending === "history") {
+					writeFileSync(join(f.agentDir, `observe-pause-${sessionId}`), "observe");
+					const navigating = f.request(holder.client, {
+						type: "navigate_tree",
+						activeSessionId: target.activeSessionId!,
+						targetId: history,
+						summarize: false,
+					});
+					await meshPath(join(f.agentDir, `pause-held-${sessionId}`), cleanup.signal);
+					rmSync(join(f.agentDir, "hold-turn"));
+					await navigating;
+				} else {
+					if (ending === "reload")
+						expect(
+							await holder.client.request({ type: "reload", activeSessionId: target.activeSessionId! }),
+						).toMatchObject({
+							success: false,
+							error: "Cannot reload: session is busy (streaming, compacting or retrying).",
+						});
+					else await f.request(holder.client, { type: ending, activeSessionId: target.activeSessionId! });
+					rmSync(join(f.agentDir, "hold-turn"));
+				}
+				await meshSignal(holder.child, "ack", stored.cotalId);
+				if (ending === "reload") {
+					await f.request(holder.client, { type: "wait_for_idle", activeSessionId: target.activeSessionId! });
+					await f.request(holder.client, { type: "reload", activeSessionId: target.activeSessionId! });
+				}
+				expect(readFileSync(recordPath, "utf8")).toBe(original);
+				const reply = (await f.request(holder.client, {
+					type: "mesh_send",
+					fromActiveSessionId: sender.activeSessionId!,
+					targetSessionId: sessionId,
+					message: "correlated reply",
+					canWait: true,
+					replyTo: `agentmsg_${stored.cotalId}`,
+				})) as { cotalId: string };
+				await meshSignal(holder.child, "ack", reply.cotalId);
+				const entries = readFileSync(target.sessionFile!, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line))
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message");
+				expect(entries.filter((entry) => entry.details.id === `agentmsg_${stored.cotalId}`)).toHaveLength(1);
+				if (ending === "update" || ending === "compact")
+					expect(readFileSync(target.sessionFile!, "utf8")).not.toContain('"customType":"agent_stop"');
+				expect(entries.filter((entry) => entry.details.id === `agentmsg_${reply.cotalId}`)).toMatchObject([
+					{ details: { replyTo: stored.cotalId, deliveryMode: "steer" } },
+				]);
+			} finally {
+				cleanup.abort();
+				holder.client.close();
+			}
+		},
+	);
+
 	it("mesh-notify stores once across daemons, renders gate-watcher without a role and refuses a second live host", async () => {
 		const f = await meshFixture();
 		const sender = await f.start(join(f.root, "sender.sock"));
@@ -2222,7 +2509,7 @@ describe("mesh supervisor compatibility", () => {
 			);
 			expect(received).toHaveLength(1);
 			expect(received[0]).toMatchObject({
-				content: "[agent-message from gate-watcher]\n\nPossibly repeated agent message.\n\nNo reply expected.",
+				content: `[agent-message from gate-watcher]\nMessage id: agentmsg_${result.receipt.cotalId}\n\nPossibly repeated agent message.\n\nNo reply expected.`,
 				details: { from: { sessionName: "gate-watcher", clientId: expect.stringMatching(/^local\.U/) } },
 			});
 			expect(received[0].details.fromRelationship).toBeUndefined();
@@ -2677,7 +2964,7 @@ describe("mesh supervisor compatibility", () => {
 				expect(JSON.parse(readFileSync(recordPath, "utf8"))).toEqual(before);
 				rmSync(join(f.agentDir, "hold-turn"));
 				await meshSignal(holder.child, "ack", held.cotalId);
-				expect(readFileSync(target.sessionFile!, "utf8").split(`agentmsg_${held.cotalId}`)).toHaveLength(2);
+				expect(readFileSync(target.sessionFile!, "utf8").split(`"id":"agentmsg_${held.cotalId}"`)).toHaveLength(2);
 				expect(readFileSync(unpublished, "utf8")).not.toContain(held.cotalId);
 				return;
 			}
@@ -2717,7 +3004,7 @@ describe("mesh supervisor compatibility", () => {
 					message: "new target",
 				})) as { cotalId: string };
 				await meshSignal(holder.child, "ack", next.cotalId);
-				expect(readFileSync(destination, "utf8").split(next.cotalId)).toHaveLength(2);
+				expect(readFileSync(destination, "utf8").split(`"id":"agentmsg_${next.cotalId}"`)).toHaveLength(2);
 				return;
 			}
 			if (mode === "holder" || mode === "no-offer" || mode === "same-daemon-holder") {
@@ -2884,7 +3171,7 @@ describe("mesh supervisor compatibility", () => {
 				message: "second",
 			})) as { cotalId: string };
 			await meshSignal(holder.child, "ack", second.cotalId);
-			expect(readFileSync(destination, "utf8").split(second.cotalId)).toHaveLength(2);
+			expect(readFileSync(destination, "utf8").split(`"id":"agentmsg_${second.cotalId}"`)).toHaveLength(2);
 			if (!samePath && mode !== "move") expect(count(target.sessionFile!)).toBe(0);
 			await f.request(holder.client, { type: "shutdown" });
 			holder.client.close();
@@ -2974,7 +3261,7 @@ describe("mesh supervisor compatibility", () => {
 			expect(existsSync(join(f.agentDir, "acks.jsonl"))).toBe(false);
 			rmSync(join(f.agentDir, "hold-turn"));
 			await meshSignal(holder.child, "ack", stored.cotalId);
-			expect(readFileSync(target.sessionFile!, "utf8").split(`agentmsg_${stored.cotalId}`)).toHaveLength(2);
+			expect(readFileSync(target.sessionFile!, "utf8").split(`"id":"agentmsg_${stored.cotalId}"`)).toHaveLength(2);
 			expect(await f.request(holder.client, { type: "get_messages", activeSessionId })).toMatchObject({
 				messages: expect.arrayContaining([
 					expect.objectContaining({ role: "custom", customType: "agent_message" }),
@@ -3395,6 +3682,7 @@ describe("mesh supervisor compatibility", () => {
 				expect.objectContaining({ sessionId: "parent" }),
 				"child",
 				"hello",
+				{},
 			);
 			expect(await client.request({ ...command, targetSessionId: "parent" })).toMatchObject({
 				success: false,
@@ -3530,7 +3818,7 @@ describe("mesh supervisor compatibility", () => {
 		internals.roster = () => roster;
 		internals.writeRosterEntry({ agentId: "a", summary }, worker);
 		const enqueueEnrollment = vi.fn((id: string, file?: string) => enroll(id, file));
-		internals.mesh = { enroll, enqueueEnrollment };
+		internals.mesh = { enroll, enqueueEnrollment, releaseDeferral: vi.fn(), hasQueuedFollowUps: () => false };
 		internals.log = vi.fn();
 		internals.workers.set("w", worker);
 		const child = {

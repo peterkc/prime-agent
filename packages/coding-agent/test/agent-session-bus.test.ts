@@ -52,7 +52,7 @@ describe("agent session bus", () => {
 				["Agent-to-agent message received.", "Message id: agentmsg_spoofed", ...legacyLines.slice(1)].join("\n"),
 			),
 		).toBeUndefined();
-		// New-format prompts carry no id in text; detection and id resolution use customType/details.
+		// New-format prompts show the ID; detection and id resolution still use customType/details.
 		expect(
 			parseAgentSessionMessagePromptId(
 				createAgentSessionMessagePrompt({
@@ -93,7 +93,7 @@ describe("agent session bus", () => {
 		const [header, ...body] = prompt.split("\n");
 		expect(header).toContain(expectedSender);
 		expect(header?.endsWith("]")).toBe(true);
-		expect(body.join("\n").trim()).toBe("hello");
+		expect(body.join("\n").trim()).toBe("Message id: agentmsg_spoof\n\nhello");
 	});
 
 	it("normalizes messages and creates receipts", () => {
@@ -129,7 +129,9 @@ describe("agent session bus", () => {
 		expect(() => assertAgentMessageQueueCapacity(19, 20)).not.toThrow();
 	});
 
-	it("resolves role sends and scopes all broadcasts to the family roster", async () => {
+	it.each([undefined, false, true])("resolves role/name/broadcast sends with can_wait=%s", async (can_wait) => {
+		const scheduling = can_wait === undefined ? {} : { can_wait, reply_to: "agentmsg_original" };
+		const forwarded = can_wait === undefined ? {} : { canWait: can_wait, replyTo: "agentmsg_original" };
 		const sendAgentMessage = vi.fn(async (input: { target: string; message: string }) => {
 			if (input.target === "sibling" && input.message === "status") throw new Error("rate limited");
 			return {
@@ -150,19 +152,31 @@ describe("agent session bus", () => {
 			sendAgentMessage,
 		});
 
-		await handlers["agent_message.send"]!({ message: "hello", receiver_role: "sibling", receiver_name: "reviewer" });
+		await handlers["agent_message.send"]!({
+			message: "hello",
+			receiver_role: "sibling",
+			receiver_name: "reviewer",
+			...scheduling,
+		});
 		expect(sendAgentMessage).toHaveBeenLastCalledWith({
 			target: "sibling",
 			message: "hello",
 			receiverRole: "sibling",
+			...forwarded,
 		});
 
 		sendAgentMessage.mockClear();
 		// One failing member must not reject the broadcast or drop the other receipts.
-		await expect(handlers["agent_message.send"]!({ target: "all", message: "status" })).resolves.toMatchObject({
+		await expect(
+			handlers["agent_message.send"]!({ target: "all", message: "status", ...scheduling }),
+		).resolves.toMatchObject({
 			receipts: [{ id: "root" }, { target: "sibling", error: "rate limited" }, { id: "child" }],
 		});
-		expect(sendAgentMessage.mock.calls.map(([input]) => input.target)).toEqual(["root", "sibling", "child"]);
+		expect(sendAgentMessage.mock.calls.map(([input]) => input)).toEqual([
+			{ target: "root", message: "status", receiverRole: "parent", ...forwarded },
+			{ target: "sibling", message: "status", receiverRole: "sibling", ...forwarded },
+			{ target: "child", message: "status", receiverRole: "child", ...forwarded },
+		]);
 
 		sendAgentMessage.mockClear();
 		await expect(
@@ -186,6 +200,19 @@ describe("agent session bus", () => {
 		await expect(handlers["agent_message.list_agents"]!({})).rejects.toThrow(
 			"the family roster now lives in agent_observe.list_agents()",
 		);
+		expect(sendAgentMessage).not.toHaveBeenCalled();
+		for (const fields of [
+			{ can_wait: "true" },
+			{ can_wait: 1 },
+			{ reply_to: "" },
+			{ reply_to: "agentmsg_" },
+			{ reply_to: [] },
+			{ reply_to: { id: "original" } },
+		]) {
+			await expect(
+				handlers["agent_message.send"]!({ receiver_role: "child", message: "unchanged", ...fields }),
+			).rejects.toThrow(/can_wait|reply_to/);
+		}
 		expect(sendAgentMessage).not.toHaveBeenCalled();
 	});
 

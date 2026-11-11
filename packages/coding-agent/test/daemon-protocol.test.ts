@@ -45,7 +45,7 @@ import { createRpcExtensionUiBridge } from "../src/modes/rpc/rpc-extension-ui-co
 import type { RpcExtensionUIRequest } from "../src/modes/rpc/rpc-types.js";
 
 describe("daemon protocol helpers", () => {
-	it("accepts schema-33/35 client list envelopes on the schema-38 supervisor", async () => {
+	it("accepts schema-33/35 client list envelopes on the schema-39 supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-legacy-wire-"));
 		vi.stubEnv("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR", join(root, "owners"));
 		const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
@@ -84,6 +84,44 @@ describe("daemon protocol helpers", () => {
 			rmSync(root, { recursive: true, force: true });
 			vi.unstubAllEnvs();
 		}
+	});
+
+	it("gates new mesh metadata while keeping old unmarked sends compatible", async () => {
+		const command: DaemonCommand = {
+			type: "mesh_send",
+			fromActiveSessionId: "a",
+			targetSessionId: "b",
+			message: "unchanged",
+			canWait: true,
+			replyTo: "agentmsg_original",
+		};
+		expect(getDaemonCommandCompatibilities(command)).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 39, capability: "mesh_follow_up" },
+			DAEMON_COMMAND_COMPATIBILITY.mesh_send,
+		]);
+		const client = new DaemonClient("unused");
+		const wire = vi.fn(async (input: DaemonCommand) => success(input.id, input.type));
+		const internal = client as unknown as {
+			socket: { destroyed: boolean };
+			helloMessage: { protocol: typeof DAEMON_PROTOCOL_INFO; schemaRevision: number; serverCapabilities: string[] };
+			requestWire: typeof wire;
+		};
+		internal.socket = { destroyed: false };
+		internal.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 38, serverCapabilities: ["mesh_send"] };
+		internal.requestWire = wire;
+		await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(wire).not.toHaveBeenCalled();
+		await client.request({ type: "mesh_send", fromActiveSessionId: "a", targetSessionId: "b", message: "unchanged" });
+		internal.helloMessage = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: 39,
+			serverCapabilities: ["mesh_send", "mesh_follow_up"],
+		};
+		await client.request(command);
+		expect(wire.mock.calls.map(([input]) => ("message" in input ? input.message : undefined))).toEqual([
+			"unchanged",
+			"unchanged",
+		]);
 	});
 
 	it.each(["mesh_send", "mesh_replace", "mesh_notify"] as const)(
@@ -276,8 +314,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(38);
-		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-38-repository-root");
+		expect(DAEMON_SCHEMA_REVISION).toBe(39);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-39-mesh-follow-up");
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.daemon_hello).toEqual({ minProtocol: 7 });
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,

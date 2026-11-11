@@ -8,6 +8,10 @@ import { ENV_AGENT_DIR } from "../src/config.js";
 import { type AgentFamilyMember, createAgentMessageHostHandlers } from "../src/core/agent-messages.js";
 import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
+import { meshMessagePayload } from "../src/modes/daemon/cotal/mesh-shared.js";
+import { DAEMON_PROTOCOL_INFO } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 
 vi.mock("@cotal-ai/core", async (original) => ({
 	...(await original<typeof core>()),
@@ -83,7 +87,10 @@ afterEach(async () => {
 async function fixture(
 	handoff: MeshEndpointOptions["handoff"] = async (_record, _message, _count, bind) => {
 		bind(recipient);
+		return undefined;
 	},
+	canWait?: MeshEndpointOptions["canWait"],
+	isCurrentRecipient: MeshEndpointOptions["isCurrentRecipient"] = (client) => client === recipient,
 ) {
 	const root = mkdtempSync(join(tmpdir(), "prime-mesh-endpoints-"));
 	roots.push(root);
@@ -96,7 +103,14 @@ async function fixture(
 	}
 	const log = vi.fn();
 	const handoffSpy = vi.fn(handoff);
-	const mesh = new MeshEndpoints({ meshRoot: root, homeSocket: "home", log, handoff: handoffSpy });
+	const mesh = new MeshEndpoints({
+		meshRoot: root,
+		homeSocket: "home",
+		log,
+		handoff: handoffSpy,
+		canWait,
+		isCurrentRecipient,
+	});
 	meshes.push(mesh);
 	await mesh.enroll("a", join(root, "a.json"));
 	await mesh.enroll("b", join(root, "b.json"));
@@ -133,6 +147,180 @@ async function settled(mesh: MeshEndpoints, id: string) {
 }
 
 describe("mesh endpoints", () => {
+	it.each([
+		["stale-roster", "run_active"],
+		["unchanged-roster", "run_active"],
+		["close", "run_active"],
+		["failure", "run_active"],
+		["passivation", "run_active"],
+		["reauth", "run_active"],
+	] as const)("F22 retries after %s with %s custody", async (event, reason) => {
+		const old = { isConnected: true, close: vi.fn() };
+		const replacement = { isConnected: true, close: vi.fn() };
+		const worker = {
+			client: old as { isConnected: boolean; close(): void } | undefined,
+			descriptor: {
+				workerId: "worker",
+				rootActiveSessionId: "active",
+				lifecycle: "ready",
+				socketPath: "unused",
+				authenticationToken: "test",
+			},
+			intentionalStop: true,
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			snapshotLoads: new Map(),
+			transcriptCaches: new Map(),
+		};
+		const recipients: object[] = [];
+		let busy = true;
+		const { mesh, target, root, handoff } = await fixture(
+			async (_record, message, _count, bind, _open, token) => {
+				worker.client ??= replacement;
+				bind(worker.client);
+				if (busy) return { status: "deferred", reason };
+				recipients.push(worker.client);
+				mesh.confirmPersisted(message.id, worker.client, token);
+			},
+			undefined,
+			(client) => client === worker.client && worker.client.isConnected,
+		);
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+		});
+		const sup = supervisor as unknown as {
+			mesh: MeshEndpoints;
+			workers: Map<string, typeof worker>;
+			writeRosterEntry(entry: unknown, worker: unknown, status: undefined, enroll: boolean): void;
+			handleWorkerClose(worker: unknown, client: object, error: Error): Promise<void>;
+			markWorkerRosterEntries(worker: unknown, status: string): void;
+			flipWorkerRosterEntriesInactive(worker: unknown): void;
+			syncRosterFromWorkerSummaries(worker: unknown): void;
+			connectWorker(worker: unknown, timeout: number): Promise<DaemonWorkerClient>;
+			cleanupSupervisorResources(): Promise<void>;
+		};
+		const row = {
+			agentId: "b",
+			meshDeferralRelease: event === "unchanged-roster" ? 1 : undefined,
+			summary: {
+				id: "active",
+				activeSessionId: "active",
+				sessionId: "b",
+				sessionFile: join(root, "b.json"),
+				isStreaming: true,
+				unfinishedActionCount: 1,
+			},
+		};
+		worker.summaries.set("active", row.summary);
+		sup.workers.set("worker", worker);
+		// Seed stale roster metadata before connecting Mesh; only the actual worker defers the offer.
+		sup.writeRosterEntry(row, worker, undefined, false);
+		sup.mesh = mesh;
+		if (event === "stale-roster") {
+			busy = false;
+			sup.writeRosterEntry(row, worker, undefined, false);
+		}
+		try {
+			const item = delivery("lifecycle");
+			item.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+			target.emit("message", item.message, item.delivery, { kind: "dm" });
+			await settled(mesh, "b");
+			expect(handoff).toHaveBeenCalledTimes(1);
+			if (event === "stale-roster") {
+				expect(item.ack).toHaveBeenCalledTimes(1);
+				return;
+			}
+			expect(item.ack).not.toHaveBeenCalled();
+			busy = false;
+			if (event === "unchanged-roster") {
+				sup.syncRosterFromWorkerSummaries(worker);
+				await settled(mesh, "b");
+				expect(handoff).toHaveBeenCalledTimes(1);
+				expect(item.ack).not.toHaveBeenCalled();
+				sup.writeRosterEntry({ ...row, meshDeferralRelease: 2 }, worker, undefined, false);
+			} else if (event === "reauth") {
+				vi.spyOn(DaemonWorkerClient.prototype, "connect").mockResolvedValue(undefined);
+				vi.spyOn(DaemonWorkerClient.prototype, "waitForHello").mockResolvedValue({
+					type: "daemon_hello",
+					socketPath: "unused",
+					protocol: DAEMON_PROTOCOL_INFO,
+					clientId: "test",
+					serverCapabilities: [],
+				});
+				vi.spyOn(DaemonWorkerClient.prototype, "authenticateWorker").mockResolvedValue({
+					type: "response",
+					command: "worker_auth",
+					success: true,
+					data: { capabilities: ["agent_roster"] },
+				});
+				vi.spyOn(DaemonWorkerClient.prototype, "isConnected", "get").mockReturnValue(true);
+				Object.assign(sup, { assertRecoveryAllowed: async () => {}, supervisorAuthenticationClaim: () => ({}) });
+				const current = await sup.connectWorker(worker, 1000);
+				const disconnect = vi.spyOn(mesh, "disconnect");
+				await sup.handleWorkerClose(worker, old, new Error("late old close"));
+				expect(disconnect).not.toHaveBeenCalled();
+				expect(worker.client).toBe(current);
+			} else if (event === "passivation") {
+				worker.client = replacement;
+				sup.workers.delete("worker");
+				sup.flipWorkerRosterEntriesInactive(worker);
+			} else {
+				old.isConnected = false;
+				await sup.handleWorkerClose(worker, old, new Error("worker exited"));
+				if (event === "failure") {
+					worker.descriptor.lifecycle = "failed";
+					sup.markWorkerRosterEntries(worker, "failed");
+				}
+			}
+			await settled(mesh, "b");
+			expect(recipients).toEqual([worker.client]);
+			if (event !== "unchanged-roster") expect(worker.client).not.toBe(old);
+			expect(item.ack).toHaveBeenCalledTimes(1);
+		} finally {
+			await sup.cleanupSupervisorResources();
+		}
+	});
+
+	it.each(["replaced", "closed"] as const)(
+		"F22 rejects a %s client deferral when another message drains",
+		async (state) => {
+			const old = { isConnected: true };
+			const current = { isConnected: true };
+			const worker = { client: old };
+			let busy = true;
+			const offers: { id: string; recipient: object }[] = [];
+			const { mesh, target } = await fixture(
+				async (_record, message, _count, bind, _open, token) => {
+					if (!worker.client.isConnected) worker.client = current;
+					bind(worker.client);
+					if (busy) return { status: "deferred", reason: "run_active" };
+					offers.push({ id: message.id, recipient: worker.client });
+					mesh.confirmPersisted(message.id, worker.client, token);
+				},
+				undefined,
+				(client) => client === worker.client && worker.client.isConnected,
+			);
+			const held = delivery("held-old");
+			held.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+			target.emit("message", held.message, held.delivery, { kind: "dm" });
+			await settled(mesh, "b");
+			busy = false;
+			if (state === "replaced") worker.client = current;
+			else old.isConnected = false;
+			// No disconnect callback: a new steer must not leave the old held offer parked.
+			const steer = delivery("new-steer");
+			target.emit("message", steer.message, steer.delivery, { kind: "dm" });
+			await settled(mesh, "b");
+			await settled(mesh, "b");
+			expect(offers).toEqual([
+				{ id: "new-steer", recipient: current },
+				{ id: "held-old", recipient: current },
+			]);
+			expect(held.ack).toHaveBeenCalledTimes(1);
+			expect(steer.ack).toHaveBeenCalledTimes(1);
+		},
+	);
+
 	it.each(["persisted", "cleared", "closed", "other"] as const)(
 		"ignores a stale %s delivery attempt",
 		async (reason) => {
@@ -257,6 +445,64 @@ describe("mesh endpoints", () => {
 		},
 	);
 
+	it.each(["held", "admitting", "accepted", "offline", "replacement", "mismatch"] as const)(
+		"logs terminal deletion before removal without changing its result (%s)",
+		async (phase) => {
+			vi.useFakeTimers();
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const { mesh, target, root, log } = await fixture(async (_record, _message, _count, bind) => {
+				bind(recipient);
+				if (phase === "held" || phase === "mismatch") return { status: "deferred", reason: "run_active" };
+				if (phase === "admitting") await gate;
+				return undefined;
+			});
+			const item = delivery("delete-held");
+			item.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+			if (phase !== "offline") target.emit("message", item.message, item.delivery, { kind: "dm" });
+			if (phase !== "admitting") await settled(mesh, "b");
+			const token = attempt(mesh, item.message.id);
+			if (phase === "offline") await mesh.closeSession("b");
+			if (phase === "replacement") {
+				vi.spyOn(enrollment, "readEnrollment").mockReturnValueOnce(
+					enrollment.ensureEnrollmentRecord(root, "b", join(root, "b.json")),
+				);
+				await mesh.beginReplacement("b", recipient, "replacement");
+			}
+			const known = phase === "held" || phase === "admitting" || phase === "accepted";
+			const record = enrollment.ensureEnrollmentRecord(root, "b", join(root, "b.json"));
+			vi.mocked(enrollment.removeEnrollment).mockImplementationOnce(
+				async (_root, _id, _file, _proof, beforeRemove) => {
+					if (phase === "mismatch") return "mismatch";
+					beforeRemove?.(record);
+					expect(item.ack).toHaveBeenCalledTimes(known ? 1 : 0);
+					const lines = log.mock.calls.flat().join("\n");
+					if (known) {
+						expect(lines).toMatch(
+							/Cotal ID delete-held, sender local.a, reason deleted session, time .*: held message dropped; acknowledged/,
+						);
+						expect(lines).not.toContain("hello");
+					} else expect(lines).toContain("Mesh session b: deletion pending count unknown");
+					directories.delete("b");
+					return record;
+				},
+			);
+			try {
+				await expect(mesh.unenroll("b", join(root, "b.json"))).resolves.toBeUndefined();
+				release();
+				await settled(mesh, "b");
+				mesh.confirmPersisted(item.message.id, recipient, token);
+				expect(item.ack).toHaveBeenCalledTimes(known ? 1 : 0);
+				if (phase === "mismatch") expect(log).toHaveBeenCalledWith(expect.stringContaining("inbox unchanged"));
+				else expect(enrollment.deprovisionEnrollment).toHaveBeenCalledTimes(1);
+			} finally {
+				release();
+			}
+		},
+	);
+
 	it("AC-32 starts session endpoints without presence or channel watches", async () => {
 		const { source, target } = await fixture();
 		for (const endpoint of [source, target])
@@ -277,6 +523,7 @@ describe("mesh endpoints", () => {
 					finishWake = resolve;
 				});
 				if (open()) sent();
+				return undefined;
 			});
 			const first = delivery("held");
 			const second = delivery("queued");
@@ -521,6 +768,150 @@ describe("mesh endpoints", () => {
 		expect(Endpoint.instances).toHaveLength(2);
 	});
 
+	const header = "[prime-agent-message v1 can_wait=true]";
+	it.each([
+		[[`${header}\npayload`], false, `${header}\npayload`],
+		[[header, "payload"], true, "payload"],
+		[[header, header, "payload"], true, `${header}\npayload`],
+		[["payload", header], false, `payload\n${header}`],
+		[["[prime-agent-message v2 can_wait=true]", "payload"], false, "[prime-agent-message v2 can_wait=true]\npayload"],
+		[[`> ${header}`, "payload"], false, `> ${header}\npayload`],
+	] as const)("recognizes only a separate exact first header: %j", (texts, canWait, text) => {
+		const message = { ...delivery("carrier").message, parts: texts.map((text) => ({ kind: "text", text })) };
+		for (const can_wait of [undefined, false, true])
+			expect(meshMessagePayload({ ...message, can_wait })).toEqual({ text, canWait });
+		if (canWait)
+			expect(meshMessagePayload({ ...message, replyTo: 7 })).toEqual({ text: texts.join("\n"), canWait: false });
+	});
+
+	it.each([true, false, undefined])(
+		"carries can_wait=%s and a canonical reply link without parsing body text",
+		async (canWait) => {
+			const { mesh, source } = await fixture();
+			const header = "[prime-agent-message v1 can_wait=true]";
+			const text = `${header}\npayload`;
+			await mesh.send({ sessionId: "a" }, "b", text, { canWait, replyTo: "agentmsg_original" });
+			expect(source.unicastAttributed).toHaveBeenCalledExactlyOnceWith("local.b", text, {
+				replyTo: "original",
+				...(canWait === true
+					? {
+							parts: [
+								{ kind: "text", text: header },
+								{ kind: "text", text },
+							],
+						}
+					: {}),
+			});
+		},
+	);
+
+	it("keeps an unresolved parent/child lookup ahead of later unmarked steers", async () => {
+		let resolvePolicy!: (canWait: boolean) => void;
+		const policy = new Promise<boolean>((resolve) => {
+			resolvePolicy = resolve;
+		});
+		const { mesh, target, handoff } = await fixture(undefined, () => policy);
+		const first = delivery("parent-first");
+		first.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+		const second = delivery("unmarked-second");
+		target.emit("message", first.message, first.delivery, { kind: "dm" });
+		target.emit("message", second.message, second.delivery, { kind: "dm" });
+		expect(handoff).not.toHaveBeenCalled();
+		resolvePolicy(false);
+		await policy;
+		expect(handoff.mock.calls.map((call) => call[1].id)).toEqual(["parent-first"]);
+		mesh.confirmPersisted(first.message.id, recipient, attempt(mesh, first.message.id));
+		await settled(mesh, "b");
+		expect(handoff.mock.calls.map((call) => call[1].id)).toEqual(["parent-first", "unmarked-second"]);
+		mesh.confirmPersisted(second.message.id, recipient, attempt(mesh, second.message.id));
+		await settled(mesh, "b");
+		expect([first.ack.mock.calls.length, second.ack.mock.calls.length]).toEqual([1, 1]);
+	});
+
+	it("keeps 25 follow-ups outside admission and lets a reply pass before FIFO idle delivery", async () => {
+		vi.useFakeTimers();
+		const offered: string[] = [];
+		let busy = true;
+		const { mesh, target } = await fixture(async (_record, message, _count, bind) => {
+			bind(recipient);
+			if (busy && !message.replyTo) return { status: "deferred", reason: "run_active" };
+			offered.push(message.id);
+		});
+		const held = Array.from({ length: 25 }, (_, index) => {
+			const item = delivery(`held-${index}`);
+			item.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+			return item;
+		});
+		for (const item of held) target.emit("message", item.message, item.delivery, { kind: "dm" });
+		await settled(mesh, "b");
+		const reply = delivery("reply");
+		reply.message.replyTo = "original";
+		reply.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+		target.emit("message", reply.message, reply.delivery, { kind: "dm" });
+		expect(offered).toEqual(["reply"]);
+		expect(reply.ack).not.toHaveBeenCalled();
+		mesh.confirmPersisted("reply", recipient, attempt(mesh, "reply"));
+		await vi.advanceTimersByTimeAsync(1000);
+		for (const item of held) {
+			expect(item.working).toHaveBeenCalledTimes(2);
+			expect(item.ack).not.toHaveBeenCalled();
+		}
+		busy = false;
+		mesh.releaseDeferral("b");
+		for (const item of held) {
+			await settled(mesh, "b");
+			mesh.confirmPersisted(item.message.id, recipient, attempt(mesh, item.message.id));
+		}
+		expect(offered).toEqual(["reply", ...held.map((item) => item.message.id)]);
+		expect(held.map((item) => item.ack.mock.calls.length)).toEqual(Array(25).fill(1));
+	});
+
+	it("F32/F33 leaves capacity refusal to broker redelivery without parking or renewal", async () => {
+		vi.useFakeTimers();
+		const { mesh, target, handoff } = await fixture();
+		handoff.mockImplementationOnce(async (_record, _message, _count, bind) => {
+			bind(recipient);
+			throw new Error("Target session has too many pending messages: 20 unfinished, limit is 20");
+		});
+		const item = delivery("capacity");
+		target.emit("message", item.message, item.delivery, { kind: "dm" });
+		await settled(mesh, "b");
+		await vi.advanceTimersByTimeAsync(4000);
+		expect(handoff).toHaveBeenCalledTimes(1);
+		expect(item.ack).not.toHaveBeenCalled();
+		expect(item.working).toHaveBeenCalledTimes(1);
+		mesh.releaseDeferral("b");
+		expect(handoff).toHaveBeenCalledTimes(1);
+		const redelivered = delivery("capacity", 2);
+		target.emit("message", redelivered.message, redelivered.delivery, { kind: "dm" });
+		expect(handoff).toHaveBeenCalledTimes(2);
+		mesh.confirmPersisted("capacity", recipient, attempt(mesh, "capacity"));
+		await settled(mesh, "b");
+		expect(item.ack).not.toHaveBeenCalled();
+		expect(redelivered.ack).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not overwrite newer idle truth with a stale busy response", async () => {
+		let finish!: () => void;
+		const { mesh, target, handoff } = await fixture();
+		handoff.mockImplementationOnce((_record, _message, _count, bind) => {
+			bind(recipient);
+			return new Promise((resolve) => {
+				finish = () => resolve({ status: "deferred", reason: "run_active" });
+			});
+		});
+		const item = delivery("idle-race");
+		item.message.parts.unshift({ kind: "text", text: "[prime-agent-message v1 can_wait=true]" });
+		target.emit("message", item.message, item.delivery, { kind: "dm" });
+		mesh.releaseDeferral("b");
+		finish();
+		await settled(mesh, "b");
+		expect(handoff).toHaveBeenCalledTimes(2);
+		mesh.confirmPersisted("idle-race", recipient, attempt(mesh, "idle-race"));
+		await settled(mesh, "b");
+		expect(item.ack).toHaveBeenCalledTimes(1);
+	});
+
 	it("publishes exactly once through the sender to the directory principal and returns broker storage proof", async () => {
 		const { mesh, root, source } = await fixture();
 		expect(await mesh.send({ sessionId: "a" }, "b", "hello")).toMatchObject({
@@ -746,6 +1137,7 @@ describe("mesh endpoints", () => {
 		const { mesh, target, log, handoff } = await fixture(async (_record, _message, _count, bind) => {
 			bind(recipient);
 			if (failure === "handoff") throw new Error("restart old worker");
+			return undefined;
 		});
 		const item = delivery("failed");
 		const queued = delivery("queued");

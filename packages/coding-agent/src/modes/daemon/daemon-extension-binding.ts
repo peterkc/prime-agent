@@ -25,6 +25,7 @@ export interface ActiveSessionBindingCallbacks {
 	/** May be async (the daemon's rebind awaits cron-store locks); awaited before session_replaced. */
 	sessionReplaced?: (state: ActiveSessionState) => void | Promise<void>;
 	sessionApplied?: (state: ActiveSessionState) => void;
+	sessionInputCheckpointChanged?: (state: ActiveSessionState) => void;
 	shutdown: () => void;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 }
@@ -62,13 +63,21 @@ export async function bindActiveSessionState(
 
 	state.unsubscribe?.();
 	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
-	state.unsubscribe = session.subscribe((event) => {
+	const unsubscribeEvents = session.subscribe((event) => {
 		callbacks.broadcast(state, {
 			type: "session_event",
 			activeSessionId: state.activeSessionId,
 			event: slimSessionEventForWire(event),
 		});
 	});
+
+	const unsubscribeCheckpoint = callbacks.sessionInputCheckpointChanged
+		? session.subscribeSessionInputCheckpoint(() => callbacks.sessionInputCheckpointChanged?.(state))
+		: undefined;
+	state.unsubscribe = () => {
+		unsubscribeEvents();
+		unsubscribeCheckpoint?.();
+	};
 
 	state.runtime.setRebindSession(
 		async () => {

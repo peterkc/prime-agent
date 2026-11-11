@@ -120,7 +120,13 @@ async function fixture() {
 	const sessionFile = session.getSessionFile()!;
 	const log = vi.fn();
 	const handoff = vi.fn();
-	const mesh = new MeshEndpoints({ meshRoot, homeSocket: join(root, "daemon.sock"), log, handoff });
+	const mesh = new MeshEndpoints({
+		meshRoot,
+		homeSocket: join(root, "daemon.sock"),
+		log,
+		handoff,
+		isCurrentRecipient: () => false,
+	});
 	meshes.push(mesh);
 	return { root, meshRoot, auth, session, sessionId, sessionFile, mesh, log, handoff };
 }
@@ -152,7 +158,7 @@ describe("mesh enrollment", () => {
 
 	it("mesh-notify reuses one private identity, endpoint and lease across overlap and restart; drops replies", async () => {
 		const { mesh, meshRoot, sessionId, log, handoff } = await notificationFixture();
-		const other = new MeshEndpoints({ meshRoot, homeSocket: "other", log, handoff });
+		const other = new MeshEndpoints({ meshRoot, homeSocket: "other", log, handoff, isCurrentRecipient: () => false });
 		meshes.push(other);
 		const claims = vi.spyOn(enrollment, "claimGateWatcher");
 		const alias = ensureEnrollmentRecord(meshRoot, "alias", "unused.jsonl");
@@ -1205,6 +1211,7 @@ describe("mesh enrollment", () => {
 		const restarted = new MeshEndpoints({
 			meshRoot,
 			homeSocket: join(meshRoot, "../daemon.sock"),
+			isCurrentRecipient: () => false,
 			log: vi.fn(),
 			handoff: vi.fn(),
 		});

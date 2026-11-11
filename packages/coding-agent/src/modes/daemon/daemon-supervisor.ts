@@ -20,10 +20,12 @@ import {
 	type AgentFamilyCatalogEntry,
 	type AgentSessionMessageAgentSummary,
 	agentFamilyRelationship,
+	agentMessageCanWait,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
@@ -100,7 +102,7 @@ import {
 	MeshNotStoredError,
 	MeshStorageUnknownError,
 	MeshTransferRecordError,
-	meshMessageText,
+	meshMessagePayload,
 	redactMeshError,
 } from "./cotal/mesh-shared.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
@@ -176,6 +178,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+	DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY,
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -231,6 +234,7 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	"agent_roster",
 	"direct_peer_transport",
 	"mesh_send",
+	"mesh_follow_up",
 	"mesh_notify",
 	"mesh_replacement",
 	"session_move",
@@ -338,6 +342,7 @@ interface ResidentWorker {
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
 	peerTransportCapable?: boolean;
 	meshDeliveryCapable?: boolean;
+	meshFollowUpCapable?: boolean;
 	meshReplacementCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
 	pendingClient?: DaemonWorkerClient;
@@ -574,6 +579,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 }
 
 class PreRosterWorkerError extends Error {}
+class WorkerUnavailableForReuseError extends Error {}
 
 function workerAuthAdvertisesRoster(data: unknown): boolean {
 	if (typeof data !== "object" || data === null) return false;
@@ -771,6 +777,7 @@ export class DaemonSupervisor {
 	private readonly repositoryRoot?: string;
 	private readonly descriptorDir: string;
 	private readonly generation = randomUUID();
+	private meshFollowUpRevision = 0;
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
 	private readonly snapshotCacheRoot: string;
@@ -906,6 +913,12 @@ export class DaemonSupervisor {
 					homeSocket: this.socketPath,
 					credentialLifetimeSeconds: this.meshCredentialLifetimeSeconds,
 					log: (message) => this.log(message),
+					isCurrentRecipient: (recipient) =>
+						Array.from(this.workers.values()).some(
+							(worker) => worker.client === recipient && worker.client.isConnected,
+						),
+					canWait: (record, message) => this.meshMessageCanWait(record, message),
+					followUpStateChanged: (sessionId, pending) => this.publishMeshFollowUpState(sessionId, pending),
 					handoff: (record, message, count, bind, isOpen, attemptToken) =>
 						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
 				});
@@ -1682,7 +1695,7 @@ export class DaemonSupervisor {
 			...(record.processStartId ? { supervisorProcessStartId: record.processStartId } : {}),
 			supervisorSocketPath: record.socketPath,
 			agentMessageTransport: this.agentMessageTransport,
-			capabilities: [DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY],
+			capabilities: [DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY, DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY],
 		};
 	}
 
@@ -2392,7 +2405,7 @@ export class DaemonSupervisor {
 					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
 					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
 					if (response.success && isSessionSummary(response.data)) {
-						this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
+						this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, response.data), worker);
 						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 					}
 					return responseWithId(response, command.id);
@@ -3073,6 +3086,7 @@ export class DaemonSupervisor {
 				},
 				targetSessionId,
 				normalizeAgentSessionMessage(command.message),
+				parseAgentMessageScheduling(command),
 			);
 			return success(command.id, command.type, receipt);
 		}
@@ -3148,6 +3162,7 @@ export class DaemonSupervisor {
 						type: "worker_deliver_message",
 						targetActiveSessionId,
 						message: command.message,
+						...parseAgentMessageScheduling(command),
 						sender: {
 							activeSessionId: source.summary.activeSessionId ?? source.summary.id,
 							sessionId: source.summary.sessionId,
@@ -3792,7 +3807,9 @@ export class DaemonSupervisor {
 				);
 			}
 			const detail = current.descriptor.lastError ? `: ${current.descriptor.lastError}` : "";
-			throw new Error(`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`);
+			throw new WorkerUnavailableForReuseError(
+				`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`,
+			);
 		}
 		const root = current.summaries.get(current.descriptor.rootActiveSessionId);
 		if (root?.sessionId) void this.enrollMeshSession(root.sessionId, root.sessionFile);
@@ -4113,7 +4130,7 @@ export class DaemonSupervisor {
 			if ((summary.activeSessionId ?? summary.id) !== rootActiveSessionId) {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
-			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
+			this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, summary), worker, undefined, false);
 			if (summary.sessionId)
 				void this.mesh
 					?.openSession(summary.sessionId, summary.sessionFile)
@@ -4232,10 +4249,17 @@ export class DaemonSupervisor {
 					}
 					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
 					worker.meshDeliveryCapable = workerAuthAdvertisesMeshDelivery(authResponse.data);
+					worker.meshFollowUpCapable =
+						Array.isArray((authResponse.data as { capabilities?: unknown })?.capabilities) &&
+						(authResponse.data as { capabilities: unknown[] }).capabilities.includes(
+							DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY,
+						);
 					worker.meshReplacementCapable = workerAuthAdvertisesMeshReplacement(authResponse.data);
 					worker.lastFrameAt = Date.now();
-					worker.client?.close();
+					const previous = worker.client;
 					worker.client = client;
+					if (previous) this.mesh?.disconnect(previous);
+					previous?.close();
 					return client;
 				} finally {
 					if (worker.pendingClient === client) worker.pendingClient = undefined;
@@ -4259,6 +4283,41 @@ export class DaemonSupervisor {
 		throw new DaemonWorkerProbeTimeoutError(`Timed out connecting to daemon session worker: ${String(lastError)}`);
 	}
 
+	private async meshMessageCanWait(record: EnrollmentRecord, message: CotalMessage): Promise<boolean> {
+		const row = [...this.roster().values()].find((entry) => entry.summary.sessionId === record.sessionId);
+		const worker = row?.workerId ? this.workers.get(row.workerId) : undefined;
+		if (worker && !worker.meshFollowUpCapable) return false;
+		const sender = this.mesh?.directoryEntryForPrincipal(message.from.id);
+		const family = await this.familyCatalogEntries();
+		const receiver = family.find((entry) => entry.id === record.sessionId);
+		const from = family.find((entry) => entry.id === sender?.sessionId);
+		const relationship = receiver && from ? agentFamilyRelationship(receiver, from) : undefined;
+		return agentMessageCanWait(meshMessagePayload(message), relationship);
+	}
+
+	private publishMeshFollowUpState(sessionId: string, pending: boolean): void {
+		const row = [...this.roster().values()].find((entry) => entry.summary.sessionId === sessionId);
+		const worker = row?.workerId ? this.workers.get(row.workerId) : undefined;
+		const client = worker?.client;
+		if (!row || !worker?.meshFollowUpCapable || !client) return;
+		const revision = ++this.meshFollowUpRevision;
+		void client
+			.requestWorker({
+				type: "worker_mesh_follow_up_state",
+				targetActiveSessionId: row.summary.activeSessionId ?? row.summary.id,
+				sessionId,
+				pending,
+				revision,
+			})
+			.then(
+				(response) => {
+					if (!response.success) this.log(`Mesh session ${sessionId}: follow-up state refused: ${response.error}`);
+				},
+				(error: unknown) =>
+					this.log(`Mesh session ${sessionId}: follow-up state unavailable: ${redactMeshError(error)}`),
+			);
+	}
+
 	private async handoffMeshMessage(
 		record: EnrollmentRecord,
 		message: CotalMessage,
@@ -4266,17 +4325,26 @@ export class DaemonSupervisor {
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
 		attemptToken: string,
-	): Promise<void> {
+	): Promise<{ status: "deferred"; reason: "run_active" } | undefined> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
-		const text = meshMessageText(message);
+		const parsed = meshMessagePayload(message);
+		const text = parsed.text;
 		if (!existsSync(record.sessionFile))
 			throw new Error(`Mesh session ${record.sessionId}: session file is missing: ${record.sessionFile}`);
 		if (!isOpen()) throw new Error("Mesh endpoint closed before worker wake");
-		const worker = await this.createOrReuseWorker("mesh", {
+		const command: DaemonCreateCommand = {
 			type: "create",
 			sessionPath: record.sessionFile,
 			continueRecent: false,
-		});
+		};
+		let worker: ResidentWorker;
+		try {
+			worker = await this.createOrReuseWorker("mesh", command);
+		} catch (error) {
+			// Recovery can finish failed while create waits; retry through all native create guards.
+			if (!(error instanceof WorkerUnavailableForReuseError)) throw error;
+			worker = await this.createOrReuseWorker("mesh", command);
+		}
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		if (!worker.meshDeliveryCapable || !worker.meshReplacementCapable)
 			throw new Error("Restart that session to receive mesh messages");
@@ -4305,11 +4373,22 @@ export class DaemonSupervisor {
 		const recipient = this.requireAvailableWorkerClient(worker);
 		if (!isOpen()) throw new Error("Mesh endpoint closed before handoff");
 		bindRecipient(recipient);
+		if (worker.meshFollowUpCapable)
+			this.publishMeshFollowUpState(record.sessionId, this.mesh?.hasQueuedFollowUps(record.sessionId) ?? false);
+		else if (parsed.canWait)
+			this.log(`Mesh session ${record.sessionId}, Cotal ID ${message.id}: scheduling unsupported; steer fallback`);
 		const response = await recipient.requestWorker(
 			{
 				type: "worker_deliver_message",
 				targetActiveSessionId: summary.activeSessionId ?? summary.id,
 				message: text,
+				...(worker.meshFollowUpCapable
+					? {
+							...(parsed.canWait ? { canWait: true } : {}),
+							...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
+							publishedAt: message.ts,
+						}
+					: {}),
 				fromRelationship,
 				sender: {
 					sessionId: sender?.sessionId,
@@ -4320,7 +4399,17 @@ export class DaemonSupervisor {
 			},
 			WORKER_REQUEST_TIMEOUT_MS,
 		);
-		if (!response.success) throw new Error("Mesh worker rejected delivery");
+		if (!response.success) throw new Error(response.error);
+		if (
+			response.data &&
+			typeof response.data === "object" &&
+			"status" in response.data &&
+			response.data.status === "deferred"
+		) {
+			if (!worker.meshFollowUpCapable || !("reason" in response.data) || response.data.reason !== "run_active")
+				throw new Error("Unsupported mesh deferral response");
+			return { status: "deferred", reason: "run_active" };
+		}
 	}
 
 	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
@@ -5278,6 +5367,14 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
+		const entry = workerRosterEntryFromSummary(summary);
+		const previous = this.roster().get(entry.agentId);
+		if (previous?.workerId === worker.descriptor.workerId && previous.meshDeferralRelease !== undefined)
+			return { ...entry, meshDeferralRelease: previous.meshDeferralRelease };
+		return entry;
+	}
+
 	private writeRosterEntry(
 		entry: WorkerRosterEntry,
 		worker?: ResidentWorker,
@@ -5287,6 +5384,13 @@ export class DaemonSupervisor {
 		const previous = this.roster().get(entry.agentId);
 		const previousDirect = previous?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
+		if (!entry.summary.activeSessionId || previous?.meshDeferralRelease !== entry.meshDeferralRelease)
+			this.mesh?.releaseDeferral(entry.summary.sessionId);
+		if (entry.summary.sessionId)
+			this.publishMeshFollowUpState(
+				entry.summary.sessionId,
+				this.mesh?.hasQueuedFollowUps(entry.summary.sessionId) ?? false,
+			);
 		if (
 			queueMeshEnrollment &&
 			entry.summary.sessionId &&
@@ -5536,7 +5640,7 @@ export class DaemonSupervisor {
 	// Behind the pull-epoch guard the pull is never staler than the row it replaces; never steal another worker's claim.
 	private syncRosterFromWorkerSummaries(worker: ResidentWorker): void {
 		for (const summary of worker.summaries.values()) {
-			const entry = workerRosterEntryFromSummary(summary);
+			const entry = this.rosterEntryForWorkerSummary(worker, summary);
 			const existing = this.roster().get(entry.agentId);
 			if (existing?.workerId !== undefined && existing.workerId !== worker.descriptor.workerId) continue;
 			this.writeRosterEntry(entry, worker);
@@ -6046,7 +6150,7 @@ export class DaemonSupervisor {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		if (command.type === "rename" && response.success && isSessionSummary(response.data)) {
-			this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
+			this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, response.data), worker);
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		return responseWithId(response, command.id);

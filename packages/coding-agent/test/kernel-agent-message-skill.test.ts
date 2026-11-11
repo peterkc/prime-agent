@@ -262,6 +262,35 @@ except TypeError as error:
 		);
 	});
 
+	it("carries optional scheduling fields and rejects malformed typed input before the host", async () => {
+		const requests: Record<string, unknown>[] = [];
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAgentMessageSkill()],
+			hostHandlers: {
+				"agent_message.send": async (payload) => {
+					requests.push(payload);
+					return { deliveryStatus: "stored", cotalId: "original" };
+				},
+			},
+		});
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+await agent_message.send("FYI", receiver_name="peer", can_wait=True, reply_to="agentmsg_original")
+await agent_message.send("literal", receiver_name="peer", can_wait=False)
+for value in (1, "true", [], {}):
+    try:
+        await agent_message.send("invalid", receiver_name="peer", can_wait=value)
+    except TypeError:
+        print("rejected")
+`);
+		expect(result.status, JSON.stringify(result)).toBe("ok");
+		expect(result.stdout.trim().split("\n")).toEqual(Array(4).fill("rejected"));
+		expect(requests).toHaveLength(2);
+		expect(requests[0]).toMatchObject({ message: "FYI", can_wait: true, reply_to: "agentmsg_original" });
+		expect(requests[1]).toMatchObject({ message: "literal", can_wait: false });
+		expect(requests[1]).not.toHaveProperty("reply_to");
+	});
+
 	it("does not expose a queueable delivery mode", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],

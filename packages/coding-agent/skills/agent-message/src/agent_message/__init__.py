@@ -20,8 +20,16 @@ async def send(
     *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
+    can_wait: bool | None = None,
+    reply_to: str | None = None,
 ) -> dict[str, Any]:
     """Send by family role, local-space name or ID, or broadcast."""
+    if can_wait is not None and not isinstance(can_wait, bool):
+        raise TypeError("can_wait must be bool or None")
+    if reply_to is not None and (
+        not isinstance(reply_to, str) or not reply_to.strip()
+    ):
+        raise TypeError("reply_to must be a nonempty message ID or None")
     roles = ("parent", "sibling", "child")
     if broadcast_message is not None:
         if message != "all":
@@ -52,6 +60,10 @@ async def send(
         payload = {"message": message, "receiver_name": receiver_name}
         if receiver_role is not None:
             payload["receiver_role"] = receiver_role
+    if can_wait is not None:
+        payload["can_wait"] = can_wait
+    if reply_to is not None:
+        payload["reply_to"] = reply_to
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):

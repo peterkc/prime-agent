@@ -30,6 +30,8 @@ import {
 	type AgentFamilyMember,
 	type AgentFamilyRelationship,
 	AgentMessageClearedError,
+	AgentMessageRunActiveError,
+	type AgentMessageSchedulingOptions,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -41,6 +43,7 @@ import {
 	type AgentSessionMessageSender,
 	type AgentSessionNameAvailabilityInput,
 	agentFamilyRelationship,
+	agentMessageCanWait,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
@@ -53,6 +56,7 @@ import {
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
 	selectAgentFamily,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
@@ -228,6 +232,7 @@ import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } f
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+	DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY,
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -518,11 +523,18 @@ export class AgentDaemon {
 	private readonly sameIdReplacements = new WeakSet<AgentSession>();
 	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
 	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
+	private readonly meshDeferredOffers = new WeakSet<AgentSession>();
 	private readonly meshAdmissions = new WeakMap<
 		AgentSession,
 		Map<string, Promise<{ status: AgentSessionMessageDeliveryStatus }>>
 	>();
 	private meshReplacementOffered = false;
+	private meshFollowUpOffered = false;
+	private readonly meshSocketCleanups = new WeakMap<
+		DaemonSocketClient["socket"],
+		{ callbacks: Set<() => void>; close: () => void }
+	>();
+	private readonly meshFollowUpUpdates = new WeakMap<AgentSession, { generation: string; revision: number }>();
 	private readonly closingSessions = new Map<
 		string,
 		{
@@ -1786,6 +1798,7 @@ export class AgentDaemon {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
 				createConnectionState: (targetSessionState) => this.createConnectionState(targetSessionState),
 				sessionReplaced: (targetSessionState) => this.refreshReplacedSessionState(targetSessionState),
+				sessionInputCheckpointChanged: (targetSessionState) => this.scheduleRosterFlush(targetSessionState),
 				sessionApplied: (targetSessionState) => {
 					if (this.agentMessageTransport === "cotal") targetSessionState.runtime.session.sessionManager.flushNow();
 				},
@@ -3497,6 +3510,8 @@ export class AgentDaemon {
 				this.sendAgentSessionMessage({
 					targetSelector: input.target,
 					message: input.message,
+					...(input.canWait !== undefined ? { canWait: input.canWait } : {}),
+					...(input.replyTo !== undefined ? { replyTo: input.replyTo } : {}),
 					targetKind: input.targetKind,
 					receiverRole: input.receiverRole,
 					fromState: requireCurrentState(),
@@ -3920,6 +3935,11 @@ export class AgentDaemon {
 				this.meshReplacementOffered =
 					Array.isArray(parsed.capabilities) &&
 					parsed.capabilities.includes(DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY);
+				this.meshFollowUpOffered =
+					Array.isArray(parsed.capabilities) &&
+					parsed.capabilities.includes(DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY);
+				if (!this.meshFollowUpOffered)
+					for (const state of this.sessions.values()) state.runtime.session.setMeshFollowUpPending(false);
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
 				this.write(client, {
@@ -3931,6 +3951,7 @@ export class AgentDaemon {
 						capabilities: [
 							DAEMON_WORKER_ROSTER_CAPABILITY,
 							DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+							DAEMON_WORKER_MESH_FOLLOW_UP_CAPABILITY,
 							DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 							...(this.options.worker.workerInstanceId !== undefined
 								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
@@ -4169,6 +4190,26 @@ export class AgentDaemon {
 					this.writeWorkerSuccess(client, command, { count });
 					return;
 				}
+				case "worker_mesh_follow_up_state": {
+					if (
+						!this.meshFollowUpOffered ||
+						typeof command.pending !== "boolean" ||
+						!Number.isSafeInteger(command.revision) ||
+						command.revision < 0
+					)
+						throw new Error("Unsupported mesh follow-up state");
+					const state = this.getBoundSessionState(command.targetActiveSessionId);
+					if (state.runtime.session.sessionId !== command.sessionId)
+						throw new Error("Mesh follow-up target changed");
+					const generation = this.supervisorClaims.get(client)!.claim.supervisorGeneration;
+					const previous = this.meshFollowUpUpdates.get(state.runtime.session);
+					if (!previous || previous.generation !== generation || previous.revision < command.revision) {
+						this.meshFollowUpUpdates.set(state.runtime.session, { generation, revision: command.revision });
+						state.runtime.session.setMeshFollowUpPending(command.pending);
+					}
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
 				case "worker_deliver_message": {
 					if (command.cotal) {
 						await this.receiveMeshMessage(client, command);
@@ -4178,6 +4219,10 @@ export class AgentDaemon {
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
 						sender: command.sender,
+						...parseAgentMessageScheduling({
+							...command,
+							canWait: command.canWait ?? (command.deliveryMode === "follow_up" ? true : undefined),
+						}),
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
 						origin: "agent",
 					});
@@ -4492,6 +4537,7 @@ export class AgentDaemon {
 
 			case "kill": {
 				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.requestAbort({ userStop: true });
 				await this.closeSession(state, "killed");
 				return success(command.id, "kill");
 			}
@@ -4812,6 +4858,10 @@ export class AgentDaemon {
 				const receipt = await this.sendAgentSessionMessage({
 					targetSelector: command.targetActiveSessionId,
 					message: command.message,
+					...parseAgentMessageScheduling({
+						...command,
+						canWait: command.canWait ?? (command.deliveryMode === "follow_up" ? true : undefined),
+					}),
 					fromState,
 					clientId: client.id,
 					senderKey: this.createCliAgentMessageSenderKey(),
@@ -4845,7 +4895,7 @@ export class AgentDaemon {
 
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.requestAbort();
+				state.runtime.session.requestAbort({ userStop: true });
 				return success(command.id, "abort");
 			}
 
@@ -5199,7 +5249,7 @@ export class AgentDaemon {
 			case "abort_and_clear_queue": {
 				const state = this.getSessionState(command.activeSessionId);
 				const queue = state.runtime.session.clearQueue();
-				state.runtime.session.requestAbort();
+				state.runtime.session.requestAbort({ userStop: true });
 				return success(command.id, "abort_and_clear_queue", queue);
 			}
 
@@ -6395,12 +6445,15 @@ export class AgentDaemon {
 		clientId?: string;
 		senderKey?: string;
 		origin: "agent" | "cli";
+		canWait?: boolean;
+		replyTo?: string;
 	}): Promise<AgentSessionMessageReceipt> {
 		if (this.agentMessagesPaused) {
 			throw new Error("Agent messaging is paused");
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+		const scheduling = parseAgentMessageScheduling(options);
 		if (this.agentMessageTransport === "cotal") {
 			if (!options.fromState) throw new Error("Message was not stored: sender has no session endpoint");
 			return this.sendMeshMessage(
@@ -6409,6 +6462,7 @@ export class AgentDaemon {
 				message,
 				options.targetKind,
 				options.receiverRole,
+				scheduling,
 			);
 		}
 		if (options.targetKind === "name")
@@ -6448,7 +6502,7 @@ export class AgentDaemon {
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
 							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
+							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message, scheduling);
 						} else {
 							throw error;
 						}
@@ -6477,6 +6531,7 @@ export class AgentDaemon {
 				options.sender ??
 				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
 			fromRelationship: this.agentMessageRelationship(options.fromState, targetState),
+			...scheduling,
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
@@ -6494,6 +6549,7 @@ export class AgentDaemon {
 		message: string,
 		targetKind?: "name",
 		receiverRole?: AgentFamilyRelationship,
+		scheduling: AgentMessageSchedulingOptions = {},
 	): Promise<AgentSessionMessageReceipt> {
 		if (!fromState.runtime.session.sessionFile) throw new Error("Message was not stored: sender has no session file");
 		let targetSessionId = selector;
@@ -6531,7 +6587,13 @@ export class AgentDaemon {
 		try {
 			// Leave room for the supervisor's 30-second publish deadline to return its error.
 			response = await link.request(
-				{ type: "mesh_send", fromActiveSessionId: fromState.activeSessionId, targetSessionId, message },
+				{
+					type: "mesh_send",
+					fromActiveSessionId: fromState.activeSessionId,
+					targetSessionId,
+					message,
+					...(this.meshFollowUpOffered ? scheduling : {}),
+				},
 				35_000,
 			);
 		} catch (error) {
@@ -6545,7 +6607,10 @@ export class AgentDaemon {
 		if (!response.success) throw deserializeDaemonError(response);
 		if (!response.data || typeof response.data !== "object")
 			throw new Error("Supervisor returned an invalid mesh receipt; storage outcome is unknown");
-		return response.data as AgentSessionMessageReceipt;
+		return {
+			...(response.data as AgentSessionMessageReceipt),
+			...(scheduling.canWait === true && !this.meshFollowUpOffered ? { schedulingFallback: "steer" as const } : {}),
+		};
 	}
 
 	private async prepareMeshReplacement(
@@ -6672,6 +6737,28 @@ export class AgentDaemon {
 		};
 	}
 
+	private registerMeshSocketCleanup(client: DaemonSocketClient, cleanup: () => void): () => void {
+		let group = this.meshSocketCleanups.get(client.socket);
+		if (!group) {
+			const callbacks = new Set<() => void>();
+			const close = () => {
+				for (const callback of [...callbacks]) callback();
+			};
+			group = { callbacks, close };
+			this.meshSocketCleanups.set(client.socket, group);
+			client.socket.once("close", close);
+		}
+		const registered = group;
+		registered.callbacks.add(cleanup);
+		return () => {
+			registered.callbacks.delete(cleanup);
+			if (registered.callbacks.size === 0) {
+				client.socket.off("close", registered.close);
+				this.meshSocketCleanups.delete(client.socket);
+			}
+		};
+	}
+
 	private async receiveMeshMessage(
 		client: DaemonSocketClient,
 		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
@@ -6717,6 +6804,14 @@ export class AgentDaemon {
 			from: command.sender,
 			fromRelationship: command.fromRelationship,
 			target: this.createAgentSessionMessageEndpoint(target),
+			...(command.canWait !== undefined ? { canWait: command.canWait === true } : {}),
+			...(command.replyTo ? { replyTo: command.replyTo } : {}),
+			...(command.publishedAt !== undefined ? { publishedAt: command.publishedAt } : {}),
+			deliveryMode:
+				this.meshFollowUpOffered &&
+				agentMessageCanWait({ canWait: command.canWait, replyTo: command.replyTo }, command.fromRelationship)
+					? "follow_up"
+					: "steer",
 			possiblyRepeated: command.cotal.deliveryCount > 1,
 		};
 		const ownEntry = (id = payload.id) =>
@@ -6731,34 +6826,31 @@ export class AgentDaemon {
 						"id" in entry.details &&
 						entry.details.id === id,
 				);
-		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
-		if (!this.meshMessageIds.has(recipientSession)) {
-			this.meshMessageIds.set(recipientSession, messageIds);
-			const stopTracking = manager.onPersist(() => {
-				for (const id of messageIds) {
-					const entry = ownEntry(id);
-					if (entry && manager.isEntryPersisted(entry.id)) messageIds.delete(id);
-				}
-			});
-			recipientSession.registerDisposeCallback(() => {
-				stopTracking();
-				messageIds.clear();
-				this.meshMessageIds.delete(recipientSession);
-			});
+		if (
+			!ownEntry() &&
+			!recipientSession.hasQueuedAgentMessage(payload.id) &&
+			payload.deliveryMode === "follow_up" &&
+			this.meshRecipientBusy(recipientSession)
+		) {
+			this.meshDeferredOffers.add(recipientSession);
+			this.scheduleRosterFlush(target);
+			this.writeWorkerSuccess(client, command, { status: "deferred", reason: "run_active" });
+			return;
 		}
-		const existing = ownEntry();
-		if (!existing || !manager.isEntryPersisted(existing.id)) messageIds.add(payload.id);
+		let messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
 		let accepted = false;
 		let sent = false;
 		let active = true;
 		let deliveryFailure: unknown;
 		let unsubscribe: (() => void) | undefined;
 		let unregisterDispose: (() => void) | undefined;
+		let unregisterSocket: (() => void) | undefined;
+		let tracking = false;
 		const cleanup = () => {
 			active = false;
 			unsubscribe?.();
 			unregisterDispose?.();
-			client.socket.off("close", cleanup);
+			unregisterSocket?.();
 		};
 		const check = () => {
 			if (!accepted || sent || !active || this.unsafeMeshSessions.has(recipientSession)) return;
@@ -6815,30 +6907,57 @@ export class AgentDaemon {
 				),
 			);
 		};
-		unsubscribe = manager.onPersist(check);
-		unregisterDispose = target.runtime.session.registerDisposeCallback(() =>
-			Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
-		);
-		client.socket.once("close", cleanup);
 		const queued = recipientSession.hasQueuedAgentMessage(payload.id);
-		if (!ownEntry()) {
-			// Native delivery waiters must be registered before admission.
-			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
-			void target.runtime.session.waitForAgentMessagePromptCompletion(payload.id).then(() => {
-				if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
-			}, dropped);
-		}
+		const startTracking = () => {
+			if (tracking) return;
+			tracking = true;
+			messageIds = this.meshMessageIds.get(recipientSession) ?? messageIds;
+			if (!this.meshMessageIds.has(recipientSession)) {
+				this.meshMessageIds.set(recipientSession, messageIds);
+				const stopTracking = manager.onPersist(() => {
+					for (const id of messageIds) {
+						const entry = ownEntry(id);
+						if (entry && manager.isEntryPersisted(entry.id)) messageIds.delete(id);
+					}
+				});
+				recipientSession.registerDisposeCallback(() => {
+					stopTracking();
+					messageIds.clear();
+					this.meshMessageIds.delete(recipientSession);
+				});
+			}
+			const existing = ownEntry();
+			if (!existing || !manager.isEntryPersisted(existing.id)) messageIds.add(payload.id);
+			unsubscribe = manager.onPersist(check);
+			unregisterDispose = recipientSession.registerDisposeCallback(() =>
+				Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
+			);
+			unregisterSocket = this.registerMeshSocketCleanup(client, cleanup);
+			if (!ownEntry()) {
+				void recipientSession.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
+				void recipientSession.waitForAgentMessagePromptCompletion(payload.id).then(() => {
+					if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
+				}, dropped);
+			}
+		};
+		if (payload.deliveryMode !== "follow_up") startTracking();
 		try {
 			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 			let status: AgentSessionMessageDeliveryStatus;
 			const admissions = this.meshAdmissions.get(recipientSession) ?? new Map();
 			this.meshAdmissions.set(recipientSession, admissions);
 			let admission = admissions.get(payload.id);
-			if (admission) status = (await admission).status;
-			else if (ownEntry()) status = "delivered";
-			else if (queued) status = "queued";
-			else {
-				admission = this.acceptAgentSessionMessage(target, payload);
+			if (admission) {
+				status = (await admission).status;
+				startTracking();
+			} else if (ownEntry()) {
+				startTracking();
+				status = "delivered";
+			} else if (queued) {
+				startTracking();
+				status = "queued";
+			} else {
+				admission = this.acceptAgentSessionMessage(target, payload, startTracking);
 				admissions.set(payload.id, admission);
 				try {
 					status = (await admission).status;
@@ -6851,6 +6970,13 @@ export class AgentDaemon {
 			check();
 			if (deliveryFailure !== undefined) dropped(deliveryFailure);
 		} catch (error) {
+			if (error instanceof AgentMessageRunActiveError) {
+				cleanup();
+				this.meshDeferredOffers.add(recipientSession);
+				this.scheduleRosterFlush(target);
+				this.writeWorkerSuccess(client, command, { status: "deferred", reason: "run_active" });
+				return;
+			}
 			target.runtime.session.rejectAgentMessagePrompt(
 				payload.id,
 				error instanceof Error ? error : new Error(String(error)),
@@ -6865,6 +6991,7 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		targetSelector: string,
 		message: string,
+		scheduling: AgentMessageSchedulingOptions = {},
 	): Promise<AgentSessionMessageReceipt> {
 		const link = this.supervisorLink();
 		if (!link) {
@@ -6894,6 +7021,7 @@ export class AgentDaemon {
 				targetActiveSessionId: targetSelector,
 				message,
 				fromActiveSessionId: fromState.activeSessionId,
+				...scheduling,
 				agentOrigin: true,
 			},
 			30_000,
@@ -6904,12 +7032,27 @@ export class AgentDaemon {
 		if (!response.data || typeof response.data !== "object") {
 			throw new Error("Supervisor returned an invalid agent-message receipt");
 		}
-		return response.data as AgentSessionMessageReceipt;
+		return {
+			...(response.data as AgentSessionMessageReceipt),
+			...(scheduling.canWait === true ? { schedulingFallback: "steer" as const } : {}),
+		};
+	}
+
+	private meshRecipientBusy(session: AgentSession): boolean {
+		return (
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isRetrying ||
+			session.isBashRunning ||
+			session.queuedActionCount > 0 ||
+			session.getSessionActionSnapshot().active !== undefined
+		);
 	}
 
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
+		startTracking?: () => void,
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
 		const message = createAgentSessionMessage(payload);
 		const recipientSession = targetState.runtime.session;
@@ -6917,7 +7060,7 @@ export class AgentDaemon {
 		let preflightQueued = false;
 		await recipientSession.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
-			streamingBehavior: "steer",
+			streamingBehavior: payload.deliveryMode === "follow_up" ? "followUp" : "steer",
 			queueIfBusy: true,
 			customMessage: message,
 			admissionCommitted: () => {
@@ -6931,9 +7074,16 @@ export class AgentDaemon {
 				) {
 					throw new Error("Target session is closing before agent message delivery");
 				}
-				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
+				if (
+					targetState.runtime.session !== recipientSession ||
+					this.sessions.get(targetState.activeSessionId) !== targetState ||
+					targetState.runtime.session.sessionId !== payload.target.sessionId
+				) {
 					throw new Error("Target session changed before agent message delivery");
 				}
+				if (payload.deliveryMode === "follow_up" && this.meshRecipientBusy(recipientSession))
+					throw new AgentMessageRunActiveError("run_active");
+				startTracking?.();
 			},
 			preflightResult: (didSucceed, didQueue) => {
 				preflightFailed = !didSucceed;
@@ -7519,7 +7669,7 @@ export class AgentDaemon {
 				await abort;
 			}
 		} else if (reason === "shutdown" || reason === "replaced") {
-			await state.runtime.session.abort().catch(() => undefined);
+			await state.runtime.session.abort({ userStop: false }).catch(() => undefined);
 		}
 		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
 		state.unsubscribe?.();
@@ -7954,7 +8104,11 @@ export class AgentDaemon {
 			const agentId = this.rosterAgentIdForState(state);
 			const summary = composedSummaries.get(agentId);
 			if (summary !== undefined) {
-				if (reporter.lastComposedSource.get(agentId) === summary) {
+				const deferralReleased =
+					this.meshDeferredOffers.has(state.runtime.session) && !this.meshRecipientBusy(state.runtime.session);
+				if (deferralReleased) this.meshDeferredOffers.delete(state.runtime.session);
+				// A busy/idle pulse can leave the memoized summary unchanged; its release must still reach the supervisor.
+				if (reporter.lastComposedSource.get(agentId) === summary && !deferralReleased) {
 					const entry = reporter.lastComposed.get(agentId);
 					if (entry) {
 						entries.set(agentId, entry);
@@ -7962,7 +8116,12 @@ export class AgentDaemon {
 						continue;
 					}
 				}
-				entries.set(agentId, workerRosterEntryFromSummary(summary));
+				const meshDeferralRelease =
+					(reporter.lastComposed.get(agentId)?.meshDeferralRelease ?? 0) + (deferralReleased ? 1 : 0);
+				entries.set(agentId, {
+					...workerRosterEntryFromSummary(summary),
+					...(meshDeferralRelease > 0 ? { meshDeferralRelease } : {}),
+				});
 				composedSources.set(agentId, summary);
 				continue;
 			}

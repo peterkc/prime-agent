@@ -77,8 +77,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal
 // and command_not_dispatched failure info for mesh_notify refusals before dispatch.
 // Revision 38 adds optional repository-root metadata to daemon greetings.
-export const DAEMON_SCHEMA_REVISION = 38;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-repository-root";
+// Revision 39 adds optional, capability-gated mesh scheduling and transient held-follow-up state.
+export const DAEMON_SCHEMA_REVISION = 39;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-mesh-follow-up";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -127,6 +128,7 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "direct_peer_transport"
 	| "mesh_send"
+	| "mesh_follow_up"
 	| "mesh_notify"
 	| "mesh_replacement"
 	| "session_move"
@@ -533,10 +535,20 @@ export type DaemonCommand =
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			canWait?: boolean;
+			replyTo?: string;
 	  }
 	// targetSessionId carries an exact ID or a directory address. IDs win over names;
 	// Supervisors built before name addressing (same revision 34) refuse names before storage.
-	| { id?: string; type: "mesh_send"; fromActiveSessionId: string; targetSessionId: string; message: string }
+	| {
+			id?: string;
+			type: "mesh_send";
+			fromActiveSessionId: string;
+			targetSessionId: string;
+			message: string;
+			canWait?: boolean;
+			replyTo?: string;
+	  }
 	| { id?: string; type: "mesh_notify"; target: string; message: string }
 	| {
 			id?: string;
@@ -1056,6 +1068,8 @@ export function isSessionPlaneDaemonCommand(type: string): boolean {
 
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
+	if (command.type === "mesh_send" && (command.canWait === true || command.replyTo !== undefined))
+		requirements.push({ minProtocol: 7, minSchemaRevision: 39, capability: "mesh_follow_up" });
 	if (command.type === "extension_ui_response" && "status" in command.response) {
 		requirements.push(DAEMON_EXTENSION_UI_COMPATIBILITY.questionnaire);
 	}

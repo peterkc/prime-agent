@@ -3,12 +3,16 @@ import { closeSync, existsSync, fsyncSync, openSync, readdirSync } from "node:fs
 import { dirname, join } from "node:path";
 import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, type MessageMeta } from "@cotal-ai/core";
 import {
+	AGENT_MESSAGE_CAN_WAIT_HEADER,
 	AGENT_MESSAGE_ID_PREFIX,
 	AGENT_MESSAGE_SOURCE,
+	type AgentMessageSchedulingOptions,
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
+	agentMessageCanWait,
 	assertDirectAgentMessageTarget,
 	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
 } from "../../../core/agent-messages.js";
 import { canonicalSessionPath, SessionAlreadyActiveError, type SessionLease } from "../../../core/session-lease.js";
 import type { SessionMoveMeshWrites } from "../../../core/session-move.js";
@@ -46,6 +50,7 @@ import {
 	MeshNotStoredError,
 	MeshStorageUnknownError,
 	MeshTransferRecordError,
+	meshMessagePayload,
 	meshMessageText,
 	redactMeshError,
 } from "./mesh-shared.js";
@@ -54,11 +59,16 @@ export { MeshTransferRecordError } from "./mesh-shared.js";
 
 const MESH_SEND_TIMEOUT_MS = 30_000;
 
+export type MeshHandoffResult = { status: "deferred"; reason: "run_active" };
+
 export interface MeshEndpointOptions {
 	readonly meshRoot: string;
 	readonly homeSocket: string;
 	readonly credentialLifetimeSeconds?: number;
 	readonly log: (message: string) => void;
+	readonly isCurrentRecipient: (recipient: object) => boolean;
+	readonly canWait?: (record: EnrollmentRecord, message: CotalMessage) => Promise<boolean>;
+	readonly followUpStateChanged?: (sessionId: string, pending: boolean) => void;
 	readonly handoff: (
 		record: EnrollmentRecord,
 		message: CotalMessage,
@@ -66,13 +76,14 @@ export interface MeshEndpointOptions {
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
 		attemptToken: string,
-	) => Promise<void>;
+	) => Promise<MeshHandoffResult | undefined>;
 }
 
 interface QueuedDelivery {
 	readonly message: CotalMessage;
 	readonly delivery: Delivery;
 	readonly deliveryCount: number;
+	canWait?: boolean;
 	readonly workingTimer?: ReturnType<typeof setInterval>;
 	stallTimer?: ReturnType<typeof setTimeout>;
 }
@@ -95,6 +106,9 @@ interface SessionEndpoint extends SendingEndpoint {
 	readonly record: EnrollmentRecord;
 	readonly claim: SessionLease;
 	readonly queue: QueuedDelivery[];
+	readonly inFlight: Set<QueuedDelivery>;
+	deferral?: { readonly recipient: object };
+	deferralRevision?: number;
 	handoff?: Promise<void>;
 	current?: QueuedDelivery;
 	close?: Promise<void>;
@@ -327,6 +341,7 @@ export class MeshEndpoints {
 				claim,
 				endpoint,
 				queue: [],
+				inFlight: new Set(),
 				state: "starting",
 				abort: new AbortController(),
 			};
@@ -628,11 +643,12 @@ export class MeshEndpoints {
 		if (session.close) return session.close;
 		session.state = "closed";
 		session.abort.abort();
-		for (const item of [...session.queue, ...(session.current ? [session.current] : [])]) {
+		for (const item of [...session.queue, ...session.inFlight]) {
 			if (item.workingTimer) clearInterval(item.workingTimer);
 			if (item.stallTimer) clearTimeout(item.stallTimer);
 		}
 		session.queue.length = 0;
+		this.notifyFollowUpState(session);
 		for (const [id, pending] of this.pending) {
 			if (pending.sessionId !== sessionId) continue;
 			this.pending.delete(id);
@@ -693,6 +709,7 @@ export class MeshEndpoints {
 			sessionId,
 			canonicalSessionPath(sessionFile),
 			ledgerProof,
+			(record) => this.dropHeldForDeletion(record, ledgerProof ? "deleted child" : "deleted session"),
 		);
 		if (record === "absent") return;
 		if (record === "mismatch") {
@@ -726,6 +743,39 @@ export class MeshEndpoints {
 			await this.removeInbox(record);
 		} finally {
 			claim.release();
+		}
+	}
+
+	private dropHeldForDeletion(record: EnrollmentRecord, reason: string): void {
+		const session = this.sessions.get(record.sessionId);
+		const held = new Set(
+			[...(session?.queue ?? []), ...(session?.inFlight ?? [])].filter((item) => item.canWait === true),
+		);
+		if (held.size === 0)
+			this.options.log(
+				`Mesh session ${record.sessionId}: deletion pending count unknown; reason ${reason}; time ${new Date().toISOString()}`,
+			);
+		for (const item of held) {
+			let outcome = "acknowledged";
+			try {
+				item.delivery.ack();
+			} catch {
+				outcome = "acknowledgement failed";
+			}
+			this.options.log(
+				`Mesh session ${record.sessionId}, Cotal ID ${item.message.id}, sender ${item.message.from.id}, reason ${reason}, time ${new Date().toISOString()}: held message dropped; ${outcome}`,
+			);
+			if (item.workingTimer) clearInterval(item.workingTimer);
+			if (item.stallTimer) clearTimeout(item.stallTimer);
+			const pending = this.pending.get(item.message.id);
+			if (pending?.sessionId === record.sessionId) {
+				this.pending.delete(item.message.id);
+				pending.reject(new Error("Mesh held message dropped by terminal deletion"));
+			}
+		}
+		if (session) {
+			for (let index = session.queue.length - 1; index >= 0; index--)
+				if (held.has(session.queue[index]!)) session.queue.splice(index, 1);
 		}
 	}
 
@@ -958,9 +1008,12 @@ export class MeshEndpoints {
 		sender: AgentSessionMessageSender & { sessionId: string },
 		targetSessionId: string,
 		message: string,
+		scheduling: AgentMessageSchedulingOptions = {},
 	): Promise<AgentSessionMessageReceipt> {
 		const deadline = Date.now() + MESH_SEND_TIMEOUT_MS;
 		const senderSessionId = sender.sessionId;
+		const policy = parseAgentMessageScheduling(scheduling);
+		normalizeAgentSessionMessage(policy.canWait === true ? `${AGENT_MESSAGE_CAN_WAIT_HEADER}\n${message}` : message);
 		if (this.closing) throw new MeshNotStoredError("Message was not stored: mesh is shutting down");
 		if (this.refusal) throw new MeshNotStoredError(`Message was not stored: mesh unavailable: ${this.refusal}`);
 		const source = this.sessions.get(senderSessionId);
@@ -980,13 +1033,21 @@ export class MeshEndpoints {
 			throw new MeshNotStoredError(
 				`Message was not stored: sender ${senderSessionId} has no enrollment record or directory entry`,
 			);
-		return this.sendFrom(source, sender, targetSessionId, message, deadline, () => {
-			if (
-				!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
-				!readDirectory(this.options.meshRoot, senderSessionId)
-			)
-				throw new Error("sender enrollment disappeared while reconnecting");
-		});
+		return this.sendFrom(
+			source,
+			sender,
+			targetSessionId,
+			message,
+			deadline,
+			() => {
+				if (
+					!existsSync(enrollmentPath(this.options.meshRoot, senderSessionId)) ||
+					!readDirectory(this.options.meshRoot, senderSessionId)
+				)
+					throw new Error("sender enrollment disappeared while reconnecting");
+			},
+			policy,
+		);
 	}
 
 	private async sendFrom(
@@ -996,6 +1057,7 @@ export class MeshEndpoints {
 		message: string,
 		deadline: number,
 		validateSource: () => void,
+		scheduling: AgentMessageSchedulingOptions = {},
 	): Promise<AgentSessionMessageReceipt> {
 		const senderSessionId = source.label;
 		let target: ReturnType<typeof readDirectory>;
@@ -1023,7 +1085,23 @@ export class MeshEndpoints {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			// From this call onward any error is ambiguous. Never retry a publish or use native delivery.
-			const publish = source.endpoint.unicastAttributed(target.principal, message);
+			const parts =
+				scheduling.canWait === true
+					? [
+							{ kind: "text" as const, text: AGENT_MESSAGE_CAN_WAIT_HEADER },
+							{ kind: "text" as const, text: message },
+						]
+					: undefined;
+			const replyTo = scheduling.replyTo?.startsWith(AGENT_MESSAGE_ID_PREFIX)
+				? scheduling.replyTo.slice(AGENT_MESSAGE_ID_PREFIX.length)
+				: scheduling.replyTo;
+			const publish =
+				parts || replyTo
+					? source.endpoint.unicastAttributed(target.principal, message, {
+							...(parts ? { parts } : {}),
+							...(replyTo ? { replyTo } : {}),
+						})
+					: source.endpoint.unicastAttributed(target.principal, message);
 			const { msg, ack } = await Promise.race([
 				publish,
 				new Promise<never>((_, reject) => {
@@ -1106,12 +1184,52 @@ export class MeshEndpoints {
 		};
 		working();
 		const workingTimer = redelivery
-			? setInterval(working, Math.max(1, Math.floor(redelivery.ackWaitMs / 3)))
+			? setInterval(
+					() => {
+						working();
+						if (session.queue[0] === item && session.deferral) this.releaseDeferral(session.record.sessionId);
+					},
+					Math.max(1, Math.floor(redelivery.ackWaitMs / 3)),
+				)
 			: undefined;
 		workingTimer?.unref();
 		const item: QueuedDelivery = { message, delivery, deliveryCount, workingTimer };
 		session.queue.push(item);
+		void this.preparePolicy(session, item);
+	}
+
+	private async preparePolicy(session: SessionEndpoint, item: QueuedDelivery): Promise<void> {
+		try {
+			const canWait = agentMessageCanWait(meshMessagePayload(item.message));
+			item.canWait =
+				canWait && this.options.canWait ? await this.options.canWait(session.record, item.message) : canWait;
+		} catch {
+			// Invalid payloads keep the existing permanent-error path in deliver().
+			item.canWait = false;
+		}
+		this.notifyFollowUpState(session);
 		this.drain(session);
+	}
+
+	private notifyFollowUpState(session: SessionEndpoint): void {
+		this.options.followUpStateChanged?.(session.record.sessionId, this.hasQueuedFollowUps(session.record.sessionId));
+	}
+
+	releaseDeferral(sessionId: string): void {
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		session.deferralRevision = (session.deferralRevision ?? 0) + 1;
+		session.deferral = undefined;
+		this.drain(session);
+	}
+
+	hasQueuedFollowUps(sessionId: string): boolean {
+		const session = this.sessions.get(sessionId);
+		return (
+			(session?.state !== "closed" &&
+				(session?.current?.canWait === true || session?.queue.some((item) => item.canWait === true))) ||
+			false
+		);
 	}
 
 	private drain(session: SessionEndpoint): void {
@@ -1123,9 +1241,16 @@ export class MeshEndpoints {
 			this.sessions.get(session.record.sessionId) !== session
 		)
 			return;
-		const item = session.queue.shift();
+		if (session.deferral && !this.options.isCurrentRecipient(session.deferral.recipient))
+			session.deferral = undefined;
+		// An unresolved family lookup is a FIFO barrier, not a held follow-up.
+		const candidate = session.queue.findIndex((item) => item.canWait !== true);
+		const steer = session.queue[candidate]?.canWait === false ? candidate : -1;
+		if (steer < 0 && (session.deferral || session.queue[0]?.canWait !== true)) return;
+		const [item] = session.queue.splice(steer < 0 ? 0 : steer, 1);
 		if (!item) return;
 		session.current = item;
+		session.inFlight.add(item);
 		const redelivery = item.delivery.redelivery;
 		if (redelivery) {
 			item.stallTimer = setTimeout(() => {
@@ -1138,20 +1263,25 @@ export class MeshEndpoints {
 			}, redelivery.ackWaitMs);
 			item.stallTimer.unref();
 		}
-		const handoff = this.deliver(session, item);
+		let admitted!: () => void;
+		const handoff = new Promise<void>((resolve) => {
+			admitted = resolve;
+		});
 		session.handoff = handoff;
 		void handoff.finally(() => {
-			if (item.workingTimer) clearInterval(item.workingTimer);
-			if (item.stallTimer) clearTimeout(item.stallTimer);
 			session.handoff = undefined;
 			session.current = undefined;
+			this.notifyFollowUpState(session);
 			this.drain(session);
 		});
+		void this.deliver(session, item, admitted);
 	}
 
-	private async deliver(session: SessionEndpoint, item: QueuedDelivery): Promise<void> {
+	private async deliver(session: SessionEndpoint, item: QueuedDelivery, admitted: () => void): Promise<void> {
 		const { message, delivery, deliveryCount } = item;
 		let pending: PendingPersistence | undefined;
+		let retained = false;
+		const deferralRevision = session.deferralRevision;
 		try {
 			meshMessageText(message);
 			if (!readDirectory(this.options.meshRoot, session.record.sessionId)) {
@@ -1173,7 +1303,7 @@ export class MeshEndpoints {
 			});
 			// A disconnect may reject this while wake/acceptance is still pending.
 			void persisted.catch(() => undefined);
-			await this.options.handoff(
+			const outcome = await this.options.handoff(
 				session.record,
 				message,
 				deliveryCount,
@@ -1188,6 +1318,15 @@ export class MeshEndpoints {
 				},
 				pending!.attemptToken,
 			);
+			if (outcome?.status === "deferred") {
+				retained = true;
+				item.canWait = true;
+				if (session.deferralRevision === deferralRevision && pending?.recipient)
+					session.deferral = { recipient: pending.recipient };
+				session.queue.unshift(item);
+				return;
+			}
+			if (item.canWait === true) admitted();
 			await persisted;
 		} catch (error) {
 			if (session.state === "closed" || (pending && this.pending.get(message.id) !== pending)) return;
@@ -1209,6 +1348,10 @@ export class MeshEndpoints {
 			}
 		} finally {
 			if (pending && this.pending.get(message.id) === pending) this.pending.delete(message.id);
+			session.inFlight.delete(item);
+			if (!retained && item.workingTimer) clearInterval(item.workingTimer);
+			if (item.stallTimer) clearTimeout(item.stallTimer);
+			admitted();
 		}
 	}
 
@@ -1249,6 +1392,9 @@ export class MeshEndpoints {
 	}
 
 	disconnect(recipient: object): void {
+		for (const session of this.sessions.values()) {
+			if (session.deferral?.recipient === recipient) this.releaseDeferral(session.record.sessionId);
+		}
 		for (const beginning of this.replacementBegins.values()) {
 			if (beginning.requester === recipient) beginning.state = "failed";
 		}
@@ -1304,7 +1450,7 @@ export class MeshEndpoints {
 			}
 		} finally {
 			for (const session of this.sessions.values()) {
-				for (const item of [...session.queue, ...(session.current ? [session.current] : [])]) {
+				for (const item of [...session.queue, ...session.inFlight]) {
 					if (item.workingTimer) clearInterval(item.workingTimer);
 					if (item.stallTimer) clearTimeout(item.stallTimer);
 				}

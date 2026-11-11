@@ -20,12 +20,14 @@ import { basename, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { CotalEndpoint, createSpaceAuth, stripSpaceAuth } from "@cotal-ai/core";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { type Api, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import { type Api, type Context, fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { streamOpenAIResponses } from "../../ai/src/providers/openai-responses.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	AGENT_MESSAGE_CAN_WAIT_HEADER,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -53,6 +55,7 @@ import {
 	SessionManager,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
 import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
@@ -87,7 +90,7 @@ import {
 
 import { type PrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
-import { createHarness } from "./suite/harness.js";
+import { createHarness, type Harness } from "./suite/harness.js";
 import { createDeferred } from "./suite/scheduling.js";
 import { userMsg } from "./utilities.js";
 
@@ -449,7 +452,7 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("Unknown active session: deleted-child");
-		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue");
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue", {});
 	});
 
 	it("reports queued status when a direct accept races into the queue", async () => {
@@ -3480,6 +3483,7 @@ function makeRuntimeSession(
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
 		subscribe: vi.fn(() => vi.fn()),
+		subscribeSessionInputCheckpoint: vi.fn(() => vi.fn()),
 		bindExtensions: vi.fn(async () => {}),
 		setExecEnvProvider: vi.fn(),
 		getAvailableThinkingLevels: vi.fn(() => []),
@@ -4423,7 +4427,8 @@ describe("mesh worker persistence", () => {
 			sessions: Map<string, ActiveSessionState>;
 			assertSupervisorClaimCurrent(): Promise<string>;
 			scheduleSupervisorFenceCheck(): void;
-			scheduleRosterFlush(): void;
+			meshRecipientBusy(session: AgentSession): boolean;
+			scheduleRosterFlush(state?: ActiveSessionState): void;
 			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 			getOrHydrateBoundSessionState(): Promise<ActiveSessionState>;
 			receiveMeshMessage(
@@ -4452,7 +4457,7 @@ describe("mesh worker persistence", () => {
 			new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
 				.push(Buffer.concat(written))
 				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
-		const authenticate = (mode?: string) =>
+		const authenticate = (mode?: string, capabilities = ["mesh_follow_up"]) =>
 			internals.handleLine(
 				client,
 				JSON.stringify({
@@ -4463,10 +4468,1119 @@ describe("mesh worker persistence", () => {
 					supervisorPid: process.pid,
 					supervisorSocketPath: join(root, "supervisor.sock"),
 					...(mode ? { agentMessageTransport: mode } : {}),
+					capabilities,
 				}),
 			);
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
+
+	async function liveFixture(
+		options: Parameters<typeof createHarness>[0] = {},
+		hold = false,
+		capabilities = ["mesh_follow_up"],
+	) {
+		const started = createDeferred();
+		const release = createDeferred();
+		const aborted = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			...options,
+			tools: hold
+				? [
+						{
+							name: "wait",
+							label: "wait",
+							description: "fixture boundary",
+							abortResultGraceMs: 1000,
+							parameters: Type.Object({}),
+							execute: async (_id, _params, signal) => {
+								signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+								started.resolve();
+								await release.promise;
+								return { content: [{ type: "text", text: "released" }], details: {} };
+							},
+						},
+					]
+				: options.tools,
+		});
+		const h = harness();
+		await h.authenticate("cotal", capabilities);
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		const receive = (
+			command: Omit<
+				Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+				"type" | "targetActiveSessionId" | "sender"
+			>,
+		) =>
+			h.internals.receiveMeshMessage(h.client, {
+				type: "worker_deliver_message",
+				targetActiveSessionId: "target",
+				sender: { sessionName: "peer" },
+				...command,
+			});
+		return { live, h, state, started, release, aborted, receive };
+	}
+
+	it.each(["supported", "unsupported", "parent", "child", "reply"] as const)(
+		"defers supported busy follow-ups, with safe control and old-peer overrides (%s)",
+		async (policy) => {
+			const {
+				live,
+				h,
+				started,
+				release: released,
+				receive,
+			} = await liveFixture({}, true, policy === "unsupported" ? [] : ["mesh_follow_up"]);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("original complete"),
+				fauxAssistantMessage("follow-up complete"),
+			]);
+			const running = live.session.prompt("original work");
+			try {
+				await started.promise;
+				const listeners = h.socket.listenerCount("close");
+				const command = {
+					message: "routine update",
+					canWait: true,
+					...(policy === "reply" ? { replyTo: "original" } : {}),
+					...(policy === "parent" || policy === "child" ? { fromRelationship: policy } : {}),
+					cotal: { id: "held", deliveryCount: 1, attemptToken: "first" },
+				} as const;
+				await receive(command);
+				if (policy !== "supported") {
+					expect(h.frames().at(-1)).toMatchObject({
+						success: true,
+						data: { deliveryStatus: "queued", deliveryMode: "steer", schedulingFallback: "steer" },
+					});
+					expect(live.session.queuedActionCount).toBe(1);
+					released.resolve();
+					await running;
+					expect(h.frames()).toContainEqual({
+						type: "agent_message_persisted",
+						cotalId: "held",
+						attemptToken: "first",
+					});
+					return;
+				}
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+				expect(h.socket.listenerCount("close")).toBe(listeners);
+				expect(live.session.queuedActionCount).toBe(0);
+				expect(JSON.stringify(live.session.messages)).not.toContain("routine update");
+				released.resolve();
+				await running;
+				await receive({
+					...command,
+					cotal: { ...command.cotal, attemptToken: "second" },
+				});
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_held");
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "held",
+					attemptToken: "second",
+				});
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+				).toHaveLength(1);
+			} finally {
+				released.resolve();
+				await running;
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["user-stop", "user-stop-then-non-user-abort", "non-user-abort"] as const)(
+		"F36 respects the held FYI recipient's %s suspension",
+		async (cause) => {
+			const userStop = cause !== "non-user-abort";
+			const { live, h, started, release, receive } = await liveFixture(
+				userStop ? { initialGoal: { objective: "original goal" } } : {},
+				userStop,
+			);
+			let running: Promise<void> | undefined;
+			try {
+				if (userStop) {
+					live.session.setMeshFollowUpPending(true);
+					live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+					running = live.session.prompt("original work");
+					await started.promise;
+					const stopping = live.session.abort({ userStop: true });
+					release.resolve();
+					await stopping;
+					await running;
+					live.session.setMeshFollowUpPending(false);
+				} else await live.session.abort({ userStop: false });
+				if (cause === "user-stop-then-non-user-abort") await live.session.abort({ userStop: false });
+				const runs = live.eventsOfType("agent_start").length;
+				live.setResponses([fauxAssistantMessage("FYI handled")]);
+				await receive({
+					message: "held stop FYI",
+					canWait: true,
+					cotal: { id: "stop-held", deliveryCount: 1, attemptToken: "stop-attempt" },
+				});
+				if (userStop) {
+					await live.session.waitForSessionInputIdle();
+					expect(
+						h
+							.frames()
+							.filter((frame) => frame.command === "worker_deliver_message")
+							.at(-1),
+					).toMatchObject({
+						data: { deliveryStatus: "queued" },
+					});
+					expect(live.eventsOfType("agent_start")).toHaveLength(runs);
+					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					expect(live.session.hasQueuedAgentMessage("agentmsg_stop-held")).toBe(true);
+					await live.session.prompt("/goal clear");
+				}
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_stop-held");
+				await live.session.waitForSessionInputIdle();
+				expect(live.eventsOfType("agent_start")).toHaveLength(runs + 1);
+				expect(
+					live.session.messages.filter(
+						(message) => message.role === "custom" && message.customType === "agent_message",
+					),
+				).toHaveLength(1);
+				if (cause === "user-stop") {
+					await live.session.abort({ userStop: false });
+					live.setResponses([fauxAssistantMessage("FYI after user resume")]);
+					await receive({
+						message: "next held FYI",
+						canWait: true,
+						cotal: { id: "after-user-resume", deliveryCount: 1, attemptToken: "resume-attempt" },
+					});
+					await live.session.waitForSessionInputIdle();
+					expect(live.eventsOfType("agent_start")).toHaveLength(runs + 2);
+				}
+			} finally {
+				release.resolve();
+				await running;
+				live.cleanup();
+			}
+		},
+	);
+
+	function checkpointGate() {
+		const entered = createDeferred();
+		const released = createDeferred();
+		async function hold<T>(result: T): Promise<T> {
+			entered.resolve();
+			await released.promise;
+			return result;
+		}
+		return { entered: entered.promise, released, hold };
+	}
+
+	async function seedBranch(live: Harness): Promise<void> {
+		live.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await live.session.prompt("one");
+		await live.session.prompt("two");
+	}
+
+	function runAutoCompaction(session: AgentSession): Promise<boolean> {
+		const internal = session as unknown as {
+			_runAutoCompaction(reason: "threshold", retry: boolean): Promise<boolean>;
+		};
+		return internal._runAutoCompaction("threshold", false);
+	}
+
+	it.each(["streaming", "manual", "auto", "branch", "retry", "bash", "user-bash", "queued", "active"] as const)(
+		"F17 defers during %s and signals its native busy clear",
+		async (cause) => {
+			const gate = checkpointGate();
+			const { live, h, receive, started, release } = await liveFixture(
+				{
+					settings: { compaction: { keepRecentTokens: 1 } },
+					extensionFactories: [
+						(pi) => {
+							pi.on("session_before_compact", () => gate.hold({ cancel: true }));
+							pi.on("session_before_tree", () => gate.hold({ cancel: true }));
+							pi.on("user_bash", () =>
+								gate.hold({ result: { output: "", exitCode: 0, cancelled: false, truncated: false } }),
+							);
+							if (cause === "active") pi.on("before_agent_start", () => gate.hold(undefined));
+						},
+					],
+				},
+				cause === "streaming",
+			);
+			const { session } = live;
+			const entered = cause === "streaming" ? started.promise : gate.entered;
+			const released = cause === "streaming" ? release : gate.released;
+			const busy = () => h.internals.meshRecipientBusy(session);
+			const checkpoints: boolean[] = [];
+			const unsubscribe = session.subscribeSessionInputCheckpoint(() => checkpoints.push(busy()));
+			const pause = cause === "queued" ? session.acquireQueuedWorkPause() : undefined;
+			const start = {
+				streaming: () => session.agent.prompt("work"),
+				manual: () => expect(session.compact()).rejects.toThrow("Compaction cancelled"),
+				auto: () => runAutoCompaction(session),
+				branch: () => session.navigateTree(live.sessionManager.getTree()[0].entry.id, { summarize: true }),
+				retry: async () => {
+					Object.assign(session, { _retryPromise: released.promise, _retryResolve: () => {} });
+					await gate.hold(undefined);
+					session.abortRetry();
+				},
+				bash: () =>
+					session.executeBash("work", undefined, { operations: { exec: () => gate.hold({ exitCode: 0 }) } }),
+				"user-bash": () => session.runUserBash("work"),
+				queued: async () => {
+					await session.followUp("queued");
+					await gate.hold(undefined);
+					session.clearQueue();
+				},
+				active: async () => {
+					await session.followUp("work", undefined, { resumeIfIdle: true });
+					await session.waitForIdle();
+				},
+			};
+			let running: Promise<unknown> | undefined;
+			try {
+				expect(session.hasPendingAdmissionWaiters).toBe(false);
+				if (cause === "manual" || cause === "auto" || cause === "branch") await seedBranch(live);
+				live.setResponses([
+					...(cause === "streaming"
+						? [fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]
+						: []),
+					fauxAssistantMessage("done"),
+				]);
+				running = start[cause]();
+				await entered;
+				expect(busy()).toBe(true);
+				checkpoints.length = 0;
+				const actions = session.unfinishedActionCount;
+				const command = {
+					message: "checkpoint FYI",
+					canWait: true,
+					cotal: { id: "checkpoint", deliveryCount: 1, attemptToken: "first" },
+				};
+				await receive(command);
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+				expect(h.socket.listenerCount("close")).toBe(0);
+				expect(session.unfinishedActionCount).toBe(actions);
+				released.resolve();
+				await running;
+				expect(busy()).toBe(false);
+				expect(checkpoints).toContain(false);
+				unsubscribe();
+				const count = checkpoints.length;
+				pause?.release();
+				session.acquireQueuedWorkPause().release();
+				expect(checkpoints).toHaveLength(count);
+				const completed = session.waitForAgentMessagePromptCompletion("agentmsg_checkpoint");
+				live.setResponses([fauxAssistantMessage("follow-up complete")]);
+				await receive({ ...command, cotal: { ...command.cotal, attemptToken: "idle" } });
+				await completed;
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "checkpoint",
+					attemptToken: "idle",
+				});
+			} finally {
+				released.resolve();
+				await running;
+				pause?.release();
+				unsubscribe();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["preflight", "commit", "busy-flush", "navigate-tree", "F31-new-session"] as const)(
+		"F14/F17 releases a held offer after busy and idle coalesce (%s)",
+		async (phase) => {
+			const summary = checkpointGate();
+			const { live, h, state } = await liveFixture({
+				extensionFactories: [
+					(pi) => pi.on("session_before_tree", () => summary.hold({ summary: { summary: "branch summary" } })),
+				],
+			});
+			let navigation: Promise<void> | undefined;
+			let swappedRuntime: AgentSessionRuntime | undefined;
+			let reopened: Harness | undefined;
+			if (phase === "F31-new-session") {
+				swappedRuntime = new AgentSessionRuntime(
+					live.session,
+					{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+					async (options) =>
+						({
+							session: new AgentSession({
+								agent: new Agent({
+									initialState: { model: live.getModel(), systemPrompt: "Test", messages: [] },
+									convertToLlm,
+								}),
+								sessionManager: options.sessionManager,
+								settingsManager: live.settingsManager,
+								cwd: live.tempDir,
+								modelRegistry: live.session.modelRegistry,
+								resourceLoader: live.session.resourceLoader,
+							}),
+							services: { cwd: live.tempDir, agentDir: live.tempDir },
+							diagnostics: [],
+						}) as never,
+				);
+				state.runtime = swappedRuntime;
+			} else Object.assign(state.runtime, { diagnostics: [] });
+			const worker = h.internals as unknown as {
+				clients: Set<DaemonSocketClient>;
+				observeRosterEvent(state: ActiveSessionState, message: unknown): void;
+				flushRoster(): void;
+			};
+			Reflect.deleteProperty(h.internals, "scheduleRosterFlush");
+			worker.clients.add(h.client);
+			const brokerMocks = (["start", "stop", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map(
+				(method) => vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			);
+			const meshRoot = join(live.tempDir, "mesh");
+			mkdirSync(meshRoot);
+			writeFileSync(join(meshRoot, "mesh.json"), JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }));
+			writeFileSync(join(meshRoot, "signer.json"), JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))), {
+				mode: 0o600,
+			});
+			const mesh = new MeshEndpoints({
+				meshRoot,
+				homeSocket: "home",
+				log: vi.fn(),
+				isCurrentRecipient: (recipient) => recipient === h.client && !h.socket.destroyed,
+				handoff: async (record, _message, count, bind, _open, token) => {
+					bind(h.client);
+					await h.internals.receiveMeshMessage(h.client, {
+						type: "worker_deliver_message",
+						targetActiveSessionId: record.sessionId,
+						sender: { sessionName: "peer" },
+						message: "coalesced FYI",
+						canWait: true,
+						cotal: { id: "coalesced", deliveryCount: count, attemptToken: token },
+					});
+					const response = h
+						.frames()
+						.filter((frame) => frame.command === "worker_deliver_message")
+						.at(-1);
+					return response.data.status === "deferred" ? response.data : undefined;
+				},
+			});
+			const supervisor = new DaemonSupervisor(join(h.root, "supervisor.sock"), {
+				defaultSessionConfig: { agentDir: h.root, cwd: h.root },
+			});
+			const sup = supervisor as unknown as {
+				mesh: MeshEndpoints;
+				writeRosterEntry(entry: unknown, worker: undefined, status: undefined, enroll: boolean): unknown;
+				cleanupSupervisorResources(): Promise<void>;
+			};
+			sup.mesh = mesh;
+			const write = h.socket.write;
+			h.socket.write = (data) => {
+				const accepted = write(data);
+				const frame = h.frames().at(-1);
+				if (frame?.type === "roster_delta")
+					for (const entry of frame.entries) sup.writeRosterEntry(entry, undefined, undefined, false);
+				if (frame?.type === "agent_message_persisted")
+					mesh.confirmPersisted(frame.cotalId, h.client, frame.attemptToken);
+				return accepted;
+			};
+			const busy =
+				phase === "navigate-tree"
+					? undefined
+					: vi.spyOn(live.session, "isCompacting", "get").mockReturnValue(false);
+			const event = (type: string) => worker.observeRosterEvent(state, { type: "session_event", event: { type } });
+			const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+			const admission = vi
+				.spyOn(live.session, "acceptAgentMessagePrompt")
+				.mockImplementationOnce((text, options) => {
+					if (phase === "commit") {
+						busy?.mockReturnValue(true);
+						event("compaction_start");
+					}
+					return originalAccept(text, options);
+				});
+			try {
+				if (phase === "navigate-tree") {
+					await seedBranch(live);
+					Object.assign(state.runtime, {
+						setRuntimeEnvScope: () => {},
+						setSubagentRuntimeHost: () => {},
+						setRebindSession: () => {},
+					});
+					await bindActiveSessionState(state, {
+						broadcast: (target, message) => worker.observeRosterEvent(target, message),
+						sessionInputCheckpointChanged: (target) => h.internals.scheduleRosterFlush(target),
+						shutdown: () => {},
+					});
+				}
+				live.sessionManager.flushNow();
+				await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+				const holder = (
+					mesh as unknown as {
+						sessions: Map<string, { endpoint: CotalEndpoint; handoff?: Promise<void>; queue: unknown[] }>;
+					}
+				).sessions.get(live.session.sessionId)!;
+				const endpoint = holder.endpoint;
+				vi.useFakeTimers({
+					toFake:
+						phase === "F31-new-session"
+							? ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"]
+							: ["Date", "setTimeout", "clearTimeout"],
+				});
+				event("compaction_end");
+				await vi.advanceTimersByTimeAsync(0);
+				const baseline = h.frames().filter((frame) => frame.type === "roster_delta");
+				expect(baseline).toHaveLength(1);
+				busy?.mockReturnValue(true);
+				event("compaction_start");
+				busy?.mockReturnValue(false);
+				event("compaction_end");
+				await vi.advanceTimersByTimeAsync(250);
+				expect(h.frames().filter((frame) => frame.type === "roster_delta")).toHaveLength(1);
+				if (phase === "navigate-tree") {
+					navigation = h.internals.handleLine(
+						h.client,
+						JSON.stringify({
+							id: "navigate",
+							type: "navigate_tree",
+							activeSessionId: "target",
+							targetId: live.sessionManager.getTree()[0].entry.id,
+							summarize: true,
+						}),
+					);
+					await Promise.race([
+						summary.entered,
+						navigation.then(() => {
+							throw new Error("navigate_tree completed before branch summary started");
+						}),
+					]);
+					expect(live.session.isCompacting).toBe(true);
+				} else if (phase !== "commit") {
+					busy?.mockReturnValue(true);
+					event("compaction_start");
+				}
+				const ack = vi.fn();
+				let completed =
+					phase === "F31-new-session"
+						? undefined
+						: live.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+				live.setResponses([fauxAssistantMessage("follow-up complete")]);
+				endpoint.emit(
+					"message",
+					{
+						id: "coalesced",
+						ts: 0,
+						space: "prime",
+						from: { id: "local.peer", name: "peer" },
+						to: "local.recipient",
+						parts: [
+							{ kind: "text", text: AGENT_MESSAGE_CAN_WAIT_HEADER },
+							{ kind: "text", text: "coalesced FYI" },
+						],
+					},
+					{
+						durable: true,
+						ack,
+						nak: vi.fn(),
+						...(phase === "F31-new-session"
+							? { redelivery: { deliveryCount: 1, ackWaitMs: 3000, working: vi.fn() } }
+							: {}),
+					},
+					{ kind: "dm" },
+				);
+				await holder.handoff;
+				expect(
+					h
+						.frames()
+						.filter((frame) => frame.command === "worker_deliver_message")
+						.at(-1)?.data.status,
+				).toBe("deferred");
+				if (phase === "busy-flush" || phase === "navigate-tree") {
+					await vi.advanceTimersByTimeAsync(250);
+					await holder.handoff;
+					await vi.advanceTimersByTimeAsync(250);
+					await holder.handoff;
+					expect(holder.queue).toHaveLength(1);
+					expect(ack).not.toHaveBeenCalled();
+				}
+				if (phase === "F31-new-session") {
+					busy?.mockRestore();
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({ id: "swap", type: "new_session", activeSessionId: "target" }),
+					);
+					expect(h.frames().at(-1)).toMatchObject({ command: "new_session", success: true });
+					expect(state.runtime.session.sessionId).not.toBe(live.session.sessionId);
+					reopened = await createHarness({ existingSessionFile: live.session.sessionFile });
+					const oldState = makeState("old-recipient");
+					oldState.runtime = { ...oldState.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+					Object.assign(oldState.runtime, { diagnostics: [] });
+					h.internals.sessions.set(oldState.activeSessionId, oldState);
+					expect(reopened.session.sessionId).toBe(live.session.sessionId);
+					reopened.setResponses([fauxAssistantMessage("old recipient handled FYI")]);
+					completed = reopened.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+					await vi.advanceTimersByTimeAsync(999);
+					expect(holder.queue).toHaveLength(1);
+					expect(ack).not.toHaveBeenCalled();
+					await vi.advanceTimersByTimeAsync(1);
+					expect(holder.queue).toHaveLength(0);
+				} else if (navigation) {
+					summary.released.resolve();
+					await navigation;
+				} else {
+					busy?.mockReturnValue(false);
+					event("compaction_end");
+				}
+				await vi.advanceTimersByTimeAsync(250);
+				expect(holder.queue).toHaveLength(0);
+				await holder.handoff;
+				await completed;
+				expect(ack).toHaveBeenCalledTimes(1);
+				const recipient = reopened?.session ?? live.session;
+				expect(recipient.messages).toContainEqual(
+					expect.objectContaining({
+						customType: "agent_message",
+						details: expect.objectContaining({
+							message: "coalesced FYI",
+							deliveryMode: "follow_up",
+							target: expect.objectContaining({ sessionId: live.session.sessionId }),
+						}),
+					}),
+				);
+				if (phase === "F31-new-session") {
+					expect(state.runtime.session.messages).not.toContainEqual(
+						expect.objectContaining({ customType: "agent_message" }),
+					);
+					expect(
+						recipient.sessionManager
+							.getEntries()
+							.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+					).toHaveLength(1);
+				}
+				worker.flushRoster();
+				const frames = h.frames().length;
+				worker.flushRoster();
+				expect(h.frames()).toHaveLength(frames);
+			} finally {
+				summary.released.resolve();
+				await navigation;
+				state.unsubscribe?.();
+				busy?.mockRestore();
+				admission.mockRestore();
+				vi.useRealTimers();
+				await sup.cleanupSupervisorResources();
+				await swappedRuntime?.dispose();
+				reopened?.cleanup();
+				live.cleanup();
+				for (const mock of brokerMocks) mock.mockRestore();
+			}
+		},
+	);
+
+	it.each(["busy", "replacement"] as const)("revalidates a marked offer at atomic admission (%s)", async (race) => {
+		const { live, h, state, receive } = await liveFixture();
+		const fence = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const observers = vi.spyOn(live.sessionManager, "onPersist");
+		const entered = createDeferred();
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const admission = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const accepting = originalAccept(text, options);
+			entered.resolve();
+			return accepting;
+		});
+		const accepting = receive({
+			message: "race FYI",
+			canWait: true,
+			cotal: { id: "race", deliveryCount: 1, attemptToken: "race-attempt" },
+		});
+		const result = race === "replacement" ? expect(accepting).rejects.toThrow("Target session changed") : accepting;
+		try {
+			await entered.promise;
+			expect(live.session.hasPendingAdmissionWaiters).toBe(true);
+			if (race === "busy") Object.assign(live.session.agent.state, { isStreaming: true });
+			else
+				state.runtime = { ...state.runtime, session: Object.create(live.session) } as ActiveSessionState["runtime"];
+			fence.resolve();
+			await result;
+			if (race === "busy")
+				expect(h.frames().at(-1)).toMatchObject({
+					success: true,
+					data: { status: "deferred", reason: "run_active" },
+				});
+			expect(observers).not.toHaveBeenCalled();
+			expect(live.session.queuedActionCount).toBe(0);
+			expect(live.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+		} finally {
+			Object.assign(live.session.agent.state, { isStreaming: false });
+			fence.resolve();
+			await Promise.allSettled([accepting]);
+			observers.mockRestore();
+			admission.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["complete", "disconnect", "dispose"] as const)(
+		"bounds 19 pending socket observers and cleans every attempt (%s)",
+		async (ending) => {
+			const { live, h, state, started: entered, release, receive } = await liveFixture({}, true);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("complete"),
+			]);
+			const running = live.session.prompt("original");
+			const warnings: Error[] = [];
+			const onWarning = (warning: Error) => warnings.push(warning);
+			process.on("warning", onWarning);
+			try {
+				await entered.promise;
+				for (let index = 0; index < 19; index++)
+					await receive({
+						message: `steer ${index}`,
+						cotal: { id: `observer-${index}`, deliveryCount: 1, attemptToken: `attempt-${index}` },
+					});
+				expect(h.socket.listenerCount("close")).toBe(1);
+				await expect(
+					receive({
+						message: "overflow",
+						cotal: { id: "overflow", deliveryCount: 1, attemptToken: "overflow" },
+					}),
+				).rejects.toThrow("Target session has too many pending messages: 20 unfinished, limit is 20");
+				if (ending === "disconnect") {
+					h.socket.destroyed = true;
+					h.socket.emit("close");
+				}
+				if (ending === "dispose") live.session.dispose();
+				release.resolve();
+				await running;
+				await live.session.waitForSessionInputIdle();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(h.socket.listenerCount("close")).toBe(0);
+				expect(warnings.filter((warning) => warning.name === "MaxListenersExceededWarning")).toEqual([]);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(
+					ending === "complete" ? 19 : 0,
+				);
+				if (ending === "complete") {
+					const worker = h.internals as unknown as { clients: Set<DaemonSocketClient>; flushRoster(): void };
+					worker.clients.add(h.client);
+					Object.assign(state.runtime, { diagnostics: [] });
+					worker.flushRoster();
+					const entry = h
+						.frames()
+						.filter((frame) => frame.type === "roster_delta")
+						.flatMap((frame) => frame.entries)
+						.filter((entry) => entry.summary.sessionId === live.session.sessionId)
+						.at(-1);
+					expect(entry).toBeDefined();
+					expect(entry.meshDeferralRelease).toBeUndefined();
+				}
+			} finally {
+				release.resolve();
+				await running;
+				process.off("warning", onWarning);
+				live.cleanup();
+			}
+		},
+	);
+
+	it("negotiates transient goal hints and rejects stale revisions and changed targets", async () => {
+		const { live, h, state } = await liveFixture();
+		const update = vi.spyOn(live.session, "setMeshFollowUpPending");
+		const command = {
+			type: "worker_mesh_follow_up_state",
+			targetActiveSessionId: "target",
+			sessionId: live.session.sessionId,
+			pending: true,
+			revision: 3,
+		};
+		try {
+			for (const change of [
+				{},
+				{ pending: false, revision: 2 },
+				{ pending: false, revision: 4 },
+				{ sessionId: "replaced", pending: true, revision: 5 },
+			])
+				await h.internals.handleLine(h.client, JSON.stringify({ ...command, ...change }));
+			expect(update.mock.calls).toEqual([[true], [false]]);
+			expect(h.frames().at(-1)).toMatchObject({ success: false, error: "Mesh follow-up target changed" });
+			const older = harness();
+			older.internals.sessions.set("target", state);
+			await older.authenticate("cotal", []);
+			await older.internals.handleLine(older.client, JSON.stringify({ ...command, revision: 6 }));
+			expect(older.frames().at(-1)).toMatchObject({ success: false, error: "Unsupported mesh follow-up state" });
+			expect(update.mock.calls).toEqual([[true], [false], [false]]);
+		} finally {
+			update.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["drained", "deleted", "explicit-start", "resume-error"] as const)(
+		"gives held follow-ups the goal boundary and resumes after %s state",
+		async (outcome) => {
+			let live: Awaited<ReturnType<typeof createHarness>>;
+			const fixture = await liveFixture({
+				tools: [
+					{
+						name: "ipython",
+						label: "ipython",
+						description: "faux completion",
+						parameters: Type.Object({}),
+						execute: async () => {
+							live.session.handleGoalHostRequest("goal.complete");
+							return { content: [{ type: "text", text: "complete" }], details: {} };
+						},
+					},
+				],
+			});
+			live = fixture.live;
+			const { receive } = fixture;
+			const complete = createDeferred();
+			const deliver = outcome === "drained" || outcome === "explicit-start";
+			live.session.subscribe((event) => {
+				if (event.type === "goal_update" && (event.goal.status === "complete" || event.goal.status === "error"))
+					complete.resolve();
+			});
+			live.session.setMeshFollowUpPending(true);
+			live.setResponses([
+				fauxAssistantMessage("original final"),
+				...(outcome === "explicit-start" ? [fauxAssistantMessage("explicit user final")] : []),
+				...(deliver ? [fauxAssistantMessage("FYI final")] : []),
+				fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("goal complete"),
+			]);
+			try {
+				await live.session.prompt("/goal bounded fixture goal");
+				expect(live.eventsOfType("agent_end")).toHaveLength(1);
+				expect(live.session.goalState.continuationsUsed).toBe(0);
+				if (outcome === "explicit-start") await live.session.prompt("explicit user start");
+				if (outcome === "resume-error")
+					vi.spyOn(
+						live.session as unknown as { _ensureGoalRuntimeActive(): void },
+						"_ensureGoalRuntimeActive",
+					).mockImplementationOnce(() => {
+						throw new Error("fixture continuation failed");
+					});
+				if (deliver) {
+					await receive({
+						message: "held FYI",
+						canWait: true,
+						cotal: { id: "goal-held", deliveryCount: 1, attemptToken: "goal-attempt" },
+					});
+				}
+				live.session.setMeshFollowUpPending(false);
+				if (outcome === "resume-error") {
+					await (live.session as unknown as { _meshGoalResume?: Promise<void> })._meshGoalResume;
+					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					live.session.resumeQueuedWork();
+				}
+				await complete.promise;
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.goalState.status).toBe("complete");
+				expect(live.getPendingResponseCount()).toBe(0);
+				expect(live.eventsOfType("agent_end").length).toBeGreaterThan(1);
+				if (outcome === "resume-error") expect(live.session.goalState.continuationsUsed).toBe(1);
+			} finally {
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each([
+		"idle",
+		"in-run",
+		"restart",
+		"update",
+		"failed",
+		"abort-clear",
+		"connection",
+		"connection-clear",
+		"kill",
+	] as const)("records only active user stops before the next serialized provider input (%s)", async (mode) => {
+		const { live, h, state, started, release, aborted, receive } = await liveFixture({}, true);
+		const warning = vi.spyOn(console, "warn");
+		const active = mode !== "idle" && mode !== "update";
+		let reopened: Awaited<ReturnType<typeof createHarness>> | undefined;
+		let running: Promise<void> | undefined;
+		try {
+			if (active) {
+				live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+				running = live.session.prompt("work to abort");
+				await started.promise;
+			}
+			if (mode === "failed")
+				vi.spyOn(live.sessionManager, "flushNow").mockImplementationOnce(() => {
+					throw new Error("stop note write failed");
+				});
+			if (mode === "kill")
+				state.runtime = {
+					...state.runtime,
+					dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+				} as ActiveSessionState["runtime"];
+			let stopping: Promise<void> | undefined;
+			if (mode === "update") live.session.abortForUpdateRestart();
+			else if (mode === "connection" || mode === "connection-clear") {
+				const connection = new InProcessAgentConnection({
+					session: live.session,
+					setRebindSession: () => {},
+				} as unknown as AgentSessionRuntime);
+				stopping = mode === "connection" ? connection.abort() : connection.abortAndClearQueue().then(() => {});
+			} else
+				stopping = h.internals.handleLine(
+					h.client,
+					JSON.stringify({
+						id: "abort",
+						type: mode === "kill" ? "kill" : mode === "abort-clear" ? "abort_and_clear_queue" : "abort",
+						activeSessionId: "target",
+					}),
+				);
+			if (active) {
+				await aborted.promise;
+				expect(
+					live.session.messages.filter(
+						(message) => message.role === "custom" && message.customType === "agent_stop",
+					),
+				).toHaveLength(0);
+			}
+			release.resolve();
+			await stopping;
+			await running;
+			await live.session.abort();
+			const notes = live.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop");
+			const hasNote = active && mode !== "failed";
+			expect(notes).toHaveLength(hasNote ? 1 : 0);
+			if (mode === "failed") expect(warning).toHaveBeenCalledWith(expect.stringContaining("stop note write failed"));
+			if (mode === "update" || mode === "kill") return;
+			if (hasNote) expect(readFileSync(live.session.sessionFile!, "utf8")).toContain('"customType":"agent_stop"');
+			if (mode === "restart") {
+				reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+				state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+			}
+			const target = reopened ?? live;
+			target.session.resumeQueuedWork();
+			let nextContext: Context | undefined;
+			target.setResponses([
+				(context) => {
+					nextContext = context;
+					return fauxAssistantMessage("follow-up complete");
+				},
+			]);
+			await receive({
+				message: "held after abort",
+				canWait: true,
+				cotal: { id: "after-abort", deliveryCount: 2, attemptToken: "next" },
+			});
+			await target.session.waitForAgentMessagePromptCompletion("agentmsg_after-abort");
+			expect(nextContext).toBeDefined();
+			let serialized = "";
+			const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+				serialized = String(options?.body);
+				return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+			});
+			try {
+				const model: Model<"openai-responses"> = {
+					...target.getModel(),
+					api: "openai-responses",
+					provider: "openai",
+					baseUrl: "https://fixture.invalid/v1",
+				};
+				await streamOpenAIResponses(model, nextContext!, { apiKey: "fixture-key" }).result();
+			} finally {
+				fetch.mockRestore();
+			}
+			const input = JSON.stringify(JSON.parse(serialized).input);
+			expect(input.split("The user stopped the previous work.")).toHaveLength(hasNote ? 2 : 1);
+			if (hasNote) expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held after abort"));
+			if (active) {
+				expect(input).toContain("released");
+				expect(input).not.toContain("No result provided");
+				if (hasNote) expect(input.indexOf("released")).toBeLessThan(input.indexOf("The user stopped"));
+			}
+			expect(h.frames()).toContainEqual({
+				type: "agent_message_persisted",
+				cotalId: "after-abort",
+				attemptToken: "next",
+			});
+		} finally {
+			release.resolve();
+			await running;
+			reopened?.cleanup();
+			warning.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("logs stop-note flush failure and still resumes queued user work", async () => {
+		const { live, started, release } = await liveFixture({}, true);
+		const warning = vi.spyOn(console, "warn");
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("queued work complete"),
+		]);
+		const running = live.session.prompt("work to stop");
+		try {
+			await started.promise;
+			await live.session.steer("queued user work");
+			vi.spyOn(live.sessionManager, "flushNow").mockImplementationOnce(() => {
+				throw new Error("stop note write failed");
+			});
+			expect(live.session.abortAndSendQueued()).toBe(true);
+			release.resolve();
+			await running;
+			await live.session.waitForIdle();
+			expect(warning).toHaveBeenCalledWith(expect.stringContaining("stop note write failed"));
+			expect(live.eventsOfType("agent_end")).toHaveLength(2);
+			expect(live.session.messages).toContainEqual(
+				expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "queued work complete" }] }),
+			);
+		} finally {
+			release.resolve();
+			await running;
+			warning.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it.each(["default-abort", "extension-abort", "dispose", "archive"] as const)(
+		"does not record a user stop for %s",
+		async (mode) => {
+			let abortExtension: (() => void) | undefined;
+			const { live, h, state, started, release, aborted } = await liveFixture(
+				{
+					extensionFactories: [
+						(pi) => {
+							pi.on("agent_start", (_event, ctx) => {
+								abortExtension = () => ctx.abort();
+							});
+						},
+					],
+				},
+				true,
+			);
+			state.runtime = {
+				...state.runtime,
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+			} as ActiveSessionState["runtime"];
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("finished"),
+			]);
+			const running = live.session.prompt("active work");
+			const settled = Promise.allSettled([running]);
+			try {
+				await started.promise;
+				let stopping: Promise<void> | undefined;
+				if (mode === "archive") {
+					Object.assign(h.internals, { fencePeerTransports: () => {}, shutdown: async () => {} });
+					stopping = h.internals.handleLine(
+						h.client,
+						JSON.stringify({ id: "archive", type: "worker_archive_and_shutdown" }),
+					);
+				} else if (mode === "extension-abort") {
+					expect(abortExtension).toBeDefined();
+					abortExtension!();
+				} else if (mode === "dispose") await live.session.disposeAsync({ kernelSnapshot: false });
+				else stopping = live.session.abort();
+				if (mode !== "dispose") await aborted.promise;
+				release.resolve();
+				await stopping;
+				await settled;
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+				).toHaveLength(0);
+			} finally {
+				release.resolve();
+				await settled;
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["cancel", "delete", "goal-mesh"] as const)("keeps RLM %s separate from user stops", async (mode) => {
+		const child = await liveFixture({}, true);
+		child.live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+		const parent = await createHarness({
+			initialGoal: mode === "goal-mesh" ? { objective: "wait for the child" } : undefined,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.live.session }),
+				deleteRlmSubagentRuntime: async () => child.live.session.disposeAsync({ kernelSnapshot: false }),
+			},
+		});
+		parent.setResponses([fauxAssistantMessage("waiting"), fauxAssistantMessage("child settled")]);
+		try {
+			const spawned = await parent.session.runRlmChild("child work", { name: "fixture-child" });
+			await child.started.promise;
+			if (mode === "goal-mesh") {
+				parent.session.setMeshFollowUpPending(true);
+				await parent.session.prompt("wait for child");
+				parent.session.setMeshFollowUpPending(false);
+				await (parent.session as unknown as { _meshGoalResume?: Promise<void> })._meshGoalResume;
+				expect(parent.eventsOfType("agent_end")).toHaveLength(1);
+				expect(parent.session.goalState.continuationsUsed).toBe(0);
+				await parent.session.prompt("/goal pause");
+			}
+			if (mode === "delete") await parent.session.deleteRlmSubagent(spawned.rlm_child_id);
+			else expect(parent.session.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
+			child.release.resolve();
+			await parent.session.waitForRlmQuiescence();
+			expect(
+				child.live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+			).toHaveLength(0);
+		} finally {
+			child.release.resolve();
+			parent.cleanup();
+			child.live.cleanup();
+		}
+	});
+
+	it.each(["shutdown", "replaced", "killed", "update"] as const)(
+		"does not label lifecycle teardown as a user stop (%s)",
+		async (reason) => {
+			const { live, h, state, started, aborted, release } = await liveFixture({}, true);
+			state.runtime = {
+				...state.runtime,
+				session: live.session,
+				dispose: async () => live.session.disposeAsync({ kernelSnapshot: false }),
+			} as ActiveSessionState["runtime"];
+			live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+			const running = live.session.prompt("active work");
+			try {
+				await started.promise;
+				const closing = (
+					h.internals as unknown as {
+						closeSession(
+							state: ActiveSessionState,
+							reason: "shutdown" | "replaced" | "killed" | "update",
+						): Promise<void>;
+					}
+				).closeSession(state, reason);
+				await aborted.promise;
+				release.resolve();
+				await closing;
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+				).toHaveLength(0);
+			} finally {
+				release.resolve();
+				await running;
+				live.cleanup();
+			}
+		},
+	);
 
 	it.each([false, true])("AC-35 shares admission across supervisor sockets (reject: %s)", async (reject) => {
 		const h = harness();
@@ -4705,6 +5819,7 @@ describe("mesh worker persistence", () => {
 				mesh = new MeshEndpoints({
 					meshRoot,
 					homeSocket: join(live.tempDir, "mesh.sock"),
+					isCurrentRecipient: () => false,
 					handoff: vi.fn(),
 					log: vi.fn(),
 				});
@@ -4905,6 +6020,7 @@ describe("mesh worker persistence", () => {
 			mesh = new MeshEndpoints({
 				meshRoot,
 				homeSocket: join(live.tempDir, "mesh.sock"),
+				isCurrentRecipient: () => false,
 				handoff: vi.fn(),
 				log: vi.fn(),
 			});
@@ -5411,6 +6527,8 @@ describe("mesh worker persistence", () => {
 				cleanupSupervisorResources(): Promise<void>;
 			};
 			sup.mesh = {
+				releaseDeferral: vi.fn(),
+				hasQueuedFollowUps: () => false,
 				enqueueEnrollment: async (id: string, file: string) => {
 					enrolledId = id;
 					enrolledInfo = await readSessionInfo(file);

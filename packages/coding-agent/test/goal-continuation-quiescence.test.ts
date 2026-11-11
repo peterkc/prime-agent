@@ -4,6 +4,15 @@ import { AgentSession } from "../src/core/agent-session.js";
 type Harness = {
 	_goalState: { status: string; objective?: string; continuationsUsed: number };
 	_goalContinuationAwaitsRlmWork: boolean;
+	_meshFollowUpPending: boolean;
+	_goalContinuationAwaitsMesh: boolean;
+	_meshGoalResume?: Promise<void>;
+	agent: { waitForIdle(): Promise<void> };
+	_agentEventQueue: Promise<void>;
+	_resumeGoalAfterMeshIdle(): void;
+	_maybeResumeGoalContinuationAfterRlmWork(): void;
+	_finishGoalWithError: ReturnType<typeof vi.fn>;
+	_asError: (error: unknown) => Error;
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -25,10 +34,28 @@ const maybeResume = Reflect.get(AgentSession.prototype, "_maybeResumeGoalContinu
 	this: Harness,
 ) => void;
 
+const resumeMesh = Reflect.get(AgentSession.prototype, "_resumeGoalAfterMeshIdle") as (this: Harness) => void;
+const setMeshPending = Reflect.get(AgentSession.prototype, "setMeshFollowUpPending") as (
+	this: Harness,
+	pending: boolean,
+) => void;
+
 function harness(overrides: Partial<Harness> = {}): Harness {
 	return {
 		_goalState: { status: "active", objective: "ship it", continuationsUsed: 0 },
 		_goalContinuationAwaitsRlmWork: false,
+		_meshFollowUpPending: false,
+		_goalContinuationAwaitsMesh: false,
+		agent: { waitForIdle: async () => {} },
+		_agentEventQueue: Promise.resolve(),
+		_resumeGoalAfterMeshIdle() {
+			resumeMesh.call(this);
+		},
+		_maybeResumeGoalContinuationAfterRlmWork() {
+			maybeResume.call(this);
+		},
+		_finishGoalWithError: vi.fn(),
+		_asError: (error) => (error instanceof Error ? error : new Error(String(error))),
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -52,6 +79,97 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 const context = { message: { role: "assistant", stopReason: "stop" }, context: {} };
 
 describe("goal continuation vs unsettled subagent work", () => {
+	it("F23 resumes once after ACP MCP close releases the overlapping idle pause", async () => {
+		let idle!: () => void;
+		let closed!: () => void;
+		const idlePromise = new Promise<void>((resolve) => {
+			idle = resolve;
+		});
+		const closePromise = new Promise<{ status: string }>((resolve) => {
+			closed = () => resolve({ status: "ok" });
+		});
+		const mode = Object.assign(
+			harness({
+				_meshFollowUpPending: true,
+				_goalContinuationAwaitsMesh: true,
+				agent: { waitForIdle: () => idlePromise },
+			}),
+			{
+				_mcpManager: { canReleaseAcpServers: () => true, replaceAcpServers: () => false },
+				_ipythonKernelProvisioner: { manager: { isRunning: true, execute: () => closePromise } },
+				acquireSessionInputPause: AgentSession.prototype.acquireSessionInputPause,
+				_sessionInputPumpEpoch: 0,
+				_notifySessionInputCheckpointChange: () => {},
+				_flushDeferredRlmTerminalNotices: () => {},
+				_maybeResumeAutonomousContinuationAfterRlmWork: () => {},
+				_scheduleSessionInputPump: () => {},
+			},
+		);
+		const closing = AgentSession.prototype.releaseAcpMcpServers.call(mode as unknown as AgentSession, "acp-owner", [
+			"server",
+		]);
+		try {
+			setMeshPending.call(mode, false);
+			idle();
+			await mode._meshGoalResume;
+			expect(mode._sessionInputAdmissionPauses.size).toBe(1);
+			expect(mode._admitSessionInput).not.toHaveBeenCalled();
+			expect(mode._goalState.continuationsUsed).toBe(0);
+			closed();
+			await closing;
+			expect(mode._sessionInputAdmissionPauses.size).toBe(0);
+			expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
+			expect(mode._goalState.continuationsUsed).toBe(1);
+			maybeResume.call(mode);
+			expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
+		} finally {
+			idle();
+			closed();
+			await closing;
+		}
+	});
+
+	it("F23 retries a Mesh-idle continuation after atomic admission refuses it", async () => {
+		const mode = harness({ _goalContinuationAwaitsMesh: true });
+		mode._admitSessionInput.mockImplementationOnce(() => {
+			throw new Error("admission race");
+		});
+		resumeMesh.call(mode);
+		await mode._meshGoalResume;
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(true);
+		expect(mode._goalState.continuationsUsed).toBe(0);
+		expect(mode._finishGoalWithError).not.toHaveBeenCalled();
+		maybeResume.call(mode);
+		maybeResume.call(mode);
+		expect(mode._admitSessionInput).toHaveBeenCalledTimes(2);
+		expect(mode._goalState.continuationsUsed).toBe(1);
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(false);
+	});
+
+	it.each([
+		["_hasUnsettledRlmQuiescenceWork", false],
+		["_hasUnsettledRlmQuiescenceWork", true],
+		["_hasLiveBackgroundBashHandles", false],
+		["_hasLiveBackgroundBashHandles", true],
+	] as const)("holds Mesh-idle goal continuation for %s (new mail: %s)", async (work, newMail) => {
+		const mode = harness({ _meshFollowUpPending: true, _goalContinuationAwaitsMesh: true, [work]: () => true });
+		setMeshPending.call(mode, false);
+		await mode._meshGoalResume;
+		expect(mode._admitSessionInput).not.toHaveBeenCalled();
+		expect(mode._goalState.continuationsUsed).toBe(0);
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(true);
+		mode[work] = () => false;
+		if (newMail) setMeshPending.call(mode, true);
+		maybeResume.call(mode);
+		if (newMail) {
+			expect(mode._admitSessionInput).not.toHaveBeenCalled();
+			setMeshPending.call(mode, false);
+			await mode._meshGoalResume;
+		}
+		expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
+		expect(mode._goalState.continuationsUsed).toBe(1);
+	});
+
 	it("defers the continuation while descendant work is unsettled", async () => {
 		const mode = harness({ _hasUnsettledRlmQuiescenceWork: () => true });
 		await expect(getGoalContinuation.call(mode, context)).resolves.toEqual([]);

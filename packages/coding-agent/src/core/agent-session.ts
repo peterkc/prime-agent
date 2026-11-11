@@ -63,6 +63,7 @@ import {
 	isAgentSessionMessageId,
 	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
+	parseAgentMessageScheduling,
 	parseAgentSessionMessagePromptId,
 	startsAgentRun,
 } from "./agent-messages.js";
@@ -1583,6 +1584,7 @@ export class AgentSession {
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
+	private _sessionInputSuspendedForUserStop = false;
 	private _sessionInputSuspendedForUpdateRestart = false;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
@@ -1595,6 +1597,7 @@ export class AgentSession {
 	private readonly _sessionActionCommitDisposeAbortController = new AbortController();
 	// Checkpoint, handoff, and activity waiters share lifecycle-edge notifications to avoid polling.
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
+	private readonly _sessionInputCheckpointListeners = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
 	private _goalState: GoalState = emptyGoalState();
@@ -1602,6 +1605,51 @@ export class AgentSession {
 	private _goalContinuationAwaitsRlmWork = false;
 	private _goalAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _goalAbortInProgress = false;
+	private _meshFollowUpPending = false;
+	private _goalContinuationAwaitsMesh = false;
+	private _meshGoalResume?: Promise<void>;
+	private _pendingStopNote?: Promise<void>;
+
+	setMeshFollowUpPending(pending: boolean): void {
+		this._meshFollowUpPending = pending;
+		if (!pending && this._goalContinuationAwaitsMesh) this._resumeGoalAfterMeshIdle();
+	}
+
+	private _resumeGoalAfterMeshIdle(): void {
+		if (this._meshGoalResume) return;
+		this._meshGoalResume = (async () => {
+			await this.agent.waitForIdle();
+			await this._agentEventQueue;
+			if (
+				this._meshFollowUpPending ||
+				!this._goalContinuationAwaitsMesh ||
+				this._disposed ||
+				this._disposing ||
+				this._goalState.status !== "active"
+			)
+				return;
+			this._goalContinuationAwaitsMesh = false;
+			this._goalContinuationAwaitsRlmWork = true;
+			this._maybeResumeGoalContinuationAfterRlmWork();
+		})()
+			.catch((error: unknown) => {
+				this._goalContinuationAwaitsMesh = false;
+				this._finishGoalWithError(this._asError(error).message);
+			})
+			.finally(() => {
+				this._meshGoalResume = undefined;
+				if (
+					!this._meshFollowUpPending &&
+					this._goalContinuationAwaitsMesh &&
+					!this._disposed &&
+					!this._disposing &&
+					!this._sessionInputPumpSuspended &&
+					this._sessionInputAdmissionPauses.size === 0 &&
+					this._goalState.status === "active"
+				)
+					this._resumeGoalAfterMeshIdle();
+			});
+	}
 	private _autonomousState: AutonomousRuntimeState;
 	private _autonomousContinuationSuppressionDepth = 0;
 	private _autonomousContinuationSuppressedMessages = new WeakSet<AgentMessage>();
@@ -2875,6 +2923,12 @@ export class AgentSession {
 		// Keep the deferral while admission is paused or the pump is suspended
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this._meshFollowUpPending) {
+			this._goalContinuationAwaitsRlmWork = false;
+			this._goalContinuationAwaitsMesh = true;
+			this._resumeGoalAfterMeshIdle();
+			return;
+		}
 		const goalBeforeResume = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
@@ -4279,6 +4333,7 @@ export class AgentSession {
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					...parseAgentMessageScheduling({ canWait: payload.canWait, replyTo: payload.replyTo }),
 					...(payload.targetKind === "name" ? { targetKind: "name" } : {}),
 					...(payload.receiverRole === "parent" ||
 					payload.receiverRole === "sibling" ||
@@ -4416,6 +4471,12 @@ export class AgentSession {
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const goalSnapshot = this._goalState;
 		const goalAccountingStartedAt = this._goalAccountingStartedAt;
+		if (this._goalState.status === "active" && this._meshFollowUpPending) {
+			this._goalContinuationAwaitsMesh = true;
+			this._resumeGoalAfterMeshIdle();
+			return [];
+		}
+		this._goalContinuationAwaitsMesh = false;
 		const goalMessages = await this._getGoalContinuationMessages(context, signal);
 		if (goalMessages.length > 0 || signal?.aborted) {
 			if (goalMessages.length > 0 && this._sessionInputArrivalEpoch !== arrivalEpoch) {
@@ -4554,6 +4615,7 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
+			void this._notifyAfterAgentIdle();
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -4602,6 +4664,11 @@ export class AgentSession {
 		);
 		this._agentEventQueue.catch(() => {});
 	};
+
+	private async _notifyAfterAgentIdle(): Promise<void> {
+		await this.agent.waitForIdle();
+		this._notifySessionInputCheckpointChange();
+	}
 
 	private _createRetryPromiseForAgentEnd(event: AgentEvent): void {
 		if (event.type !== "agent_end" || this._retryPromise) {
@@ -5026,6 +5093,11 @@ export class AgentSession {
 		};
 	}
 
+	subscribeSessionInputCheckpoint(listener: () => void): () => void {
+		this._sessionInputCheckpointListeners.add(listener);
+		return () => this._sessionInputCheckpointListeners.delete(listener);
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -5329,6 +5401,7 @@ export class AgentSession {
 			);
 			this._disconnectFromAgent();
 			this._eventListeners = [];
+			this._sessionInputCheckpointListeners.clear();
 			cleanupSessionResources(this.sessionId);
 		} finally {
 			void this._startDisposeCallbacks();
@@ -5839,8 +5912,16 @@ export class AgentSession {
 	}
 
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._pendingStopNote) await this._pendingStopNote;
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
+		if (
+			customMessage?.details.deliveryMode === "follow_up" &&
+			!this.isStreaming &&
+			!this._sessionInputSuspendedForUserStop &&
+			!this._sessionInputSuspendedForUpdateRestart
+		)
+			this._resumeSessionInputAdmission();
 		const clearEpoch = this._agentMessageClearEpoch;
 		const admissionCommitted = () => {
 			if (customMessage && this._replacingAgentMessageIds.has(customMessage.details.id))
@@ -5852,7 +5933,8 @@ export class AgentSession {
 		};
 		if (
 			this._sessionInputPumpSuspended &&
-			this._isBusyForSessionInput("preflight") &&
+			(this._isBusyForSessionInput("preflight") ||
+				(this._sessionInputSuspendedForUserStop && customMessage?.details.deliveryMode === "follow_up")) &&
 			options?.queueIfBusy === true &&
 			options.streamingBehavior
 		) {
@@ -7118,6 +7200,7 @@ export class AgentSession {
 				}
 				if (epoch !== this._sessionInputPumpEpoch) {
 					for (const action of actions) this._actionStore.rollback(action);
+					this._notifySessionInputCheckpointChange();
 					return;
 				}
 				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
@@ -7325,6 +7408,7 @@ export class AgentSession {
 	}
 
 	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+		if (this._pendingStopNote) await this._pendingStopNote;
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -8125,6 +8209,13 @@ export class AgentSession {
 		const waiters = [...this._sessionInputCheckpointWaiters];
 		this._sessionInputCheckpointWaiters.clear();
 		for (const resolve of waiters) resolve();
+		for (const listener of this._sessionInputCheckpointListeners) {
+			try {
+				listener();
+			} catch (error) {
+				console.warn("Session input checkpoint listener failed", error);
+			}
+		}
 	}
 
 	private _waitForSessionActivityChange(signal: AbortSignal): Promise<void> {
@@ -8327,6 +8418,7 @@ export class AgentSession {
 	private _resumeSessionInputAdmission(): void {
 		if (!this._sessionInputPumpSuspended) return;
 		this._sessionInputPumpSuspended = false;
+		this._sessionInputSuspendedForUserStop = false;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._sessionInputPumpEpoch++;
 		this._notifySessionInputCheckpointChange();
@@ -8454,7 +8546,8 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	requestAbort(): void {
+	requestAbort(options: { userStop?: boolean } = {}): void {
+		const userStop = options.userStop === true && this.isSessionActive;
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -8462,6 +8555,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputSuspendedForUserStop ||= options.userStop === true;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._demoteRlmTerminalNoticeActions();
 		this._cancelSessionActions(
@@ -8481,18 +8575,48 @@ export class AgentSession {
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
 		this.agent.abort();
+		this._goalContinuationAwaitsMesh = false;
+		if (userStop && !this._pendingStopNote) {
+			this._pendingStopNote = this.agent
+				.waitForIdle()
+				.then(() => this._agentEventQueue)
+				.then(() => {
+					const note: CustomMessage = {
+						role: "custom",
+						customType: "agent_stop",
+						display: true,
+						timestamp: Date.now(),
+						content:
+							"The user stopped the previous work. Do not restart that work because of a later agent message or FYI. Follow later user instructions.",
+					};
+					this.sessionManager.appendCustomMessageEntryWithRollback(note.customType, note.content, note.display);
+					this.agent.state.messages.push(note);
+					this._emit({ type: "message_start", message: note });
+					this._emit({ type: "message_end", message: note });
+				})
+				.catch((error: unknown) => {
+					console.warn(`Warning: Could not persist user stop note: ${this._asError(error).message}`);
+				})
+				.finally(() => {
+					this._pendingStopNote = undefined;
+				});
+		}
 	}
 
-	async abort(): Promise<void> {
+	async abort(options: { userStop?: boolean } = {}): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
-		this.requestAbort();
-		this._cancelActiveRlmChildRuns("Parent session aborted");
+		try {
+			this.requestAbort(options);
+		} finally {
+			this._cancelActiveRlmChildRuns("Parent session aborted");
+		}
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
 			await Promise.allSettled([
 				this.agent.waitForIdle(),
 				this._agentEventQueue,
+				...(this._pendingStopNote ? [this._pendingStopNote] : []),
 				...(compactionOperation ? [compactionOperation] : []),
 				...(branchSummaryOperation ? [branchSummaryOperation] : []),
 			]);
@@ -8526,11 +8650,11 @@ export class AgentSession {
 			this._sessionInputAdmissionPauses.size === 0 &&
 			this._queuedWorkPauses.size === 0;
 		if (queuedSteering.length === 0 || !canResume) {
-			this.requestAbort();
+			this.requestAbort({ userStop: true });
 			return false;
 		}
 		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
-		this.requestAbort();
+		this.requestAbort({ userStop: true });
 		this.resumeQueuedWork();
 		return true;
 	}
@@ -8551,6 +8675,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputSuspendedForUserStop = false;
 		this._sessionInputSuspendedForUpdateRestart = true;
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
@@ -9032,7 +9157,7 @@ export class AgentSession {
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		if (!options.skipAbort) await this.abort({ userStop: false });
 		let didCompact = false;
 		const compactionAbort = new AbortController();
 		this._compactionAbortController = compactionAbort;
@@ -11415,6 +11540,8 @@ export class AgentSession {
 							message: input.message,
 							receiverRole: input.receiverRole,
 							targetKind: input.targetKind,
+							...(input.canWait !== undefined ? { canWait: input.canWait } : {}),
+							...(input.replyTo !== undefined ? { replyTo: input.replyTo } : {}),
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";

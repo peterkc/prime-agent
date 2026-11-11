@@ -43,6 +43,8 @@ export interface WorkerRosterEntry {
 	agentId: string;
 	queuedChild?: true;
 	seededCwd?: true;
+	/** Worker idle-release revision for a previously deferred Mesh offer. */
+	meshDeferralRelease?: number;
 	summary: RosterSessionSummary;
 }
 

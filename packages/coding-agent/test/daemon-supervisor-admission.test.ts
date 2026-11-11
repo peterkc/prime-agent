@@ -98,6 +98,51 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
+	it.each(["parent", "child", "sibling", "unknown", "old-worker"] as const)(
+		"derives marked policy from authenticated receiver family truth (%s)",
+		async (relationship) => {
+			const root = { id: "root", depth: 0, status: "running" };
+			const receiver = { id: "receiver", depth: 1, status: "running", parentSessionId: "root" };
+			const sender =
+				relationship === "parent"
+					? root
+					: {
+							id: "sender",
+							depth: relationship === "child" ? 2 : 1,
+							status: "idle",
+							...(relationship === "child"
+								? { parentSessionId: "receiver" }
+								: relationship === "sibling"
+									? { parentSessionId: "root" }
+									: {}),
+						};
+			const directoryEntryForPrincipal = vi.fn(() => ({ sessionId: sender.id }));
+			const supervisor = Object.assign(createHarness(), {
+				mesh: { directoryEntryForPrincipal },
+				roster: () => new Map([["receiver", { workerId: "worker", summary: { sessionId: "receiver" } }]]),
+				workers: new Map([["worker", { meshFollowUpCapable: relationship !== "old-worker" }]]),
+				familyCatalogEntries: async () => [root, receiver, sender],
+			}) as unknown as { meshMessageCanWait(record: { sessionId: string }, message: object): Promise<boolean> };
+			const message = {
+				id: "mark",
+				ts: 0,
+				space: "prime",
+				from: { id: "authenticated.sender", name: "parent:spoof", sessionId: "root" },
+				to: "local.receiver",
+				fromRelationship: "parent",
+				parts: [
+					{ kind: "text", text: "[prime-agent-message v1 can_wait=true]" },
+					{ kind: "text", text: "payload" },
+				],
+			};
+			await expect(supervisor.meshMessageCanWait({ sessionId: "receiver" }, message)).resolves.toBe(
+				relationship === "sibling" || relationship === "unknown",
+			);
+			if (relationship !== "old-worker")
+				expect(directoryEntryForPrincipal).toHaveBeenCalledExactlyOnceWith("authenticated.sender");
+		},
+	);
+
 	it.each<[string, DaemonCommand?]>([
 		["shutdown"],
 		["lease"],

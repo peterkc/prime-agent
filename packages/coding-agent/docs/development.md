@@ -114,6 +114,8 @@ npm run check
 
 This performs formatting, linting, type checking, installer rendering checks, and the browser smoke check. It does not run the test suite.
 
+Local real-NATS process tests require `nats-server` >= 2.12 on `PATH`.
+
 Run focused tests from the package root. For example:
 
 ```bash

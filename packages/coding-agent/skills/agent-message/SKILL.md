@@ -31,7 +31,7 @@ if child is not None:
   lists the parent, siblings, and children this skill can reach, active or not,
   with the `relationship` and `sessionName` that `send` takes as
   `receiver_role` and `receiver_name`.
-- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None)` — sends one direct
+- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None, can_wait=None, reply_to=None)` — sends one direct
   text message to one family member. Sending to an inactive or idle completed
   subagent wakes it and starts an ordinary follow-up turn in that same session
   and context.
@@ -41,8 +41,8 @@ if child is not None:
   `send("all", message)` broadcasts only to the family roster and returns
   `{receipts: [...]}` in roster order; successful entries are ordinary receipts
   and failed entries contain the target id and a short `error`. One failed delivery
-  does not reject successful deliveries. Messages always use steering delivery so
-  a busy target sees them during its active run. Returns a receipt with a
+  does not reject successful deliveries. Unmarked messages use steering delivery.
+  Returns a receipt with a
   `deliveryStatus` field: `"delivered"` means the message reached an idle target's
   context; `"queued"` means a steering message was accepted and will deliver when
   the target's current work allows (`send` does not block waiting for that).
@@ -58,6 +58,32 @@ if child is not None:
   and `cotalId`. This proves broker storage, not delivery to the target. It carries
   neither `deliveredAt` nor `queuedAt`. A storage-outcome-unknown error must not be
   retried automatically: a resend can show the message twice.
+
+## Wait-safe messages and replies
+
+- Before setting `can_wait=True`, ask: "Will someone stop, wait or come to harm
+  until the recipient reads this?" Set it only when the answer is no. If uncertain,
+  omit it. A message that needs no reply is not necessarily safe to delay.
+- Never mark stop/cancel, relayed user instructions, a reply someone awaits,
+  a request that starts work, a blocker or conflict, or a harmful time limit.
+- On supported Cotal receivers, a marked message waits outside the active run.
+  It starts a follow-up run when idle, without another prompt. After a user stop,
+  a held message waits until the user or another input resumes the session.
+  Steers and replies pass held messages. Sustained steering can delay follow-ups
+  indefinitely.
+- Set `reply_to` to the canonical received message ID shown in the message header,
+  or to a receipt's `id` or `cotalId`. A linked reply always steers, even when marked.
+  Direct parent-child messages also always steer, for each broadcast target.
+- Native delivery and older receivers keep steering. A native receipt may report
+  `schedulingFallback: "steer"`. An old Cotal receiver may show a cosmetic
+  `[prime-agent-message v1 can_wait=true]` line. Do not copy that line into a body
+  to select delivery; only the typed argument marks a message.
+- FIFO follows the current arrival/admission queue. A broker or consumer crash
+  can change redelivery order; original publication order is not guaranteed.
+- Deleting a recipient drops held messages without notifying the sender.
+  A `stored` receipt proves broker storage, not recipient delivery.
+- A stop note records a user stop of active work. Do not restart work the user stopped
+  because a later agent message or FYI arrives. Delivery grants no work authority.
 
 ## Safety
 

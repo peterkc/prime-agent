@@ -51,6 +51,7 @@ describe("mesh directory addressing", () => {
 		const mesh = new MeshEndpoints({
 			meshRoot: root,
 			homeSocket: "home",
+			isCurrentRecipient: () => false,
 			log: (line) => logs.push(line),
 			handoff: async () => undefined,
 		});

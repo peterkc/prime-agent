@@ -274,6 +274,7 @@ describe("daemon worker peer transport", () => {
 				supervisorClaims: new Map(),
 				peerClaims: new Map(),
 				peerGrants: new Map(),
+				sessions: new Map(),
 				clearSupervisorAvailabilityCheck: vi.fn(),
 				scheduleSupervisorFenceCheck: vi.fn(),
 				scheduleRosterFlush: vi.fn(),
