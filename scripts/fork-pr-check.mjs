@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Local pre-PR check for two Testing Policy rules that `npm run check` does not cover: the added test
-// line limit and shuffle-seed runs of changed test files. Run it after `npm run check`, so the counts
-// include Biome's formatting. It reports a line-rule breach without failing, because the maintainer
-// can grant an exception; a failed test run exits 1.
+// line counts and shuffle-seed runs of changed test files. Run it after `npm run check`, so the counts
+// include Biome's formatting. It reports tests that outgrow the source without failing, because the PR
+// text then names the behaviors the extra tests cover; a failed test run exits 1.
 // Usage: node scripts/fork-pr-check.mjs [--base <ref>] [--no-run]
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -73,11 +73,11 @@ function lineRule({ test, source }) {
 	if (source.added === 0 && source.deleted === 0) {
 		return test.deleted >= test.added
 			? "ok"
-			: `test-only change adds ${test.added} test lines and deletes ${test.deleted}; needs a maintainer exception`;
+			: `test-only change adds ${test.added} test lines and deletes ${test.deleted}; name the covered behaviors in the PR text`;
 	}
 	return test.added <= source.added
 		? "ok"
-		: `adds ${test.added} test lines for ${source.added} source lines; needs a maintainer exception`;
+		: `adds ${test.added} test lines for ${source.added} source lines; name the covered behaviors in the PR text`;
 }
 
 // Use the package's own runner: a `node --test` script gets its flags, the seed and the changed files.

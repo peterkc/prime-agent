@@ -40,7 +40,7 @@
 - Never use a fixed sleep, real-time delay, polling loop, or larger timeout as a readiness signal. Await a concrete event or deferred promise, use a fake clock, or expose the missing completion signal. A timer may only bound failure; it must not make the test pass.
 - Tests using subprocesses, sockets, concurrency, or shared process state must bind port `0`, use unique temporary paths, restore environment/cwd/globals/fake timers, and close every resource in `finally`.
 - Run every modified test file directly. For concurrency, process, timer, or ordering changes, also run the focused suite repeatedly with multiple shuffle seeds. Stop on the first failure; repeated runs are evidence, never retries.
-- A change may not add more lines of test than source. A test-only change must delete at least as many test lines as it adds.
+- Keep tests as short as the behavior allows: share setup through small named helpers instead of copying it. Each added test or table row must cover a behavior that no other test covers; delete any that does not. When a change adds more test lines than source lines, or a test-only change adds more test lines than it deletes, the PR text names the behaviors the extra tests cover.
 - After `npm run check`, run `node scripts/fork-pr-check.mjs`. It reports the counts for the line rule above, including new files, and runs each changed test file with shuffle seeds 17, 43 and 101.
 - Regressions go in the existing suite for the module that broke, with the issue number in the test name. Never create one file per issue. One test file per source module; repeated cases belong in an `it.each` table.
 - Deleting code deletes its tests. A flaky test is made deterministic or deleted, never skipped or retried.
