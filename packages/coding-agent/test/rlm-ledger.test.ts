@@ -705,6 +705,7 @@ function makeRuntimeSession(
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
 		subscribe: vi.fn(() => vi.fn()),
+		subscribeSessionInputCheckpoint: vi.fn(() => vi.fn()),
 		bindExtensions: vi.fn(async () => {}),
 		setExecEnvProvider: vi.fn(),
 		getAvailableThinkingLevels: vi.fn(() => []),

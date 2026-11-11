@@ -770,7 +770,7 @@ describe("supervisor session move", () => {
 		clients.push(client);
 		await client.connect();
 		const hello = await client.waitForHello();
-		expect(hello.schemaRevision).toBe(38);
+		expect(hello.schemaRevision).toBe(39);
 		expect(hello.root).toBe(kind === "repository" ? root : undefined);
 		expect(hello.serverCapabilities).toContain("session_move");
 		const wire = createDaemonCommandEnvelope({ type: "list" }, "old-client", "old-client", 7);
