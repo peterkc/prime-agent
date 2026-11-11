@@ -4757,6 +4757,7 @@ describe("mesh worker persistence", () => {
 				meshRoot,
 				homeSocket: "home",
 				log: vi.fn(),
+				isCurrentRecipient: (recipient) => recipient === h.client && !h.socket.destroyed,
 				handoff: async (_record, _message, count, bind, _open, token) => {
 					bind(h.client);
 					await receive({
@@ -4977,7 +4978,7 @@ describe("mesh worker persistence", () => {
 	it.each(["complete", "disconnect", "dispose"] as const)(
 		"bounds 19 pending socket observers and cleans every attempt (%s)",
 		async (ending) => {
-			const { live, h, started: entered, release, receive } = await liveFixture({}, true);
+			const { live, h, state, started: entered, release, receive } = await liveFixture({}, true);
 			live.setResponses([
 				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 				fauxAssistantMessage("complete"),
@@ -5014,6 +5015,19 @@ describe("mesh worker persistence", () => {
 				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(
 					ending === "complete" ? 19 : 0,
 				);
+				if (ending === "complete") {
+					const worker = h.internals as unknown as { clients: Set<DaemonSocketClient>; flushRoster(): void };
+					worker.clients.add(h.client);
+					Object.assign(state.runtime, { diagnostics: [] });
+					worker.flushRoster();
+					const entry = h
+						.frames()
+						.filter((frame) => frame.type === "roster_delta")
+						.flatMap((frame) => frame.entries)
+						.filter((entry) => entry.summary.sessionId === live.session.sessionId)
+						.at(-1);
+					expect(entry?.meshDeferralRelease).toBe(1);
+				}
 			} finally {
 				release.resolve();
 				await running;
@@ -5086,12 +5100,8 @@ describe("mesh worker persistence", () => {
 				fauxAssistantMessage("original final"),
 				...(outcome === "explicit-start" ? [fauxAssistantMessage("explicit user final")] : []),
 				...(deliver ? [fauxAssistantMessage("FYI final")] : []),
-				...(outcome === "resume-error"
-					? []
-					: [
-							fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
-							fauxAssistantMessage("goal complete"),
-						]),
+				fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("goal complete"),
 			]);
 			try {
 				await live.session.prompt("/goal bounded fixture goal");
@@ -5113,13 +5123,17 @@ describe("mesh worker persistence", () => {
 					});
 				}
 				live.session.setMeshFollowUpPending(false);
+				if (outcome === "resume-error") {
+					await (live.session as unknown as { _meshGoalResume?: Promise<void> })._meshGoalResume;
+					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					live.session.resumeQueuedWork();
+				}
 				await complete.promise;
 				await live.session.waitForSessionInputIdle();
-				expect(live.session.goalState.status).toBe(outcome === "resume-error" ? "error" : "complete");
+				expect(live.session.goalState.status).toBe("complete");
 				expect(live.getPendingResponseCount()).toBe(0);
-				if (outcome === "resume-error")
-					expect(live.session.goalState.lastError).toBe("fixture continuation failed");
-				else expect(live.eventsOfType("agent_end").length).toBeGreaterThan(1);
+				expect(live.eventsOfType("agent_end").length).toBeGreaterThan(1);
+				if (outcome === "resume-error") expect(live.session.goalState.continuationsUsed).toBe(1);
 			} finally {
 				live.cleanup();
 			}
@@ -5652,6 +5666,7 @@ describe("mesh worker persistence", () => {
 				mesh = new MeshEndpoints({
 					meshRoot,
 					homeSocket: join(live.tempDir, "mesh.sock"),
+					isCurrentRecipient: () => false,
 					handoff: vi.fn(),
 					log: vi.fn(),
 				});
@@ -5852,6 +5867,7 @@ describe("mesh worker persistence", () => {
 			mesh = new MeshEndpoints({
 				meshRoot,
 				homeSocket: join(live.tempDir, "mesh.sock"),
+				isCurrentRecipient: () => false,
 				handoff: vi.fn(),
 				log: vi.fn(),
 			});
@@ -6358,7 +6374,7 @@ describe("mesh worker persistence", () => {
 				cleanupSupervisorResources(): Promise<void>;
 			};
 			sup.mesh = {
-				setRunActive: vi.fn(),
+				releaseDeferral: vi.fn(),
 				hasQueuedFollowUps: () => false,
 				enqueueEnrollment: async (id: string, file: string) => {
 					enrolledId = id;

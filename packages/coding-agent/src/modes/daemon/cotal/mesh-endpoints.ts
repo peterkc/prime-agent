@@ -66,6 +66,7 @@ export interface MeshEndpointOptions {
 	readonly homeSocket: string;
 	readonly credentialLifetimeSeconds?: number;
 	readonly log: (message: string) => void;
+	readonly isCurrentRecipient: (recipient: object) => boolean;
 	readonly canWait?: (record: EnrollmentRecord, message: CotalMessage) => Promise<boolean>;
 	readonly followUpStateChanged?: (sessionId: string, pending: boolean) => void;
 	readonly handoff: (
@@ -106,9 +107,8 @@ interface SessionEndpoint extends SendingEndpoint {
 	readonly claim: SessionLease;
 	readonly queue: QueuedDelivery[];
 	readonly inFlight: Set<QueuedDelivery>;
-	runActive?: boolean;
-	runRevision?: number;
-	capacityBlocked?: boolean;
+	deferral?: { readonly recipient: object; readonly reason: "run_active" | "capacity" };
+	deferralRevision?: number;
 	handoff?: Promise<void>;
 	current?: QueuedDelivery;
 	close?: Promise<void>;
@@ -1209,12 +1209,11 @@ export class MeshEndpoints {
 		this.options.followUpStateChanged?.(session.record.sessionId, this.hasQueuedFollowUps(session.record.sessionId));
 	}
 
-	setRunActive(sessionId: string, active: boolean): void {
+	releaseDeferral(sessionId: string): void {
 		const session = this.sessions.get(sessionId);
 		if (!session) return;
-		session.runRevision = (session.runRevision ?? 0) + 1;
-		session.runActive = active;
-		session.capacityBlocked = false;
+		session.deferralRevision = (session.deferralRevision ?? 0) + 1;
+		session.deferral = undefined;
 		this.drain(session);
 	}
 
@@ -1233,14 +1232,16 @@ export class MeshEndpoints {
 			session.state === "closed" ||
 			session.state === "starting" ||
 			session.handoff ||
-			session.capacityBlocked ||
 			this.sessions.get(session.record.sessionId) !== session
 		)
 			return;
+		if (session.deferral && !this.options.isCurrentRecipient(session.deferral.recipient))
+			session.deferral = undefined;
+		if (session.deferral?.reason === "capacity") return;
 		// An unresolved family lookup is a FIFO barrier, not a held follow-up.
 		const candidate = session.queue.findIndex((item) => item.canWait !== true);
 		const steer = session.queue[candidate]?.canWait === false ? candidate : -1;
-		if (steer < 0 && (session.runActive || session.queue[0]?.canWait !== true)) return;
+		if (steer < 0 && (session.deferral || session.queue[0]?.canWait !== true)) return;
 		const [item] = session.queue.splice(steer < 0 ? 0 : steer, 1);
 		if (!item) return;
 		session.current = item;
@@ -1275,7 +1276,7 @@ export class MeshEndpoints {
 		const { message, delivery, deliveryCount } = item;
 		let pending: PendingPersistence | undefined;
 		let retained = false;
-		const runRevision = session.runRevision;
+		const deferralRevision = session.deferralRevision;
 		try {
 			meshMessageText(message);
 			if (!readDirectory(this.options.meshRoot, session.record.sessionId)) {
@@ -1315,7 +1316,8 @@ export class MeshEndpoints {
 			if (outcome?.status === "deferred") {
 				retained = true;
 				item.canWait = true;
-				if (session.runRevision === runRevision) session.runActive = true;
+				if (session.deferralRevision === deferralRevision && pending?.recipient)
+					session.deferral = { recipient: pending.recipient, reason: "run_active" };
 				session.queue.unshift(item);
 				return;
 			}
@@ -1328,7 +1330,8 @@ export class MeshEndpoints {
 				/^Target session has too many pending messages: \d+ unfinished, limit is 20$/.test(error.message)
 			) {
 				retained = true;
-				if (session.runRevision === runRevision) session.capacityBlocked = true;
+				if (session.deferralRevision === deferralRevision && pending?.recipient)
+					session.deferral = { recipient: pending.recipient, reason: "capacity" };
 				session.queue.unshift(item);
 				this.logDelivery(session, message.id, deliveryCount, "worker at capacity; custody retained");
 			} else if (error instanceof InvalidMeshPayloadError) {
@@ -1393,6 +1396,9 @@ export class MeshEndpoints {
 	}
 
 	disconnect(recipient: object): void {
+		for (const session of this.sessions.values()) {
+			if (session.deferral?.recipient === recipient) this.releaseDeferral(session.record.sessionId);
+		}
 		for (const beginning of this.replacementBegins.values()) {
 			if (beginning.requester === recipient) beginning.state = "failed";
 		}

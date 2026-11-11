@@ -10,6 +10,9 @@ type Harness = {
 	agent: { waitForIdle(): Promise<void> };
 	_agentEventQueue: Promise<void>;
 	_resumeGoalAfterMeshIdle(): void;
+	_maybeResumeGoalContinuationAfterRlmWork(): void;
+	_finishGoalWithError: ReturnType<typeof vi.fn>;
+	_asError: (error: unknown) => Error;
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -48,6 +51,11 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 		_resumeGoalAfterMeshIdle() {
 			resumeMesh.call(this);
 		},
+		_maybeResumeGoalContinuationAfterRlmWork() {
+			maybeResume.call(this);
+		},
+		_finishGoalWithError: vi.fn(),
+		_asError: (error) => (error instanceof Error ? error : new Error(String(error))),
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -71,6 +79,23 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 const context = { message: { role: "assistant", stopReason: "stop" }, context: {} };
 
 describe("goal continuation vs unsettled subagent work", () => {
+	it("F23 retries a Mesh-idle continuation after atomic admission refuses it", async () => {
+		const mode = harness({ _goalContinuationAwaitsMesh: true });
+		mode._admitSessionInput.mockImplementationOnce(() => {
+			throw new Error("admission race");
+		});
+		resumeMesh.call(mode);
+		await mode._meshGoalResume;
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(true);
+		expect(mode._goalState.continuationsUsed).toBe(0);
+		expect(mode._finishGoalWithError).not.toHaveBeenCalled();
+		maybeResume.call(mode);
+		maybeResume.call(mode);
+		expect(mode._admitSessionInput).toHaveBeenCalledTimes(2);
+		expect(mode._goalState.continuationsUsed).toBe(1);
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(false);
+	});
+
 	it.each([
 		["_hasUnsettledRlmQuiescenceWork", false],
 		["_hasUnsettledRlmQuiescenceWork", true],

@@ -6977,6 +6977,13 @@ export class AgentDaemon {
 				this.writeWorkerSuccess(client, command, { status: "deferred", reason: "run_active" });
 				return;
 			}
+			if (
+				error instanceof Error &&
+				/^Target session has too many pending messages: \d+ unfinished, limit is 20$/.test(error.message)
+			) {
+				this.meshDeferredOffers.add(recipientSession);
+				this.scheduleRosterFlush(target);
+			}
 			target.runtime.session.rejectAgentMessagePrompt(
 				payload.id,
 				error instanceof Error ? error : new Error(String(error)),

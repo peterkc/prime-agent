@@ -105,7 +105,7 @@ await agent_message.send(
 )
 ```
 
-Messages always use steering delivery. A busy target receives a message when its current work allows.
+Messages use steering delivery by default. With Cotal, `can_wait=True` can defer an uncorrelated message to a separate follow-up run after the target becomes idle. Messages to parents or children and correlated replies still steer. Native messaging or an older peer falls back to steering.
 
 With native messaging, a receipt is `delivered` when the message reached an idle target's context, or `queued` when accepted for later steering delivery.
 With Cotal, a successful send returns `stored`, a stream sequence and a Cotal ID. This proves broker storage, not delivery to the target.

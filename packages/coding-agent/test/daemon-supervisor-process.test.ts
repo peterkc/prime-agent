@@ -2421,10 +2421,16 @@ describe("mesh supervisor compatibility", () => {
 						);
 						if (sender.workerPid) workerPids.add(sender.workerPid);
 					}
-					target = requireSummary(
-						await f.request(holder.client, { type: "create", sessionPath: target.sessionFile!, launchEnv: {} }),
-					);
-					if (target.workerPid) workerPids.add(target.workerPid);
+					if (ending === "update") {
+						target = requireSummary(
+							await f.request(holder.client, {
+								type: "create",
+								sessionPath: target.sessionFile!,
+								launchEnv: {},
+							}),
+						);
+						if (target.workerPid) workerPids.add(target.workerPid);
+					}
 				} else if (ending === "history") {
 					writeFileSync(join(f.agentDir, `observe-pause-${sessionId}`), "observe");
 					const navigating = f.request(holder.client, {
@@ -3812,7 +3818,7 @@ describe("mesh supervisor compatibility", () => {
 		internals.roster = () => roster;
 		internals.writeRosterEntry({ agentId: "a", summary }, worker);
 		const enqueueEnrollment = vi.fn((id: string, file?: string) => enroll(id, file));
-		internals.mesh = { enroll, enqueueEnrollment, setRunActive: vi.fn(), hasQueuedFollowUps: () => false };
+		internals.mesh = { enroll, enqueueEnrollment, releaseDeferral: vi.fn(), hasQueuedFollowUps: () => false };
 		internals.log = vi.fn();
 		internals.workers.set("w", worker);
 		const child = {

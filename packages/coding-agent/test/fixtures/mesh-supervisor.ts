@@ -384,13 +384,13 @@ const heldPrototype = MeshEndpoints.prototype as unknown as {
 	notifyFollowUpState(session: {
 		queue: Array<{ canWait?: boolean; message: CotalMessage }>;
 		current?: unknown;
-		runActive?: boolean;
+		deferral?: { recipient: object };
 	}): void;
 };
 const notifyFollowUpState = heldPrototype.notifyFollowUpState;
 heldPrototype.notifyFollowUpState = function (session) {
 	notifyFollowUpState.call(this, session);
-	if (session.runActive && !session.current)
+	if (session.deferral && !session.current)
 		for (const item of session.queue) if (item.canWait) signal("held", item.message.id);
 };
 

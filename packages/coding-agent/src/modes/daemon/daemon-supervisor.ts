@@ -579,6 +579,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 }
 
 class PreRosterWorkerError extends Error {}
+class WorkerUnavailableForReuseError extends Error {}
 
 function workerAuthAdvertisesRoster(data: unknown): boolean {
 	if (typeof data !== "object" || data === null) return false;
@@ -912,6 +913,10 @@ export class DaemonSupervisor {
 					homeSocket: this.socketPath,
 					credentialLifetimeSeconds: this.meshCredentialLifetimeSeconds,
 					log: (message) => this.log(message),
+					isCurrentRecipient: (recipient) =>
+						Array.from(this.workers.values()).some(
+							(worker) => worker.client === recipient && worker.client.isConnected,
+						),
 					canWait: (record, message) => this.meshMessageCanWait(record, message),
 					followUpStateChanged: (sessionId, pending) => this.publishMeshFollowUpState(sessionId, pending),
 					handoff: (record, message, count, bind, isOpen, attemptToken) =>
@@ -2400,7 +2405,7 @@ export class DaemonSupervisor {
 					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
 					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
 					if (response.success && isSessionSummary(response.data)) {
-						this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
+						this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, response.data), worker);
 						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 					}
 					return responseWithId(response, command.id);
@@ -3802,7 +3807,9 @@ export class DaemonSupervisor {
 				);
 			}
 			const detail = current.descriptor.lastError ? `: ${current.descriptor.lastError}` : "";
-			throw new Error(`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`);
+			throw new WorkerUnavailableForReuseError(
+				`Session "${sessionPath}" worker is ${this.effectiveWorkerState(current)}${detail}`,
+			);
 		}
 		const root = current.summaries.get(current.descriptor.rootActiveSessionId);
 		if (root?.sessionId) void this.enrollMeshSession(root.sessionId, root.sessionFile);
@@ -4123,7 +4130,7 @@ export class DaemonSupervisor {
 			if ((summary.activeSessionId ?? summary.id) !== rootActiveSessionId) {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
-			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, undefined, false);
+			this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, summary), worker, undefined, false);
 			if (summary.sessionId)
 				void this.mesh
 					?.openSession(summary.sessionId, summary.sessionFile)
@@ -4249,8 +4256,10 @@ export class DaemonSupervisor {
 						);
 					worker.meshReplacementCapable = workerAuthAdvertisesMeshReplacement(authResponse.data);
 					worker.lastFrameAt = Date.now();
-					worker.client?.close();
+					const previous = worker.client;
 					worker.client = client;
+					if (previous) this.mesh?.disconnect(previous);
+					previous?.close();
 					return client;
 				} finally {
 					if (worker.pendingClient === client) worker.pendingClient = undefined;
@@ -4323,11 +4332,19 @@ export class DaemonSupervisor {
 		if (!existsSync(record.sessionFile))
 			throw new Error(`Mesh session ${record.sessionId}: session file is missing: ${record.sessionFile}`);
 		if (!isOpen()) throw new Error("Mesh endpoint closed before worker wake");
-		const worker = await this.createOrReuseWorker("mesh", {
+		const command: DaemonCreateCommand = {
 			type: "create",
 			sessionPath: record.sessionFile,
 			continueRecent: false,
-		});
+		};
+		let worker: ResidentWorker;
+		try {
+			worker = await this.createOrReuseWorker("mesh", command);
+		} catch (error) {
+			// Recovery can finish failed while create waits; retry through all native create guards.
+			if (!(error instanceof WorkerUnavailableForReuseError)) throw error;
+			worker = await this.createOrReuseWorker("mesh", command);
+		}
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		if (!worker.meshDeliveryCapable || !worker.meshReplacementCapable)
 			throw new Error("Restart that session to receive mesh messages");
@@ -5350,6 +5367,14 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
+		const entry = workerRosterEntryFromSummary(summary);
+		const previous = this.roster().get(entry.agentId);
+		if (previous?.workerId === worker.descriptor.workerId && previous.meshDeferralRelease !== undefined)
+			return { ...entry, meshDeferralRelease: previous.meshDeferralRelease };
+		return entry;
+	}
+
 	private writeRosterEntry(
 		entry: WorkerRosterEntry,
 		worker?: ResidentWorker,
@@ -5359,10 +5384,8 @@ export class DaemonSupervisor {
 		const previous = this.roster().get(entry.agentId);
 		const previousDirect = previous?.summary.directAttachedClients ?? 0;
 		const stored = this.roster().write(entry, worker?.descriptor.workerId, statusLabel);
-		this.mesh?.setRunActive(
-			entry.summary.sessionId,
-			entry.summary.isStreaming || (entry.summary.unfinishedActionCount ?? 0) > 0,
-		);
+		if (!entry.summary.activeSessionId || previous?.meshDeferralRelease !== entry.meshDeferralRelease)
+			this.mesh?.releaseDeferral(entry.summary.sessionId);
 		if (entry.summary.sessionId)
 			this.publishMeshFollowUpState(
 				entry.summary.sessionId,
@@ -5617,7 +5640,7 @@ export class DaemonSupervisor {
 	// Behind the pull-epoch guard the pull is never staler than the row it replaces; never steal another worker's claim.
 	private syncRosterFromWorkerSummaries(worker: ResidentWorker): void {
 		for (const summary of worker.summaries.values()) {
-			const entry = workerRosterEntryFromSummary(summary);
+			const entry = this.rosterEntryForWorkerSummary(worker, summary);
 			const existing = this.roster().get(entry.agentId);
 			if (existing?.workerId !== undefined && existing.workerId !== worker.descriptor.workerId) continue;
 			this.writeRosterEntry(entry, worker);
@@ -6127,7 +6150,7 @@ export class DaemonSupervisor {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		if (command.type === "rename" && response.success && isSessionSummary(response.data)) {
-			this.writeRosterEntry(workerRosterEntryFromSummary(response.data), worker);
+			this.writeRosterEntry(this.rosterEntryForWorkerSummary(worker, response.data), worker);
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		return responseWithId(response, command.id);

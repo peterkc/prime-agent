@@ -1630,21 +1630,8 @@ export class AgentSession {
 			)
 				return;
 			this._goalContinuationAwaitsMesh = false;
-			if (this._hasUnsettledRlmQuiescenceWork() || this._hasLiveBackgroundBashHandles()) {
-				this._goalContinuationAwaitsRlmWork = true;
-				return;
-			}
-			this._goalContinuationAwaitsRlmWork = false;
-			this._ensureGoalRuntimeActive();
-			this._setGoalState({ ...this._goalState, continuationsUsed: this._goalState.continuationsUsed + 1 });
-			const message = createGoalContextMessage(this._goalState, "continuation");
-			const normalized = normalizeMessageContent(message.content);
-			this._admitSessionInput(
-				this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
-					message,
-					resumeIfIdle: true,
-				}),
-			);
+			this._goalContinuationAwaitsRlmWork = true;
+			this._maybeResumeGoalContinuationAfterRlmWork();
 		})()
 			.catch((error: unknown) => {
 				this._goalContinuationAwaitsMesh = false;
