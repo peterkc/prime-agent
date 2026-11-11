@@ -117,10 +117,11 @@ describe("goal continuation vs unsettled subagent work", () => {
 			expect(mode._goalState.continuationsUsed).toBe(0);
 			closed();
 			await closing;
-			maybeResume.call(mode);
 			expect(mode._sessionInputAdmissionPauses.size).toBe(0);
 			expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
 			expect(mode._goalState.continuationsUsed).toBe(1);
+			maybeResume.call(mode);
+			expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
 		} finally {
 			idle();
 			closed();

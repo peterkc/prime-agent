@@ -1584,6 +1584,7 @@ export class AgentSession {
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
+	private _sessionInputSuspendedForUserStop = false;
 	private _sessionInputSuspendedForUpdateRestart = false;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
@@ -5917,6 +5918,7 @@ export class AgentSession {
 		if (
 			customMessage?.details.deliveryMode === "follow_up" &&
 			!this.isStreaming &&
+			!this._sessionInputSuspendedForUserStop &&
 			!this._sessionInputSuspendedForUpdateRestart
 		)
 			this._resumeSessionInputAdmission();
@@ -5931,7 +5933,8 @@ export class AgentSession {
 		};
 		if (
 			this._sessionInputPumpSuspended &&
-			this._isBusyForSessionInput("preflight") &&
+			(this._isBusyForSessionInput("preflight") ||
+				(this._sessionInputSuspendedForUserStop && customMessage?.details.deliveryMode === "follow_up")) &&
 			options?.queueIfBusy === true &&
 			options.streamingBehavior
 		) {
@@ -8415,6 +8418,7 @@ export class AgentSession {
 	private _resumeSessionInputAdmission(): void {
 		if (!this._sessionInputPumpSuspended) return;
 		this._sessionInputPumpSuspended = false;
+		this._sessionInputSuspendedForUserStop = false;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._sessionInputPumpEpoch++;
 		this._notifySessionInputCheckpointChange();
@@ -8551,6 +8555,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputSuspendedForUserStop = options.userStop === true;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._demoteRlmTerminalNoticeActions();
 		this._cancelSessionActions(
@@ -8670,6 +8675,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputSuspendedForUserStop = false;
 		this._sessionInputSuspendedForUpdateRestart = true;
 		this._cancelPostCompactionContinue();
 		this.abortRetry();

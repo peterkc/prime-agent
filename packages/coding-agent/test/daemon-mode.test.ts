@@ -4597,6 +4597,64 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
+	it.each(["user-stop", "non-user-abort"] as const)(
+		"F36 respects the held FYI recipient's %s suspension",
+		async (cause) => {
+			const { live, h, started, release, receive } = await liveFixture(
+				cause === "user-stop" ? { initialGoal: { objective: "original goal" } } : {},
+				cause === "user-stop",
+			);
+			let running: Promise<void> | undefined;
+			try {
+				if (cause === "user-stop") {
+					live.session.setMeshFollowUpPending(true);
+					live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+					running = live.session.prompt("original work");
+					await started.promise;
+					const stopping = live.session.abort({ userStop: true });
+					release.resolve();
+					await stopping;
+					await running;
+					live.session.setMeshFollowUpPending(false);
+				} else await live.session.abort({ userStop: false });
+				const runs = live.eventsOfType("agent_start").length;
+				live.setResponses([fauxAssistantMessage("FYI handled")]);
+				await receive({
+					message: "held stop FYI",
+					canWait: true,
+					cotal: { id: "stop-held", deliveryCount: 1, attemptToken: "stop-attempt" },
+				});
+				if (cause === "user-stop") {
+					await live.session.waitForSessionInputIdle();
+					expect(
+						h
+							.frames()
+							.filter((frame) => frame.command === "worker_deliver_message")
+							.at(-1),
+					).toMatchObject({
+						data: { deliveryStatus: "queued" },
+					});
+					expect(live.eventsOfType("agent_start")).toHaveLength(runs);
+					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					expect(live.session.hasQueuedAgentMessage("agentmsg_stop-held")).toBe(true);
+					await live.session.prompt("/goal clear");
+				}
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_stop-held");
+				await live.session.waitForSessionInputIdle();
+				expect(live.eventsOfType("agent_start")).toHaveLength(runs + 1);
+				expect(
+					live.session.messages.filter(
+						(message) => message.role === "custom" && message.customType === "agent_message",
+					),
+				).toHaveLength(1);
+			} finally {
+				release.resolve();
+				await running;
+				live.cleanup();
+			}
+		},
+	);
+
 	function checkpointGate() {
 		const entered = createDeferred();
 		const released = createDeferred();
@@ -4730,13 +4788,14 @@ describe("mesh worker persistence", () => {
 		"F14/F17 releases a held offer after busy and idle coalesce (%s)",
 		async (phase) => {
 			const summary = checkpointGate();
-			const { live, h, state, receive } = await liveFixture({
+			const { live, h, state } = await liveFixture({
 				extensionFactories: [
 					(pi) => pi.on("session_before_tree", () => summary.hold({ summary: { summary: "branch summary" } })),
 				],
 			});
 			let navigation: Promise<void> | undefined;
 			let swappedRuntime: AgentSessionRuntime | undefined;
+			let reopened: Harness | undefined;
 			if (phase === "F31-new-session") {
 				swappedRuntime = new AgentSessionRuntime(
 					live.session,
@@ -4781,9 +4840,12 @@ describe("mesh worker persistence", () => {
 				homeSocket: "home",
 				log: vi.fn(),
 				isCurrentRecipient: (recipient) => recipient === h.client && !h.socket.destroyed,
-				handoff: async (_record, _message, count, bind, _open, token) => {
+				handoff: async (record, _message, count, bind, _open, token) => {
 					bind(h.client);
-					await receive({
+					await h.internals.receiveMeshMessage(h.client, {
+						type: "worker_deliver_message",
+						targetActiveSessionId: record.sessionId,
+						sender: { sessionName: "peer" },
 						message: "coalesced FYI",
 						canWait: true,
 						cotal: { id: "coalesced", deliveryCount: count, attemptToken: token },
@@ -4941,7 +5003,14 @@ describe("mesh worker persistence", () => {
 					);
 					expect(h.frames().at(-1)).toMatchObject({ command: "new_session", success: true });
 					expect(state.runtime.session.sessionId).not.toBe(live.session.sessionId);
-					completed = state.runtime.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+					reopened = await createHarness({ existingSessionFile: live.session.sessionFile });
+					const oldState = makeState("old-recipient");
+					oldState.runtime = { ...oldState.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+					Object.assign(oldState.runtime, { diagnostics: [] });
+					h.internals.sessions.set(oldState.activeSessionId, oldState);
+					expect(reopened.session.sessionId).toBe(live.session.sessionId);
+					reopened.setResponses([fauxAssistantMessage("old recipient handled FYI")]);
+					completed = reopened.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
 					await vi.advanceTimersByTimeAsync(999);
 					expect(holder.queue).toHaveLength(1);
 					expect(ack).not.toHaveBeenCalled();
@@ -4959,12 +5028,27 @@ describe("mesh worker persistence", () => {
 				await holder.handoff;
 				await completed;
 				expect(ack).toHaveBeenCalledTimes(1);
-				expect(state.runtime.session.messages).toContainEqual(
+				const recipient = reopened?.session ?? live.session;
+				expect(recipient.messages).toContainEqual(
 					expect.objectContaining({
 						customType: "agent_message",
-						details: expect.objectContaining({ message: "coalesced FYI", deliveryMode: "follow_up" }),
+						details: expect.objectContaining({
+							message: "coalesced FYI",
+							deliveryMode: "follow_up",
+							target: expect.objectContaining({ sessionId: live.session.sessionId }),
+						}),
 					}),
 				);
+				if (phase === "F31-new-session") {
+					expect(state.runtime.session.messages).not.toContainEqual(
+						expect.objectContaining({ customType: "agent_message" }),
+					);
+					expect(
+						recipient.sessionManager
+							.getEntries()
+							.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+					).toHaveLength(1);
+				}
 				worker.flushRoster();
 				const frames = h.frames().length;
 				worker.flushRoster();
@@ -4978,6 +5062,7 @@ describe("mesh worker persistence", () => {
 				vi.useRealTimers();
 				await sup.cleanupSupervisorResources();
 				await swappedRuntime?.dispose();
+				reopened?.cleanup();
 				live.cleanup();
 				for (const mock of brokerMocks) mock.mockRestore();
 			}
