@@ -107,7 +107,7 @@ interface SessionEndpoint extends SendingEndpoint {
 	readonly claim: SessionLease;
 	readonly queue: QueuedDelivery[];
 	readonly inFlight: Set<QueuedDelivery>;
-	deferral?: { readonly recipient: object; readonly reason: "run_active" | "capacity" };
+	deferral?: { readonly recipient: object };
 	deferralRevision?: number;
 	handoff?: Promise<void>;
 	current?: QueuedDelivery;
@@ -1184,7 +1184,13 @@ export class MeshEndpoints {
 		};
 		working();
 		const workingTimer = redelivery
-			? setInterval(working, Math.max(1, Math.floor(redelivery.ackWaitMs / 3)))
+			? setInterval(
+					() => {
+						working();
+						if (session.queue[0] === item && session.deferral) this.releaseDeferral(session.record.sessionId);
+					},
+					Math.max(1, Math.floor(redelivery.ackWaitMs / 3)),
+				)
 			: undefined;
 		workingTimer?.unref();
 		const item: QueuedDelivery = { message, delivery, deliveryCount, workingTimer };
@@ -1237,7 +1243,6 @@ export class MeshEndpoints {
 			return;
 		if (session.deferral && !this.options.isCurrentRecipient(session.deferral.recipient))
 			session.deferral = undefined;
-		if (session.deferral?.reason === "capacity") return;
 		// An unresolved family lookup is a FIFO barrier, not a held follow-up.
 		const candidate = session.queue.findIndex((item) => item.canWait !== true);
 		const steer = session.queue[candidate]?.canWait === false ? candidate : -1;
@@ -1317,7 +1322,7 @@ export class MeshEndpoints {
 				retained = true;
 				item.canWait = true;
 				if (session.deferralRevision === deferralRevision && pending?.recipient)
-					session.deferral = { recipient: pending.recipient, reason: "run_active" };
+					session.deferral = { recipient: pending.recipient };
 				session.queue.unshift(item);
 				return;
 			}
@@ -1325,16 +1330,7 @@ export class MeshEndpoints {
 			await persisted;
 		} catch (error) {
 			if (session.state === "closed" || (pending && this.pending.get(message.id) !== pending)) return;
-			if (
-				error instanceof Error &&
-				/^Target session has too many pending messages: \d+ unfinished, limit is 20$/.test(error.message)
-			) {
-				retained = true;
-				if (session.deferralRevision === deferralRevision && pending?.recipient)
-					session.deferral = { recipient: pending.recipient, reason: "capacity" };
-				session.queue.unshift(item);
-				this.logDelivery(session, message.id, deliveryCount, "worker at capacity; custody retained");
-			} else if (error instanceof InvalidMeshPayloadError) {
+			if (error instanceof InvalidMeshPayloadError) {
 				let outcome = "invalid payload acknowledged";
 				try {
 					delivery.ack();

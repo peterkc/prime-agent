@@ -1624,8 +1624,6 @@ export class AgentSession {
 				!this._goalContinuationAwaitsMesh ||
 				this._disposed ||
 				this._disposing ||
-				this._sessionInputPumpSuspended ||
-				this._sessionInputAdmissionPauses.size > 0 ||
 				this._goalState.status !== "active"
 			)
 				return;

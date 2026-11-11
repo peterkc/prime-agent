@@ -79,6 +79,55 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 const context = { message: { role: "assistant", stopReason: "stop" }, context: {} };
 
 describe("goal continuation vs unsettled subagent work", () => {
+	it("F23 resumes once after ACP MCP close releases the overlapping idle pause", async () => {
+		let idle!: () => void;
+		let closed!: () => void;
+		const idlePromise = new Promise<void>((resolve) => {
+			idle = resolve;
+		});
+		const closePromise = new Promise<{ status: string }>((resolve) => {
+			closed = () => resolve({ status: "ok" });
+		});
+		const mode = Object.assign(
+			harness({
+				_meshFollowUpPending: true,
+				_goalContinuationAwaitsMesh: true,
+				agent: { waitForIdle: () => idlePromise },
+			}),
+			{
+				_mcpManager: { canReleaseAcpServers: () => true, replaceAcpServers: () => false },
+				_ipythonKernelProvisioner: { manager: { isRunning: true, execute: () => closePromise } },
+				acquireSessionInputPause: AgentSession.prototype.acquireSessionInputPause,
+				_sessionInputPumpEpoch: 0,
+				_notifySessionInputCheckpointChange: () => {},
+				_flushDeferredRlmTerminalNotices: () => {},
+				_maybeResumeAutonomousContinuationAfterRlmWork: () => {},
+				_scheduleSessionInputPump: () => {},
+			},
+		);
+		const closing = AgentSession.prototype.releaseAcpMcpServers.call(mode as unknown as AgentSession, "acp-owner", [
+			"server",
+		]);
+		try {
+			setMeshPending.call(mode, false);
+			idle();
+			await mode._meshGoalResume;
+			expect(mode._sessionInputAdmissionPauses.size).toBe(1);
+			expect(mode._admitSessionInput).not.toHaveBeenCalled();
+			expect(mode._goalState.continuationsUsed).toBe(0);
+			closed();
+			await closing;
+			maybeResume.call(mode);
+			expect(mode._sessionInputAdmissionPauses.size).toBe(0);
+			expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
+			expect(mode._goalState.continuationsUsed).toBe(1);
+		} finally {
+			idle();
+			closed();
+			await closing;
+		}
+	});
+
 	it("F23 retries a Mesh-idle continuation after atomic admission refuses it", async () => {
 		const mode = harness({ _goalContinuationAwaitsMesh: true });
 		mode._admitSessionInput.mockImplementationOnce(() => {

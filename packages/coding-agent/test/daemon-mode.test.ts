@@ -4726,7 +4726,7 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["preflight", "commit", "busy-flush", "navigate-tree"] as const)(
+	it.each(["preflight", "commit", "busy-flush", "navigate-tree", "F31-new-session"] as const)(
 		"F14/F17 releases a held offer after busy and idle coalesce (%s)",
 		async (phase) => {
 			const summary = checkpointGate();
@@ -4736,7 +4736,30 @@ describe("mesh worker persistence", () => {
 				],
 			});
 			let navigation: Promise<void> | undefined;
-			Object.assign(state.runtime, { diagnostics: [] });
+			let swappedRuntime: AgentSessionRuntime | undefined;
+			if (phase === "F31-new-session") {
+				swappedRuntime = new AgentSessionRuntime(
+					live.session,
+					{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+					async (options) =>
+						({
+							session: new AgentSession({
+								agent: new Agent({
+									initialState: { model: live.getModel(), systemPrompt: "Test", messages: [] },
+									convertToLlm,
+								}),
+								sessionManager: options.sessionManager,
+								settingsManager: live.settingsManager,
+								cwd: live.tempDir,
+								modelRegistry: live.session.modelRegistry,
+								resourceLoader: live.session.resourceLoader,
+							}),
+							services: { cwd: live.tempDir, agentDir: live.tempDir },
+							diagnostics: [],
+						}) as never,
+				);
+				state.runtime = swappedRuntime;
+			} else Object.assign(state.runtime, { diagnostics: [] });
 			const worker = h.internals as unknown as {
 				clients: Set<DaemonSocketClient>;
 				observeRosterEvent(state: ActiveSessionState, message: unknown): void;
@@ -4828,7 +4851,12 @@ describe("mesh worker persistence", () => {
 					}
 				).sessions.get(live.session.sessionId)!;
 				const endpoint = holder.endpoint;
-				vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+				vi.useFakeTimers({
+					toFake:
+						phase === "F31-new-session"
+							? ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"]
+							: ["Date", "setTimeout", "clearTimeout"],
+				});
 				event("compaction_end");
 				await vi.advanceTimersByTimeAsync(0);
 				const baseline = h.frames().filter((frame) => frame.type === "roster_delta");
@@ -4862,7 +4890,10 @@ describe("mesh worker persistence", () => {
 					event("compaction_start");
 				}
 				const ack = vi.fn();
-				const completed = live.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+				let completed =
+					phase === "F31-new-session"
+						? undefined
+						: live.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
 				live.setResponses([fauxAssistantMessage("follow-up complete")]);
 				endpoint.emit(
 					"message",
@@ -4877,7 +4908,14 @@ describe("mesh worker persistence", () => {
 							{ kind: "text", text: "coalesced FYI" },
 						],
 					},
-					{ durable: true, ack, nak: vi.fn() },
+					{
+						durable: true,
+						ack,
+						nak: vi.fn(),
+						...(phase === "F31-new-session"
+							? { redelivery: { deliveryCount: 1, ackWaitMs: 3000, working: vi.fn() } }
+							: {}),
+					},
 					{ kind: "dm" },
 				);
 				await holder.handoff;
@@ -4895,7 +4933,21 @@ describe("mesh worker persistence", () => {
 					expect(holder.queue).toHaveLength(1);
 					expect(ack).not.toHaveBeenCalled();
 				}
-				if (navigation) {
+				if (phase === "F31-new-session") {
+					busy?.mockRestore();
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({ id: "swap", type: "new_session", activeSessionId: "target" }),
+					);
+					expect(h.frames().at(-1)).toMatchObject({ command: "new_session", success: true });
+					expect(state.runtime.session.sessionId).not.toBe(live.session.sessionId);
+					completed = state.runtime.session.waitForAgentMessagePromptCompletion("agentmsg_coalesced");
+					await vi.advanceTimersByTimeAsync(999);
+					expect(holder.queue).toHaveLength(1);
+					expect(ack).not.toHaveBeenCalled();
+					await vi.advanceTimersByTimeAsync(1);
+					expect(holder.queue).toHaveLength(0);
+				} else if (navigation) {
 					summary.released.resolve();
 					await navigation;
 				} else {
@@ -4907,7 +4959,7 @@ describe("mesh worker persistence", () => {
 				await holder.handoff;
 				await completed;
 				expect(ack).toHaveBeenCalledTimes(1);
-				expect(live.session.messages).toContainEqual(
+				expect(state.runtime.session.messages).toContainEqual(
 					expect.objectContaining({
 						customType: "agent_message",
 						details: expect.objectContaining({ message: "coalesced FYI", deliveryMode: "follow_up" }),
@@ -4925,6 +4977,7 @@ describe("mesh worker persistence", () => {
 				admission.mockRestore();
 				vi.useRealTimers();
 				await sup.cleanupSupervisorResources();
+				await swappedRuntime?.dispose();
 				live.cleanup();
 				for (const mock of brokerMocks) mock.mockRestore();
 			}
@@ -5026,7 +5079,8 @@ describe("mesh worker persistence", () => {
 						.flatMap((frame) => frame.entries)
 						.filter((entry) => entry.summary.sessionId === live.session.sessionId)
 						.at(-1);
-					expect(entry?.meshDeferralRelease).toBe(1);
+					expect(entry).toBeDefined();
+					expect(entry.meshDeferralRelease).toBeUndefined();
 				}
 			} finally {
 				release.resolve();

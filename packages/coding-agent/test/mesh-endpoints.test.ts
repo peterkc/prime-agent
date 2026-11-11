@@ -154,10 +154,6 @@ describe("mesh endpoints", () => {
 		["failure", "run_active"],
 		["passivation", "run_active"],
 		["reauth", "run_active"],
-		["close", "capacity"],
-		["failure", "capacity"],
-		["passivation", "capacity"],
-		["reauth", "capacity"],
 	] as const)("F22 retries after %s with %s custody", async (event, reason) => {
 		const old = { isConnected: true, close: vi.fn() };
 		const replacement = { isConnected: true, close: vi.fn() };
@@ -182,11 +178,7 @@ describe("mesh endpoints", () => {
 			async (_record, message, _count, bind, _open, token) => {
 				worker.client ??= replacement;
 				bind(worker.client);
-				if (busy) {
-					if (reason === "capacity")
-						throw new Error("Target session has too many pending messages: 20 unfinished, limit is 20");
-					return { status: "deferred", reason: "run_active" };
-				}
+				if (busy) return { status: "deferred", reason };
 				recipients.push(worker.client);
 				mesh.confirmPersisted(message.id, worker.client, token);
 			},
@@ -874,7 +866,7 @@ describe("mesh endpoints", () => {
 		expect(held.map((item) => item.ack.mock.calls.length)).toEqual(Array(25).fill(1));
 	});
 
-	it("keeps capacity refusal in renewing custody until an action update", async () => {
+	it("F32/F33 leaves capacity refusal to broker redelivery without parking or renewal", async () => {
 		vi.useFakeTimers();
 		const { mesh, target, handoff } = await fixture();
 		handoff.mockImplementationOnce(async (_record, _message, _count, bind) => {
@@ -887,12 +879,16 @@ describe("mesh endpoints", () => {
 		await vi.advanceTimersByTimeAsync(4000);
 		expect(handoff).toHaveBeenCalledTimes(1);
 		expect(item.ack).not.toHaveBeenCalled();
-		expect(item.working).toHaveBeenCalledTimes(5);
+		expect(item.working).toHaveBeenCalledTimes(1);
 		mesh.releaseDeferral("b");
+		expect(handoff).toHaveBeenCalledTimes(1);
+		const redelivered = delivery("capacity", 2);
+		target.emit("message", redelivered.message, redelivered.delivery, { kind: "dm" });
 		expect(handoff).toHaveBeenCalledTimes(2);
 		mesh.confirmPersisted("capacity", recipient, attempt(mesh, "capacity"));
 		await settled(mesh, "b");
-		expect(item.ack).toHaveBeenCalledTimes(1);
+		expect(item.ack).not.toHaveBeenCalled();
+		expect(redelivered.ack).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not overwrite newer idle truth with a stale busy response", async () => {
