@@ -1596,6 +1596,7 @@ export class AgentSession {
 	private readonly _sessionActionCommitDisposeAbortController = new AbortController();
 	// Checkpoint, handoff, and activity waiters share lifecycle-edge notifications to avoid polling.
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
+	private readonly _sessionInputCheckpointListeners = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
 	private _goalState: GoalState = emptyGoalState();
@@ -4628,6 +4629,7 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
+			void this._notifyAfterAgentIdle();
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -4676,6 +4678,11 @@ export class AgentSession {
 		);
 		this._agentEventQueue.catch(() => {});
 	};
+
+	private async _notifyAfterAgentIdle(): Promise<void> {
+		await this.agent.waitForIdle();
+		this._notifySessionInputCheckpointChange();
+	}
 
 	private _createRetryPromiseForAgentEnd(event: AgentEvent): void {
 		if (event.type !== "agent_end" || this._retryPromise) {
@@ -5100,6 +5107,11 @@ export class AgentSession {
 		};
 	}
 
+	subscribeSessionInputCheckpoint(listener: () => void): () => void {
+		this._sessionInputCheckpointListeners.add(listener);
+		return () => this._sessionInputCheckpointListeners.delete(listener);
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -5403,6 +5415,7 @@ export class AgentSession {
 			);
 			this._disconnectFromAgent();
 			this._eventListeners = [];
+			this._sessionInputCheckpointListeners.clear();
 			cleanupSessionResources(this.sessionId);
 		} finally {
 			void this._startDisposeCallbacks();
@@ -7199,6 +7212,7 @@ export class AgentSession {
 				}
 				if (epoch !== this._sessionInputPumpEpoch) {
 					for (const action of actions) this._actionStore.rollback(action);
+					this._notifySessionInputCheckpointChange();
 					return;
 				}
 				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
@@ -8207,6 +8221,13 @@ export class AgentSession {
 		const waiters = [...this._sessionInputCheckpointWaiters];
 		this._sessionInputCheckpointWaiters.clear();
 		for (const resolve of waiters) resolve();
+		for (const listener of this._sessionInputCheckpointListeners) {
+			try {
+				listener();
+			} catch (error) {
+				console.warn("Session input checkpoint listener failed", error);
+			}
+		}
 	}
 
 	private _waitForSessionActivityChange(signal: AbortSignal): Promise<void> {

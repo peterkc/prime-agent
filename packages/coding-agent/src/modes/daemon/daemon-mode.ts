@@ -1798,6 +1798,7 @@ export class AgentDaemon {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
 				createConnectionState: (targetSessionState) => this.createConnectionState(targetSessionState),
 				sessionReplaced: (targetSessionState) => this.refreshReplacedSessionState(targetSessionState),
+				sessionInputCheckpointChanged: (targetSessionState) => this.scheduleRosterFlush(targetSessionState),
 				sessionApplied: (targetSessionState) => {
 					if (this.agentMessageTransport === "cotal") targetSessionState.runtime.session.sessionManager.flushNow();
 				},
