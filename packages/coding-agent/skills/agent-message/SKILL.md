@@ -67,8 +67,9 @@ if child is not None:
 - Never mark stop/cancel, relayed user instructions, a reply someone awaits,
   a request that starts work, a blocker or conflict, or a harmful time limit.
 - On supported Cotal receivers, a marked message waits outside the active run.
-  It starts a follow-up run when idle, without another prompt. Steers and replies
-  pass held messages. Sustained steering can delay follow-ups indefinitely.
+  It starts a follow-up run when idle, without another prompt. After a user stop,
+  a held message waits for the user. Steers and replies pass held messages.
+  Sustained steering can delay follow-ups indefinitely.
 - Set `reply_to` to the canonical received message ID shown in the message header,
   or to a receipt's `id` or `cotalId`. A linked reply always steers, even when marked.
   Direct parent-child messages also always steer, for each broadcast target.

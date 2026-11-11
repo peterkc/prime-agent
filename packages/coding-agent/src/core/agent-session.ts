@@ -8555,7 +8555,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
-		this._sessionInputSuspendedForUserStop = options.userStop === true;
+		this._sessionInputSuspendedForUserStop ||= options.userStop === true;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._demoteRlmTerminalNoticeActions();
 		this._cancelSessionActions(

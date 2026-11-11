@@ -4597,16 +4597,17 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it.each(["user-stop", "non-user-abort"] as const)(
+	it.each(["user-stop", "user-stop-then-non-user-abort", "non-user-abort"] as const)(
 		"F36 respects the held FYI recipient's %s suspension",
 		async (cause) => {
+			const userStop = cause !== "non-user-abort";
 			const { live, h, started, release, receive } = await liveFixture(
-				cause === "user-stop" ? { initialGoal: { objective: "original goal" } } : {},
-				cause === "user-stop",
+				userStop ? { initialGoal: { objective: "original goal" } } : {},
+				userStop,
 			);
 			let running: Promise<void> | undefined;
 			try {
-				if (cause === "user-stop") {
+				if (userStop) {
 					live.session.setMeshFollowUpPending(true);
 					live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
 					running = live.session.prompt("original work");
@@ -4617,6 +4618,7 @@ describe("mesh worker persistence", () => {
 					await running;
 					live.session.setMeshFollowUpPending(false);
 				} else await live.session.abort({ userStop: false });
+				if (cause === "user-stop-then-non-user-abort") await live.session.abort({ userStop: false });
 				const runs = live.eventsOfType("agent_start").length;
 				live.setResponses([fauxAssistantMessage("FYI handled")]);
 				await receive({
@@ -4624,7 +4626,7 @@ describe("mesh worker persistence", () => {
 					canWait: true,
 					cotal: { id: "stop-held", deliveryCount: 1, attemptToken: "stop-attempt" },
 				});
-				if (cause === "user-stop") {
+				if (userStop) {
 					await live.session.waitForSessionInputIdle();
 					expect(
 						h
@@ -4647,6 +4649,17 @@ describe("mesh worker persistence", () => {
 						(message) => message.role === "custom" && message.customType === "agent_message",
 					),
 				).toHaveLength(1);
+				if (cause === "user-stop") {
+					await live.session.abort({ userStop: false });
+					live.setResponses([fauxAssistantMessage("FYI after user resume")]);
+					await receive({
+						message: "next held FYI",
+						canWait: true,
+						cotal: { id: "after-user-resume", deliveryCount: 1, attemptToken: "resume-attempt" },
+					});
+					await live.session.waitForSessionInputIdle();
+					expect(live.eventsOfType("agent_start")).toHaveLength(runs + 2);
+				}
 			} finally {
 				release.resolve();
 				await running;
@@ -5352,6 +5365,7 @@ describe("mesh worker persistence", () => {
 				state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
 			}
 			const target = reopened ?? live;
+			target.session.resumeQueuedWork();
 			let nextContext: Context | undefined;
 			target.setResponses([
 				(context) => {
