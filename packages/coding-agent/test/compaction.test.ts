@@ -112,6 +112,28 @@ function createCompactionEntry(summary: string, firstKeptEntryId: string): Compa
 	return entry;
 }
 
+function createTailEntry(type: "custom_message" | "branch_summary" | "custom", text = "x".repeat(400)): SessionEntry {
+	const id = `test-id-${entryCounter++}`;
+	const base = { id, parentId: lastId, timestamp: new Date().toISOString() };
+	lastId = id;
+	switch (type) {
+		case "custom_message":
+			return { ...base, type, customType: "goal_context", content: text, display: false };
+		case "branch_summary":
+			return { ...base, type, summary: text, fromId: "branch-id" };
+		case "custom":
+			return { ...base, type, customType: "extension-state", data: text };
+		default: {
+			const unhandled: never = type;
+			return unhandled;
+		}
+	}
+}
+
+function createContextTail(type: "custom_message" | "branch_summary"): SessionEntry[] {
+	return Array.from({ length: 20 }, () => createTailEntry(type));
+}
+
 function extractText(messages: AgentMessage[]): string {
 	return messages
 		.map((message) => {
@@ -228,6 +250,70 @@ describe("findCutPoint", () => {
 		const entries = makeEntries();
 		const result = findCutPoint(entries, 0, entries.length, keepRecentTokens);
 		expect(result).toMatchObject(expected);
+	});
+});
+
+describe("findCutPoint context-bearing entries (pi-amu7x)", () => {
+	it.each(["custom_message", "branch_summary"] as const)("budgets a %s-heavy tail", (type) => {
+		const entries = [createMessageEntry(createUserMessage("Start")), ...createContextTail(type)];
+		const cut = findCutPoint(entries, 0, entries.length, 250);
+		expect(cut.firstKeptEntryIndex).toBe(18);
+		const keptTokens = estimateContextTokens(buildSessionContext(entries.slice(cut.firstKeptEntryIndex)).messages);
+		expect(keptTokens.tokens).toBe(300);
+	});
+
+	it.each(["custom_message", "branch_summary"] as const)("stops metadata walk-back at %s", (type) => {
+		const entries = [
+			createMessageEntry(createUserMessage("Start")),
+			createTailEntry(type),
+			createTailEntry("custom"),
+			createMessageEntry(createAssistantMessage("x".repeat(400))),
+		];
+		expect(findCutPoint(entries, 0, entries.length, 50)).toEqual({
+			firstKeptEntryIndex: 2,
+			turnStartIndex: 1,
+			isSplitTurn: true,
+		});
+	});
+
+	it.each(["before", "after"] as const)("never cuts at a tool result with a custom message %s it", (order) => {
+		const custom = createTailEntry("custom_message", "Context");
+		const call = createMessageEntry(createAssistantMessage([toolCall("tc1", "ipython", { code: "print(1)" })]));
+		const result = createMessageEntry(toolResult("x".repeat(40_000)));
+		const tail = order === "before" ? [custom, call, result] : [call, result, custom];
+		const entries = [createMessageEntry(createUserMessage("Start")), ...tail];
+		const cut = findCutPoint(entries, 0, entries.length, 1000);
+		expect(cut.firstKeptEntryIndex).toBe(order === "before" ? 2 : 3);
+		expect(entries[cut.firstKeptEntryIndex]).toBe(order === "before" ? call : custom);
+	});
+
+	it.each(["custom"] as const)("does not count plain %s extension state", (type) => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Start")),
+			createMessageEntry(createAssistantMessage("x".repeat(400))),
+			createMessageEntry(createUserMessage("Next")),
+			createMessageEntry(createAssistantMessage("Short")),
+		];
+		const before = findCutPoint(entries, 0, entries.length, 50);
+		entries.push(createTailEntry(type, "x".repeat(40_000)));
+		expect(findCutPoint(entries, 0, entries.length, 50)).toEqual(before);
+		expect(before.firstKeptEntryIndex).toBe(1);
+	});
+
+	it.each(["custom_message"] as const)("bounds repeated compactions over %s tails", (type) => {
+		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Start"))];
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 250 };
+		let previousCompactionIndex = -1;
+		for (let round = 0; round < 3; round++) {
+			entries.push(...createContextTail(type));
+			const preparation = prepareCompaction(entries, settings);
+			expect(preparation).toBeDefined();
+			const firstKept = entries.findIndex((entry) => entry.id === preparation!.firstKeptEntryId);
+			expect(firstKept).toBeGreaterThan(previousCompactionIndex);
+			expect(entries.length - firstKept).toBe(3);
+			previousCompactionIndex = entries.length;
+			entries.push(createCompactionEntry("Summary", preparation!.firstKeptEntryId));
+		}
 	});
 });
 

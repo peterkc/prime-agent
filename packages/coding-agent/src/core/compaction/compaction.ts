@@ -395,8 +395,10 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-		const messageTokens = estimateTokens(entry.message);
+		if (entry.type === "compaction") continue;
+		const message = getMessageFromEntry(entry);
+		if (!message) continue;
+		const messageTokens = estimateTokens(message);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
 			// No cut point at/after i (trailing tool results): keep only the final turn, not everything.
@@ -415,7 +417,7 @@ export function findCutPoint(
 		if (prevEntry.type === "compaction") {
 			break;
 		}
-		if (prevEntry.type === "message") {
+		if (prevEntry.type === "message" || prevEntry.type === "custom_message" || prevEntry.type === "branch_summary") {
 			break;
 		}
 		cutIndex--;
