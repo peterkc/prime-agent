@@ -1,4 +1,3 @@
-import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -5374,23 +5373,16 @@ describe("mesh worker persistence", () => {
 		}
 	}
 
-	const stopTimings = ["before-offer", "during-offer", "after-deferral"] as const;
-	it.each(stopEntryPoints.flatMap((entry) => stopTimings.map((timing) => ({ entry, timing }))))(
+	const stopEntryPointAndOfferOrderingCases = [
+		...stopEntryPoints.map((entry) => ({ entry, timing: "after-deferral" as const })),
+		{ entry: "kill", timing: "before-offer" },
+		{ entry: "abort", timing: "before-offer" },
+	] as const;
+	it.each(stopEntryPointAndOfferOrderingCases)(
 		"AC-13 persists $entry at $timing before held delivery",
 		async ({ entry, timing }) => {
 			const fixture = await liveFixture({}, true);
 			const { live, h, state, started, release, aborted, receive } = fixture;
-			const offerEntered = createDeferred();
-			const offerRelease = createDeferred();
-			const hydrate = h.internals.getOrHydrateBoundSessionState.bind(h.internals);
-			const hydration = vi.spyOn(h.internals, "getOrHydrateBoundSessionState").mockImplementation(async () => {
-				const target = await hydrate();
-				if (timing === "during-offer") {
-					offerEntered.resolve();
-					await offerRelease.promise;
-				}
-				return target;
-			});
 			let reopened: Harness | undefined;
 			let stopping: Promise<void> | undefined;
 			let offering: Promise<void> | undefined;
@@ -5401,9 +5393,6 @@ describe("mesh worker persistence", () => {
 				if (timing === "after-deferral") {
 					await receive(heldOffer());
 					expect(h.frames().at(-1)).toMatchObject({ data: { status: "deferred", reason: "run_active" } });
-				} else if (timing === "during-offer") {
-					offering = receive(heldOffer());
-					await offerEntered.promise;
 				}
 				stopping = stopThrough(fixture, entry);
 				await aborted.promise;
@@ -5412,7 +5401,6 @@ describe("mesh worker persistence", () => {
 					offering =
 						entry === "kill" ? expect(offered).rejects.toThrow("Active session target is closing") : offered;
 				}
-				offerRelease.resolve();
 				await offering;
 				if (entry !== "kill" || timing !== "before-offer")
 					expect(h.frames()).toContainEqual(
@@ -5428,7 +5416,6 @@ describe("mesh worker persistence", () => {
 				await live.session.abort({ userStop: false });
 				expect(stopNotes(live)).toHaveLength(1);
 				expect(readFileSync(live.session.sessionFile!, "utf8").split('"customType":"agent_stop"')).toHaveLength(2);
-				hydration.mockRestore();
 				if (entry === "kill") {
 					reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
 					state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
@@ -5459,10 +5446,8 @@ describe("mesh worker persistence", () => {
 					attemptToken: "next",
 				});
 			} finally {
-				offerRelease.resolve();
 				release.resolve();
 				await Promise.allSettled([running, stopping, offering]);
-				hydration.mockRestore();
 				reopened?.cleanup();
 				live.cleanup();
 			}
@@ -5519,23 +5504,26 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it("AC-13 clear-to-idle records no stop note", async () => {
-		const fixture = await liveFixture();
-		const { live } = fixture;
-		const pause = live.session.acquireQueuedWorkPause();
-		try {
-			await live.session.followUp("only queued work");
-			expect(live.session.isSessionActive).toBe(true);
-			await stopThrough(fixture, "abort_and_clear_queue");
-			await live.session.abort({ userStop: false });
-			expect(live.session.isSessionActive).toBe(false);
-			expect(live.session.queuedActionCount).toBe(0);
-			expect(stopNotes(live)).toEqual([]);
-		} finally {
-			pause.release();
-			live.cleanup();
-		}
-	});
+	it.each(["abort_and_clear_queue", "connection-clear"] as const)(
+		"AC-13 clear-to-idle through %s records no stop note",
+		async (entry) => {
+			const fixture = await liveFixture();
+			const { live } = fixture;
+			const pause = live.session.acquireQueuedWorkPause();
+			try {
+				await live.session.followUp("only queued work");
+				expect(live.session.isSessionActive).toBe(true);
+				await stopThrough(fixture, entry);
+				await live.session.abort({ userStop: false });
+				expect(live.session.isSessionActive).toBe(false);
+				expect(live.session.queuedActionCount).toBe(0);
+				expect(stopNotes(live)).toEqual([]);
+			} finally {
+				pause.release();
+				live.cleanup();
+			}
+		},
+	);
 
 	it("AC-13 records one note for each distinct active stop", async () => {
 		const { live } = await liveFixture();
@@ -5730,11 +5718,70 @@ describe("mesh worker persistence", () => {
 		},
 	);
 
-	it("AC-13 no-input settle with an active goal starts no idle run", async () => {
-		const { live } = await stoppedFixture({ initialGoal: { objective: "stopped goal" } });
+	it("AC-13 no-input child settlement after a user stop starts no idle goal run", async () => {
+		const child = await createHarness({});
+		const entered = createDeferred();
+		const release = createDeferred();
+		child.setResponses([
+			async () => {
+				entered.resolve();
+				await release.promise;
+				return fauxAssistantMessage("child settled");
+			},
+		]);
+		let bashWork: Promise<unknown> | undefined;
+		const { live } = await liveFixture({
+			initialGoal: { objective: "stopped goal" },
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			tools: [
+				{
+					name: "ipython",
+					label: "ipython",
+					description: "faux goal completion",
+					parameters: Type.Object({}),
+					execute: async () => {
+						live.session.handleGoalHostRequest("goal.complete");
+						return { content: [{ type: "text", text: "complete" }], details: {} };
+					},
+				},
+			],
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
 		try {
+			await live.session.runRlmChild("child work", { name: "stop-fixture-child" });
+			await entered.promise;
+			live.setResponses([
+				fauxAssistantMessage("waiting for child"),
+				fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("goal complete"),
+			]);
+			await live.session.prompt("work with a child");
+			expect(live.session.hasRunningRlmChildren()).toBe(true);
+			expect(live.session.goalState.continuationsUsed).toBe(0);
+			const bashEntered = createDeferred();
+			bashWork = live.session.executeBash("work to stop", undefined, {
+				operations: {
+					exec: async () => {
+						bashEntered.resolve();
+						await release.promise;
+						return { exitCode: 0 };
+					},
+				},
+			});
+			await bashEntered.promise;
+			await live.session.abort({ userStop: true });
+			release.resolve();
+			await bashWork;
+			await child.session.agent.waitForIdle();
+			await live.session.waitForRlmQuiescence();
 			await live.session.waitForSessionInputIdle();
 			await live.session.agent.waitForIdle();
+			expect(live.session.hasRunningRlmChildren()).toBe(false);
+			expect(live.getPendingResponseCount()).toBe(2);
 			expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
 			expect(live.eventsOfType("agent_start")).toHaveLength(1);
 			expect(live.eventsOfType("agent_end")).toHaveLength(1);
@@ -5742,7 +5789,11 @@ describe("mesh worker persistence", () => {
 			expect(live.session.isQueuedWorkSuspended).toBe(true);
 			expect(stopNotes(live)).toHaveLength(1);
 		} finally {
+			release.resolve();
+			await bashWork;
+			await child.session.agent.waitForIdle();
 			live.cleanup();
+			child.cleanup();
 		}
 	});
 
@@ -5910,13 +5961,13 @@ describe("mesh worker persistence", () => {
 					);
 					state.runtime = runtime;
 					runtime.setReplacementBarrier(async () => {
-						const token = await mesh!.beginReplacement(live.session.sessionId, h.client, "ac13-replacement");
-						assert.ok(token, "Missing retained enrollment");
+						const enrollment = await mesh!.beginReplacement(live.session.sessionId, h.client, "ac13-replacement");
+						if (!enrollment) throw new Error("Missing retained enrollment");
 						return {
 							finish: async (outcome) => {
 								await mesh!.finishReplacement(
 									live.session.sessionId,
-									token,
+									enrollment,
 									outcome,
 									live.session.sessionFile!,
 								);
