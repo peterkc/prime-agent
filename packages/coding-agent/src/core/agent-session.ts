@@ -2557,6 +2557,12 @@ export class AgentSession {
 		});
 	}
 
+	/** A user input after a user stop resumes the goal, without a goal run ahead of that input. */
+	private _resumeStopPausedGoal(): void {
+		if (this._goalState.status !== "paused" || this._goalState.lastReason !== GOAL_USER_STOP_PAUSE_REASON) return;
+		void this._resumeGoal({ queueContext: false });
+	}
+
 	private async _resumeGoal(options: { queueContext?: boolean } = {}): Promise<void> {
 		if (!this._goalState.objective) {
 			this._emitGoalUpdate();
@@ -6378,14 +6384,7 @@ export class AgentSession {
 					acceptedAgentMessage,
 					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
 				});
-				if (
-					!acceptedAgentMessage &&
-					action.priority === "user" &&
-					this._goalState.status === "paused" &&
-					this._goalState.lastReason === GOAL_USER_STOP_PAUSE_REASON
-				) {
-					await this._resumeGoal({ queueContext: false });
-				}
+				if (!acceptedAgentMessage && action.priority === "user") this._resumeStopPausedGoal();
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
@@ -8674,6 +8673,8 @@ export class AgentSession {
 		}
 		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
 		this.requestAbort({ userStop: true });
+		// Sending queued user steering redirects the goal rather than stopping it.
+		if (queuedSteering.some((action) => action.priority === "user")) this._resumeStopPausedGoal();
 		this.resumeQueuedWork();
 		return true;
 	}

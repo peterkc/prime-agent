@@ -712,6 +712,32 @@ describe("AgentSession goals", () => {
 			},
 		);
 
+		it("pi-9waqh keeps the goal going when an interrupt sends queued user steering", async () => {
+			const { harness, running } = await blockedGoal();
+			await harness.session.steer("change course");
+			harness.setResponses([
+				(context) => {
+					expect(harness.session.goalState.status).toBe("active");
+					expect(getMessageText(context.messages.at(-1))).toBe("change course");
+					return fauxAssistantMessage("redirected");
+				},
+				...completeGoalResponses(),
+			]);
+			expect(harness.session.abortAndSendQueued()).toBe(true);
+			await running;
+			await harness.session.waitForSessionInputIdle();
+			expect(visibleAssistantTexts(harness)).toEqual(["redirected", "Goal complete."]);
+			expect(harness.session.goalState).toMatchObject({ status: "complete", continuationsUsed: 1 });
+		});
+
+		it("pi-9waqh pauses the goal when an interrupt has no queued steering", async () => {
+			const { harness, running } = await blockedGoal();
+			expect(harness.session.abortAndSendQueued()).toBe(false);
+			await running;
+			await harness.session.waitForSessionInputIdle();
+			expectStopPaused(harness);
+		});
+
 		it.each(["idle", "paused", "complete", "budget_limited", "error"] satisfies GoalStatus[])(
 			"pi-9waqh leaves a %s goal unchanged through stop and prompt",
 			async (status) => {
