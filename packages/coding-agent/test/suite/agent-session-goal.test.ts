@@ -640,48 +640,58 @@ describe("AgentSession goals", () => {
 			runCount: 0,
 		};
 
-		it.each(["agent steer", "bash notice", "heartbeat", "extension custom", "extension user"] as const)(
-			"pi-9waqh keeps a stopped goal paused after %s",
-			async (input) => {
-				const harness = await stoppedGoal();
-				harness.setResponses([fauxAssistantMessage("input handled")]);
-				if (input === "agent steer") {
-					const payload: AgentSessionMessagePayload = {
-						id: "agentmsg_stop-steer",
-						source: AGENT_MESSAGE_SOURCE,
-						message: "FYI",
-						target: { activeSessionId: "test", sessionId: harness.session.sessionId },
-					};
-					await expect(
-						harness.session.acceptAgentMessagePrompt(createAgentSessionMessagePrompt(payload), {
-							customMessage: createAgentSessionMessage(payload),
-							streamingBehavior: "steer",
-							queueIfBusy: true,
-						}),
-					).rejects.toThrow("queued session input is suspended");
-				} else if (input === "bash notice") {
-					const host = harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers };
-					await host._createKernelHostHandlers()["bash.completed"]!({
-						pid: 42,
-						command: "echo done",
-						exitCode: 0,
-					});
-				} else if (input === "heartbeat") {
-					await harness.session.promptHeartbeat(heartbeat);
-				} else if (input === "extension custom") {
-					await harness.session.sendCustomMessage(
-						{ customType: "extension", content: "FYI", display: true },
-						{ triggerTurn: true },
-					);
-				} else {
-					await harness.session.sendUserMessage("extension input");
-				}
-				await harness.session.waitForSessionInputIdle();
-				expectStopPaused(harness);
-				expect(goalContextMessages(harness)).toHaveLength(1);
-				expect(harness.session.goalState.continuationsUsed).toBe(0);
-			},
-		);
+		it.each([
+			"agent steer",
+			"bash notice",
+			"heartbeat",
+			"scheduled prompt",
+			"extension custom",
+			"extension user",
+		] as const)("pi-9waqh keeps a stopped goal paused after %s", async (input) => {
+			const harness = await stoppedGoal();
+			harness.setResponses([fauxAssistantMessage("input handled")]);
+			if (input === "agent steer") {
+				const payload: AgentSessionMessagePayload = {
+					id: "agentmsg_stop-steer",
+					source: AGENT_MESSAGE_SOURCE,
+					message: "FYI",
+					target: { activeSessionId: "test", sessionId: harness.session.sessionId },
+				};
+				await expect(
+					harness.session.acceptAgentMessagePrompt(createAgentSessionMessagePrompt(payload), {
+						customMessage: createAgentSessionMessage(payload),
+						streamingBehavior: "steer",
+						queueIfBusy: true,
+					}),
+				).rejects.toThrow("queued session input is suspended");
+			} else if (input === "bash notice") {
+				const host = harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers };
+				await host._createKernelHostHandlers()["bash.completed"]!({
+					pid: 42,
+					command: "echo done",
+					exitCode: 0,
+				});
+			} else if (input === "heartbeat") {
+				await harness.session.promptHeartbeat(heartbeat);
+			} else if (input === "scheduled prompt") {
+				await harness.session.promptUntilAccepted("scheduled job", {
+					streamingBehavior: "followUp",
+					source: "rpc",
+					priority: "background",
+				});
+			} else if (input === "extension custom") {
+				await harness.session.sendCustomMessage(
+					{ customType: "extension", content: "FYI", display: true },
+					{ triggerTurn: true },
+				);
+			} else {
+				await harness.session.sendUserMessage("extension input");
+			}
+			await harness.session.waitForSessionInputIdle();
+			expectStopPaused(harness);
+			expect(goalContextMessages(harness)).toHaveLength(1);
+			expect(harness.session.goalState.continuationsUsed).toBe(0);
+		});
 
 		it.each(["interactive", "rpc"] as const)(
 			"pi-9waqh resumes on a %s prompt without a goal run ahead of it",
@@ -715,7 +725,7 @@ describe("AgentSession goals", () => {
 			},
 		);
 
-		it.each(["compaction", "update restart", "extension"] as const)(
+		it.each(["userStop false", "update restart", "extension"] as const)(
 			"pi-9waqh leaves the goal active on %s abort",
 			async (cause) => {
 				let abortExtension: (() => void) | undefined;

@@ -6380,8 +6380,7 @@ export class AgentSession {
 				});
 				if (
 					!acceptedAgentMessage &&
-					sessionActionPriorityFor(isHumanInputSource(action.source), primaryMessage, action.agentMessageId) ===
-						"user" &&
+					action.priority === "user" &&
 					this._goalState.status === "paused" &&
 					this._goalState.lastReason === GOAL_USER_STOP_PAUSE_REASON
 				) {
