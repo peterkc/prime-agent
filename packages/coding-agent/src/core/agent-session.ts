@@ -176,6 +176,7 @@ import {
 	GOAL_CONTEXT_PREVIEW_LABEL,
 	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
+	GOAL_USER_STOP_PAUSE_REASON,
 	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
@@ -2539,7 +2540,10 @@ export class AgentSession {
 
 	private _pauseGoal(reason = "Paused by user"): void {
 		this._clearQueuedGoalContexts();
-		if (this._goalState.status !== "active") {
+		if (
+			this._goalState.status !== "active" &&
+			!(this._goalState.status === "paused" && this._goalState.lastReason === GOAL_USER_STOP_PAUSE_REASON)
+		) {
 			this._emitGoalUpdate();
 			return;
 		}
@@ -2553,7 +2557,15 @@ export class AgentSession {
 		});
 	}
 
-	private async _resumeGoal(): Promise<void> {
+	/** A user input after a user stop resumes the goal, without a goal run ahead of that input. */
+	private _resumeStopPausedGoal(): void {
+		if (this._goalState.status !== "paused" || this._goalState.lastReason !== GOAL_USER_STOP_PAUSE_REASON) return;
+		this._resumeGoal({ queueContext: false }).catch((error: unknown) => {
+			console.warn(`Warning: Could not persist user stop goal resume: ${this._asError(error).message}`);
+		});
+	}
+
+	private async _resumeGoal(options: { queueContext?: boolean } = {}): Promise<void> {
 		if (!this._goalState.objective) {
 			this._emitGoalUpdate();
 			return;
@@ -2572,7 +2584,7 @@ export class AgentSession {
 			lastReason: exhausted ? "Goal token budget already reached" : undefined,
 			lastError: undefined,
 		});
-		if (nextStatus === "active") {
+		if (nextStatus === "active" && options.queueContext !== false) {
 			await this._runOrQueueGoalContext("continuation");
 		}
 	}
@@ -6374,6 +6386,7 @@ export class AgentSession {
 					acceptedAgentMessage,
 					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
 				});
+				if (!acceptedAgentMessage && action.priority === "user") this._resumeStopPausedGoal();
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
@@ -8576,6 +8589,13 @@ export class AgentSession {
 		this._refineAbortController?.abort();
 		this.agent.abort();
 		this._goalContinuationAwaitsMesh = false;
+		if (userStop && this._goalState.status === "active") {
+			try {
+				this._pauseGoal(GOAL_USER_STOP_PAUSE_REASON);
+			} catch (error) {
+				console.warn(`Warning: Could not persist user stop goal pause: ${this._asError(error).message}`);
+			}
+		}
 		if (userStop && !this._pendingStopNote) {
 			this._pendingStopNote = this.agent
 				.waitForIdle()
@@ -8655,6 +8675,8 @@ export class AgentSession {
 		}
 		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
 		this.requestAbort({ userStop: true });
+		// Sending queued user steering redirects the goal rather than stopping it.
+		if (queuedSteering.some((action) => action.priority === "user")) this._resumeStopPausedGoal();
 		this.resumeQueuedWork();
 		return true;
 	}

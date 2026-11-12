@@ -43,6 +43,7 @@ import {
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { GOAL_USER_STOP_PAUSE_REASON } from "../src/core/goals.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
@@ -4637,7 +4638,11 @@ describe("mesh worker persistence", () => {
 						data: { deliveryStatus: "queued" },
 					});
 					expect(live.eventsOfType("agent_start")).toHaveLength(runs);
-					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					expect(live.session.goalState).toMatchObject({
+						status: "paused",
+						lastReason: GOAL_USER_STOP_PAUSE_REASON,
+						continuationsUsed: 0,
+					});
 					expect(live.session.hasQueuedAgentMessage("agentmsg_stop-held")).toBe(true);
 					await live.session.prompt("/goal clear");
 				}
@@ -5555,23 +5560,48 @@ describe("mesh worker persistence", () => {
 		}
 	});
 
-	it.each(["prompt", "resume_queue", "delete", "compaction", "update-restart"] as const)(
+	function compactingStoppedFixture() {
+		return stoppedFixture({
+			initialGoal: { objective: "finish after compacting" },
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) =>
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "compacted work",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					})),
+			],
+		});
+	}
+
+	it("AC-13 compaction keeps the user-stop wait while the stopped goal is paused", async () => {
+		const { live, receive } = await compactingStoppedFixture();
+		try {
+			await receive(heldOffer());
+			await live.session.waitForSessionInputIdle();
+			live.session.setMeshFollowUpPending(true);
+			await live.session.compact();
+			await live.session.waitForSessionInputIdle();
+			expect(live.eventsOfType("compaction_end").at(-1)).toMatchObject({
+				aborted: false,
+				result: { summary: "compacted work" },
+			});
+			expect(live.session.goalState).toMatchObject({ status: "paused", lastReason: GOAL_USER_STOP_PAUSE_REASON });
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(live.session.hasQueuedAgentMessage("agentmsg_ac13-held")).toBe(true);
+			expect(live.eventsOfType("agent_start")).toHaveLength(1);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["prompt", "resume_queue", "delete", "update-restart"] as const)(
 		"AC-13 clears the user-stop wait through %s",
 		async (input) => {
-			const fixture = await stoppedFixture({
-				initialGoal: input === "compaction" ? { objective: "finish after compacting" } : undefined,
-				settings: { compaction: { keepRecentTokens: 1 } },
-				extensionFactories: [
-					(pi) =>
-						pi.on("session_before_compact", async (event) => ({
-							compaction: {
-								summary: "compacted work",
-								firstKeptEntryId: event.preparation.firstKeptEntryId,
-								tokensBefore: event.preparation.tokensBefore,
-							},
-						})),
-				],
-			});
+			const fixture = await stoppedFixture();
 			const { live, h, state, receive } = fixture;
 			let restarted: Harness | undefined;
 			try {
@@ -5630,14 +5660,6 @@ describe("mesh worker persistence", () => {
 						expect(h.frames()).toContainEqual(
 							expect.objectContaining({ command: "mutate_queued_message", data: { status: "applied" } }),
 						);
-					} else {
-						live.session.setMeshFollowUpPending(true);
-						await live.session.compact();
-						expect(live.session.goalState.status).toBe("active");
-						expect(live.eventsOfType("compaction_end").at(-1)).toMatchObject({
-							aborted: false,
-							result: { summary: "compacted work" },
-						});
 					}
 				}
 				const target = restarted ?? live;
@@ -5782,7 +5804,11 @@ describe("mesh worker persistence", () => {
 			await live.session.agent.waitForIdle();
 			expect(live.session.hasRunningRlmChildren()).toBe(false);
 			expect(live.getPendingResponseCount()).toBe(2);
-			expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+			expect(live.session.goalState).toMatchObject({
+				status: "paused",
+				lastReason: GOAL_USER_STOP_PAUSE_REASON,
+				continuationsUsed: 0,
+			});
 			expect(live.eventsOfType("agent_start")).toHaveLength(1);
 			expect(live.eventsOfType("agent_end")).toHaveLength(1);
 			expect(live.session.queuedActionCount).toBe(0);

@@ -1,6 +1,7 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CustomMessage } from "./messages.js";
 
+export const GOAL_USER_STOP_PAUSE_REASON = "Paused by user stop until the next user prompt";
 export const GOAL_STATE_CUSTOM_TYPE = "thread_goal_state";
 export const GOAL_CONTEXT_CUSTOM_TYPE = "goal_context";
 export const GOAL_CONTEXT_PREVIEW_LABEL = "Goal context";
