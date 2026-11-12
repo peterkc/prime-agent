@@ -2560,7 +2560,9 @@ export class AgentSession {
 	/** A user input after a user stop resumes the goal, without a goal run ahead of that input. */
 	private _resumeStopPausedGoal(): void {
 		if (this._goalState.status !== "paused" || this._goalState.lastReason !== GOAL_USER_STOP_PAUSE_REASON) return;
-		void this._resumeGoal({ queueContext: false });
+		this._resumeGoal({ queueContext: false }).catch((error: unknown) => {
+			console.warn(`Warning: Could not persist user stop goal resume: ${this._asError(error).message}`);
+		});
 	}
 
 	private async _resumeGoal(options: { queueContext?: boolean } = {}): Promise<void> {

@@ -625,6 +625,31 @@ describe("AgentSession goals", () => {
 			}
 		});
 
+		it("pi-9waqh still runs the user prompt if goal-resume persistence fails", async () => {
+			const harness = await stoppedGoal();
+			const flush = vi.spyOn(harness.sessionManager, "flushNow").mockImplementationOnce(() => {
+				throw new Error("goal resume flush failed");
+			});
+			try {
+				harness.setResponses([fauxAssistantMessage("interjection answered"), ...completeGoalResponses()]);
+				await harness.session.prompt("user interjection");
+				expect(visibleAssistantTexts(harness)).toContain("interjection answered");
+			} finally {
+				flush.mockRestore();
+			}
+		});
+
+		it("pi-9waqh keeps the goal paused when an interrupt sends only extension steering", async () => {
+			const { harness, running } = await blockedGoal();
+			await harness.session.sendUserMessage("extension steer", { deliverAs: "steer" });
+			harness.setResponses([fauxAssistantMessage("extension steer handled")]);
+			harness.session.abortAndSendQueued();
+			await running;
+			await harness.session.waitForSessionInputIdle();
+			expectStopPaused(harness);
+			expect(harness.session.goalState.continuationsUsed).toBe(0);
+		});
+
 		const heartbeat: AgentCronJob = {
 			id: "stop-heartbeat",
 			status: "active",
