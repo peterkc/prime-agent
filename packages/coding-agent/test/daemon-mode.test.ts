@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -5291,6 +5292,754 @@ describe("mesh worker persistence", () => {
 			}
 		},
 	);
+
+	type StopFixture = Awaited<ReturnType<typeof liveFixture>>;
+	const stopEntryPoints = [
+		"abort",
+		"kill",
+		"abort_and_clear_queue",
+		"abort_and_send_queued",
+		"connection-abort",
+		"connection-clear",
+		"connection-send",
+	] as const;
+	type StopEntryPoint = (typeof stopEntryPoints)[number];
+
+	async function stopThrough(fixture: StopFixture, entry: StopEntryPoint): Promise<void> {
+		const { live, h, state } = fixture;
+		if (entry === "kill") state.runtime.dispose = async () => live.session.disposeAsync({ kernelSnapshot: false });
+		if (entry.startsWith("connection-")) {
+			const connection = new InProcessAgentConnection({
+				session: live.session,
+				setRebindSession: () => {},
+			} as unknown as AgentSessionRuntime);
+			if (entry === "connection-abort") await connection.abort();
+			else if (entry === "connection-clear") await connection.abortAndClearQueue();
+			else await connection.abortAndSendQueued();
+		} else {
+			await h.internals.handleLine(
+				h.client,
+				JSON.stringify({ id: "ac13-stop", type: entry, activeSessionId: "target" }),
+			);
+			expect(h.frames()).toContainEqual(expect.objectContaining({ command: entry, success: true }));
+		}
+	}
+
+	function stopNotes(live: Harness) {
+		return live.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop");
+	}
+
+	function heldOffer(id = "ac13-held", attemptToken = "first") {
+		return { message: `held FYI ${id}`, canWait: true, cotal: { id, deliveryCount: 1, attemptToken } };
+	}
+
+	async function serializedInput(live: Harness, context: Context): Promise<string> {
+		let serialized = "";
+		const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+			serialized = String(options?.body);
+			return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+		});
+		try {
+			const model: Model<"openai-responses"> = {
+				...live.getModel(),
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "https://fixture.invalid/v1",
+			};
+			await streamOpenAIResponses(model, context, { apiKey: "fixture-key" }).result();
+			return JSON.stringify(JSON.parse(serialized).input);
+		} finally {
+			fetch.mockRestore();
+		}
+	}
+
+	async function stoppedFixture(options: Parameters<typeof createHarness>[0] = {}): Promise<StopFixture> {
+		const fixture = await liveFixture(options, true);
+		const { live, started, release } = fixture;
+		try {
+			live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+			const running = live.session.prompt("work to stop");
+			await started.promise;
+			const stopping = live.session.abort({ userStop: true });
+			release.resolve();
+			await stopping;
+			await running;
+			return fixture;
+		} catch (error) {
+			release.resolve();
+			live.cleanup();
+			throw error;
+		}
+	}
+
+	const stopTimings = ["before-offer", "during-offer", "after-deferral"] as const;
+	it.each(stopEntryPoints.flatMap((entry) => stopTimings.map((timing) => ({ entry, timing }))))(
+		"AC-13 persists $entry at $timing before held delivery",
+		async ({ entry, timing }) => {
+			const fixture = await liveFixture({}, true);
+			const { live, h, state, started, release, aborted, receive } = fixture;
+			const offerEntered = createDeferred();
+			const offerRelease = createDeferred();
+			const hydrate = h.internals.getOrHydrateBoundSessionState.bind(h.internals);
+			const hydration = vi.spyOn(h.internals, "getOrHydrateBoundSessionState").mockImplementation(async () => {
+				const target = await hydrate();
+				if (timing === "during-offer") {
+					offerEntered.resolve();
+					await offerRelease.promise;
+				}
+				return target;
+			});
+			let reopened: Harness | undefined;
+			let stopping: Promise<void> | undefined;
+			let offering: Promise<void> | undefined;
+			live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+			const running = live.session.prompt("work to stop");
+			try {
+				await started.promise;
+				if (timing === "after-deferral") {
+					await receive(heldOffer());
+					expect(h.frames().at(-1)).toMatchObject({ data: { status: "deferred", reason: "run_active" } });
+				} else if (timing === "during-offer") {
+					offering = receive(heldOffer());
+					await offerEntered.promise;
+				}
+				stopping = stopThrough(fixture, entry);
+				await aborted.promise;
+				if (timing === "before-offer") {
+					const offered = receive(heldOffer());
+					offering =
+						entry === "kill" ? expect(offered).rejects.toThrow("Active session target is closing") : offered;
+				}
+				offerRelease.resolve();
+				await offering;
+				if (entry !== "kill" || timing !== "before-offer")
+					expect(h.frames()).toContainEqual(
+						expect.objectContaining({
+							command: "worker_deliver_message",
+							data: { status: "deferred", reason: "run_active" },
+						}),
+					);
+				expect(stopNotes(live)).toHaveLength(0);
+				release.resolve();
+				await stopping;
+				await running;
+				await live.session.abort({ userStop: false });
+				expect(stopNotes(live)).toHaveLength(1);
+				expect(readFileSync(live.session.sessionFile!, "utf8").split('"customType":"agent_stop"')).toHaveLength(2);
+				hydration.mockRestore();
+				if (entry === "kill") {
+					reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+					state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+					h.internals.sessions.set("target", state);
+				}
+				const target = reopened ?? live;
+				let input = "";
+				target.setResponses([
+					async (context) => {
+						input = await serializedInput(target, context);
+						return fauxAssistantMessage("FYI handled");
+					},
+				]);
+				await receive(heldOffer("ac13-held", "next"));
+				if (!reopened) {
+					await target.session.waitForSessionInputIdle();
+					expect(target.eventsOfType("agent_start")).toHaveLength(1);
+					expect(target.session.hasQueuedAgentMessage("agentmsg_ac13-held")).toBe(true);
+					expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+					target.session.resumeQueuedWork();
+				}
+				await target.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+				expect(input.split("The user stopped the previous work.")).toHaveLength(2);
+				expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held FYI ac13-held"));
+				expect(h.frames()).toContainEqual({
+					type: "agent_message_persisted",
+					cotalId: "ac13-held",
+					attemptToken: "next",
+				});
+			} finally {
+				offerRelease.resolve();
+				release.resolve();
+				await Promise.allSettled([running, stopping, offering]);
+				hydration.mockRestore();
+				reopened?.cleanup();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("AC-13 persists a non-run stop with no assistant entry before the next provider request", async () => {
+		const { live, receive, h, state } = await liveFixture();
+		let reopened: Harness | undefined;
+		const entered = createDeferred();
+		const release = createDeferred();
+		const bashWork = live.session.executeBash("fixture work", undefined, {
+			operations: {
+				exec: async () => {
+					entered.resolve();
+					await release.promise;
+					return { exitCode: 0 };
+				},
+			},
+		});
+		let input = "";
+		try {
+			await entered.promise;
+			expect(live.eventsOfType("agent_start")).toHaveLength(0);
+			expect(live.session.messages.filter((message) => message.role === "assistant")).toEqual([]);
+			await h.internals.handleLine(h.client, JSON.stringify({ type: "abort", activeSessionId: "target" }));
+			await live.session.abort({ userStop: false });
+			expect(stopNotes(live)).toHaveLength(1);
+			expect(SessionManager.open(live.session.sessionFile!).getEntries()).toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "custom_message", customType: "agent_stop" })]),
+			);
+			release.resolve();
+			await bashWork;
+			reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+			state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+			const target = reopened;
+			const completion = target.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+			target.setResponses([
+				async (context) => {
+					input = await serializedInput(target, context);
+					return fauxAssistantMessage("handled");
+				},
+			]);
+			await receive(heldOffer());
+			await completion;
+			expect(target.eventsOfType("agent_start")).toHaveLength(1);
+			expect(input.split("The user stopped the previous work.")).toHaveLength(2);
+			expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held FYI ac13-held"));
+		} finally {
+			release.resolve();
+			await bashWork;
+			reopened?.cleanup();
+			live.cleanup();
+		}
+	});
+
+	it("AC-13 clear-to-idle records no stop note", async () => {
+		const fixture = await liveFixture();
+		const { live } = fixture;
+		const pause = live.session.acquireQueuedWorkPause();
+		try {
+			await live.session.followUp("only queued work");
+			expect(live.session.isSessionActive).toBe(true);
+			await stopThrough(fixture, "abort_and_clear_queue");
+			await live.session.abort({ userStop: false });
+			expect(live.session.isSessionActive).toBe(false);
+			expect(live.session.queuedActionCount).toBe(0);
+			expect(stopNotes(live)).toEqual([]);
+		} finally {
+			pause.release();
+			live.cleanup();
+		}
+	});
+
+	it("AC-13 records one note for each distinct active stop", async () => {
+		const { live } = await liveFixture();
+		try {
+			for (let index = 0; index < 2; index++) {
+				const entered = createDeferred();
+				live.setResponses([
+					async (_context, options) => {
+						entered.resolve();
+						await new Promise<void>((resolve) =>
+							options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+						);
+						return fauxAssistantMessage("", { stopReason: "aborted" });
+					},
+				]);
+				const running = live.session.prompt(`work ${index}`);
+				await entered.promise;
+				await live.session.abort({ userStop: true });
+				await running;
+				expect(stopNotes(live)).toHaveLength(index + 1);
+			}
+			expect(
+				SessionManager.open(live.session.sessionFile!)
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_stop"),
+			).toHaveLength(2);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["prompt", "resume_queue", "delete", "compaction", "update-restart"] as const)(
+		"AC-13 clears the user-stop wait through %s",
+		async (input) => {
+			const fixture = await stoppedFixture({
+				initialGoal: input === "compaction" ? { objective: "finish after compacting" } : undefined,
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [
+					(pi) =>
+						pi.on("session_before_compact", async (event) => ({
+							compaction: {
+								summary: "compacted work",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						})),
+				],
+			});
+			const { live, h, state, receive } = fixture;
+			let restarted: Harness | undefined;
+			try {
+				await receive(heldOffer());
+				await live.session.waitForSessionInputIdle();
+				expect(live.eventsOfType("agent_start")).toHaveLength(1);
+				expect(live.session.hasQueuedAgentMessage("agentmsg_ac13-held")).toBe(true);
+				let completion =
+					input === "update-restart"
+						? undefined
+						: live.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+				if (input === "update-restart") {
+					live.session.abortForUpdateRestart();
+					const snapshot = live.session.getSessionActionRecoverySnapshot();
+					restarted = await createHarness({
+						existingSessionFile: live.session.sessionFile!,
+						persistSession: true,
+					});
+					state.runtime = { ...state.runtime, session: restarted.session } as ActiveSessionState["runtime"];
+					restarted.setResponses([fauxAssistantMessage("restored FYI")]);
+					completion = restarted.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+					await restarted.session.restoreSessionActions(snapshot);
+					expect(restarted.session.isQueuedWorkSuspended).toBe(false);
+					await receive(heldOffer("ac13-held", "restart"));
+					await h.internals.handleLine(
+						h.client,
+						JSON.stringify({ type: "resume_queue", activeSessionId: "target" }),
+					);
+				} else {
+					live.setResponses([
+						...(input === "prompt" ? [fauxAssistantMessage("ordinary work complete")] : []),
+						fauxAssistantMessage("FYI handled"),
+					]);
+					if (input === "prompt") await live.session.prompt("next ordinary user prompt");
+					else if (input === "resume_queue") {
+						await h.internals.handleLine(
+							h.client,
+							JSON.stringify({ type: "resume_queue", activeSessionId: "target" }),
+						);
+						expect(h.frames()).toContainEqual(
+							expect.objectContaining({ command: "resume_queue", success: true }),
+						);
+					} else if (input === "delete") {
+						await live.session.followUp("delete this queued item");
+						await h.internals.handleLine(
+							h.client,
+							JSON.stringify({
+								type: "mutate_queued_message",
+								activeSessionId: "target",
+								lane: "followUp",
+								index: 0,
+								expectedText: "delete this queued item",
+								mutation: { type: "delete" },
+							}),
+						);
+						expect(h.frames()).toContainEqual(
+							expect.objectContaining({ command: "mutate_queued_message", data: { status: "applied" } }),
+						);
+					} else {
+						live.session.setMeshFollowUpPending(true);
+						await live.session.compact();
+						expect(live.session.goalState.status).toBe("active");
+						expect(live.eventsOfType("compaction_end").at(-1)).toMatchObject({
+							aborted: false,
+							result: { summary: "compacted work" },
+						});
+					}
+				}
+				const target = restarted ?? live;
+				expect(target.session.isQueuedWorkSuspended).toBe(false);
+				await completion;
+				await target.session.waitForSessionInputIdle();
+				expect(target.eventsOfType("agent_start")).toHaveLength(restarted ? 1 : input === "prompt" ? 3 : 2);
+				expect(target.session.hasQueuedAgentMessage("agentmsg_ac13-held")).toBe(false);
+			} finally {
+				restarted?.cleanup();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("AC-13 same-lane reorder keeps the user-stop wait", async () => {
+		const { live, h, receive } = await stoppedFixture();
+		try {
+			await receive(heldOffer());
+			await live.session.followUp("second queued item", undefined, { priority: "background" });
+			const [first] = live.session.getSessionActionSnapshot().followUps;
+			expect(first).toBe("Agent message received: held FYI ac13-held");
+			await h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					type: "mutate_queued_message",
+					activeSessionId: "target",
+					lane: "followUp",
+					index: 0,
+					expectedText: first,
+					mutation: { type: "move", direction: 1 },
+				}),
+			);
+			expect(h.frames()).toContainEqual(
+				expect.objectContaining({ command: "mutate_queued_message", data: { status: "applied" } }),
+			);
+			await live.session.waitForSessionInputIdle();
+			expect(live.session.getSessionActionSnapshot().followUps).toEqual(["second queued item", first]);
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(live.eventsOfType("agent_start")).toHaveLength(1);
+			expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+			live.setResponses([fauxAssistantMessage("second complete"), fauxAssistantMessage("FYI complete")]);
+			live.session.resumeQueuedWork();
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+			expect(live.eventsOfType("agent_start")).toHaveLength(3);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["input-pause", "update-restart"] as const)(
+		"AC-13 interrupt preserves suspension under %s",
+		async (suspension) => {
+			const { live, receive, h } = await stoppedFixture();
+			let pause: { release(): void } | undefined;
+			try {
+				await receive(heldOffer());
+				await live.session.steer("queued user steering");
+				if (suspension === "input-pause") pause = live.session.acquireSessionInputPause();
+				else live.session.abortForUpdateRestart();
+				expect(live.session.abortAndSendQueued()).toBe(false);
+				if (suspension === "input-pause") await live.session.abort({ userStop: false });
+				pause?.release();
+				pause = undefined;
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.hasQueuedAgentMessage("agentmsg_ac13-held")).toBe(true);
+				expect(live.eventsOfType("agent_start")).toHaveLength(1);
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual([]);
+				live.setResponses([fauxAssistantMessage("steering complete"), fauxAssistantMessage("FYI complete")]);
+				live.session.resumeQueuedWork();
+				await live.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+				expect(live.eventsOfType("agent_start")).toHaveLength(3);
+			} finally {
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("AC-13 no-input settle with an active goal starts no idle run", async () => {
+		const { live } = await stoppedFixture({ initialGoal: { objective: "stopped goal" } });
+		try {
+			await live.session.waitForSessionInputIdle();
+			await live.session.agent.waitForIdle();
+			expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+			expect(live.eventsOfType("agent_start")).toHaveLength(1);
+			expect(live.eventsOfType("agent_end")).toHaveLength(1);
+			expect(live.session.queuedActionCount).toBe(0);
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(stopNotes(live)).toHaveLength(1);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it("AC-13 literal stop text does not abort active work or hold the later FYI", async () => {
+		const { live, receive, started, release } = await liveFixture({}, true);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original completed"),
+			fauxAssistantMessage("FYI completed"),
+		]);
+		const running = live.session.prompt("original work");
+		try {
+			await started.promise;
+			await receive({
+				message: "The user said stop. Stop the work.",
+				cotal: { id: "literal", deliveryCount: 1, attemptToken: "literal" },
+			});
+			expect(stopNotes(live)).toEqual([]);
+			expect(live.session.isQueuedWorkSuspended).toBe(false);
+			release.resolve();
+			await running;
+			await receive(heldOffer());
+			await live.session.waitForAgentMessagePromptCompletion("agentmsg_ac13-held");
+			expect(live.eventsOfType("agent_start")).toHaveLength(3);
+			expect(
+				live.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "aborted"),
+			).toEqual([]);
+			expect(stopNotes(live)).toEqual([]);
+			expect(live.session.isQueuedWorkSuspended).toBe(false);
+		} finally {
+			release.resolve();
+			await running;
+			live.cleanup();
+		}
+	});
+
+	it("AC-13 active update suspension alone creates no stop note", async () => {
+		const { live, started, release, aborted } = await liveFixture({}, true);
+		live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+		const running = live.session.prompt("active work");
+		try {
+			await started.promise;
+			live.session.abortForUpdateRestart();
+			await aborted.promise;
+			release.resolve();
+			await running;
+			await live.session.waitForSessionInputIdle();
+			expect(stopNotes(live)).toEqual([]);
+			expect(readFileSync(live.session.sessionFile!, "utf8")).not.toContain('"customType":"agent_stop"');
+			expect(live.eventsOfType("agent_start")).toHaveLength(1);
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+		} finally {
+			release.resolve();
+			await running;
+			live.cleanup();
+		}
+	});
+
+	it.each(["restart", "replacement"] as const)(
+		"AC-13 retained enrollment admits after %s without a user resume",
+		async (mode) => {
+			const fixture = await liveFixture({}, true);
+			const { live, h, state, started, release } = fixture;
+			const brokerMocks = (["start", "stop", "provisionDmInbox", "provisionDlvInbox", "reissueAcl"] as const).map(
+				(method) => vi.spyOn(CotalEndpoint.prototype, method).mockResolvedValue(undefined),
+			);
+			let mesh: MeshEndpoints | undefined;
+			let reopened: Harness | undefined;
+			let runtime: AgentSessionRuntime | undefined;
+			let running: Promise<void> | undefined;
+			let input = "";
+			try {
+				const meshRoot = join(live.tempDir, "mesh");
+				mkdirSync(meshRoot);
+				writeFileSync(
+					join(meshRoot, "mesh.json"),
+					JSON.stringify({ space: "prime", server: "nats://127.0.0.1:1" }),
+				);
+				writeFileSync(
+					join(meshRoot, "signer.json"),
+					JSON.stringify(stripSpaceAuth(await createSpaceAuth("prime"))),
+					{ mode: 0o600 },
+				);
+				mesh = new MeshEndpoints({
+					meshRoot,
+					homeSocket: join(meshRoot, "home.sock"),
+					log: vi.fn(),
+					isCurrentRecipient: (recipient) => recipient === h.client,
+					handoff: async (_record, _message, count, bind, _open, token) => {
+						bind(h.client);
+						await fixture.receive({
+							...heldOffer("retained", token),
+							cotal: { id: "retained", deliveryCount: count, attemptToken: token },
+						});
+						const receipt = h
+							.frames()
+							.filter((frame) => frame.command === "worker_deliver_message")
+							.at(-1);
+						return receipt.data.status === "deferred" ? receipt.data : undefined;
+					},
+				});
+				const write = h.socket.write;
+				h.socket.write = (data) => {
+					const accepted = write(data);
+					const frame = h.frames().at(-1);
+					if (frame?.type === "agent_message_persisted")
+						mesh!.confirmPersisted(frame.cotalId, h.client, frame.attemptToken);
+					return accepted;
+				};
+				live.sessionManager.flushNow();
+				await mesh.enroll(live.session.sessionId, live.session.sessionFile!);
+				const enrollment = join(meshRoot, "enrollments", `${live.session.sessionId}.json`);
+				const before = readFileSync(enrollment, "utf8");
+				live.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+				running = live.session.prompt("work to stop");
+				await started.promise;
+				const endpointFor = () =>
+					(
+						mesh as unknown as { sessions: Map<string, { endpoint: CotalEndpoint; handoff?: Promise<void> }> }
+					).sessions.get(live.session.sessionId)!;
+				const held = endpointFor();
+				const ack = vi.fn();
+				function offerRetained(endpoint: CotalEndpoint): void {
+					endpoint.emit(
+						"message",
+						{
+							id: "retained",
+							ts: 0,
+							space: "prime",
+							from: { id: "local.peer", name: "peer" },
+							to: "local.recipient",
+							parts: [
+								{ kind: "text", text: AGENT_MESSAGE_CAN_WAIT_HEADER },
+								{ kind: "text", text: "held FYI retained" },
+							],
+						},
+						{ durable: true, ack, nak: vi.fn() },
+						{ kind: "dm" },
+					);
+				}
+				offerRetained(held.endpoint);
+				await held.handoff;
+				expect(mesh.hasQueuedFollowUps(live.session.sessionId)).toBe(true);
+				expect(ack).not.toHaveBeenCalled();
+				const stopping = live.session.abort({ userStop: true });
+				release.resolve();
+				await stopping;
+				await running;
+				const factory: CreateAgentSessionRuntimeFactory = async (options) => {
+					reopened = await createHarness({
+						existingSessionFile: options.sessionManager.getSessionFile()!,
+						persistSession: true,
+					});
+					return {
+						session: reopened.session,
+						services: { cwd: live.tempDir, agentDir: live.tempDir },
+						diagnostics: [],
+					} as never;
+				};
+				if (mode === "replacement") {
+					runtime = new AgentSessionRuntime(
+						live.session,
+						{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+						factory,
+					);
+					state.runtime = runtime;
+					runtime.setReplacementBarrier(async () => {
+						const token = await mesh!.beginReplacement(live.session.sessionId, h.client, "ac13-replacement");
+						assert.ok(token, "Missing retained enrollment");
+						return {
+							finish: async (outcome) => {
+								await mesh!.finishReplacement(
+									live.session.sessionId,
+									token,
+									outcome,
+									live.session.sessionFile!,
+								);
+							},
+						};
+					});
+					await runtime.switchSession(live.session.sessionFile!);
+				} else {
+					await live.session.disposeAsync({ kernelSnapshot: false });
+					reopened = await createHarness({ existingSessionFile: live.session.sessionFile!, persistSession: true });
+					state.runtime = { ...state.runtime, session: reopened.session } as ActiveSessionState["runtime"];
+				}
+				if (!reopened) throw new Error("Missing reopened session");
+				expect(readFileSync(enrollment, "utf8")).toBe(before);
+				expect(reopened.session.sessionId).toBe(live.session.sessionId);
+				expect(reopened.session.isQueuedWorkSuspended).toBe(false);
+				const completion = reopened.session.waitForAgentMessagePromptCompletion("agentmsg_retained");
+				reopened.setResponses([
+					async (context) => {
+						input = await serializedInput(reopened!, context);
+						return fauxAssistantMessage("retained FYI handled");
+					},
+				]);
+				const holder = endpointFor();
+				if (mode === "restart") {
+					expect(holder).toBe(held);
+					mesh.releaseDeferral(live.session.sessionId);
+				} else {
+					expect(holder).not.toBe(held);
+					expect(ack).not.toHaveBeenCalled();
+					offerRetained(holder.endpoint);
+				}
+				await holder.handoff;
+				expect(
+					h
+						.frames()
+						.filter((frame) => frame.command === "worker_deliver_message")
+						.at(-1),
+				).toMatchObject({ data: { deliveryStatus: "delivered" } });
+				await completion;
+				expect(reopened.eventsOfType("agent_start")).toHaveLength(1);
+				expect(ack).toHaveBeenCalledOnce();
+				expect(stopNotes(reopened)).toHaveLength(1);
+				expect(input.split("The user stopped the previous work.")).toHaveLength(2);
+				expect(input.indexOf("The user stopped")).toBeLessThan(input.indexOf("held FYI retained"));
+			} finally {
+				release.resolve();
+				await running;
+				await mesh?.stop();
+				await runtime?.dispose();
+				reopened?.cleanup();
+				live.cleanup();
+				for (const mock of brokerMocks) mock.mockRestore();
+			}
+		},
+	);
+
+	it("AC-13 resumed non-user abort gives each held follow-up its own durable idle run", async () => {
+		const gates = [checkpointGate(), checkpointGate(), checkpointGate()];
+		const fixture = await stoppedFixture({
+			extensionFactories: [
+				(pi) =>
+					pi.on("message_start", async (event) => {
+						if (event.message.role !== "custom" || event.message.customType !== "agent_message") return;
+						const id = (event.message.details as { id: string }).id;
+						const index = ["agentmsg_multi-0", "agentmsg_multi-1", "agentmsg_multi-2"].indexOf(id);
+						if (index < 0) throw new Error(`Unexpected agent message ${id}`);
+						await gates[index].hold(undefined);
+					}),
+			],
+		});
+		const { live, h, receive } = fixture;
+		let receiving: Promise<void> | undefined;
+		const writtenAtAck: string[][] = [];
+		const write = h.socket.write;
+		h.socket.write = (data) => {
+			const accepted = write(data);
+			if (h.frames().at(-1)?.type === "agent_message_persisted")
+				writtenAtAck.push(
+					SessionManager.open(live.session.sessionFile!)
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message")
+						.map((entry) => (entry as { details: { id: string } }).details.id),
+				);
+			return accepted;
+		};
+		try {
+			live.setResponses([fauxAssistantMessage("ordinary prompt complete")]);
+			await live.session.prompt("resume ordinary work");
+			await live.session.abort({ userStop: false });
+			for (let index = 0; index < gates.length; index++) {
+				const id = `multi-${index}`;
+				const completion = live.session.waitForAgentMessagePromptCompletion(`agentmsg_${id}`);
+				live.setResponses([fauxAssistantMessage(`handled ${id}`)]);
+				receiving = receive(heldOffer(id));
+				await gates[index].entered;
+				expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toHaveLength(index);
+				expect(
+					live.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+				).toHaveLength(index);
+				gates[index].released.resolve();
+				await receiving;
+				await completion;
+				await live.session.waitForSessionInputIdle();
+				expect(live.eventsOfType("agent_start")).toHaveLength(index + 3);
+				expect(writtenAtAck[index]).toEqual(Array.from({ length: index + 1 }, (_, own) => `agentmsg_multi-${own}`));
+			}
+			expect(h.frames().filter((frame) => frame.type === "agent_message_persisted")).toEqual(
+				[0, 1, 2].map((index) => ({
+					type: "agent_message_persisted",
+					cotalId: `multi-${index}`,
+					attemptToken: "first",
+				})),
+			);
+			expect(stopNotes(live)).toHaveLength(1);
+		} finally {
+			for (const gate of gates) gate.released.resolve();
+			await receiving;
+			live.cleanup();
+		}
+	});
 
 	it.each([
 		"idle",
