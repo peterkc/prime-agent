@@ -176,6 +176,7 @@ import {
 	GOAL_CONTEXT_PREVIEW_LABEL,
 	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
+	GOAL_USER_STOP_PAUSE_REASON,
 	type GoalContextDetails,
 	type GoalHostResponse,
 	type GoalState,
@@ -2539,7 +2540,10 @@ export class AgentSession {
 
 	private _pauseGoal(reason = "Paused by user"): void {
 		this._clearQueuedGoalContexts();
-		if (this._goalState.status !== "active") {
+		if (
+			this._goalState.status !== "active" &&
+			!(this._goalState.status === "paused" && this._goalState.lastReason === GOAL_USER_STOP_PAUSE_REASON)
+		) {
 			this._emitGoalUpdate();
 			return;
 		}
@@ -2553,7 +2557,7 @@ export class AgentSession {
 		});
 	}
 
-	private async _resumeGoal(): Promise<void> {
+	private async _resumeGoal(options: { queueContext?: boolean } = {}): Promise<void> {
 		if (!this._goalState.objective) {
 			this._emitGoalUpdate();
 			return;
@@ -2572,7 +2576,7 @@ export class AgentSession {
 			lastReason: exhausted ? "Goal token budget already reached" : undefined,
 			lastError: undefined,
 		});
-		if (nextStatus === "active") {
+		if (nextStatus === "active" && options.queueContext !== false) {
 			await this._runOrQueueGoalContext("continuation");
 		}
 	}
@@ -6374,6 +6378,15 @@ export class AgentSession {
 					acceptedAgentMessage,
 					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
 				});
+				if (
+					!acceptedAgentMessage &&
+					sessionActionPriorityFor(isHumanInputSource(action.source), primaryMessage, action.agentMessageId) ===
+						"user" &&
+					this._goalState.status === "paused" &&
+					this._goalState.lastReason === GOAL_USER_STOP_PAUSE_REASON
+				) {
+					await this._resumeGoal({ queueContext: false });
+				}
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
@@ -8576,6 +8589,13 @@ export class AgentSession {
 		this._refineAbortController?.abort();
 		this.agent.abort();
 		this._goalContinuationAwaitsMesh = false;
+		if (userStop && this._goalState.status === "active") {
+			try {
+				this._pauseGoal(GOAL_USER_STOP_PAUSE_REASON);
+			} catch (error) {
+				console.warn(`Warning: Could not persist user stop goal pause: ${this._asError(error).message}`);
+			}
+		}
 		if (userStop && !this._pendingStopNote) {
 			this._pendingStopNote = this.agent
 				.waitForIdle()

@@ -4,10 +4,24 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessagePayload,
+	createAgentSessionMessage,
+	createAgentSessionMessagePrompt,
+} from "../../src/core/agent-messages.js";
 import { AgentSession } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import type { AgentCronJob } from "../../src/core/cron-jobs.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import { GOAL_STATE_CUSTOM_TYPE } from "../../src/core/goals.js";
+import {
+	createGoalContextMessage,
+	emptyGoalState,
+	GOAL_STATE_CUSTOM_TYPE,
+	GOAL_USER_STOP_PAUSE_REASON,
+	type GoalStatus,
+} from "../../src/core/goals.js";
+import type { HostRequestHandlers } from "../../src/core/kernel/index.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
@@ -525,6 +539,246 @@ describe("AgentSession goals", () => {
 			status: "budget_limited",
 			tokenBudget: 10,
 			continuationsUsed: 0,
+		});
+	});
+
+	describe("pi-9waqh user-stop goal pause", () => {
+		async function blockedGoal(options: HarnessOptions = {}, status: GoalStatus = "active") {
+			const waiting = createWaitingTool();
+			const sessionRef: { current?: AgentSession } = {};
+			const tools = [createFauxIpythonTool(sessionRef), waiting.tool];
+			let harness = await createHarness({
+				...options,
+				persistSession: status !== "active" || options.persistSession,
+				tools,
+			});
+			sessionRef.current = harness.session;
+			harnesses.push(harness);
+			if (status === "paused") {
+				harness.session.handleGoalHostRequest("goal.create", { objective: "existing task" });
+				await harness.session.prompt("/goal pause");
+			} else if (status !== "active") {
+				harness.sessionManager.appendCustomEntry(GOAL_STATE_CUSTOM_TYPE, {
+					...emptyGoalState(),
+					status,
+					objective: status === "idle" ? undefined : "existing task",
+					lastReason: "existing reason",
+				});
+				harness.sessionManager.flushNow();
+				const existingSessionFile = harness.sessionManager.getSessionFile();
+				if (!existingSessionFile) throw new Error("missing goal fixture session");
+				harness = await createHarness({ existingSessionFile, tools });
+				sessionRef.current = harness.session;
+				harnesses.push(harness);
+			}
+			harness.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+			const started = waiting.waitForStart(harness);
+			const running = harness.session.prompt(status === "active" ? "/goal finish the task" : "ordinary work");
+			await started;
+			return { harness, running };
+		}
+
+		async function stoppedGoal(options: HarnessOptions = {}) {
+			const { harness, running } = await blockedGoal(options);
+			await harness.session.abort({ userStop: true });
+			await running;
+			return harness;
+		}
+
+		function expectStopPaused(harness: Harness) {
+			expect(harness.session.goalState).toMatchObject({
+				status: "paused",
+				active: false,
+				lastReason: GOAL_USER_STOP_PAUSE_REASON,
+			});
+		}
+
+		it("pi-9waqh pauses an active goal and removes queued continuation on user stop", async () => {
+			const { harness, running } = await blockedGoal();
+			await harness.session.sendCustomMessage(createGoalContextMessage(harness.session.goalState, "continuation"), {
+				deliverAs: "followUp",
+			});
+			await harness.session.abort({ userStop: true });
+			await running;
+			await harness.session.waitForSessionInputIdle();
+
+			expectStopPaused(harness);
+			expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+			expect(goalContextMessages(harness)).toHaveLength(1);
+			expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+		});
+
+		it("pi-9waqh still stops active work if goal-pause persistence fails", async () => {
+			const { harness, running } = await blockedGoal();
+			const flush = vi.spyOn(harness.sessionManager, "flushNow").mockImplementationOnce(() => {
+				throw new Error("goal pause flush failed");
+			});
+			try {
+				await expect(harness.session.abort({ userStop: true })).resolves.toBeUndefined();
+				await running;
+				expectStopPaused(harness);
+				expect(harness.session.isStreaming).toBe(false);
+			} finally {
+				flush.mockRestore();
+				await harness.session.abort();
+				await running;
+			}
+		});
+
+		const heartbeat: AgentCronJob = {
+			id: "stop-heartbeat",
+			status: "active",
+			source: "heartbeat",
+			activeSessionId: "test",
+			sessionId: "test",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp",
+			prompt: "check progress",
+			schedule: { kind: "interval", expression: "every 5m", intervalMs: 300000 },
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			runCount: 0,
+		};
+
+		it.each(["agent steer", "bash notice", "heartbeat", "extension custom", "extension user"] as const)(
+			"pi-9waqh keeps a stopped goal paused after %s",
+			async (input) => {
+				const harness = await stoppedGoal();
+				harness.setResponses([fauxAssistantMessage("input handled")]);
+				if (input === "agent steer") {
+					const payload: AgentSessionMessagePayload = {
+						id: "agentmsg_stop-steer",
+						source: AGENT_MESSAGE_SOURCE,
+						message: "FYI",
+						target: { activeSessionId: "test", sessionId: harness.session.sessionId },
+					};
+					await expect(
+						harness.session.acceptAgentMessagePrompt(createAgentSessionMessagePrompt(payload), {
+							customMessage: createAgentSessionMessage(payload),
+							streamingBehavior: "steer",
+							queueIfBusy: true,
+						}),
+					).rejects.toThrow("queued session input is suspended");
+				} else if (input === "bash notice") {
+					const host = harness.session as unknown as { _createKernelHostHandlers(): HostRequestHandlers };
+					await host._createKernelHostHandlers()["bash.completed"]!({
+						pid: 42,
+						command: "echo done",
+						exitCode: 0,
+					});
+				} else if (input === "heartbeat") {
+					await harness.session.promptHeartbeat(heartbeat);
+				} else if (input === "extension custom") {
+					await harness.session.sendCustomMessage(
+						{ customType: "extension", content: "FYI", display: true },
+						{ triggerTurn: true },
+					);
+				} else {
+					await harness.session.sendUserMessage("extension input");
+				}
+				await harness.session.waitForSessionInputIdle();
+				expectStopPaused(harness);
+				expect(goalContextMessages(harness)).toHaveLength(1);
+				expect(harness.session.goalState.continuationsUsed).toBe(0);
+			},
+		);
+
+		it.each(["interactive", "rpc"] as const)(
+			"pi-9waqh resumes on a %s prompt without a goal run ahead of it",
+			async (source) => {
+				const harness = await stoppedGoal();
+				expectStopPaused(harness);
+				harness.setResponses([
+					(context) => {
+						expect(harness.session.goalState.status).toBe("active");
+						expect(getMessageText(context.messages.at(-1))).toBe("user interjection");
+						return fauxAssistantMessage("interjection answered");
+					},
+					...completeGoalResponses(),
+				]);
+				await harness.session.prompt("user interjection", { source });
+				expect(visibleAssistantTexts(harness)).toEqual(["interjection answered", "Goal complete."]);
+				expect(harness.session.goalState).toMatchObject({ status: "complete", continuationsUsed: 1 });
+			},
+		);
+
+		it.each(["idle", "paused", "complete", "budget_limited", "error"] satisfies GoalStatus[])(
+			"pi-9waqh leaves a %s goal unchanged through stop and prompt",
+			async (status) => {
+				const { harness, running } = await blockedGoal({}, status);
+				const before = harness.session.goalState;
+				await harness.session.abort({ userStop: true });
+				await running;
+				harness.setResponses([fauxAssistantMessage("new request answered")]);
+				await harness.session.prompt("new request");
+				expect(harness.session.goalState).toEqual(before);
+			},
+		);
+
+		it.each(["compaction", "update restart", "extension"] as const)(
+			"pi-9waqh leaves the goal active on %s abort",
+			async (cause) => {
+				let abortExtension: (() => void) | undefined;
+				const { harness, running } = await blockedGoal({
+					extensionFactories: [
+						(pi) => {
+							pi.on("before_agent_start", (_event, ctx) => {
+								abortExtension = () => ctx.abort();
+							});
+						},
+					],
+				});
+				if (cause === "update restart") harness.session.abortForUpdateRestart();
+				else if (cause === "extension") {
+					if (!abortExtension) throw new Error("extension context was not initialized");
+					abortExtension();
+				} else await harness.session.abort({ userStop: false });
+				await running;
+				expect(harness.session.goalState.status).toBe("active");
+			},
+		);
+
+		it("pi-9waqh leaves an idle session's active goal unchanged on stop", async () => {
+			const harness = await createGoalHarness();
+			harness.session.handleGoalHostRequest("goal.create", { objective: "not started" });
+			const before = harness.session.goalState;
+			await harness.session.abort({ userStop: true });
+			expect(harness.session.goalState).toEqual(before);
+		});
+
+		it("pi-9waqh persists a stop pause across reopen and resumes on the next prompt", async () => {
+			const original = await stoppedGoal({ persistSession: true });
+			const sessionFile = original.sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("missing persisted session");
+			const reopened = await createHarness({ existingSessionFile: sessionFile });
+			harnesses.push(reopened);
+			expectStopPaused(reopened);
+			reopened.setResponses([
+				(context) => {
+					expect(reopened.session.goalState.status).toBe("active");
+					expect(getMessageText(context.messages.at(-1))).toBe("new user prompt");
+					reopened.session.handleGoalHostRequest("goal.complete");
+					return fauxAssistantMessage("done after restart");
+				},
+			]);
+			await reopened.session.prompt("new user prompt");
+			expect(reopened.session.goalState.status).toBe("complete");
+		});
+
+		it("pi-9waqh keeps an explicit /goal pause after a stop paused", async () => {
+			const harness = await stoppedGoal();
+			await harness.session.prompt("/goal pause");
+			harness.setResponses([fauxAssistantMessage("new request answered")]);
+			await harness.session.prompt("new request");
+			expect(harness.session.goalState).toMatchObject({ status: "paused", lastReason: "Paused by user" });
+		});
+
+		it.each(["resume", "clear"] as const)("pi-9waqh supports /goal %s after user stop", async (command) => {
+			const harness = await stoppedGoal();
+			harness.setResponses(completeGoalResponses());
+			await harness.session.prompt(`/goal ${command}`);
+			expect(harness.session.goalState.status).toBe(command === "resume" ? "complete" : "idle");
+			expect(harness.getPendingResponseCount()).toBe(command === "resume" ? 0 : 2);
 		});
 	});
 

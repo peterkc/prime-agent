@@ -43,6 +43,7 @@ import {
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { GOAL_USER_STOP_PAUSE_REASON } from "../src/core/goals.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
@@ -4637,7 +4638,11 @@ describe("mesh worker persistence", () => {
 						data: { deliveryStatus: "queued" },
 					});
 					expect(live.eventsOfType("agent_start")).toHaveLength(runs);
-					expect(live.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+					expect(live.session.goalState).toMatchObject({
+						status: "paused",
+						lastReason: GOAL_USER_STOP_PAUSE_REASON,
+						continuationsUsed: 0,
+					});
 					expect(live.session.hasQueuedAgentMessage("agentmsg_stop-held")).toBe(true);
 					await live.session.prompt("/goal clear");
 				}

@@ -196,6 +196,8 @@ state = await goal.get()
 await goal.complete()
 ```
 
+Stopping active work pauses an active goal with the reason "Paused by user stop until the next user prompt". Agent messages, background-command notices, heartbeats, and extension messages do not resume it. The next user prompt resumes it before that prompt runs, with no goal continuation ahead of the prompt. This pause survives restart. `/goal resume` and `/goal clear` still work; a goal paused with `/goal pause` does not resume automatically.
+
 Goal state records token usage, elapsed time, continuation count, and an optional explicit token budget. The harness keeps prompting an active goal after ordinary assistant turns; only `goal.complete()` marks successful completion. Creating a persistent goal is an explicit user or host action, not something the agent should infer from every task.
 
 ## Autonomous Mode
