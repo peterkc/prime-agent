@@ -395,8 +395,7 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type === "compaction") continue;
-		const message = getMessageFromEntry(entry);
+		const message = getMessageFromEntryForCompaction(entry);
 		if (!message) continue;
 		const messageTokens = estimateTokens(message);
 		accumulatedTokens += messageTokens;

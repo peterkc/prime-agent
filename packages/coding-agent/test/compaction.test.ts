@@ -15,6 +15,7 @@ import {
 	shouldCompact,
 } from "../src/core/compaction/index.js";
 import { SUMMARIZATION_SYSTEM_PROMPT, serializeConversation } from "../src/core/compaction/utils.js";
+import { HARNESS_DIGEST_CUSTOM_TYPE } from "../src/core/messages.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({ completeSimpleMock: vi.fn() }));
 vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
@@ -128,6 +129,21 @@ function createTailEntry(type: "custom_message" | "branch_summary" | "custom", t
 			return unhandled;
 		}
 	}
+}
+
+function createDigestEntry(): SessionEntry {
+	const id = `test-id-${entryCounter++}`;
+	const entry: SessionEntry = {
+		id,
+		parentId: lastId,
+		timestamp: new Date().toISOString(),
+		type: "custom_message",
+		customType: HARNESS_DIGEST_CUSTOM_TYPE,
+		content: "d".repeat(10_000),
+		display: false,
+	};
+	lastId = id;
+	return entry;
 }
 
 function createContextTail(type: "custom_message" | "branch_summary"): SessionEntry[] {
@@ -287,7 +303,18 @@ describe("findCutPoint context-bearing entries (pi-amu7x)", () => {
 		expect(entries[cut.firstKeptEntryIndex]).toBe(order === "before" ? call : custom);
 	});
 
-	it.each(["custom"] as const)("does not count plain %s extension state", (type) => {
+	it("does not count harness digests, which the next context drops", () => {
+		const tail = createContextTail("custom_message");
+		const digests = Array.from({ length: 4 }, createDigestEntry);
+		const lastThree = tail.slice(-3);
+		tail.splice(-1, 0, ...digests);
+		const entries = [createMessageEntry(createUserMessage("Start")), ...tail];
+		const cut = findCutPoint(entries, 0, entries.length, 250);
+		const kept = entries.slice(cut.firstKeptEntryIndex).filter((entry) => !digests.includes(entry));
+		expect(kept).toEqual(lastThree);
+	});
+
+	it("does not count plain custom extension state", () => {
 		const entries: SessionEntry[] = [
 			createMessageEntry(createUserMessage("Start")),
 			createMessageEntry(createAssistantMessage("x".repeat(400))),
@@ -295,17 +322,17 @@ describe("findCutPoint context-bearing entries (pi-amu7x)", () => {
 			createMessageEntry(createAssistantMessage("Short")),
 		];
 		const before = findCutPoint(entries, 0, entries.length, 50);
-		entries.push(createTailEntry(type, "x".repeat(40_000)));
+		entries.push(createTailEntry("custom", "x".repeat(40_000)));
 		expect(findCutPoint(entries, 0, entries.length, 50)).toEqual(before);
 		expect(before.firstKeptEntryIndex).toBe(1);
 	});
 
-	it.each(["custom_message"] as const)("bounds repeated compactions over %s tails", (type) => {
+	it("bounds repeated compactions over custom_message tails", () => {
 		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Start"))];
 		const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 250 };
 		let previousCompactionIndex = -1;
 		for (let round = 0; round < 3; round++) {
-			entries.push(...createContextTail(type));
+			entries.push(...createContextTail("custom_message"));
 			const preparation = prepareCompaction(entries, settings);
 			expect(preparation).toBeDefined();
 			const firstKept = entries.findIndex((entry) => entry.id === preparation!.firstKeptEntryId);
