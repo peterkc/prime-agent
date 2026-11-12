@@ -76,6 +76,7 @@ export interface MeshEndpointOptions {
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
 		attemptToken: string,
+		canWait: boolean,
 	) => Promise<MeshHandoffResult | undefined>;
 }
 
@@ -1317,6 +1318,7 @@ export class MeshEndpoints {
 					return false;
 				},
 				pending!.attemptToken,
+				item.canWait === true,
 			);
 			if (outcome?.status === "deferred") {
 				retained = true;

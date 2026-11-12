@@ -1,0 +1,1 @@
+- Added the global `agentMessageCanWait` setting to control new marked agent messages on the next settings re-read, preserving held custody.

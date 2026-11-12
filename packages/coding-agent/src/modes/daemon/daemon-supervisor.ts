@@ -787,6 +787,7 @@ export class DaemonSupervisor {
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
+	private agentMessageCanWait = true;
 	private readonly agentMessageTransport: "native" | "cotal";
 	private readonly meshCredentialLifetimeSeconds?: number;
 	private mesh?: MeshEndpoints;
@@ -849,6 +850,7 @@ export class DaemonSupervisor {
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 		this.agentMessageTransport = this.settingsManager.getAgentMessageTransport();
+		this.agentMessageCanWait = this.settingsManager.getAgentMessageCanWait();
 		this.meshCredentialLifetimeSeconds = options.meshCredentialLifetimeSeconds;
 	}
 
@@ -919,8 +921,8 @@ export class DaemonSupervisor {
 						),
 					canWait: (record, message) => this.meshMessageCanWait(record, message),
 					followUpStateChanged: (sessionId, pending) => this.publishMeshFollowUpState(sessionId, pending),
-					handoff: (record, message, count, bind, isOpen, attemptToken) =>
-						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken),
+					handoff: (record, message, count, bind, isOpen, attemptToken, canWait) =>
+						this.handoffMeshMessage(record, message, count, bind, isOpen, attemptToken, canWait),
 				});
 			}
 			const recoveredMoves = await this.recoverSessionMoves();
@@ -1488,6 +1490,7 @@ export class DaemonSupervisor {
 		if (this.shuttingDown || this.updateRestartPhase !== undefined || this.idleEvictionFence) return;
 		await this.settingsManager.reload();
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		this.agentMessageCanWait = this.settingsManager.getAgentMessageCanWait();
 		const idleEvictionMinutes = this.settingsManager.getIdleEvictionMinutes();
 		if (idleEvictionMinutes === "off") return;
 
@@ -3077,6 +3080,8 @@ export class DaemonSupervisor {
 			const targetSessionId = await this.mesh.resolveAddress(command.targetSessionId);
 			if (targetSessionId === source.summary.sessionId)
 				throw new Error("Message was not stored: agent messaging cannot target the sending session");
+			const scheduling = parseAgentMessageScheduling(command);
+			const fallback = scheduling.canWait === true && this.agentMessageCanWait === false;
 			const receipt = await this.mesh.send(
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
@@ -3086,9 +3091,12 @@ export class DaemonSupervisor {
 				},
 				targetSessionId,
 				normalizeAgentSessionMessage(command.message),
-				parseAgentMessageScheduling(command),
+				fallback ? { ...scheduling, canWait: false } : scheduling,
 			);
-			return success(command.id, command.type, receipt);
+			return success(command.id, command.type, {
+				...receipt,
+				...(fallback ? { schedulingFallback: "steer" as const } : {}),
+			});
 		}
 
 		if (command.type === "send_message") {
@@ -4284,6 +4292,7 @@ export class DaemonSupervisor {
 	}
 
 	private async meshMessageCanWait(record: EnrollmentRecord, message: CotalMessage): Promise<boolean> {
+		if (this.agentMessageCanWait === false) return false;
 		const row = [...this.roster().values()].find((entry) => entry.summary.sessionId === record.sessionId);
 		const worker = row?.workerId ? this.workers.get(row.workerId) : undefined;
 		if (worker && !worker.meshFollowUpCapable) return false;
@@ -4325,6 +4334,7 @@ export class DaemonSupervisor {
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
 		attemptToken: string,
+		canWait?: boolean,
 	): Promise<{ status: "deferred"; reason: "run_active" } | undefined> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		const parsed = meshMessagePayload(message);
@@ -4384,7 +4394,7 @@ export class DaemonSupervisor {
 				message: text,
 				...(worker.meshFollowUpCapable
 					? {
-							...(parsed.canWait ? { canWait: true } : {}),
+							...((canWait ?? parsed.canWait) ? { canWait: true } : {}),
 							...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
 							publishedAt: message.ts,
 						}

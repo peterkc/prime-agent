@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
@@ -12,6 +15,44 @@ import {
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { type Deferred, createDeferred as deferred } from "./suite/scheduling.js";
+
+interface CanWaitSupervisor {
+	runIdleEvictionSweep(): Promise<void>;
+	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse>;
+	meshMessageCanWait(record: { sessionId: string }, message: object): Promise<boolean>;
+}
+
+function canWaitHarness(root: string) {
+	const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+		defaultSessionConfig: { cwd: root, agentDir: root },
+	});
+	Object.assign(supervisor, {
+		workers: new Map([["resident", { meshFollowUpCapable: true, client: { isConnected: true } }]]),
+		roster: () => new Map([["receiver", { workerId: "resident", summary: { sessionId: "receiver" } }]]),
+		familyCatalogEntries: async () => [],
+	});
+	return supervisor as unknown as CanWaitSupervisor;
+}
+
+async function reloadCanWait(root: string, supervisor: CanWaitSupervisor, enabled: boolean) {
+	writeFileSync(
+		join(root, "settings.json"),
+		JSON.stringify({ idleEvictionMinutes: "off", agentMessageCanWait: enabled }),
+	);
+	await supervisor.runIdleEvictionSweep();
+}
+
+const markedMessage = {
+	id: "marked",
+	ts: 0,
+	space: "prime",
+	to: "local.receiver",
+	from: { id: "local.sender", name: "sender" },
+	parts: [
+		{ kind: "text", text: "[prime-agent-message v1 can_wait=true]" },
+		{ kind: "text", text: "FYI" },
+	],
+};
 
 interface AdmissionRecord {
 	client: DaemonSocketClient;
@@ -98,6 +139,133 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
+	it.each(["toggle", "update", "shutdown"] as const)("can-wait switch settings reload: %s", async (scenario) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-can-wait-"));
+		const supervisor = canWaitHarness(root);
+		try {
+			expect(await supervisor.meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(true);
+			writeFileSync(
+				join(root, "settings.json"),
+				JSON.stringify({ idleEvictionMinutes: "off", agentMessageCanWait: false }),
+			);
+			expect(await supervisor.meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(true);
+			if (scenario !== "toggle") {
+				Object.assign(
+					supervisor,
+					scenario === "update" ? { updateRestartPhase: "draining" } : { shuttingDown: true },
+				);
+				await supervisor.runIdleEvictionSweep();
+				expect(await supervisor.meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(true);
+				Object.assign(supervisor, { updateRestartPhase: undefined, shuttingDown: false });
+			}
+			await supervisor.runIdleEvictionSweep();
+			expect(await supervisor.meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(false);
+			expect(await canWaitHarness(root).meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(false);
+			await reloadCanWait(root, supervisor, true);
+			expect(await supervisor.meshMessageCanWait({ sessionId: "receiver" }, markedMessage)).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["off-marked", false, { canWait: true }, { canWait: false }, true],
+		["on-marked", true, { canWait: true }, { canWait: true }, false],
+		["off-unmarked", false, {}, {}, false],
+		[
+			"off-reply",
+			false,
+			{ canWait: true, replyTo: "agentmsg_original" },
+			{ canWait: false, replyTo: "agentmsg_original" },
+			true,
+		],
+	] as const)("can-wait switch send receipt: %s", async (_name, enabled, scheduling, forwarded, fallback) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-can-wait-send-"));
+		const supervisor = canWaitHarness(root);
+		const receipt = { id: "agentmsg_stored", deliveryStatus: "stored" };
+		const send = vi.fn(async () => receipt);
+		Object.assign(supervisor, {
+			mesh: { resolveAddress: async () => "target", send },
+			findWorkerForClient: async () => ({
+				worker: { meshDeliveryCapable: true, meshReplacementCapable: true },
+				summary: { id: "source", sessionId: "source", sessionFile: join(root, "source.jsonl") },
+			}),
+		});
+		try {
+			await reloadCanWait(root, supervisor, enabled);
+			const result = await supervisor.handleCommand(client("sender"), {
+				type: "mesh_send",
+				fromActiveSessionId: "source",
+				targetSessionId: "target",
+				message: "FYI",
+				...scheduling,
+			});
+			expect(send.mock.calls).toEqual([[expect.any(Object), "target", "FYI", forwarded]]);
+			expect(result).toMatchObject({ success: true, data: receipt });
+			if (fallback) expect(result).toHaveProperty("data.schedulingFallback", "steer");
+			else expect(result).not.toHaveProperty("data.schedulingFallback");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([true, false])(
+		"can-wait switch handoff uses cached policy %s instead of current setting",
+		async (cached) => {
+			const root = mkdtempSync(join(tmpdir(), "prime-can-wait-handoff-"));
+			const supervisor = canWaitHarness(root);
+			const file = join(root, "target.jsonl");
+			writeFileSync(file, "{}");
+			const summary = { id: "target", sessionId: "receiver", sessionFile: file, cwd: root };
+			const requestWorker = vi.fn(async (_command: unknown, _timeout: number) => ({ success: true }));
+			const worker = {
+				descriptor: { rootActiveSessionId: "target", lifecycle: "ready", createCommand: {} },
+				client: { requestWorker },
+				meshDeliveryCapable: true,
+				meshReplacementCapable: true,
+				meshFollowUpCapable: true,
+			};
+			Object.assign(supervisor, {
+				roster: () => ({ values: () => [][Symbol.iterator](), byActiveSessionId: () => undefined }),
+				createOrReuseWorker: async () => worker,
+				findSummaryInWorker: () => summary,
+				publishMeshFollowUpState: () => undefined,
+			});
+			const internals = supervisor as unknown as {
+				handoffMeshMessage(
+					record: object,
+					message: object,
+					count: number,
+					bind: (client: object) => void,
+					open: () => boolean,
+					token: string,
+					canWait: boolean,
+				): Promise<unknown>;
+			};
+			try {
+				await reloadCanWait(root, supervisor, false);
+				await internals.handoffMeshMessage(
+					{ sessionId: "receiver", sessionFile: file },
+					markedMessage,
+					1,
+					() => undefined,
+					() => true,
+					"attempt",
+					cached,
+				);
+				expect(requestWorker.mock.calls).toEqual([
+					[
+						expect.objectContaining({ type: "worker_deliver_message", ...(cached ? { canWait: true } : {}) }),
+						expect.any(Number),
+					],
+				]);
+				if (!cached) expect(requestWorker.mock.calls[0]![0]).not.toHaveProperty("canWait");
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it.each(["parent", "child", "sibling", "unknown", "old-worker"] as const)(
 		"derives marked policy from authenticated receiver family truth (%s)",
 		async (relationship) => {

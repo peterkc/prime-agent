@@ -227,6 +227,7 @@ export interface Settings {
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
 	autoReload?: "off" | "idle"; // global daemon policy; default: off
 	agentMessageTransport?: "native" | "cotal"; // global daemon policy; default: native
+	agentMessageCanWait?: boolean; // global daemon policy for new marked messages; default: true
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -454,6 +455,7 @@ export class SettingsManager {
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
+	private warnedAgentMessageCanWait = false;
 	private readonly warnedCompactionSettings = new Set<keyof CompactionSettings>();
 	private readonly warnedBuiltinExtensionSettings = new Set<string>();
 
@@ -1233,6 +1235,16 @@ export class SettingsManager {
 		return !this.globalSettingsLoadError && this.globalSettings.agentMessageTransport === "cotal"
 			? "cotal"
 			: "native";
+	}
+
+	getAgentMessageCanWait(): boolean {
+		const value: unknown = this.globalSettings.agentMessageCanWait;
+		if (value !== undefined && typeof value !== "boolean" && !this.warnedAgentMessageCanWait) {
+			console.warn("Warning: agentMessageCanWait is invalid; ignoring it.");
+			this.warnedAgentMessageCanWait = true;
+		}
+		// A reload that fails keeps the last good global settings, so a broken edit keeps the current choice.
+		return value !== false;
 	}
 
 	getCodemodeExcludeTools(): readonly string[] {

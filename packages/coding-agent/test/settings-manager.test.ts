@@ -25,6 +25,34 @@ describe("SettingsManager", () => {
 	const readSettings = (path: string): Record<string, unknown> =>
 		JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 
+	it.each([
+		["default", {}, true],
+		["off", { agentMessageCanWait: false }, false],
+		["invalid", { agentMessageCanWait: "off" }, true],
+	] as const)("can-wait switch global policy: %s", async (_name, global, expected) => {
+		writeSettings(globalPath, global);
+		writeSettings(projectPath, { agentMessageCanWait: !expected });
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getAgentMessageCanWait()).toBe(expected);
+			expect(manager.getAgentMessageCanWait()).toBe(expected);
+			expect(warning.mock.calls).toEqual(
+				_name === "invalid" ? [["Warning: agentMessageCanWait is invalid; ignoring it."]] : [],
+			);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("can-wait switch stays off when a later settings edit cannot be parsed", async () => {
+		writeSettings(globalPath, { agentMessageCanWait: false });
+		const manager = SettingsManager.create(projectDir, agentDir);
+		writeFileSync(globalPath, "{ broken");
+		await manager.reload();
+		expect(manager.getAgentMessageCanWait()).toBe(false);
+	});
+
 	it("notification settings default on, reject non-booleans, and persist independently", async () => {
 		writeSettings(globalPath, { terminal: { notifyOnCompletion: "off", notifyOnError: 0, notifyOnInput: false } });
 		writeSettings(projectPath, { terminal: { notifyOnCompletion: false } });
