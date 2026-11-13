@@ -107,6 +107,8 @@ await agent_message.send(
 
 Messages use steering delivery by default. With Cotal, `can_wait=True` can defer an uncorrelated message to a separate follow-up run after the target becomes idle. After a user stop, a held message waits until the user or another input resumes the session. Messages to parents or children and correlated replies still steer. Native messaging or an older peer falls back to steering.
 
+Set `"agentMessageCanWait": false` in the daemon's global `settings.json` to make new marked messages steer, or `true` (the default) to restore marked delivery. Any value other than `true` counts as off. The setting applies on the next settings re-read, normally in 1 to 5 minutes, and later during an update or shutdown. Downgraded new marked sends report `schedulingFallback: "steer"`; native messages still steer. A held message keeps its mark only while it stays in the supervisor's in-memory mesh queue. Any redelivery through intake while off, including after a session close or supervisor restart, becomes one plain steer, in arrival order among steers (so it can pass held messages that are still marked), without early acknowledgement, deletion or bulk replay.
+
 With native messaging, a receipt is `delivered` when the message reached an idle target's context, or `queued` when accepted for later steering delivery.
 With Cotal, a successful send returns `stored`, a stream sequence and a Cotal ID. This proves broker storage, not delivery to the target.
 `agent_message.send("all", message)` broadcasts only within the family roster. The daemon derives sender identity and enforces message-size, rate, and pending-queue limits.

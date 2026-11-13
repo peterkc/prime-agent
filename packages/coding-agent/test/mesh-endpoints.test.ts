@@ -828,6 +828,162 @@ describe("mesh endpoints", () => {
 		expect([first.ack.mock.calls.length, second.ack.mock.calls.length]).toEqual([1, 1]);
 	});
 
+	it.each(["stay-off", "restore-on"] as const)(
+		"can-wait switch preserves held custody and cached handoff after %s",
+		async (transition) => {
+			const admitted: Array<[string, boolean]> = [];
+			let busy = true;
+			const { mesh, target, root } = await fixture(
+				async (_record, message, _count, bind, _open, _token, canWait) => {
+					bind(recipient);
+					if (busy && canWait) return { status: "deferred", reason: "run_active" };
+					admitted.push([message.id, canWait]);
+				},
+				(record, message) => policy.meshMessageCanWait(record, message),
+			);
+			const supervisor = new DaemonSupervisor(join(root, "daemon.sock"), {
+				defaultSessionConfig: { cwd: root, agentDir: root },
+			});
+			const policy = Object.assign(supervisor, {
+				mesh,
+				workers: new Map([["resident", { meshFollowUpCapable: true, client: recipient }]]),
+				roster: () => new Map([["b", { workerId: "resident", summary: { sessionId: "b" } }]]),
+				familyCatalogEntries: async () => [],
+			}) as unknown as {
+				runIdleEvictionSweep(): Promise<void>;
+				meshMessageCanWait(record: enrollment.EnrollmentRecord, message: core.CotalMessage): Promise<boolean>;
+			};
+			async function setEnabled(enabled: boolean) {
+				writeFileSync(
+					join(root, "settings.json"),
+					JSON.stringify({ idleEvictionMinutes: "off", agentMessageCanWait: enabled }),
+				);
+				await policy.runIdleEvictionSweep();
+			}
+			async function enqueue(id: string, held = true) {
+				const item = delivery(id);
+				item.message.parts.unshift({ kind: "text", text: header });
+				target.emit("message", item.message, item.delivery, { kind: "dm" });
+				await policy.meshMessageCanWait({ sessionId: "b" } as enrollment.EnrollmentRecord, item.message);
+				if (held) await settled(mesh, "b");
+				return item;
+			}
+			const held = [await enqueue("old-a"), await enqueue("old-b")];
+			expect(mesh.hasQueuedFollowUps("b")).toBe(true);
+			expect(admitted).toEqual([]);
+			await setEnabled(false);
+			expect(held.map((item) => item.ack.mock.calls.length)).toEqual([0, 0]);
+			expect(mesh.hasQueuedFollowUps("b")).toBe(true);
+			const fresh = await enqueue("off-steer", false);
+			expect(admitted).toEqual([["off-steer", false]]);
+			mesh.confirmPersisted(fresh.message.id, recipient, attempt(mesh, fresh.message.id));
+			await settled(mesh, "b");
+			if (transition === "restore-on") {
+				await setEnabled(true);
+				held.push(await enqueue("on-held"));
+				expect(admitted).toEqual([["off-steer", false]]);
+			}
+			busy = false;
+			mesh.releaseDeferral("b");
+			for (const item of held) {
+				await settled(mesh, "b");
+				mesh.confirmPersisted(item.message.id, recipient, attempt(mesh, item.message.id));
+			}
+			await settled(mesh, "b");
+			expect(admitted).toEqual([["off-steer", false], ...held.map((item) => [item.message.id, true])]);
+			expect([fresh, ...held].map((item) => item.ack.mock.calls.length)).toEqual(Array(held.length + 1).fill(1));
+			expect(mesh.hasQueuedFollowUps("b")).toBe(false);
+		},
+	);
+
+	it.each(["restart", "refused-handoff"] as const)(
+		"can-wait switch %s retains custody and redelivers held IDs once as FIFO steers",
+		async (event) => {
+			const offered: Array<[string, boolean]> = [];
+			let refuse = false;
+			const handoff: MeshEndpointOptions["handoff"] = async (
+				_record,
+				message,
+				_count,
+				bind,
+				_open,
+				_token,
+				canWait,
+			) => {
+				bind(recipient);
+				if (canWait) {
+					if (refuse) throw new Error("fixture recipient unavailable");
+					return { status: "deferred", reason: "run_active" };
+				}
+				offered.push([message.id, canWait]);
+				return undefined;
+			};
+			const original = await fixture(handoff, (record, message) => policy.meshMessageCanWait(record, message));
+			const supervisor = new DaemonSupervisor(join(original.root, "daemon.sock"), {
+				defaultSessionConfig: { cwd: original.root, agentDir: original.root },
+			});
+			const policy = Object.assign(supervisor, {
+				roster: () => new Map(),
+				familyCatalogEntries: async () => [],
+			}) as unknown as {
+				runIdleEvictionSweep(): Promise<void>;
+				meshMessageCanWait(record: enrollment.EnrollmentRecord, message: core.CotalMessage): Promise<boolean>;
+			};
+			const held = [delivery("redelivery-a"), delivery("redelivery-b")];
+			for (const item of held) {
+				item.message.parts.unshift({ kind: "text", text: header });
+				original.target.emit("message", item.message, item.delivery, { kind: "dm" });
+			}
+			await policy.meshMessageCanWait({ sessionId: "b" } as enrollment.EnrollmentRecord, held[0]!.message);
+			await settled(original.mesh, "b");
+			expect(original.mesh.hasQueuedFollowUps("b")).toBe(true);
+			writeFileSync(
+				join(original.root, "settings.json"),
+				JSON.stringify({ idleEvictionMinutes: "off", agentMessageCanWait: false }),
+			);
+			await policy.runIdleEvictionSweep();
+			let resumed = original.mesh;
+			if (event === "restart") {
+				await original.mesh.stop();
+				const replacement = new DaemonSupervisor(join(original.root, "daemon.sock"), {
+					defaultSessionConfig: { cwd: original.root, agentDir: original.root },
+				}) as unknown as typeof policy;
+				resumed = new MeshEndpoints({
+					meshRoot: original.root,
+					homeSocket: "home",
+					log: () => undefined,
+					isCurrentRecipient: (client) => client === recipient,
+					canWait: (record, message) => replacement.meshMessageCanWait(record, message),
+					handoff,
+				});
+				meshes.push(resumed);
+			} else {
+				refuse = true;
+				original.mesh.releaseDeferral("b");
+				for (const _item of held) await settled(original.mesh, "b");
+			}
+			expect(offered).toEqual([]);
+			expect(held.map((item) => item.ack.mock.calls.length)).toEqual([0, 0]);
+			await resumed.enroll("b", join(original.root, "b.json"));
+			const endpoint = Endpoint.instances.at(-1)!;
+			const redelivered = held.map((item) => ({ ...delivery(item.message.id, 2), message: item.message }));
+			for (const item of redelivered) endpoint.emit("message", item.message, item.delivery, { kind: "dm" });
+			await policy.meshMessageCanWait({ sessionId: "b" } as enrollment.EnrollmentRecord, held[0]!.message);
+			expect(offered).toEqual([["redelivery-a", false]]);
+			expect(redelivered.map((item) => item.ack.mock.calls.length)).toEqual([0, 0]);
+			for (const item of redelivered) {
+				resumed.confirmPersisted(item.message.id, recipient, attempt(resumed, item.message.id));
+				await settled(resumed, "b");
+			}
+			expect(offered).toEqual([
+				["redelivery-a", false],
+				["redelivery-b", false],
+			]);
+			expect(redelivered.map((item) => item.ack.mock.calls.length)).toEqual([1, 1]);
+			expect(held.map((item) => item.ack.mock.calls.length)).toEqual([0, 0]);
+		},
+	);
+
 	it("keeps 25 follow-ups outside admission and lets a reply pass before FIFO idle delivery", async () => {
 		vi.useFakeTimers();
 		const offered: string[] = [];

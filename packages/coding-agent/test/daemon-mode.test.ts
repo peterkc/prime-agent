@@ -31,6 +31,7 @@ import {
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
+	type AgentSessionMessageReceipt,
 	createAgentMessageHostHandlers,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
@@ -4523,6 +4524,51 @@ describe("mesh worker persistence", () => {
 			});
 		return { live, h, state, started, release, aborted, receive };
 	}
+
+	it.each([
+		["marked", { canWait: true }, true],
+		["unmarked", {}, false],
+		["reply", { canWait: true, replyTo: "agentmsg_original" }, true],
+	] as const)("can-wait switch leaves native %s delivery steering", async (_name, scheduling, fallback) => {
+		const fixture = await liveFixture({}, true);
+		const { live, started, release } = fixture;
+		const h = harness();
+		await h.authenticate("native");
+		h.internals.sessions.set("target", fixture.state);
+		writeFileSync(join(h.root, "settings.json"), JSON.stringify({ agentMessageCanWait: false }));
+		const native = h.internals as unknown as {
+			sendAgentSessionMessage(options: object): Promise<AgentSessionMessageReceipt>;
+		};
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("complete"),
+		]);
+		const running = live.session.prompt("original work");
+		try {
+			await started.promise;
+			const receipt = await native.sendAgentSessionMessage({
+				targetSelector: "target",
+				message: "native update",
+				origin: "cli",
+				...scheduling,
+			});
+			expect(receipt).toMatchObject({ deliveryStatus: "queued", deliveryMode: "steer" });
+			if (fallback) expect(receipt.schedulingFallback).toBe("steer");
+			else expect(receipt).not.toHaveProperty("schedulingFallback");
+			expect(live.session.queuedActionCount).toBe(1);
+			release.resolve();
+			await running;
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom_message" && entry.customType === "agent_message"),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await running;
+			live.cleanup();
+		}
+	});
 
 	it.each(["supported", "unsupported", "parent", "child", "reply"] as const)(
 		"defers supported busy follow-ups, with safe control and old-peer overrides (%s)",
