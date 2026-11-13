@@ -1240,11 +1240,12 @@ export class SettingsManager {
 	getAgentMessageCanWait(): boolean {
 		const value: unknown = this.globalSettings.agentMessageCanWait;
 		if (value !== undefined && typeof value !== "boolean" && !this.warnedAgentMessageCanWait) {
-			console.warn("Warning: agentMessageCanWait is invalid; ignoring it.");
+			console.warn("Warning: agentMessageCanWait is not a boolean; treating it as off.");
 			this.warnedAgentMessageCanWait = true;
 		}
 		// A reload that fails keeps the last good global settings, so a broken edit keeps the current choice.
-		return value !== false;
+		// A pause lever fails safe: any present value other than true turns marked delivery off.
+		return value === undefined || value === true;
 	}
 
 	getCodemodeExcludeTools(): readonly string[] {

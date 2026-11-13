@@ -209,62 +209,63 @@ describe("daemon supervisor prompt admission ownership", () => {
 		}
 	});
 
-	it.each([true, false])(
-		"can-wait switch handoff uses cached policy %s instead of current setting",
-		async (cached) => {
-			const root = mkdtempSync(join(tmpdir(), "prime-can-wait-handoff-"));
-			const supervisor = canWaitHarness(root);
-			const file = join(root, "target.jsonl");
-			writeFileSync(file, "{}");
-			const summary = { id: "target", sessionId: "receiver", sessionFile: file, cwd: root };
-			const requestWorker = vi.fn(async (_command: unknown, _timeout: number) => ({ success: true }));
-			const worker = {
-				descriptor: { rootActiveSessionId: "target", lifecycle: "ready", createCommand: {} },
-				client: { requestWorker },
-				meshDeliveryCapable: true,
-				meshReplacementCapable: true,
-				meshFollowUpCapable: true,
-			};
-			Object.assign(supervisor, {
-				roster: () => ({ values: () => [][Symbol.iterator](), byActiveSessionId: () => undefined }),
-				createOrReuseWorker: async () => worker,
-				findSummaryInWorker: () => summary,
-				publishMeshFollowUpState: () => undefined,
-			});
-			const internals = supervisor as unknown as {
-				handoffMeshMessage(
-					record: object,
-					message: object,
-					count: number,
-					bind: (client: object) => void,
-					open: () => boolean,
-					token: string,
-					canWait: boolean,
-				): Promise<unknown>;
-			};
-			try {
-				await reloadCanWait(root, supervisor, false);
-				await internals.handoffMeshMessage(
-					{ sessionId: "receiver", sessionFile: file },
-					markedMessage,
-					1,
-					() => undefined,
-					() => true,
-					"attempt",
-					cached,
-				);
-				expect(requestWorker.mock.calls).toEqual([
-					[
-						expect.objectContaining({ type: "worker_deliver_message", ...(cached ? { canWait: true } : {}) }),
-						expect.any(Number),
-					],
-				]);
-				if (!cached) expect(requestWorker.mock.calls[0]![0]).not.toHaveProperty("canWait");
-			} finally {
-				rmSync(root, { recursive: true, force: true });
-			}
-		},
-	);
+	it.each([
+		["off, cached mark kept", false, true, true],
+		["off, cached steer kept", false, false, false],
+		["on, sender mark recorded as on base", true, false, true],
+	] as const)("can-wait switch handoff: %s", async (_name, enabled, cached, marked) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-can-wait-handoff-"));
+		const supervisor = canWaitHarness(root);
+		const file = join(root, "target.jsonl");
+		writeFileSync(file, "{}");
+		const summary = { id: "target", sessionId: "receiver", sessionFile: file, cwd: root };
+		const requestWorker = vi.fn(async (_command: unknown, _timeout: number) => ({ success: true }));
+		const worker = {
+			descriptor: { rootActiveSessionId: "target", lifecycle: "ready", createCommand: {} },
+			client: { requestWorker },
+			meshDeliveryCapable: true,
+			meshReplacementCapable: true,
+			meshFollowUpCapable: true,
+		};
+		Object.assign(supervisor, {
+			roster: () => ({ values: () => [][Symbol.iterator](), byActiveSessionId: () => undefined }),
+			createOrReuseWorker: async () => worker,
+			findSummaryInWorker: () => summary,
+			publishMeshFollowUpState: () => undefined,
+		});
+		const internals = supervisor as unknown as {
+			handoffMeshMessage(
+				record: object,
+				message: object,
+				count: number,
+				bind: (client: object) => void,
+				open: () => boolean,
+				token: string,
+				canWait: boolean,
+			): Promise<unknown>;
+		};
+		try {
+			await reloadCanWait(root, supervisor, enabled);
+			await internals.handoffMeshMessage(
+				{ sessionId: "receiver", sessionFile: file },
+				markedMessage,
+				1,
+				() => undefined,
+				() => true,
+				"attempt",
+				cached,
+			);
+			expect(requestWorker.mock.calls).toEqual([
+				[
+					expect.objectContaining({ type: "worker_deliver_message", ...(marked ? { canWait: true } : {}) }),
+					expect.any(Number),
+				],
+			]);
+			if (!marked) expect(requestWorker.mock.calls[0]![0]).not.toHaveProperty("canWait");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	it.each(["parent", "child", "sibling", "unknown", "old-worker"] as const)(
 		"derives marked policy from authenticated receiver family truth (%s)",

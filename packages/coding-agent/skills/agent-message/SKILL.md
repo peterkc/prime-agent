@@ -74,7 +74,8 @@ if child is not None:
 - Set `reply_to` to the canonical received message ID shown in the message header,
   or to a receipt's `id` or `cotalId`. A linked reply always steers, even when marked.
   Direct parent-child messages also always steer, for each broadcast target.
-- Native delivery and older receivers keep steering. A native receipt may report
+- Native delivery and older receivers keep steering. A native receipt, or a Cotal
+  receipt while the daemon's `agentMessageCanWait` setting is off, may report
   `schedulingFallback: "steer"`. An old Cotal receiver may show a cosmetic
   `[prime-agent-message v1 can_wait=true]` line. Do not copy that line into a body
   to select delivery; only the typed argument marks a message.

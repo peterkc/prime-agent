@@ -4334,7 +4334,7 @@ export class DaemonSupervisor {
 		bindRecipient: (recipient: object) => void,
 		isOpen: () => boolean,
 		attemptToken: string,
-		canWait?: boolean,
+		canWait: boolean,
 	): Promise<{ status: "deferred"; reason: "run_active" } | undefined> {
 		if (this.shuttingDown) throw new Error("Mesh is shutting down");
 		const parsed = meshMessagePayload(message);
@@ -4394,7 +4394,7 @@ export class DaemonSupervisor {
 				message: text,
 				...(worker.meshFollowUpCapable
 					? {
-							...((canWait ?? parsed.canWait) ? { canWait: true } : {}),
+							...(canWait || (parsed.canWait && this.agentMessageCanWait) ? { canWait: true } : {}),
 							...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
 							publishedAt: message.ts,
 						}

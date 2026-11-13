@@ -28,7 +28,8 @@ describe("SettingsManager", () => {
 	it.each([
 		["default", {}, true],
 		["off", { agentMessageCanWait: false }, false],
-		["invalid", { agentMessageCanWait: "off" }, true],
+		["invalid string", { agentMessageCanWait: "off" }, false],
+		["invalid number", { agentMessageCanWait: 1 }, false],
 	] as const)("can-wait switch global policy: %s", async (_name, global, expected) => {
 		writeSettings(globalPath, global);
 		writeSettings(projectPath, { agentMessageCanWait: !expected });
@@ -38,7 +39,7 @@ describe("SettingsManager", () => {
 			expect(manager.getAgentMessageCanWait()).toBe(expected);
 			expect(manager.getAgentMessageCanWait()).toBe(expected);
 			expect(warning.mock.calls).toEqual(
-				_name === "invalid" ? [["Warning: agentMessageCanWait is invalid; ignoring it."]] : [],
+				_name.startsWith("invalid") ? [["Warning: agentMessageCanWait is not a boolean; treating it as off."]] : [],
 			);
 		} finally {
 			warning.mockRestore();
