@@ -13,6 +13,22 @@ import {
 } from "../src/utils.js";
 
 describe("wrapTextWithAnsi", () => {
+	for (const [name, text] of [
+		["an unbroken token", "abcd".repeat(50_000)],
+		["many short tokens", "a b c d ".repeat(50_000)],
+	] as const) {
+		it(`wraps ${name} beyond the call-argument limit (pi #5185)`, () => {
+			const lines = wrapTextWithAnsi(text, 1);
+			assert.strictEqual(lines.length, 200_000);
+			assert.strictEqual(lines.join(""), "abcd".repeat(50_000));
+		});
+	}
+
+	it("keeps empty input and ANSI state across literal newlines (pi #5185)", () => {
+		assert.deepStrictEqual(wrapTextWithAnsi("", 1), [""]);
+		assert.deepStrictEqual(wrapTextWithAnsi("\x1b[31ma\nb\x1b[0m", 1), ["\x1b[31ma", "\x1b[31mb\x1b[0m"]);
+	});
+
 	describe("underline styling", () => {
 		it("should not apply underline style before the styled text", () => {
 			const underlineOn = "\x1b[4m";

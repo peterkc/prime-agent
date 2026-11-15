@@ -30,6 +30,40 @@ function getCellUnderline(terminal: VirtualTerminal, row: number, col: number): 
 }
 
 describe("Markdown component", () => {
+	it("renders deeply nested blockquotes without expanding output (pi #11272)", () => {
+		const text = `${">".repeat(60)}x`;
+		const markdown = new Markdown(text, 1, 0, defaultMarkdownTheme);
+		const lines = markdown.render(80);
+		assert.strictEqual(lines.length, 1);
+		assert.ok(stripAnsi(lines[0]).trimEnd().endsWith("x"));
+		assert.deepStrictEqual(markdown.render(80), lines);
+		markdown.invalidate();
+		assert.deepStrictEqual(markdown.render(80), lines);
+		markdown.setText("> y");
+		assert.deepStrictEqual(markdown.render(80), render("> y", 80, 1));
+		markdown.setText(text);
+		assert.deepStrictEqual(markdown.render(80), lines);
+	});
+
+	it("keeps fitting blockquote borders, style and spacing (pi #11272)", () => {
+		const theme = defaultMarkdownTheme;
+		assert.deepStrictEqual(render("> x\n\nnext", 8, 1), [
+			` ${theme.quoteBorder("│ ")}${theme.quote(theme.italic("x"))}    `,
+			"        ",
+			" next   ",
+		]);
+	});
+
+	for (const [width, expected] of [
+		[1, "x"],
+		[2, "x"],
+		[3, "│ x"],
+	] as const) {
+		it(`bounds blockquote borders at width ${width} (pi #11272)`, () => {
+			assert.deepStrictEqual(renderPlain("> x", width), [expected]);
+		});
+	}
+
 	it("keeps labeled links clickable when the visible URL fallback is shown (ENG-6126)", () => {
 		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
 		try {

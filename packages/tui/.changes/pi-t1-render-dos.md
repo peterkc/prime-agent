@@ -1,0 +1,2 @@
+- Fixed deeply nested Markdown blockquotes causing excessive output and crashes.
+- Fixed text wrapping crashes on very long lines while preserving ANSI styles and hyperlinks.
