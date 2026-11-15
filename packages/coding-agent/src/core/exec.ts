@@ -2,6 +2,7 @@
  * Shared command execution utilities for extensions and custom tools.
  */
 
+import { StringDecoder } from "node:string_decoder";
 import { spawnHidden, waitForChildProcess } from "../utils/child-process.js";
 
 /**
@@ -68,6 +69,8 @@ export async function execCommand(
 
 		let stdout = "";
 		let stderr = "";
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
 		let forceKillTimeoutId: NodeJS.Timeout | undefined;
@@ -100,11 +103,11 @@ export async function execCommand(
 		}
 
 		proc.stdout?.on("data", (data) => {
-			stdout += data.toString();
+			stdout += stdoutDecoder.write(data);
 		});
 
 		proc.stderr?.on("data", (data) => {
-			stderr += data.toString();
+			stderr += stderrDecoder.write(data);
 		});
 
 		const cleanup = () => {
@@ -119,12 +122,16 @@ export async function execCommand(
 		// held open by detached descendants.
 		waitForChildProcess(proc)
 			.then((code) => {
+				stdout += stdoutDecoder.end();
+				stderr += stderrDecoder.end();
 				cleanup();
 				resolve({ stdout, stderr, code: code ?? 0, killed });
 			})
-			.catch((_err) => {
+			.catch((error: Error) => {
+				stdout += stdoutDecoder.end();
+				stderr += stderrDecoder.end();
 				cleanup();
-				resolve({ stdout, stderr, code: 1, killed });
+				resolve({ stdout, stderr: stderr || error.message, code: 1, killed });
 			});
 	});
 }
