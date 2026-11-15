@@ -1,0 +1,2 @@
+- Fixed GitHub Copilot login accepting non-web verification URLs.
+- Fixed `pi-ai` login saving credentials with file permissions readable by other users.

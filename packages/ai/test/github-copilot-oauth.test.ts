@@ -31,6 +31,64 @@ describe("GitHub Copilot OAuth device flow", () => {
 		vi.useRealTimers();
 	});
 
+	it.each(["file:///tmp/payload.app", "search-ms:query=x", "ms-msdt:/id", "not a URL"])(
+		"pi 89c921d8b rejects untrusted verification URI %j before auth or polling",
+		async (verificationUri) => {
+			const fetchMock = vi.fn(async () =>
+				jsonResponse({
+					device_code: "device-code",
+					user_code: "ABCD-EFGH",
+					verification_uri: verificationUri,
+					interval: 5,
+					expires_in: 900,
+				}),
+			);
+			vi.stubGlobal("fetch", fetchMock);
+			const onAuth = vi.fn(() => {
+				throw new Error("untrusted URI reached onAuth");
+			});
+			await expect(loginGitHubCopilot({ onAuth, onPrompt: async () => "" })).rejects.toThrow(
+				"Untrusted verification_uri in device code response",
+			);
+			expect(onAuth).not.toHaveBeenCalled();
+			expect(fetchMock).toHaveBeenCalledExactlyOnceWith("https://github.com/login/device/code", expect.any(Object));
+		},
+	);
+
+	it.each([
+		["HTTPS://GITHUB.COM:443/login/device", "https://github.com/login/device", ""],
+		["HTTP://EXAMPLE.COM:80/device", "http://example.com/device", "company.ghe.com"],
+	])(
+		"pi 89c921d8b normalizes web verification URI %j and continues polling",
+		async (verificationUri, normalized, domain) => {
+			vi.useFakeTimers();
+			const fetchMock = vi
+				.fn()
+				.mockResolvedValueOnce(
+					jsonResponse({
+						device_code: "device-code",
+						user_code: "ABCD-EFGH",
+						verification_uri: verificationUri,
+						interval: 5,
+						expires_in: 900,
+					}),
+				)
+				.mockResolvedValueOnce(jsonResponse({ error: "access_denied" }));
+			vi.stubGlobal("fetch", fetchMock);
+			const onAuth = vi.fn();
+			const login = loginGitHubCopilot({ onAuth, onPrompt: async () => domain });
+			const rejection = expect(login).rejects.toThrow("Device flow failed: access_denied");
+			await vi.advanceTimersByTimeAsync(6000);
+			await rejection;
+			expect(onAuth).toHaveBeenCalledExactlyOnceWith(normalized, "Enter code: ABCD-EFGH");
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenLastCalledWith(
+				`https://${domain || "github.com"}/login/oauth/access_token`,
+				expect.any(Object),
+			);
+		},
+	);
+
 	it("waits before the first poll and increases the safety margin after slow_down", async () => {
 		vi.useFakeTimers();
 		const startTime = new Date("2026-03-09T00:00:00Z");

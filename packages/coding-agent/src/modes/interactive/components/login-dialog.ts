@@ -6,6 +6,7 @@ import {
 	type Focusable,
 	getCapabilities,
 	getKeybindings,
+	replaceControlCharacters,
 	Spacer,
 	Text,
 	type TUI,
@@ -129,7 +130,13 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showAuth(url: string, instructions?: string): void {
 		this.startContent();
 		this.authUrl = url;
-		const linkedUrl = getCapabilities().hyperlinks ? `\x1b]8;;${url}\x07${url}\x1b]8;;\x07` : url;
+		const parsedUrl = URL.canParse(url) ? new URL(url) : undefined;
+		const target = parsedUrl?.protocol === "https:" || parsedUrl?.protocol === "http:" ? parsedUrl.href : undefined;
+		const displayedUrl = target ?? replaceControlCharacters(url);
+		const linkedUrl =
+			target !== undefined && getCapabilities().hyperlinks
+				? `\x1b]8;;${target}\x07${displayedUrl}\x1b]8;;\x07`
+				: displayedUrl;
 		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
 		// Keep the browser-step text visually distinct from the URL.
 		this.addSectionSpacer();
@@ -142,18 +149,20 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.authActions = new Text(this.getAuthActionsText(), 0, 0);
 		this.contentContainer.addChild(this.authActions);
 
-		// Try to open browser
-		const [command, ...args] =
-			process.platform === "darwin"
-				? ["open", url]
-				: process.platform === "win32"
-					? [
-							win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe"),
-							"url.dll,FileProtocolHandler",
-							url,
-						]
-					: ["xdg-open", url];
-		execFileHidden(command, args, {}, () => {});
+		if (target !== undefined) {
+			// Try to open browser
+			const [command, ...args] =
+				process.platform === "darwin"
+					? ["open", target]
+					: process.platform === "win32"
+						? [
+								win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe"),
+								"url.dll,FileProtocolHandler",
+								target,
+							]
+						: ["xdg-open", target];
+			execFileHidden(command, args, {}, () => {});
+		}
 
 		this.tui.requestRender();
 	}

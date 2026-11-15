@@ -1,0 +1,1 @@
+- Fixed sign-in URLs launching non-web handlers or injecting terminal escape sequences.

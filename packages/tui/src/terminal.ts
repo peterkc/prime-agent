@@ -12,6 +12,7 @@ import {
 	setDefaultTerminalColors,
 } from "./terminal-colors.js";
 import { type TerminalNotification, TerminalNotifications } from "./terminal-notify.js";
+import { replaceControlCharacters } from "./utils.js";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -618,8 +619,8 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setTitle(title: string): void {
-		// OSC 0;title BEL - set terminal window title
-		process.stdout.write(`\x1b]0;${title}\x07`);
+		// OSC 0;title BEL. Control characters in a title could end the sequence early.
+		process.stdout.write(`\x1b]0;${replaceControlCharacters(title)}\x07`);
 	}
 
 	setProgress(active: boolean): void {
