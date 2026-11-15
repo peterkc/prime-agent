@@ -64,6 +64,12 @@ Type `/` followed by the template name in the editor. Autocomplete shows availab
 
 ## Arguments
 
+Arguments split on tabs and Unicode horizontal spaces, not line breaks. Single or double quotes group spaces only when the quote starts an argument. Empty quoted arguments (`""` or `''`) are kept. Apostrophes inside words such as `doesn't` stay literal; `key="a b"` splits into `key="a` and `b"`.
+
+Inside a quoted argument, a backslash before the enclosing quote gives a literal quote. For example, `"the \"fast\" path"` supplies `the "fast" path`. Other backslashes stay as typed.
+
+A quote without a closing match stays literal, and the remaining text splits normally. For example, `'tis the season` gives `'tis`, `the`, and `season`. A trailing `\"` escapes the closing quote, so `"C:\dir\"` stays literal, including both quotes and backslashes.
+
 Templates support positional arguments and simple slicing:
 
 - `$1`, `$2`, ... positional args
