@@ -1,0 +1,1 @@
+- Fixed symlinked extensions failing to load dependencies installed beside their real entry files.
