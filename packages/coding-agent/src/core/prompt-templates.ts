@@ -19,7 +19,7 @@ export interface PromptTemplate {
 }
 
 /**
- * Parse command arguments respecting quoted strings (bash-style)
+ * Parse command arguments with quotes at argument boundaries.
  * Returns array of arguments
  */
 export function parseCommandArgs(argsString: string): string[] {
@@ -28,18 +28,23 @@ export function parseCommandArgs(argsString: string): string[] {
 	let inQuote: string | null = null;
 	// An explicitly quoted token is an argument even when empty ("" or '').
 	let quoted = false;
+	let quoteStart = 0;
 
 	for (let i = 0; i < argsString.length; i++) {
 		const char = argsString[i];
 
 		if (inQuote) {
-			if (char === inQuote) {
+			if (char === "\\" && argsString[i + 1] === inQuote) {
+				current += inQuote;
+				i++;
+			} else if (char === inQuote) {
 				inQuote = null;
 			} else {
 				current += char;
 			}
-		} else if (char === '"' || char === "'") {
+		} else if ((char === '"' || char === "'") && !current && !quoted) {
 			inQuote = char;
+			quoteStart = i;
 			quoted = true;
 		} else if (/[\t\p{Zs}]/u.test(char)) {
 			if (current || quoted) {
@@ -49,6 +54,13 @@ export function parseCommandArgs(argsString: string): string[] {
 			}
 		} else {
 			current += char;
+		}
+
+		if (inQuote && i === argsString.length - 1) {
+			// Re-read an unmatched quote as literal text, with normal argument boundaries.
+			inQuote = null;
+			current = argsString[quoteStart];
+			i = quoteStart;
 		}
 	}
 

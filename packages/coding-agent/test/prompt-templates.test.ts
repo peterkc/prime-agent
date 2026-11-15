@@ -63,9 +63,26 @@ describe("parseCommandArgs", () => {
 		["$100 @user #tag", ["$100", "@user", "#tag"]],
 		["日本語 🎉 café", ["日本語", "🎉", "café"]],
 		['"line1\nline2" second', ["line1\nline2", "second"]],
-		// No escape mechanism exists - backslash is literal.
-		['"quoted \\"text\\""', ["quoted \\text\\"]],
+		["'' \"\"tail", ["", "tail"]],
+		["a\nb\rc\u2028d", ["a\nb\rc\u2028d"]],
+		["\"C:\\dir\\file\" '\\\\server\\share'", ["C:\\dir\\file", "\\\\server\\share"]],
+		["\"it's\" 'a\\\"b'", ["it's", 'a\\"b']],
 	])("parses %j", (input, expected) => {
+		expect(parseCommandArgs(input)).toEqual(expected);
+	});
+
+	test.each<[string, string[]]>([
+		["why doesn't the user's cache work", ["why", "doesn't", "the", "user's", "cache", "work"]],
+		["'tis the season", ["'tis", "the", "season"]],
+		['say "hello world', ["say", '"hello', "world"]],
+		['"quoted \\"text\\""', ['quoted "text"']],
+		["'it\\'s here' next", ["it's here", "next"]],
+		['key="a b"', ['key="a', 'b"']],
+		['say \\"hi', ["say", '\\"hi']],
+		["\"\"'a b'", ["'a", "b'"]],
+		['"C:\\dir\\"', ['"C:\\dir\\"']],
+		['"" "unfinished text', ["", '"unfinished', "text"]],
+	])("keeps literal and escaped quotes in %j (pi #11861)", (input, expected) => {
 		expect(parseCommandArgs(input)).toEqual(expected);
 	});
 

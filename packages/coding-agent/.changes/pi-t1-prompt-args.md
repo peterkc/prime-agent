@@ -1,0 +1,1 @@
+- Fixed prompt template argument parsing to keep apostrophes and unmatched quotes as text, open quotes only at argument boundaries, and read escaped enclosing quotes literally ([pi #11861](https://github.com/earendil-works/pi/issues/11861)).
