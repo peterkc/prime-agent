@@ -64,7 +64,7 @@ Type `/` followed by the template name in the editor. Autocomplete shows availab
 
 ## Arguments
 
-Arguments split on tabs and Unicode horizontal spaces, not line breaks. Single or double quotes group spaces only when the quote starts an argument. Empty quoted arguments (`""` or `''`) are kept. Apostrophes inside words such as `doesn't` stay literal; `key="a b"` splits into `key="a` and `b"`.
+Arguments split on spaces, tabs and other Unicode horizontal spaces, not on line breaks. Single or double quotes group spaces only when the quote starts an argument, so a quote right after a line break stays literal. Empty quoted arguments (`""` or `''`) are kept. Apostrophes inside words such as `doesn't` stay literal; `key="a b"` splits into `key="a` and `b"`. To pass a value with spaces in `--flag=value` form, quote the whole argument: `"--gate=npm run check"`.
 
 Inside a quoted argument, a backslash before the enclosing quote gives a literal quote. For example, `"the \"fast\" path"` supplies `the "fast" path`. Other backslashes stay as typed.
 

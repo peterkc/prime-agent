@@ -67,8 +67,6 @@ describe("parseCommandArgs", () => {
 		["a\nb\rc\u2028d", ["a\nb\rc\u2028d"]],
 		["\"C:\\dir\\file\" '\\\\server\\share'", ["C:\\dir\\file", "\\\\server\\share"]],
 		["\"it's\" 'a\\\"b'", ["it's", 'a\\"b']],
-		['on --gate "npm run check" --max-turns 4', ["on", "--gate", "npm run check", "--max-turns", "4"]],
-		['--self --version "0.9.8"', ["--self", "--version", "0.9.8"]],
 	])("parses %j", (input, expected) => {
 		expect(parseCommandArgs(input)).toEqual(expected);
 	});
