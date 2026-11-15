@@ -1,8 +1,9 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 
 const recordedWindowsHide = vi.hoisted(() => [] as Array<boolean | undefined>);
@@ -17,7 +18,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 		};
 	return {
 		...actual,
-		spawn: wrap(actual.spawn, 2),
+		spawn: vi.fn(wrap(actual.spawn, 2)),
 		spawnSync: wrap(actual.spawnSync, 2),
 		execSync: wrap(actual.execSync, 1),
 		execFileSync: wrap(actual.execFileSync, 2),
@@ -51,6 +52,68 @@ async function waitForFile(path: string): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+
+describe("execCommand output", () => {
+	it("reports spawn errors in stderr (pi #11085)", async () => {
+		const result = await execCommand("pi-command-that-does-not-exist-11085", [], process.cwd());
+
+		expect(result).toMatchObject({ stdout: "", code: 1, killed: false });
+		expect(result.stderr).toMatch(/ENOENT/);
+	});
+
+	it("keeps stderr empty when a command exits silently (pi #11085)", async () => {
+		const result = await execCommand(process.execPath, ["-e", "process.exit(1)"], process.cwd());
+
+		expect(result).toEqual({ stdout: "", stderr: "", code: 1, killed: false });
+	});
+
+	it.each([
+		{
+			name: "decodes split UTF-8 on both streams",
+			chunks: [Buffer.from([0xe4]), Buffer.from([0xbd, 0xa0, 0xe5, 0xa5, 0xbd])],
+			error: undefined,
+			expected: "你好",
+		},
+		{
+			name: "flushes both UTF-8 tails on success",
+			chunks: [Buffer.from([0xe4, 0xbd])],
+			error: undefined,
+			expected: "\uFFFD",
+		},
+		{
+			name: "flushes both UTF-8 tails on failure",
+			chunks: [Buffer.from([0xe4, 0xbd])],
+			error: new Error("wait failed"),
+			expected: "\uFFFD",
+		},
+	])("$name (pi #11312)", async ({ chunks, error, expected }) => {
+		const child = new ChildProcess();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		child.stdout = stdout;
+		child.stderr = stderr;
+		vi.mocked(spawn).mockReturnValueOnce(child);
+		try {
+			const resultPromise = execCommand("mock-command", [], process.cwd());
+			for (const chunk of chunks) {
+				stdout.write(chunk);
+				stderr.write(chunk);
+			}
+			if (error) child.emit("error", error);
+			else child.emit("close", 0);
+
+			expect(await resultPromise).toEqual({
+				stdout: expected,
+				stderr: expected,
+				code: error ? 1 : 0,
+				killed: false,
+			});
+		} finally {
+			stdout.destroy();
+			stderr.destroy();
+		}
+	});
+});
 
 describe.skipIf(process.platform === "win32")("execCommand", () => {
 	it("force kills a process that ignores SIGTERM and cleans up the fallback timer", async () => {

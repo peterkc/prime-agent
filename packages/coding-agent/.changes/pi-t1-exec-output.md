@@ -1,0 +1,2 @@
+- Fixed missing command errors being lost from extension command results.
+- Fixed corrupted command output when UTF-8 characters span output chunks.
