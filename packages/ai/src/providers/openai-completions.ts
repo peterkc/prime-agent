@@ -33,7 +33,7 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
-import { parseStreamingJson } from "../utils/json-parse.js";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
@@ -235,7 +235,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						partial: output,
 					});
 				} else if (block.type === "toolCall") {
-					block.arguments = parseStreamingJson(block.partialArgs);
+					Object.assign(block, parseToolCallArguments(block.partialArgs));
 					// Finalize in-place and strip the scratch buffers so replay only
 					// carries parsed arguments.
 					delete block.partialArgs;

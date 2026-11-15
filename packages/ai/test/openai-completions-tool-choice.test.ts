@@ -14,8 +14,21 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../src/types.js";
+import { validateToolArguments } from "../src/utils/validation.js";
 import { getFixtureModel } from "./fixture-models.js";
 import { getZaiTestModel } from "./zai-test-model.js";
+
+const malformedToolArguments = [
+	'{"action":"apply","actions":[{"kind":"seek","time":.5}]}',
+	'{"kind":"seek","clipId":"clip-fl',
+	"[1,2]",
+];
+const repairedToolArguments = String.raw`{"kind":"seek","note":"\url"}`;
+const optionalArgumentsTool: Tool = {
+	name: "work",
+	description: "Work",
+	parameters: Type.Object({ kind: Type.Optional(Type.String()), note: Type.Optional(Type.String()) }),
+};
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -439,6 +452,47 @@ describe("openai-completions tool_choice", () => {
 		expect(response.usage.totalTokens).toBe(4);
 		expect(response.content).toEqual([{ type: "text", text: "OK" }]);
 	});
+
+	it.each([...malformedToolArguments, repairedToolArguments])(
+		"finalizes tool arguments %s (pi #10897)",
+		async (raw) => {
+			mockState.chunks = [
+				{
+					choices: [
+						{
+							finish_reason: "tool_calls",
+							delta: {
+								tool_calls: [
+									{ index: 0, id: "tool-1", type: "function", function: { name: "work", arguments: raw } },
+								],
+							},
+						},
+					],
+				},
+			];
+			const { compat: _compat, ...baseModel } = getFixtureModel<"openai-completions">("openai", "gpt-4o-mini");
+			const result = await streamSimple(
+				{ ...baseModel, api: "openai-completions" },
+				{ messages: [{ role: "user", content: "Work", timestamp: 1 }], tools: [optionalArgumentsTool] },
+				{ apiKey: "test" },
+			).result();
+			expect(result.stopReason).toBe("toolUse");
+			const call = result.content[0];
+			if (call?.type !== "toolCall") throw new Error("Expected toolCall");
+			expect(call).not.toHaveProperty("partialArgs");
+			if (raw === repairedToolArguments) {
+				expect(call.arguments).toEqual({ kind: "seek", note: "\\url" });
+				expect(call.argumentsError).toBeUndefined();
+			} else {
+				expect(call.arguments).toEqual({});
+				expect(call.argumentsError).toEqual(expect.stringContaining(`\n\nReceived arguments:\n${raw}`));
+				expect(call.argumentsError?.endsWith(raw)).toBe(true);
+				expect(() => validateToolArguments(optionalArgumentsTool, call)).toThrow(
+					'Invalid arguments for tool "work"',
+				);
+			}
+		},
+	);
 
 	it("coalesces tool call deltas by stable index when provider mutates ids mid-stream", async () => {
 		mockState.chunks = [

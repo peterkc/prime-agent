@@ -1,0 +1,2 @@
+- Fixed invalid Unicode escapes dropping later tool arguments.
+- Fixed malformed final tool arguments running with a partially parsed prefix instead of reporting the raw arguments.

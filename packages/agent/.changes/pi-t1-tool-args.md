@@ -1,0 +1,1 @@
+- Fixed malformed final arguments from the agent proxy bypassing tool validation.

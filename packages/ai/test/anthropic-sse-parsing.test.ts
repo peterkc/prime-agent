@@ -2,8 +2,21 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { streamAnthropic } from "../src/providers/anthropic.js";
-import type { Context, ToolCall } from "../src/types.js";
+import type { Context, Tool, ToolCall } from "../src/types.js";
+import { validateToolArguments } from "../src/utils/validation.js";
 import { getFixtureModel } from "./fixture-models.js";
+
+const malformedToolArguments = [
+	'{"action":"apply","actions":[{"kind":"seek","time":.5}]}',
+	'{"kind":"seek","clipId":"clip-fl',
+	"[1,2]",
+];
+const repairedToolArguments = String.raw`{"kind":"seek","note":"\url"}`;
+const optionalArgumentsTool: Tool = {
+	name: "work",
+	description: "Work",
+	parameters: Type.Object({ kind: Type.Optional(Type.String()), note: Type.Optional(Type.String()) }),
+};
 
 function createSseResponse(events: Array<{ event: string; data: string }>): Response {
 	const body = events.map(({ event, data }) => `event: ${event}\ndata: ${data}\n`).join("\n");
@@ -121,6 +134,47 @@ function createCacheUsageEvents(
 }
 
 describe("Anthropic raw SSE parsing", () => {
+	it.each([...malformedToolArguments, repairedToolArguments])(
+		"finalizes tool arguments %s (pi #10897)",
+		async (raw) => {
+			const events = [
+				{
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "tool-1", name: "work", input: {} },
+				},
+				{ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: raw } },
+				{ type: "content_block_stop", index: 0 },
+				{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: {} },
+			];
+			const response = createSseResponse([
+				minimalAnthropicEvents[0],
+				...events.map((event) => ({ event: event.type, data: JSON.stringify(event) })),
+				minimalAnthropicEvents[5],
+			]);
+			const stream = streamAnthropic(
+				getFixtureModel<"anthropic-messages">("anthropic", "claude-haiku-4-5"),
+				{ messages: [{ role: "user", content: "Work", timestamp: 1 }], tools: [optionalArgumentsTool] },
+				{ client: createFakeAnthropicClient(response) },
+			);
+			const result = await stream.result();
+			expect(result.stopReason).toBe("toolUse");
+			const call = result.content[0];
+			if (call?.type !== "toolCall") throw new Error("Expected toolCall");
+			expect(call).not.toHaveProperty("partialJson");
+			if (raw === repairedToolArguments) {
+				expect(call.arguments).toEqual({ kind: "seek", note: "\\url" });
+				expect(call.argumentsError).toBeUndefined();
+			} else {
+				expect(call.arguments).toEqual({});
+				expect(call.argumentsError).toEqual(expect.stringContaining(`\n\nReceived arguments:\n${raw}`));
+				expect(call.argumentsError?.endsWith(raw)).toBe(true);
+				expect(() => validateToolArguments(optionalArgumentsTool, call)).toThrow(
+					'Invalid arguments for tool "work"',
+				);
+			}
+		},
+	);
 	it.each([
 		{
 			name: "five-minute writes",

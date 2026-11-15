@@ -24,7 +24,7 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
-import { parseStreamingJson } from "../utils/json-parse.js";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -439,7 +439,7 @@ async function consumeChatStream(
 		const block = output.content[index];
 		if (block.type !== "toolCall") continue;
 		const toolBlock = block as ToolCall & { partialArgs?: string };
-		toolBlock.arguments = parseStreamingJson<Record<string, unknown>>(toolBlock.partialArgs);
+		Object.assign(toolBlock, parseToolCallArguments(toolBlock.partialArgs));
 		// Finalize in-place and strip the scratch buffer so replay only
 		// carries parsed arguments.
 		delete toolBlock.partialArgs;

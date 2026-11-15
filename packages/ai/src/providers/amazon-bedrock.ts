@@ -41,7 +41,7 @@ import type {
 	ToolResultMessage,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
-import { parseStreamingJson } from "../utils/json-parse.js";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
@@ -469,7 +469,7 @@ function handleContentBlockStop(
 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
 			break;
 		case "toolCall":
-			block.arguments = parseStreamingJson(block.partialJson);
+			Object.assign(block, parseToolCallArguments(block.partialJson));
 			// Finalize in-place and strip the scratch buffer so replay only
 			// carries parsed arguments.
 			delete (block as Block).partialJson;
