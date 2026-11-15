@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.js";
-import { resolveUserPath } from "../../utils/paths.js";
+import { canonicalizePath, resolveUserPath } from "../../utils/paths.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
@@ -337,7 +337,7 @@ async function loadExtensionModule(extensionPath: string) {
 			: { alias: getAliases() }),
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
 	const factory = module as ExtensionFactory;
 	return typeof factory !== "function" ? undefined : factory;
 }

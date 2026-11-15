@@ -164,6 +164,42 @@ describe("extensions discovery", () => {
 		]);
 	});
 
+	it("loads a symlinked pnpm entry with its sibling dependency and reloads it (pi #8092)", async () => {
+		const storeScope = path.join(tempDir, "node_modules", ".pnpm", "@test+ext@1.0.0", "node_modules", "@test");
+		const extDir = path.join(storeScope, "ext");
+		const depDir = path.join(storeScope, "dep");
+		fs.mkdirSync(extDir, { recursive: true });
+		fs.mkdirSync(depDir, { recursive: true });
+		fs.writeFileSync(path.join(depDir, "index.js"), "export const value = 42;\n");
+		const code = `
+			import { value } from "@test/dep";
+			export default function(pi) {
+				pi.registerCommand("test", { description: String(value), handler: async () => {} });
+			}
+		`;
+		const realEntry = path.join(extDir, "index.ts");
+		fs.writeFileSync(realEntry, code);
+		const linkedScope = path.join(tempDir, "node_modules", "@test");
+		fs.mkdirSync(linkedScope, { recursive: true });
+		fs.symlinkSync(extDir, path.join(linkedScope, "ext"), process.platform === "win32" ? "junction" : "dir");
+		const entry = path.join(linkedScope, "ext", "index.ts");
+
+		const result = await loadExtensions([entry], tempDir);
+
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toHaveLength(1);
+		expect(result.extensions[0].commands.get("test")?.description).toBe("42");
+		expect(result.extensions[0].path).toBe(entry);
+		expect(result.extensions[0].resolvedPath).toBe(entry);
+
+		fs.writeFileSync(realEntry, code.replace("String(value)", '"reloaded " + value'));
+		const reloaded = await loadExtensions([entry], tempDir);
+
+		expect(reloaded.errors).toEqual([]);
+		expect(reloaded.extensions).toHaveLength(1);
+		expect(reloaded.extensions[0].commands.get("test")?.description).toBe("reloaded 42");
+	});
+
 	it("silently skips a symlink whose target does not exist", async () => {
 		write("kept.ts");
 		fs.symlinkSync(path.join(tempDir, "missing.ts"), path.join(extensionsDir, "broken.ts"));
