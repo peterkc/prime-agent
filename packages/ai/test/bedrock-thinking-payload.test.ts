@@ -1,10 +1,25 @@
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type BedrockOptions, streamBedrock } from "../src/providers/amazon-bedrock.js";
-import type { Context, Model } from "../src/types.js";
+import type { Context, Model, Tool } from "../src/types.js";
+import { validateToolArguments } from "../src/utils/validation.js";
 import { getFixtureModel } from "./fixture-models.js";
+
+const malformedToolArguments = [
+	'{"action":"apply","actions":[{"kind":"seek","time":.5}]}',
+	'{"kind":"seek","clipId":"clip-fl',
+	"[1,2]",
+];
+const repairedToolArguments = String.raw`{"kind":"seek","note":"\url"}`;
+const optionalArgumentsTool: Tool = {
+	name: "work",
+	description: "Work",
+	parameters: Type.Object({ kind: Type.Optional(Type.String()), note: Type.Optional(Type.String()) }),
+};
 
 const bedrockMock = vi.hoisted(() => ({
 	constructorCalls: [] as Array<Record<string, unknown>>,
+	stream: undefined as AsyncIterable<unknown> | undefined,
 }));
 
 vi.mock("@aws-sdk/client-bedrock-runtime", () => {
@@ -15,8 +30,10 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 			bedrockMock.constructorCalls.push(config);
 		}
 
-		send(): Promise<never> {
-			return Promise.reject(new Error("mock send"));
+		send() {
+			return bedrockMock.stream
+				? Promise.resolve({ $metadata: {}, stream: bedrockMock.stream })
+				: Promise.reject(new Error("mock send"));
 		}
 	}
 
@@ -333,5 +350,39 @@ describe("Bedrock endpoint resolution", () => {
 		expect(bedrockMock.constructorCalls).toHaveLength(1);
 		expect(bedrockMock.constructorCalls[0].endpoint).toBe(endpoint);
 		expect(bedrockMock.constructorCalls[0].region).toBe(region);
+	});
+});
+
+describe("Bedrock final tool arguments (pi #10897)", () => {
+	afterEach(() => {
+		bedrockMock.stream = undefined;
+	});
+	it.each([...malformedToolArguments, repairedToolArguments])("finalizes %s", async (raw) => {
+		bedrockMock.stream = (async function* () {
+			yield { messageStart: { role: "assistant" } };
+			yield {
+				contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "tool-1", name: "work" } } },
+			};
+			yield { contentBlockDelta: { contentBlockIndex: 0, delta: { toolUse: { input: raw } } } };
+			yield { contentBlockStop: { contentBlockIndex: 0 } };
+			yield { messageStop: { stopReason: "tool_use" } };
+		})();
+		const result = await streamBedrock(
+			getFixtureModel<"bedrock-converse-stream">("amazon-bedrock", "global.anthropic.claude-opus-4-6-v1"),
+			{ ...makeContext(), tools: [optionalArgumentsTool] },
+		).result();
+		expect(result.stopReason).toBe("toolUse");
+		const call = result.content[0];
+		if (call?.type !== "toolCall") throw new Error("Expected toolCall");
+		expect(call).not.toHaveProperty("partialJson");
+		if (raw === repairedToolArguments) {
+			expect(call.arguments).toEqual({ kind: "seek", note: "\\url" });
+			expect(call.argumentsError).toBeUndefined();
+		} else {
+			expect(call.arguments).toEqual({});
+			expect(call.argumentsError).toEqual(expect.stringContaining(`\n\nReceived arguments:\n${raw}`));
+			expect(call.argumentsError?.endsWith(raw)).toBe(true);
+			expect(() => validateToolArguments(optionalArgumentsTool, call)).toThrow('Invalid arguments for tool "work"');
+		}
 	});
 });

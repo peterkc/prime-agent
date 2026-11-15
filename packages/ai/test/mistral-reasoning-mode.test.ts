@@ -1,8 +1,37 @@
+import type { CompletionEvent } from "@mistralai/mistralai/models/components";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamSimple } from "../src/stream.js";
-import type { Context, Model, SimpleStreamOptions } from "../src/types.js";
+import type { Context, Model, SimpleStreamOptions, Tool } from "../src/types.js";
+import { validateToolArguments } from "../src/utils/validation.js";
 import { getFixtureModel } from "./fixture-models.js";
+
+const malformedToolArguments = [
+	'{"action":"apply","actions":[{"kind":"seek","time":.5}]}',
+	'{"kind":"seek","clipId":"clip-fl',
+	"[1,2]",
+];
+const repairedToolArguments = String.raw`{"kind":"seek","note":"\url"}`;
+const optionalArgumentsTool: Tool = {
+	name: "work",
+	description: "Work",
+	parameters: Type.Object({ kind: Type.Optional(Type.String()), note: Type.Optional(Type.String()) }),
+};
+
+const mistralMock = vi.hoisted(() => ({ stream: undefined as AsyncIterable<CompletionEvent> | undefined }));
+vi.mock("@mistralai/mistralai", () => ({
+	Mistral: class {
+		chat = {
+			stream: async () => {
+				if (!mistralMock.stream) throw new Error("mock stream");
+				return mistralMock.stream;
+			},
+		};
+	},
+}));
+afterEach(() => {
+	mistralMock.stream = undefined;
+});
 
 interface MistralPayload {
 	promptMode?: "reasoning";
@@ -128,5 +157,48 @@ describe("Mistral tool schema serialization", () => {
 		}
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).not.toContain("Input validation failed");
+	});
+});
+
+describe("Mistral final tool arguments (pi #10897)", () => {
+	it.each([...malformedToolArguments, repairedToolArguments])("finalizes %s", async (raw) => {
+		mistralMock.stream = (async function* () {
+			yield {
+				data: {
+					id: "response-1",
+					model: "devstral-medium-latest",
+					created: 1,
+					choices: [
+						{
+							index: 0,
+							finishReason: "tool_calls",
+							delta: {
+								toolCalls: [
+									{ index: 0, id: "tool12345", type: "function", function: { name: "work", arguments: raw } },
+								],
+							},
+						},
+					],
+				},
+			};
+		})();
+		const result = await streamSimple(
+			getFixtureModel<"mistral-conversations">("mistral", "devstral-medium-latest"),
+			{ ...makeContext(), tools: [optionalArgumentsTool] },
+			{ apiKey: "test" },
+		).result();
+		expect(result.stopReason).toBe("toolUse");
+		const call = result.content[0];
+		if (call?.type !== "toolCall") throw new Error("Expected toolCall");
+		expect(call).not.toHaveProperty("partialArgs");
+		if (raw === repairedToolArguments) {
+			expect(call.arguments).toEqual({ kind: "seek", note: "\\url" });
+			expect(call.argumentsError).toBeUndefined();
+		} else {
+			expect(call.arguments).toEqual({});
+			expect(call.argumentsError).toEqual(expect.stringContaining(`\n\nReceived arguments:\n${raw}`));
+			expect(call.argumentsError?.endsWith(raw)).toBe(true);
+			expect(() => validateToolArguments(optionalArgumentsTool, call)).toThrow('Invalid arguments for tool "work"');
+		}
 	});
 });

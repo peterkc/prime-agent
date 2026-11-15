@@ -185,6 +185,8 @@ export interface ToolCall {
 	name: string;
 	arguments: Record<string, any>;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
+	/** Malformed final arguments: `arguments` is `{}` and validation reports this reason and raw text. */
+	argumentsError?: string;
 }
 
 export interface Usage {

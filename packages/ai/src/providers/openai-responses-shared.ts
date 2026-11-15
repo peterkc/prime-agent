@@ -29,7 +29,7 @@ import type {
 } from "../types.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
-import { parseStreamingJson } from "../utils/json-parse.js";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
@@ -470,15 +470,15 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				currentBlock = null;
 			} else if (item.type === "function_call") {
-				const args = parseStreamingJson(
-					item.arguments || (currentBlock?.type === "toolCall" ? currentBlock.partialJson : "") || "{}",
+				const args = parseToolCallArguments(
+					item.arguments || (currentBlock?.type === "toolCall" ? currentBlock.partialJson : undefined),
 				);
 
 				let toolCall: ToolCall;
 				if (currentBlock?.type === "toolCall") {
 					// Finalize in-place and strip the scratch buffer so replay only
 					// carries parsed arguments.
-					currentBlock.arguments = args;
+					Object.assign(currentBlock, args);
 					delete (currentBlock as { partialJson?: string }).partialJson;
 					toolCall = currentBlock;
 				} else {
@@ -486,7 +486,7 @@ export async function processResponsesStream<TApi extends Api>(
 						type: "toolCall",
 						id: `${item.call_id}|${item.id}`,
 						name: item.name,
-						arguments: args,
+						...args,
 					};
 				}
 

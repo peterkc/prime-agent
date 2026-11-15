@@ -2,7 +2,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { Type } from "typebox";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clampServiceTier, supportsFastMode } from "../src/models.js";
 import {
 	getOpenAICodexWebSocketDebugStats,
@@ -12,12 +13,41 @@ import {
 } from "../src/providers/openai-codex-responses.js";
 import { convertResponsesMessages, processResponsesStream } from "../src/providers/openai-responses-shared.js";
 import { buildBaseOptions } from "../src/providers/simple-options.js";
-import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model, ToolResultMessage } from "../src/types.js";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	Context,
+	Model,
+	Tool,
+	ToolResultMessage,
+} from "../src/types.js";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.js";
+import { validateToolArguments } from "../src/utils/validation.js";
+
+const malformedToolArguments = [
+	'{"action":"apply","actions":[{"kind":"seek","time":.5}]}',
+	'{"kind":"seek","clipId":"clip-fl',
+	"[1,2]",
+];
+const repairedToolArguments = String.raw`{"kind":"seek","note":"\url"}`;
+const optionalArgumentsTool: Tool = {
+	name: "work",
+	description: "Work",
+	parameters: Type.Object({ kind: Type.Optional(Type.String()), note: Type.Optional(Type.String()) }),
+};
 
 const originalFetch = global.fetch;
 const originalWebSocket = globalThis.WebSocket;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+beforeEach(() => {
+	globalThis.WebSocket = class {
+		constructor() {
+			throw new Error("WebSocket must be mocked by this test");
+		}
+	} as unknown as typeof WebSocket;
+});
 
 afterEach(() => {
 	global.fetch = originalFetch;
@@ -1528,6 +1558,62 @@ describe("openai-responses shared conversions", () => {
 	function toolResult(toolName: string, content: ToolResultMessage["content"]): ToolResultMessage {
 		return { role: "toolResult", toolCallId: "tool-1", toolName, content, isError: false, timestamp: 3 };
 	}
+
+	describe.each(["streamed", "completion-only"])("final tool arguments %s (pi #10897)", (path) => {
+		it.each([...malformedToolArguments, repairedToolArguments])("finalizes %s", async (raw) => {
+			async function* events(): AsyncIterable<ResponseStreamEvent> {
+				const item = { type: "function_call", id: "fc_test", call_id: "call_test", name: "work" };
+				if (path === "streamed") {
+					yield {
+						type: "response.output_item.added",
+						output_index: 0,
+						item: { ...item, arguments: "" },
+					} as ResponseStreamEvent;
+					yield {
+						type: "response.function_call_arguments.delta",
+						output_index: 0,
+						delta: '{"kind":"stale"}',
+					} as ResponseStreamEvent;
+				}
+				yield {
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { ...item, arguments: raw },
+				} as ResponseStreamEvent;
+			}
+			const output: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: responsesModel.api,
+				provider: responsesModel.provider,
+				model: responsesModel.id,
+				usage: emptyUsage,
+				stopReason: "stop",
+				timestamp: 1,
+			};
+			const stream = new AssistantMessageEventStream();
+			await processResponsesStream(events(), output, stream, responsesModel);
+			stream.end();
+			const emitted: AssistantMessageEvent[] = [];
+			for await (const event of stream) emitted.push(event);
+			const end = emitted.find((event) => event.type === "toolcall_end");
+			if (end?.type !== "toolcall_end") throw new Error("Expected toolcall_end");
+			const call = end.toolCall;
+			expect(call).not.toHaveProperty("partialJson");
+			if (path === "streamed") expect(output.content[0]).toBe(call);
+			if (raw === repairedToolArguments) {
+				expect(call.arguments).toEqual({ kind: "seek", note: "\\url" });
+				expect(call.argumentsError).toBeUndefined();
+			} else {
+				expect(call.arguments).toEqual({});
+				expect(call.argumentsError).toEqual(expect.stringContaining(`\n\nReceived arguments:\n${raw}`));
+				expect(call.argumentsError?.endsWith(raw)).toBe(true);
+				expect(() => validateToolArguments(optionalArgumentsTool, call)).toThrow(
+					'Invalid arguments for tool "work"',
+				);
+			}
+		});
+	});
 
 	it("removes partialJson from persisted tool-call blocks at output_item.done", async () => {
 		const argumentsJson = '{"path":"README.md","content":"updated"}';

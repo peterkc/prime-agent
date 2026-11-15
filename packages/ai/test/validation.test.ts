@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import { Settings } from "typebox/system";
 import { describe, expect, it } from "vitest";
 import type { Tool, ToolCall } from "../src/types.js";
 import { validateToolArguments } from "../src/utils/validation.js";
@@ -35,6 +36,7 @@ function createToolCallWithPlainSchema(
 describe("validateToolArguments", () => {
 	it("still validates when Function constructor is unavailable", () => {
 		const originalFunction = globalThis.Function;
+		const originalAcceleration = Settings.Get().useAcceleration;
 		const tool: Tool = {
 			name: "echo",
 			description: "Echo tool",
@@ -49,6 +51,7 @@ describe("validateToolArguments", () => {
 			arguments: { count: "42" as unknown as number },
 		};
 
+		Settings.Set({ useAcceleration: false });
 		globalThis.Function = (() => {
 			throw new EvalError("Code generation from strings disallowed for this context");
 		}) as unknown as FunctionConstructor;
@@ -57,6 +60,7 @@ describe("validateToolArguments", () => {
 			expect(validateToolArguments(tool, toolCall)).toEqual({ count: 42 });
 		} finally {
 			globalThis.Function = originalFunction;
+			Settings.Set({ useAcceleration: originalAcceleration });
 		}
 	});
 
@@ -112,5 +116,21 @@ describe("validateToolArguments", () => {
 			const { tool, toolCall } = createToolCallWithPlainSchema(testCase.schema, testCase.input);
 			expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
 		}
+	});
+	it("rejects argumentsError before optional-schema validation (pi #10897)", () => {
+		const tool: Tool = {
+			name: "work",
+			description: "Work",
+			parameters: Type.Object({ value: Type.Optional(Type.String()) }),
+		};
+		const call = {
+			type: "toolCall" as const,
+			id: "call-1",
+			name: "work",
+			arguments: {},
+			argumentsError: "malformed raw text",
+		};
+		expect(() => validateToolArguments(tool, call)).toThrow('Invalid arguments for tool "work": malformed raw text');
+		expect(validateToolArguments(tool, { ...call, argumentsError: undefined })).toEqual({});
 	});
 });

@@ -5,6 +5,7 @@ import {
 	EventStream,
 	type Model,
 	parseStreamingJson,
+	parseToolCallArguments,
 	type SimpleStreamOptions,
 	type StopReason,
 	type ToolCall,
@@ -342,6 +343,7 @@ function processProxyEvent(
 		case "toolcall_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
+				Object.assign(content, parseToolCallArguments((content as { partialJson?: string }).partialJson));
 				delete (content as any).partialJson;
 				return {
 					type: "toolcall_end",
