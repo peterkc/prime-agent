@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { PassThrough } from "node:stream";
@@ -14,6 +14,10 @@ function normalizeForMatch(value: string): string {
 
 function pathEndsWith(actualPath: string, suffix: string): boolean {
 	return normalizeForMatch(actualPath).endsWith(normalizeForMatch(suffix));
+}
+
+interface PackageManagerCommands {
+	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -717,6 +721,9 @@ Content`,
 
 	describe("source parsing", () => {
 		it("should emit progress events on install attempt", async () => {
+			const runCommandSpy = vi
+				.spyOn(packageManager as unknown as PackageManagerCommands, "runCommand")
+				.mockRejectedValue(new Error("install failed"));
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
 
@@ -726,9 +733,13 @@ Content`,
 
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
 			expect(events.some((e) => e.type === "error")).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "-g", "nonexistent-package@1.0.0"], undefined);
 		});
 
 		it("should recognize github URLs without git: prefix", async () => {
+			const runCommandSpy = vi
+				.spyOn(packageManager as unknown as PackageManagerCommands, "runCommand")
+				.mockRejectedValue(new Error("install failed"));
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
 			const previousGitTerminalPrompt = process.env.GIT_TERMINAL_PROMPT;
@@ -747,6 +758,11 @@ Content`,
 			}
 
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledWith("git", [
+				"clone",
+				"https://github.com/nonexistent/repo",
+				join(agentDir, "git", "github.com", "nonexistent", "repo"),
+			]);
 		});
 
 		it("should parse package source types from docs examples", () => {
@@ -771,6 +787,41 @@ Content`,
 			const dotDotSlash = (packageManager as any).parseSource("../packages/agent-timers");
 			expect(dotDotSlash.type).toBe("local");
 			expect(dotDotSlash.path).toBe("../packages/agent-timers");
+		});
+	});
+
+	describe("temporary install paths", () => {
+		it.each(["new", "permissive"])("uses a private %s npm cache (pi #5345)", async (initialRoot) => {
+			const tempRoot = join(agentDir, "tmp", "extensions");
+			if (initialRoot === "permissive") {
+				mkdirSync(tempRoot, { recursive: true });
+				chmodSync(tempRoot, 0o777);
+			}
+			const installRoot = join(tempRoot, "npm", "f35b2129");
+			const packageRoot = join(installRoot, "node_modules", "@scope", "pkg");
+			const extensionPath = join(packageRoot, "extensions", "index.ts");
+			const commandSpy = vi
+				.spyOn(packageManager as unknown as PackageManagerCommands, "runCommand")
+				.mockImplementation(async (command, args) => {
+					expect([command, args]).toEqual(["npm", ["install", "@scope/pkg@1.2.3", "--prefix", installRoot]]);
+					mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+					writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ version: "1.2.3" }));
+					writeFileSync(extensionPath, "export default function() {};");
+				});
+
+			const result = await packageManager.resolveExtensionSources(["npm:@scope/pkg@1.2.3"], { temporary: true });
+
+			expect(result.extensions.map((resource) => resource.path)).toEqual([extensionPath]);
+			expect(result.extensions[0].metadata.baseDir).toBe(packageRoot);
+			expect(extensionPath.startsWith(join(tmpdir(), "pi-extensions"))).toBe(false);
+			// test-policy: allow environment-gated-path -- POSIX permission bits do not apply on Windows.
+			if (process.platform !== "win32") {
+				expect(statSync(tempRoot).mode & 0o777).toBe(0o700);
+			}
+
+			const cached = await packageManager.resolveExtensionSources(["npm:@scope/pkg@1.2.3"], { temporary: true });
+			expect(cached.extensions.map((resource) => resource.path)).toEqual([extensionPath]);
+			expect(commandSpy).toHaveBeenCalledTimes(1);
 		});
 	});
 

@@ -1,10 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+
+interface PackageManagerCommands {
+	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+}
 
 function git(args: string[], cwd: string): string {
 	const result = spawnSync("git", args, {
@@ -67,6 +71,7 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -84,6 +89,61 @@ describe("DefaultPackageManager git update", () => {
 
 		settingsManager.setPackages([sourceOverride ?? gitSource]);
 	}
+
+	describe("temporary git sources", () => {
+		it.each([
+			{ name: "refreshes an unpinned cache", pinned: false, offline: false, expected: "// v2" },
+			{ name: "keeps a pinned cache", pinned: true, offline: false, expected: "// v1" },
+			{ name: "keeps an offline cache", pinned: false, offline: true, expected: "// v1" },
+		])("uses the private git root and $name (pi #5345)", async ({ pinned, offline, expected }) => {
+			const previousOfflineEnv = process.env.PI_OFFLINE;
+			delete process.env.PI_OFFLINE;
+			try {
+				mkdirSync(join(remoteDir, "extensions"), { recursive: true });
+				initGitRepo(remoteDir);
+				const initialCommit = createCommit(remoteDir, "extensions/index.ts", "// v1", "Initial commit");
+				const source = pinned ? `${gitSource}@${initialCommit}` : gitSource;
+				const tempRoot = join(agentDir, "tmp", "extensions");
+				const cachedDir = join(tempRoot, "git-github.com", "7db90b30", "test", "extension");
+				const extensionPath = join(cachedDir, "extensions", "index.ts");
+				const commandSpy = vi
+					.spyOn(packageManager as unknown as PackageManagerCommands, "runCommand")
+					.mockImplementation(async (command, args, options) => {
+						expect(command).toBe("git");
+						if (args[0] === "clone") {
+							expect(args).toEqual(["clone", "https://github.com/test/extension", cachedDir]);
+							git(["clone", remoteDir, cachedDir], tempDir);
+						} else {
+							git(args, options?.cwd ?? tempDir);
+						}
+					});
+
+				const installed = await packageManager.resolveExtensionSources([source], { temporary: true });
+				expect(installed.extensions.map((resource) => resource.path)).toEqual([extensionPath]);
+				expect(installed.extensions[0].metadata.baseDir).toBe(cachedDir);
+				expect(cachedDir.startsWith(join(tmpdir(), "pi-extensions"))).toBe(false);
+				// test-policy: allow environment-gated-path -- POSIX permission bits do not apply on Windows.
+				if (process.platform !== "win32") {
+					expect(statSync(tempRoot).mode & 0o777).toBe(0o700);
+				}
+
+				createCommit(remoteDir, "extensions/index.ts", "// v2", "Second commit");
+				commandSpy.mockClear();
+				if (offline) process.env.PI_OFFLINE = "1";
+				const resolved = await packageManager.resolveExtensionSources([source], { temporary: true });
+
+				expect(resolved.extensions.map((resource) => resource.path)).toEqual([extensionPath]);
+				expect(getFileContent(cachedDir, "extensions/index.ts")).toBe(expected);
+				if (pinned || offline) {
+					expect(getCurrentCommit(cachedDir)).toBe(initialCommit);
+					expect(commandSpy).not.toHaveBeenCalled();
+				}
+			} finally {
+				if (previousOfflineEnv === undefined) delete process.env.PI_OFFLINE;
+				else process.env.PI_OFFLINE = previousOfflineEnv;
+			}
+		});
+	});
 
 	// Each case first fast-forwards onto `before`, then the remote drops those commits
 	// (git reset --hard HEAD~n) and publishes `after` in their place.
