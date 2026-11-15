@@ -503,7 +503,19 @@ export class Markdown implements Component {
 					return quoteStyle(lineWithReappliedStyle);
 				};
 
-				const quoteContentWidth = Math.max(1, width - 2);
+				// Stop adding borders when they would consume the remaining content width.
+				// Rewrapping at width 1 makes deeply nested quote output grow exponentially.
+				if (width < 3) {
+					const quoteTokens = token.tokens || [];
+					for (let i = 0; i < quoteTokens.length; i++) {
+						for (const line of this.renderToken(quoteTokens[i], width, quoteTokens[i + 1]?.type, styleContext)) {
+							lines.push(line);
+						}
+					}
+					break;
+				}
+
+				const quoteContentWidth = width - 2;
 
 				// Blockquotes contain block-level tokens (paragraph, list, code, etc.), so render
 				// children with renderToken() instead of renderInlineTokens().
@@ -517,9 +529,14 @@ export class Markdown implements Component {
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
-					renderedQuoteLines.push(
-						...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
-					);
+					for (const line of this.renderToken(
+						quoteToken,
+						quoteContentWidth,
+						nextQuoteToken?.type,
+						quoteInlineStyleContext,
+					)) {
+						renderedQuoteLines.push(line);
+					}
 				}
 
 				while (renderedQuoteLines.length > 0 && renderedQuoteLines[renderedQuoteLines.length - 1] === "") {
