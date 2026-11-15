@@ -10,6 +10,32 @@ import { parseOscColorResponse } from "../src/terminal-colors.js";
 
 const identify = "\x1b[>0q\x1b[c";
 
+describe("ProcessTerminal title", () => {
+	it("pi 89c921d8b replaces control runs without changing ordinary or repeated titles", () => {
+		const writes: string[] = [];
+		const previousWrite = process.stdout.write;
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		try {
+			const terminal = new ProcessTerminal();
+			terminal.setTitle("pi - work\x07\x1b]52;c;Zm9v\x07\u009b2J - repo");
+			terminal.setTitle("pi - ordinary - repo");
+			terminal.setTitle("");
+			terminal.setTitle("\x00\x1f\x7f\u009fend");
+			assert.deepEqual(writes, [
+				"\x1b]0;pi - work ]52;c;Zm9v 2J - repo\x07",
+				"\x1b]0;pi - ordinary - repo\x07",
+				"\x1b]0;\x07",
+				"\x1b]0; end\x07",
+			]);
+		} finally {
+			process.stdout.write = previousWrite;
+		}
+	});
+});
+
 describe("ProcessTerminal dimensions", () => {
 	it("falls back to COLUMNS and LINES before default dimensions", () => {
 		const previousColumnsDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");

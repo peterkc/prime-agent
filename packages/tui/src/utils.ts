@@ -327,6 +327,13 @@ export function normalizeTerminalOutput(str: string): string {
 	return normalized;
 }
 
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]+/g;
+
+/** Replace each run of C0 and C1 control characters with one space. */
+export function replaceControlCharacters(str: string): string {
+	return str.replace(CONTROL_CHARACTERS, " ");
+}
+
 interface AnsiCode {
 	code: string;
 	length: number;

@@ -47,6 +47,42 @@ describe("LoginDialogComponent", () => {
 		resetCapabilitiesCache();
 	});
 
+	it.each([
+		["https://example.com/authorize", "https://example.com/authorize", true],
+		["HTTP://EXAMPLE.COM:80/authorize", "http://example.com/authorize", true],
+		["file:///tmp/payload.app", "file:///tmp/payload.app", false],
+		["https://example.com/device\x07\x1b]52;c;Zm9v\x07", "https://example.com/device%07%1B]52;c;Zm9v", true],
+		["x\x07\x1b]52;c;Zm9v\x07", "x ]52;c;Zm9v ", false],
+	] as const)("pi 89c921d8b safely displays and copies sign-in URL %j", (url, displayed, launches) => {
+		for (const hyperlinks of [true, false]) {
+			mocks.execFile.mockClear();
+			mocks.copyToClipboard.mockClear();
+			setCapabilities({ images: null, trueColor: true, hyperlinks });
+			const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+			dialog.showAuth(url);
+			const output = dialog.render(120).join("\n");
+			expect(output).not.toContain("\x1b]52");
+			expect(stripAnsi(output)).toContain(displayed.trimEnd());
+			if (launches) {
+				expect(mocks.execFile).toHaveBeenCalledExactlyOnceWith(
+					expect.any(String),
+					expect.arrayContaining([displayed]),
+					{ windowsHide: true },
+					expect.any(Function),
+				);
+			} else {
+				expect(mocks.execFile).not.toHaveBeenCalled();
+			}
+			if (launches && hyperlinks) {
+				expect(output).toContain(`\x1b]8;;${displayed}\x07`);
+			} else {
+				expect(output).not.toContain("\x1b]8;;");
+			}
+			dialog.handleInput("c");
+			expect(mocks.copyToClipboard).toHaveBeenCalledExactlyOnceWith(url);
+		}
+	});
+
 	it("renders browser login without legacy border chrome", () => {
 		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
 
@@ -112,7 +148,7 @@ describe("LoginDialogComponent", () => {
 
 			expect(mocks.execFile).toHaveBeenCalledWith(
 				command,
-				[...prefixArgs, url],
+				[...prefixArgs, "https://example.com/oauth?state=$(touch%20/tmp/pwned);whoami&pipe=|id"],
 				{ windowsHide: true },
 				expect.any(Function),
 			);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "fs";
 import { getOAuthProvider, getOAuthProviders } from "./utils/oauth/index.js";
 import type { OAuthCredentials, OAuthProviderId } from "./utils/oauth/types.js";
 
@@ -22,7 +22,9 @@ function loadAuth(): Record<string, { type: "oauth" } & OAuthCredentials> {
 }
 
 function saveAuth(auth: Record<string, { type: "oauth" } & OAuthCredentials>): void {
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), "utf-8");
+	// Restrict an older file before writing new tokens; mode only applies on creation.
+	if (existsSync(AUTH_FILE)) chmodSync(AUTH_FILE, 0o600);
+	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
 async function login(providerId: OAuthProviderId): Promise<void> {

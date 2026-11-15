@@ -1,0 +1,1 @@
+- Fixed terminal titles allowing control characters to inject terminal escape sequences.

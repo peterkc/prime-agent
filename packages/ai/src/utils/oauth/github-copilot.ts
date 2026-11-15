@@ -124,10 +124,15 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		throw new Error("Invalid device code response fields");
 	}
 
+	const parsedUri = URL.canParse(verificationUri) ? new URL(verificationUri) : undefined;
+	if (!parsedUri || (parsedUri.protocol !== "https:" && parsedUri.protocol !== "http:")) {
+		throw new Error("Untrusted verification_uri in device code response");
+	}
+
 	return {
 		device_code: deviceCode,
 		user_code: userCode,
-		verification_uri: verificationUri,
+		verification_uri: parsedUri.href,
 		interval,
 		expires_in: expiresIn,
 	};
