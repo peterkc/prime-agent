@@ -1,0 +1,1 @@
+- Fixed temporary extension installs to use a private agent-folder cache with owner-only permissions.
