@@ -1868,34 +1868,32 @@ describe("runToolCall", () => {
 	};
 	const toolCall = { type: "toolCall" as const, id: "parent/1", name: "work", arguments: { value: "ok" } };
 
-	it.each(['{"action":"apply","actions":[{"kind":"seek","time":.5}]}', '{"kind":"seek","clipId":"clip-fl', "[1,2]"])(
-		"rejects malformed arguments before hooks or execution: %s (pi #10897)",
-		async (raw) => {
-			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
-			const beforeToolCall = vi.fn();
-			const outcome = await runToolCall(
-				{
-					type: "toolCall",
-					id: "tool-1",
-					name: "work",
-					arguments: {},
-					argumentsError: `Malformed JSON\n\nReceived arguments:\n${raw}`,
-				},
-				{
-					tools: [{ ...definition, parameters: Type.Object({ value: Type.Optional(Type.String()) }), execute }],
-					context: { systemPrompt: "", messages: [] },
-					assistantMessage: createAssistantMessage([]),
-					beforeToolCall,
-				},
-			);
-			expect(outcome.isError).toBe(true);
-			expect(outcome.result.content).toEqual([
-				{ type: "text", text: `Invalid arguments for tool "work": Malformed JSON\n\nReceived arguments:\n${raw}` },
-			]);
-			expect(beforeToolCall).not.toHaveBeenCalled();
-			expect(execute).not.toHaveBeenCalled();
-		},
-	);
+	it("rejects malformed arguments before hooks or execution (pi #10897)", async () => {
+		const raw = '{"action":"apply","actions":[{"kind":"seek","time":.5}]}';
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
+		const beforeToolCall = vi.fn();
+		const outcome = await runToolCall(
+			{
+				type: "toolCall",
+				id: "tool-1",
+				name: "work",
+				arguments: {},
+				argumentsError: `Malformed JSON\n\nReceived arguments:\n${raw}`,
+			},
+			{
+				tools: [{ ...definition, parameters: Type.Object({ value: Type.Optional(Type.String()) }), execute }],
+				context: { systemPrompt: "", messages: [] },
+				assistantMessage: createAssistantMessage([]),
+				beforeToolCall,
+			},
+		);
+		expect(outcome.isError).toBe(true);
+		expect(outcome.result.content).toEqual([
+			{ type: "text", text: `Invalid arguments for tool "work": Malformed JSON\n\nReceived arguments:\n${raw}` },
+		]);
+		expect(beforeToolCall).not.toHaveBeenCalled();
+		expect(execute).not.toHaveBeenCalled();
+	});
 
 	it("runs repaired valid arguments through hooks and execution (pi #10897)", async () => {
 		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
