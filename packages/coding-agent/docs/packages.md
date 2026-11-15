@@ -36,7 +36,7 @@ prime-agent update --force                # reinstall Prime Agent even if curren
 
 By default, `package install` and `package remove` write to global settings (`~/.prime/agent/settings.json`). Use `--local` to write to project settings (`.prime/agent/settings.json`) instead. Project settings can be shared with your team, and Prime Agent installs any missing packages automatically on startup.
 
-To try a package without installing it, use `--extension` or `-e`. This installs to a temporary directory for the current run only:
+To try a package without installing it, use `--extension` or `-e`. This installs it to a cache in the agent folder (`tmp/extensions`) and loads it for the current run only; Prime Agent does not add it to settings:
 
 ```bash
 prime-agent -e npm:@foo/bar
