@@ -1,0 +1,2 @@
+- Fixed extension overlays left behind by reloads and session switches without closing internal overlays.
+- Fixed concurrent extension dialogs replacing each other instead of restoring the dialog below.
