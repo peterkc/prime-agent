@@ -49,7 +49,11 @@ export class OutputSpill {
 			return;
 		}
 		this.path = defaultTempFilePath(this.prefix);
-		const stream = createWriteStream(this.path);
+		const stream = createWriteStream(this.path, { mode: 0o600, flags: "wx" });
+		let created = false;
+		stream.once("open", () => {
+			created = true;
+		});
 		// An unlistened 'error' (ENOSPC, unwritable tmpdir) would crash the process.
 		stream.on("error", () => {
 			this.failed = true;
@@ -61,7 +65,7 @@ export class OutputSpill {
 			// The partial file would squat on the disk pressure that degraded the spill.
 			stream.once("close", () => {
 				try {
-					if (partial) rmSync(partial, { force: true });
+					if (created && partial) rmSync(partial, { force: true });
 				} catch {
 					// Best-effort cleanup: an EACCES/EBUSY here must not kill the process.
 				}

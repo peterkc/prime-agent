@@ -1,0 +1,1 @@
+- Fixed full-output spill files to be private and to preserve existing files and symlinks when a spill path is already taken.
