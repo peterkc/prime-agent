@@ -162,6 +162,37 @@ describe("side questions: abort, bash slot races, foreign-run isolation (ENG-450
 		expect((host.activeBashComponent as BashExecutionComponent).getOutput()).toContain("compiling");
 	});
 
+	it("releases a pending side bash on dispatch failure before bash_start (pi #9068)", async () => {
+		const finishBash = vi.fn();
+		const showError = vi.fn();
+		const host = interactiveHost({
+			sideQuestionBash: { runId: "side-run-1", input: "!ls", seedTranscript: true },
+			sideQuestionBashComponent: undefined,
+			sideQuestionBashDiscarded: undefined,
+			sideQuestionComponent: { finishBash },
+			sideQuestionTurns: [],
+			activeBashComponent: undefined,
+			showError,
+			...eventPreamble(new Container()),
+		});
+
+		await handleEvent.call(host, {
+			type: "bash_end",
+			exitCode: undefined,
+			cancelled: false,
+			truncated: false,
+			errorMessage: "Routing failed",
+			transient: true,
+			runId: "side-run-1",
+		});
+
+		expect(host.sideQuestionBash).toBeUndefined();
+		expect(finishBash).toHaveBeenCalledTimes(1);
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("Routing failed"));
+		expect(host.sideQuestionTurns).toEqual([]);
+	});
+
 	it("keeps foreign runs out of the pane and suppresses foreign transient runs", async () => {
 		const addBash = vi.fn();
 		const showError = vi.fn();

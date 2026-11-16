@@ -1,0 +1,1 @@
+- Changed `user_bash` to fail closed: a handler error or any defined result other than one valid `{ operations }` or `{ result }` stops the command instead of running it locally. Return `undefined` to pass.

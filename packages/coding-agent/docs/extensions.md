@@ -887,6 +887,10 @@ pi.on("user_bash", (event, ctx) => {
 });
 ```
 
+Returning `undefined` continues to the next handler, then local execution if none handles the event. A valid result stops propagation: `operations` executes the command through the supplied backend, while `result` records the completed command without executing it.
+
+If a handler throws or returns any other value, dispatch stops with an extension error and the command does not run.
+
 ### Input Events
 
 #### input

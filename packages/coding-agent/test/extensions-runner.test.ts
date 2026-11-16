@@ -279,6 +279,41 @@ describe("ExtensionRunner", () => {
 		expect(errors[0].error).toContain("Handler error!");
 	});
 
+	describe("user_bash results (pi #9068)", () => {
+		it.each([
+			["null operations", "return { operations: null }"],
+			["a null result", "return { result: null }"],
+			["non-string output", "return { result: { ...valid, output: 1 } }"],
+			["missing exitCode", 'return { result: { output: "", cancelled: false, truncated: false } }'],
+			["null exitCode", "return { result: { ...valid, exitCode: null } }"],
+			["non-boolean cancelled", "return { result: { ...valid, cancelled: 0 } }"],
+			["non-boolean truncated", "return { result: { ...valid, truncated: 0 } }"],
+			["non-string fullOutputPath", "return { result: { ...valid, fullOutputPath: 1 } }"],
+		])("rejects %s, reports the error and stops propagation (pi #9068)", async (_name, body) => {
+			const error = "Invalid user_bash handler result";
+			const later = path.join(tempDir, "later-handler");
+			writeExt(
+				"routing.ts",
+				`import * as fs from "node:fs";
+				export default function(pi) {
+					const valid = { output: "", exitCode: 0, cancelled: false, truncated: false };
+					pi.on("user_bash", async () => { ${body}; });
+					pi.on("user_bash", async () => { fs.writeFileSync(${JSON.stringify(later)}, "ran"); });
+				}`,
+			);
+			const { runner } = await loadRunner();
+			const errors: Array<{ event: string; error: string }> = [];
+			runner.onError((failure) => errors.push(failure));
+
+			await expect(
+				runner.emitUserBash({ type: "user_bash", command: "pwd", excludeFromContext: false, cwd: tempDir }),
+			).rejects.toThrow(error);
+			expect(errors).toMatchObject([{ event: "user_bash", error: expect.stringContaining(error) }]);
+			expect(errors).toHaveLength(1);
+			expect(fs.existsSync(later)).toBe(false);
+		});
+	});
+
 	describe("host timers", () => {
 		it("reports throwing ctx timer callbacks and keeps other extensions' timers running", async () => {
 			const firedMarker = path.join(tempDir, "other-timer-fired");

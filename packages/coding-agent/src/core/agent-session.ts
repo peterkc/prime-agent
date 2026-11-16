@@ -14857,7 +14857,7 @@ export class AgentSession {
 	 * bash_output, and bash_end session events so any attached client can render
 	 * streaming output. Extensions can intercept execution via the user_bash event.
 	 * Execution failures are reported through bash_end rather than a rejected promise;
-	 * only the already-running guard and extension dispatch errors reject.
+	 * only the already-running guard rejects.
 	 * @param command The bash command to execute
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
 	 */
@@ -14891,6 +14891,13 @@ export class AgentSession {
 				options?.transient ?? false,
 				identity,
 			);
+		} catch (error) {
+			end = {
+				exitCode: undefined,
+				cancelled: false,
+				truncated: false,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			};
 		} finally {
 			this._userBashRunning = false;
 			this._notifySessionInputCheckpointChange();
