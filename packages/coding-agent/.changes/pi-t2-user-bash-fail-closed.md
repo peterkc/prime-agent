@@ -1,0 +1,1 @@
+- Fixed `user_bash` handlers so errors and invalid results stop the command instead of falling back to local execution.

@@ -1,8 +1,11 @@
 import { Buffer } from "node:buffer";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import type { UserBashEventResult } from "../../src/core/extensions/types.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 
@@ -296,6 +299,127 @@ describe("AgentSession bash and persistence characterization", () => {
 			expect(lastMessage.output).toContain("spawn failure");
 		}
 	});
+
+	it.each([
+		[
+			"throws",
+			() => {
+				throw new Error("Routing failed");
+			},
+			"Routing failed",
+		],
+		["returns false", () => false, "Invalid user_bash handler result"],
+		["returns null", () => null, "Invalid user_bash handler result"],
+		["returns an empty object", () => ({}), "Invalid user_bash handler result"],
+		[
+			"returns both fields",
+			() => ({
+				operations: { exec: async () => ({ exitCode: 0 }) },
+				result: { output: "handled", exitCode: 0, cancelled: false, truncated: false },
+			}),
+			"Invalid user_bash handler result",
+		],
+		["returns operations without exec", () => ({ operations: {} }), "Invalid user_bash handler result"],
+		["returns a malformed result", () => ({ result: { output: "handled" } }), "Invalid user_bash handler result"],
+	])("fails closed and releases the slot when user_bash %s (pi #9068)", async (_name, handler, error) => {
+		let laterCalls = 0;
+		const completed = { output: "recovered", exitCode: 0, cancelled: false, truncated: false };
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) =>
+					pi.on("user_bash", async (event) =>
+						event.command === "recover" ? { result: completed } : (handler() as UserBashEventResult),
+					),
+				(pi) =>
+					pi.on("user_bash", async () => {
+						laterCalls++;
+					}),
+			],
+		});
+		harnesses.push(harness);
+		const sentinel = join(harness.tempDir, "local-command-ran");
+		const errors: string[] = [];
+		harness.session.extensionRunner.onError((failure) => errors.push(failure.error));
+		let failure: unknown;
+		try {
+			await harness.session.runUserBash(`printf ran > '${sentinel}'`);
+		} catch (caught) {
+			failure = caught;
+		}
+
+		expect(existsSync(sentinel)).toBe(false);
+		expect(laterCalls).toBe(0);
+		expect(harness.session.isBashRunning).toBe(false);
+		expect(harness.eventsOfType("bash_start")).toEqual([]);
+		expect(harness.session.messages.filter((message) => message.role === "bashExecution")).toEqual([]);
+		expect(failure).toBeInstanceOf(Error);
+		expect(String(failure)).toContain(error);
+		expect(errors).toEqual([expect.stringContaining(error)]);
+		await harness.session.runUserBash("recover");
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "bashExecution",
+			command: "recover",
+			output: "recovered",
+		});
+	});
+
+	it.each(["undefined", "operations", "result"] as const)(
+		"routes a valid user_bash %s without local execution (pi #9068)",
+		async (mode) => {
+			let backendCalls = 0;
+			let nextCalls = 0;
+			let lastCalls = 0;
+			const completed = {
+				output: "remote",
+				exitCode: undefined,
+				cancelled: false,
+				truncated: false,
+				fullOutputPath: "/remote/output",
+			};
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, options) => {
+					backendCalls++;
+					options.onData(Buffer.from("remote"));
+					return { exitCode: 0 };
+				},
+			};
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) =>
+						pi.on("user_bash", async () =>
+							mode === "undefined" ? undefined : mode === "operations" ? { operations } : { result: completed },
+						),
+					(pi) =>
+						pi.on("user_bash", async () => {
+							nextCalls++;
+							return { operations };
+						}),
+					(pi) =>
+						pi.on("user_bash", async () => {
+							lastCalls++;
+						}),
+				],
+			});
+			harnesses.push(harness);
+			const sentinel = join(harness.tempDir, "local-command-ran");
+			await harness.session.runUserBash(`printf ran > '${sentinel}'`, { excludeFromContext: true });
+
+			expect(existsSync(sentinel)).toBe(false);
+			expect(backendCalls).toBe(mode === "result" ? 0 : 1);
+			expect(nextCalls).toBe(mode === "undefined" ? 1 : 0);
+			expect(lastCalls).toBe(0);
+			expect(harness.session.isBashRunning).toBe(false);
+			expect(harness.session.messages.at(-1)).toMatchObject({
+				role: "bashExecution",
+				output: "remote",
+				excludeFromContext: true,
+			});
+			expect(harness.eventsOfType("bash_end")).toMatchObject([
+				{ exitCode: mode === "result" ? undefined : 0, cancelled: false, truncated: false },
+			]);
+			if (mode === "result") expect(harness.session.messages.at(-1)).toMatchObject(completed);
+		},
+	);
 
 	it("cancels runUserBash when abortBash arrives before execution starts", async () => {
 		const harness = await createHarness();
