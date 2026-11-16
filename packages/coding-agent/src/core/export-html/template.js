@@ -545,7 +545,7 @@
       }
 
       function sanitizeMarkdownUrl(value) {
-        const href = String(value || '').trim().replace(/[\x00-\x1f\x7f]/g, '');
+        const href = String(value || '').replace(/[\x00-\x1f\x7f]/g, '').trim();
         if (!href) return href;
 
         const scheme = href.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);

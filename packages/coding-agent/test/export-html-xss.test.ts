@@ -50,6 +50,7 @@ describe("export HTML markdown link sanitization", () => {
 		"vbscript:msgbox(1)",
 		"data:text/html,<script>",
 		"java\tscript:alert(1)",
+		"\x01 javascript:alert(1)",
 		"custom+app:x",
 	])("renders only labels for rejected URLs: %j (pi 6cb23f9b5)", (href) => {
 		const html = renderMarkdown(`[**label**](<${href}>) ![<alt>&](<${href}>)`);
