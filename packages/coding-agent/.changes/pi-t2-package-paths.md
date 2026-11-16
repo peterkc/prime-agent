@@ -1,0 +1,1 @@
+- Fixed unsafe git package sources and managed clone paths escaping their install roots.

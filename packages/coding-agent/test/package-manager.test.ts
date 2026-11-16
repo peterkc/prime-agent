@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { PassThrough } from "node:stream";
@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { shouldUseWindowsShell } from "../src/utils/child-process.js";
+import { type GitSource, parseGitUrl } from "../src/utils/git.js";
 
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -18,6 +19,17 @@ function pathEndsWith(actualPath: string, suffix: string): boolean {
 
 interface PackageManagerCommands {
 	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+}
+
+type GitScope = "user" | "project" | "temporary";
+
+interface GitPackageManagerInternals extends PackageManagerCommands {
+	getGitInstallPath(source: GitSource, scope: GitScope): string;
+	getPackageIdentity(source: string): string;
+	installGit(source: GitSource, scope: GitScope): Promise<void>;
+	updateGit(source: GitSource, scope: GitScope): Promise<void>;
+	removeGit(source: GitSource, scope: GitScope): Promise<void>;
+	runCommandCapture(command: string, args: string[]): Promise<string>;
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -822,6 +834,108 @@ Content`,
 			const cached = await packageManager.resolveExtensionSources(["npm:@scope/pkg@1.2.3"], { temporary: true });
 			expect(cached.extensions.map((resource) => resource.path)).toEqual([extensionPath]);
 			expect(commandSpy).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("git install paths (pi a98e087e5)", () => {
+		it.each([
+			"git:git@evil.example:../../victim/repo",
+			"https://evil.example/..%2F..%2Fvictim/repo",
+			"https://evil.example/user/repo%",
+			"git:git@evil.example:/absolute/repo",
+			"git:git@evil.example:user\\repo/name",
+			"git:git@evil.example:user/repo\0name",
+			"git:git@evil.example/nested:user/repo",
+			"git:git@evil.example%2Fnested:user/repo",
+		])("rejects unsafe source %s before clone (pi a98e087e5)", async (source) => {
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
+			expect(parseGitUrl(source)).toBeNull();
+			await expect(packageManager.install(source)).rejects.toThrow("Path does not exist");
+			expect(command).not.toHaveBeenCalled();
+		});
+
+		it.each(["git:github.com/../..", "git:github.com/../../../../.."])(
+			"rejects generic traversal %s without external effects (pi a98e087e5)",
+			async (source) => {
+				const manager = packageManager as unknown as GitPackageManagerInternals;
+				const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
+				const capture = vi.spyOn(manager, "runCommandCapture").mockResolvedValue("");
+				const outside = `${tempDir}-outside`;
+				mkdirSync(outside);
+				const sentinel = join(outside, "sentinel");
+				writeFileSync(sentinel, "untouched");
+				const before = statSync(sentinel);
+				try {
+					expect(parseGitUrl(source)).toBeNull();
+					settingsManager.setPackages([source]);
+					await packageManager.install(source);
+					await expect(packageManager.update(source)).rejects.toThrow("No matching package found");
+					await packageManager.remove(source);
+					expect(command).not.toHaveBeenCalled();
+					expect(capture).not.toHaveBeenCalled();
+					expect(readdirSync(outside)).toEqual(["sentinel"]);
+					expect(statSync(sentinel)).toEqual(before);
+					expect(readFileSync(sentinel, "utf8")).toBe("untouched");
+				} finally {
+					rmSync(outside, { recursive: true, force: true });
+				}
+			},
+		);
+
+		it.each(["user", "project", "temporary"] as const)(
+			"refuses escaping %s paths before clone, update or delete (pi a98e087e5)",
+			async (scope) => {
+				const manager = packageManager as unknown as GitPackageManagerInternals;
+				const source: GitSource = {
+					type: "git",
+					repo: "git@evil.example:../../victim/repo",
+					host: "evil.example",
+					path: "../../victim/repo",
+					pinned: false,
+				};
+				const root =
+					scope === "temporary"
+						? join(agentDir, "tmp", "extensions", "git-evil.example")
+						: scope === "project"
+							? join(tempDir, ".prime", "agent", "git")
+							: join(agentDir, "git");
+				const sentinel = join(root, "..", "victim", "repo", "sentinel");
+				mkdirSync(dirname(sentinel), { recursive: true });
+				writeFileSync(sentinel, "untouched");
+				const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
+				const capture = vi.spyOn(manager, "runCommandCapture").mockResolvedValue("");
+				for (const operation of ["installGit", "updateGit", "removeGit"] as const) {
+					await expect(manager[operation](source, scope)).rejects.toThrow("outside package install root");
+				}
+				expect(readFileSync(sentinel, "utf8")).toBe("untouched");
+				expect(command).not.toHaveBeenCalled();
+				expect(capture).not.toHaveBeenCalled();
+			},
+		);
+
+		it.each([
+			["https://github.com/user/repo@v1", "https://github.com/user/repo", "github.com", "user/repo", "338a1076"],
+			["ssh://git@github.com/user/repo@v1", "ssh://git@github.com/user/repo", "github.com", "user/repo", "338a1076"],
+			["git:github.com/user/repo@v1", "https://github.com/user/repo", "github.com", "user/repo", "338a1076"],
+			[
+				"git:git@gitlab.com:group/subgroup/repo@v1",
+				"git@gitlab.com:group/subgroup/repo",
+				"gitlab.com",
+				"group/subgroup/repo",
+				"4e6245d5",
+			],
+		])("keeps safe identity and paths for %s (pi a98e087e5)", (input, repo, host, path, hash) => {
+			const source = parseGitUrl(input);
+			expect(source).toEqual({ type: "git", repo, host, path, ref: "v1", pinned: true });
+			if (!source) throw new Error("Expected safe git source");
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			expect(manager.getPackageIdentity(input)).toBe(`git:${host}/${path}`);
+			expect(manager.getGitInstallPath(source, "user")).toBe(join(agentDir, "git", host, path));
+			expect(manager.getGitInstallPath(source, "project")).toBe(join(tempDir, ".prime", "agent", "git", host, path));
+			expect(manager.getGitInstallPath(source, "temporary")).toBe(
+				join(agentDir, "tmp", "extensions", `git-${host}`, hash, path),
+			);
 		});
 	});
 
