@@ -862,6 +862,18 @@ Content`,
 		it.each(["git:github.com/../..", "git:github.com/../../../../.."])(
 			"rejects generic traversal %s without external effects (pi a98e087e5)",
 			async (source) => {
+				// Keep both identity roots distinct after the deepest source's five parent segments.
+				const nesting = join("one", "two", "three", "four", "five", "six");
+				const cwd = join(tempDir, "project", nesting);
+				const localAgentDir = join(tempDir, "user", nesting);
+				mkdirSync(cwd, { recursive: true });
+				mkdirSync(localAgentDir, { recursive: true });
+				packageManager = new DefaultPackageManager({
+					cwd,
+					agentDir: localAgentDir,
+					settingsManager,
+					bundledSkillsDir: null,
+				});
 				const manager = packageManager as unknown as GitPackageManagerInternals;
 				const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
 				const capture = vi.spyOn(manager, "runCommandCapture").mockResolvedValue("");
