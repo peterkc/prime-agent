@@ -26,6 +26,7 @@ afterEach(() => vi.unstubAllEnvs());
 
 const initialWriteFault = vi.hoisted(() => ({ count: -1 }));
 const renameFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+const ownershipFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
 const absenceIllusion = vi.hoisted(() => ({ paths: new Set<string>() }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
@@ -44,6 +45,10 @@ vi.mock("node:fs", async (importOriginal) => {
 			}
 			return actual.writeSync(fd, data as never, offset as never, length as never);
 		}) as typeof actual.writeSync,
+		chownSync: (...args: Parameters<typeof actual.chownSync>) => {
+			if (ownershipFault.error) throw ownershipFault.error;
+			return actual.chownSync(...args);
+		},
 		renameSync: (from: Parameters<typeof actual.renameSync>[0], to: Parameters<typeof actual.renameSync>[1]) => {
 			if (renameFault.error && String(to).endsWith("auth.json")) throw renameFault.error;
 			return actual.renameSync(from, to);
@@ -687,6 +692,45 @@ describe("AuthStorage", () => {
 				unregisterOAuthProvider(providerId);
 			}
 		});
+
+		test.each(["sync", "oauth"])(
+			"failed %s ownership preservation keeps file and cache intact (pi #7779)",
+			async (writer) => {
+				const providerId = "ownership-oauth";
+				const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
+				const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
+				registerOAuthProvider({
+					id: providerId,
+					name: "Ownership OAuth",
+					login: async () => expired,
+					refreshToken: async () => rotated,
+					getApiKey: (credential) => credential.access,
+				});
+				try {
+					writeAuthJson({ [providerId]: expired });
+					chmodSync(authJsonPath, 0o660);
+					authStorage = AuthStorage.create(authJsonPath);
+					const before = readFileSync(authJsonPath, "utf8");
+					const metadata = statSync(authJsonPath);
+					const failure = Object.assign(new Error("cannot preserve auth ownership"), { code: "EPERM" });
+					ownershipFault.error = failure;
+					if (writer === "sync") expect(() => authStorage.set(providerId, rotated)).toThrow(failure);
+					else await expect(authStorage.getApiKey(providerId)).resolves.toBeUndefined();
+					expect(authStorage.drainErrors()).toEqual([failure]);
+					expect(readFileSync(authJsonPath, "utf8")).toBe(before);
+					expect(statSync(authJsonPath)).toMatchObject({
+						ino: metadata.ino,
+						mode: metadata.mode,
+						uid: metadata.uid,
+						gid: metadata.gid,
+					});
+					expect(authStorage.get(providerId)).toEqual(expired);
+				} finally {
+					ownershipFault.error = undefined;
+					unregisterOAuthProvider(providerId);
+				}
+			},
+		);
 
 		test("symlink aliases share the real auth lock (pi #11655)", async () => {
 			writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });

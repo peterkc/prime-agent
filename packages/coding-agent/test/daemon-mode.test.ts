@@ -96,6 +96,12 @@ import { createHarness, type Harness } from "./suite/harness.js";
 import { createDeferred } from "./suite/scheduling.js";
 import { userMsg } from "./utilities.js";
 
+function makeRuntimeServices(cwd: string, agentDir: string) {
+	return { cwd, agentDir, authStorage: AuthStorage.inMemory() } as Awaited<
+		ReturnType<CreateAgentSessionRuntimeFactory>
+	>["services"];
+}
+
 describe("daemon mode helpers", () => {
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-real-completion-"));
@@ -112,9 +118,7 @@ describe("daemon mode helpers", () => {
 				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 					ReturnType<CreateAgentSessionRuntimeFactory>
 				>["extensionsResult"],
-				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
-					ReturnType<CreateAgentSessionRuntimeFactory>
-				>["services"],
+				services: makeRuntimeServices(options.cwd, options.agentDir),
 				diagnostics: [],
 			}));
 			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
@@ -3436,9 +3440,7 @@ function makePersistedRlmDaemonFixture(
 			extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["extensionsResult"],
-			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir } as Awaited<
-				ReturnType<CreateAgentSessionRuntimeFactory>
-			>["services"],
+			services: makeRuntimeServices(runtimeOptions.cwd, runtimeOptions.agentDir),
 			diagnostics: [],
 		};
 	});
@@ -4863,7 +4865,7 @@ describe("mesh worker persistence", () => {
 			if (phase === "F31-new-session") {
 				swappedRuntime = new AgentSessionRuntime(
 					live.session,
-					{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+					makeRuntimeServices(live.tempDir, live.tempDir),
 					async (options) =>
 						({
 							session: new AgentSession({
@@ -4877,7 +4879,7 @@ describe("mesh worker persistence", () => {
 								modelRegistry: live.session.modelRegistry,
 								resourceLoader: live.session.resourceLoader,
 							}),
-							services: { cwd: live.tempDir, agentDir: live.tempDir },
+							services: makeRuntimeServices(live.tempDir, live.tempDir),
 							diagnostics: [],
 						}) as never,
 				);
@@ -6021,14 +6023,14 @@ describe("mesh worker persistence", () => {
 					});
 					return {
 						session: reopened.session,
-						services: { cwd: live.tempDir, agentDir: live.tempDir },
+						services: makeRuntimeServices(live.tempDir, live.tempDir),
 						diagnostics: [],
 					} as never;
 				};
 				if (mode === "replacement") {
 					runtime = new AgentSessionRuntime(
 						live.session,
-						{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+						makeRuntimeServices(live.tempDir, live.tempDir),
 						factory,
 					);
 					state.runtime = runtime;
@@ -6633,14 +6635,14 @@ describe("mesh worker persistence", () => {
 						modelRegistry: live.session.modelRegistry,
 						resourceLoader: live.session.resourceLoader,
 					}),
-					services: { cwd: live.tempDir, agentDir: live.tempDir },
+					services: makeRuntimeServices(live.tempDir, live.tempDir),
 					diagnostics: [],
 				}) as never;
 			const h = harness(factory);
 			await h.authenticate("cotal");
 			const runtime = new AgentSessionRuntime(
 				live.session,
-				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				makeRuntimeServices(live.tempDir, live.tempDir),
 				factory,
 			);
 			const state = await (
@@ -6859,16 +6861,12 @@ describe("mesh worker persistence", () => {
 					hasRunningRlmChildren: () => false,
 					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 				}),
-				services: { cwd: live.tempDir, agentDir: live.tempDir },
+				services: makeRuntimeServices(live.tempDir, live.tempDir),
 				diagnostics: [],
 			}) as never;
 		const h = harness(factory);
 		await h.authenticate("cotal");
-		const runtime = new AgentSessionRuntime(
-			live.session,
-			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
-			factory,
-		);
+		const runtime = new AgentSessionRuntime(live.session, makeRuntimeServices(live.tempDir, live.tempDir), factory);
 		const state = await (
 			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
 		).addRuntime(runtime);
@@ -6978,11 +6976,7 @@ describe("mesh worker persistence", () => {
 		const factory = vi.fn(async () => {
 			throw new Error("must not build");
 		});
-		const runtime = new AgentSessionRuntime(
-			live.session,
-			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
-			factory,
-		);
+		const runtime = new AgentSessionRuntime(live.session, makeRuntimeServices(live.tempDir, live.tempDir), factory);
 		await (
 			h.internals as unknown as { addRuntime(runtime: AgentSessionRuntime): Promise<ActiveSessionState> }
 		).addRuntime(runtime);
@@ -7009,7 +7003,7 @@ describe("mesh worker persistence", () => {
 		await h.authenticate("cotal");
 		const runtime = new AgentSessionRuntime(
 			live.session,
-			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			makeRuntimeServices(live.tempDir, live.tempDir),
 			async () => {
 				throw new Error("must not build");
 			},
@@ -7047,7 +7041,7 @@ describe("mesh worker persistence", () => {
 		await h.authenticate("cotal");
 		const runtime = new AgentSessionRuntime(
 			live.session,
-			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			makeRuntimeServices(live.tempDir, live.tempDir),
 			async () => {
 				throw new Error("must not build");
 			},
@@ -7109,7 +7103,7 @@ describe("mesh worker persistence", () => {
 		const live = await createHarness({ persistSession: true });
 		const runtime = new AgentSessionRuntime(
 			live.session,
-			{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+			makeRuntimeServices(live.tempDir, live.tempDir),
 			async () => {
 				throw new Error("must not build");
 			},
@@ -7153,7 +7147,7 @@ describe("mesh worker persistence", () => {
 				});
 				return {
 					session: next.session,
-					services: { cwd: next.tempDir, agentDir: next.tempDir },
+					services: makeRuntimeServices(next.tempDir, next.tempDir),
 					diagnostics: [],
 				} as never;
 			};
@@ -7161,7 +7155,7 @@ describe("mesh worker persistence", () => {
 			await h.authenticate("cotal");
 			const runtime = new AgentSessionRuntime(
 				live.session,
-				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				makeRuntimeServices(live.tempDir, live.tempDir),
 				factory,
 			);
 			const state = await (
@@ -7302,7 +7296,7 @@ describe("mesh worker persistence", () => {
 				return {
 					session,
 					extensionsResult: { extensions: [], errors: [], runtime: {} },
-					services: { cwd: options.cwd, agentDir: options.agentDir },
+					services: makeRuntimeServices(options.cwd, options.agentDir),
 					diagnostics: [],
 				} as never;
 			});
@@ -7353,7 +7347,7 @@ describe("mesh worker persistence", () => {
 				return {
 					session,
 					extensionsResult: { extensions: [], errors: [], runtime: {} },
-					services: { cwd: options.cwd, agentDir: options.agentDir },
+					services: makeRuntimeServices(options.cwd, options.agentDir),
 					diagnostics: [],
 				} as never;
 			});
@@ -7488,14 +7482,14 @@ describe("mesh worker persistence", () => {
 						hasRunningRlmChildren: () => false,
 						getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 					}),
-					services: { cwd: live.tempDir, agentDir: live.tempDir },
+					services: makeRuntimeServices(live.tempDir, live.tempDir),
 					diagnostics: [],
 				}) as never;
 			const h = harness(createRuntime);
 			await h.authenticate("cotal");
 			const runtime = new AgentSessionRuntime(
 				live.session,
-				{ cwd: live.tempDir, agentDir: live.tempDir } as never,
+				makeRuntimeServices(live.tempDir, live.tempDir),
 				createRuntime,
 			);
 			const state = await (

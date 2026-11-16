@@ -15,7 +15,17 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "fs";
+import {
+	chownSync,
+	closeSync,
+	existsSync,
+	fchmodSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	statSync,
+	writeSync,
+} from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
@@ -202,8 +212,10 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
+				const { mode, uid, gid } = statSync(this.authPath);
 				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
-					mode: statSync(this.authPath).mode & 0o7777,
+					mode: mode & 0o7777,
+					beforeRename: (tempPath) => chownSync(tempPath, uid, gid),
 				});
 			}
 			return result;
@@ -248,8 +260,10 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
+				const { mode, uid, gid } = statSync(this.authPath);
 				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
-					mode: statSync(this.authPath).mode & 0o7777,
+					mode: mode & 0o7777,
+					beforeRename: (tempPath) => chownSync(tempPath, uid, gid),
 				});
 			}
 			throwIfCompromised();
