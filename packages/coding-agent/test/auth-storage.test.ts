@@ -30,11 +30,30 @@ const ownershipFault = vi.hoisted(() => ({
 	error: undefined as Error | undefined,
 	tempMode: undefined as number | undefined,
 }));
+const metadataFault = vi.hoisted(() => ({ path: "", error: undefined as Error | undefined }));
+const tempSymlink = vi.hoisted(() => ({ target: "", swapped: false }));
 const absenceIllusion = vi.hoisted(() => ({ paths: new Set<string>() }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
 		...actual,
+		openSync: (...args: Parameters<typeof actual.openSync>) => {
+			const descriptor = actual.openSync(...args);
+			if (tempSymlink.target && args[1] === "wx" && String(args[0]).endsWith(".tmp")) {
+				actual.rmSync(args[0]);
+				actual.symlinkSync(tempSymlink.target, args[0]);
+				tempSymlink.swapped = true;
+			}
+			return descriptor;
+		},
+		statSync: (...args: Parameters<typeof actual.statSync>) => {
+			if (metadataFault.path === String(args[0])) {
+				metadataFault.path = "";
+				if (metadataFault.error) throw metadataFault.error;
+				actual.rmSync(args[0]);
+			}
+			return actual.statSync(...args);
+		},
 		writeSync: ((fd: number, data: NodeJS.ArrayBufferView | string, offset?: number, length?: number) => {
 			if (initialWriteFault.count >= 0) {
 				const count = initialWriteFault.count;
@@ -48,12 +67,12 @@ vi.mock("node:fs", async (importOriginal) => {
 			}
 			return actual.writeSync(fd, data as never, offset as never, length as never);
 		}) as typeof actual.writeSync,
-		chownSync: (...args: Parameters<typeof actual.chownSync>) => {
+		fchownSync: (...args: Parameters<typeof actual.fchownSync>) => {
 			if (ownershipFault.error) {
-				ownershipFault.tempMode = actual.statSync(args[0]).mode & 0o7777;
+				ownershipFault.tempMode = actual.fstatSync(args[0]).mode & 0o7777;
 				throw ownershipFault.error;
 			}
-			return actual.chownSync(...args);
+			return actual.fchownSync(...args);
 		},
 		renameSync: (from: Parameters<typeof actual.renameSync>[0], to: Parameters<typeof actual.renameSync>[1]) => {
 			if (renameFault.error && String(to).endsWith("auth.json")) throw renameFault.error;
@@ -666,6 +685,68 @@ describe("AuthStorage", () => {
 			},
 		);
 
+		test("a swapped temp symlink cannot change target metadata (pi #7779)", () => {
+			writeAuthJson({});
+			chmodSync(authJsonPath, 0o660);
+			authStorage = AuthStorage.create(authJsonPath);
+			const target = join(tempDir, "target.json");
+			writeFileSync(target, "{}");
+			chmodSync(target, 0o644);
+			const before = statSync(target);
+			tempSymlink.target = target;
+			try {
+				authStorage.set("openai", { type: "api_key", key: "new-key" });
+				expect(tempSymlink.swapped).toBe(true);
+				expect(statSync(target)).toMatchObject({ mode: before.mode, uid: before.uid, gid: before.gid });
+			} finally {
+				tempSymlink.target = "";
+				tempSymlink.swapped = false;
+			}
+		});
+
+		test.each(["sync", "oauth"])(
+			"$0 save recreates auth deleted after the locked read and rejects other stat errors (pi #7779)",
+			async (writer) => {
+				const providerId = "deleted-auth-oauth";
+				const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
+				const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
+				registerOAuthProvider({
+					id: providerId,
+					name: "Deleted Auth OAuth",
+					login: async () => expired,
+					refreshToken: async () => rotated,
+					getApiKey: (credential) => credential.access,
+				});
+				try {
+					writeAuthJson({ [providerId]: expired });
+					chmodSync(authJsonPath, 0o660);
+					authStorage = AuthStorage.create(authJsonPath);
+					ownershipFault.error = new Error("new files must not restore ownership");
+					metadataFault.path = authJsonPath;
+					if (writer === "sync") authStorage.set(providerId, rotated);
+					else await expect(authStorage.getApiKey(providerId)).resolves.toBe("rotated");
+					expect(metadataFault.path).toBe("");
+					expect(statSync(authJsonPath).mode & 0o7777).toBe(0o600);
+					expect(AuthStorage.create(authJsonPath).get(providerId)).toEqual(rotated);
+					expect(authStorage.get(providerId)).toEqual(rotated);
+					expect(authStorage.drainErrors()).toEqual([]);
+					const before = readFileSync(authJsonPath, "utf8");
+					const failure = Object.assign(new Error("cannot read auth metadata"), { code: "EACCES" });
+					Object.assign(metadataFault, { path: authJsonPath, error: failure });
+					expect(() => authStorage.set("rejected", { type: "api_key", key: "new-key" })).toThrow(failure);
+					expect(authStorage.get("rejected")).toBeUndefined();
+					expect(authStorage.drainErrors()).toEqual([failure]);
+					expect(readFileSync(authJsonPath, "utf8")).toBe(before);
+				} finally {
+					metadataFault.path = "";
+					metadataFault.error = undefined;
+					ownershipFault.error = undefined;
+					ownershipFault.tempMode = undefined;
+					unregisterOAuthProvider(providerId);
+				}
+			},
+		);
+
 		test("sync writes keep managed mode 0660 (pi #7779)", () => {
 			const mode = 0o660;
 			writeAuthJson({});
@@ -676,7 +757,7 @@ describe("AuthStorage", () => {
 			expect(AuthStorage.create(authJsonPath).get("openai")).toEqual({ type: "api_key", key: "new-key" });
 		});
 
-		test.each([0o660, 0o600])("OAuth refresh writes keep mode %s (pi #7779)", async (mode) => {
+		test.each([0o660])("OAuth refresh writes keep mode %s (pi #7779)", async (mode) => {
 			const providerId = "mode-oauth";
 			const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
 			const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
@@ -749,7 +830,10 @@ describe("AuthStorage", () => {
 			},
 		);
 
-		test.each([0o600, 0o644])("current-owner mode %s saves without preserving the group (pi #7779)", async (mode) => {
+		test.each([
+			0o4600, // Private access plus setuid checks the full mode mask.
+			0o644,
+		])("current-owner mode %s saves without preserving the group (pi #7779)", async (mode) => {
 			const providerId = "private-ownership-oauth";
 			const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
 			const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };

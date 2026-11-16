@@ -16,14 +16,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import {
-	chmodSync,
-	chownSync,
 	closeSync,
 	existsSync,
 	fchmodSync,
+	fchownSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	type Stats,
 	statSync,
 	writeSync,
 } from "fs";
@@ -166,14 +166,21 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	private writeAuthFile(next: string): void {
-		const { mode, uid, gid } = statSync(this.authPath);
+		let metadata: Stats | undefined;
+		try {
+			metadata = statSync(this.authPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
 			mode: 0o600,
-			beforeRename: (tempPath) => {
+			beforeClose: (descriptor) => {
+				if (metadata === undefined) return;
+				const { mode, uid, gid } = metadata;
 				// The group only matters when its bits differ from the bits everyone else gets.
 				const groupMatters = ((mode >> 3) & 0o7) !== (mode & 0o7);
-				if (groupMatters || uid !== process.getuid?.()) chownSync(tempPath, uid, gid);
-				chmodSync(tempPath, mode & 0o7777);
+				if (groupMatters || uid !== process.getuid?.()) fchownSync(descriptor, uid, gid);
+				fchmodSync(descriptor, mode & 0o7777);
 			},
 		});
 	}
