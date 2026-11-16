@@ -847,6 +847,10 @@ Content`,
 			"git:git@evil.example:user/repo\0name",
 			"git:git@evil.example/nested:user/repo",
 			"git:git@evil.example%2Fnested:user/repo",
+			"git:././.",
+			"git:github.com/./.",
+			"git:git@.:github.com/u",
+			"git:github.com/user/",
 		])("rejects unsafe source %s before clone (pi a98e087e5)", async (source) => {
 			const manager = packageManager as unknown as GitPackageManagerInternals;
 			const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
@@ -882,6 +886,22 @@ Content`,
 				}
 			},
 		);
+
+		it("keeps safe trailing-slash paths (pi a98e087e5)", () => {
+			const source = parseGitUrl("https://host/a/b/");
+			expect(source).toEqual({
+				type: "git",
+				repo: "https://host/a/b/",
+				host: "host",
+				path: "a/b",
+				ref: undefined,
+				pinned: false,
+			});
+			if (!source) throw new Error("Expected safe git source");
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			expect(manager.getPackageIdentity("https://host/a/b/")).toBe("git:host/a/b");
+			expect(manager.getGitInstallPath(source, "user")).toBe(join(agentDir, "git", "host", "a", "b"));
+		});
 
 		it.each(["user", "project", "temporary"] as const)(
 			"refuses escaping %s paths before clone, update or delete (pi a98e087e5)",
