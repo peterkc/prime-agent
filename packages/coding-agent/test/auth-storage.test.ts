@@ -26,7 +26,10 @@ afterEach(() => vi.unstubAllEnvs());
 
 const initialWriteFault = vi.hoisted(() => ({ count: -1 }));
 const renameFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
-const ownershipFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+const ownershipFault = vi.hoisted(() => ({
+	error: undefined as Error | undefined,
+	tempMode: undefined as number | undefined,
+}));
 const absenceIllusion = vi.hoisted(() => ({ paths: new Set<string>() }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
@@ -46,7 +49,10 @@ vi.mock("node:fs", async (importOriginal) => {
 			return actual.writeSync(fd, data as never, offset as never, length as never);
 		}) as typeof actual.writeSync,
 		chownSync: (...args: Parameters<typeof actual.chownSync>) => {
-			if (ownershipFault.error) throw ownershipFault.error;
+			if (ownershipFault.error) {
+				ownershipFault.tempMode = actual.statSync(args[0]).mode & 0o7777;
+				throw ownershipFault.error;
+			}
 			return actual.chownSync(...args);
 		},
 		renameSync: (from: Parameters<typeof actual.renameSync>[0], to: Parameters<typeof actual.renameSync>[1]) => {
@@ -717,6 +723,7 @@ describe("AuthStorage", () => {
 					if (writer === "sync") expect(() => authStorage.set(providerId, rotated)).toThrow(failure);
 					else await expect(authStorage.getApiKey(providerId)).resolves.toBeUndefined();
 					expect(authStorage.drainErrors()).toEqual([failure]);
+					expect(ownershipFault.tempMode).toBe(0o600);
 					expect(readFileSync(authJsonPath, "utf8")).toBe(before);
 					expect(statSync(authJsonPath)).toMatchObject({
 						ino: metadata.ino,
@@ -727,10 +734,42 @@ describe("AuthStorage", () => {
 					expect(authStorage.get(providerId)).toEqual(expired);
 				} finally {
 					ownershipFault.error = undefined;
+					ownershipFault.tempMode = undefined;
 					unregisterOAuthProvider(providerId);
 				}
 			},
 		);
+
+		test("private current-owner files save without preserving the group (pi #7779)", async () => {
+			const providerId = "private-ownership-oauth";
+			const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
+			const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
+			registerOAuthProvider({
+				id: providerId,
+				name: "Private Ownership OAuth",
+				login: async () => expired,
+				refreshToken: async () => rotated,
+				getApiKey: (credential) => credential.access,
+			});
+			try {
+				writeAuthJson({ [providerId]: expired, openai: { type: "api_key", key: "old-key" } });
+				chmodSync(authJsonPath, 0o600);
+				authStorage = AuthStorage.create(authJsonPath);
+				ownershipFault.error = Object.assign(new Error("cannot preserve auth ownership"), { code: "EPERM" });
+				const apiKey = { type: "api_key" as const, key: "new-key" };
+				authStorage.set("openai", apiKey);
+				expect(AuthStorage.create(authJsonPath).get("openai")).toEqual(apiKey);
+				expect(authStorage.get("openai")).toEqual(apiKey);
+				await expect(authStorage.getApiKey(providerId)).resolves.toBe("rotated");
+				expect(AuthStorage.create(authJsonPath).get(providerId)).toEqual(rotated);
+				expect(authStorage.get(providerId)).toEqual(rotated);
+				expect(authStorage.drainErrors()).toEqual([]);
+			} finally {
+				ownershipFault.error = undefined;
+				ownershipFault.tempMode = undefined;
+				unregisterOAuthProvider(providerId);
+			}
+		});
 
 		test("symlink aliases share the real auth lock (pi #11655)", async () => {
 			writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });

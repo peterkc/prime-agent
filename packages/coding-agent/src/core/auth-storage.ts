@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import {
+	chmodSync,
 	chownSync,
 	closeSync,
 	existsSync,
@@ -164,6 +165,18 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		}
 	}
 
+	private writeAuthFile(next: string): void {
+		const { mode, uid, gid } = statSync(this.authPath);
+		writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
+			mode: 0o600,
+			beforeRename: (tempPath) => {
+				// A private file owned by this user may have a group we cannot preserve.
+				if ((mode & 0o070) !== 0 || uid !== process.getuid?.()) chownSync(tempPath, uid, gid);
+				chmodSync(tempPath, mode & 0o7777);
+			},
+		});
+	}
+
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
 		const delayMs = 20;
@@ -212,11 +225,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				const { mode, uid, gid } = statSync(this.authPath);
-				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
-					mode: mode & 0o7777,
-					beforeRename: (tempPath) => chownSync(tempPath, uid, gid),
-				});
+				this.writeAuthFile(next);
 			}
 			return result;
 		} finally {
@@ -260,11 +269,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
-				const { mode, uid, gid } = statSync(this.authPath);
-				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
-					mode: mode & 0o7777,
-					beforeRename: (tempPath) => chownSync(tempPath, uid, gid),
-				});
+				this.writeAuthFile(next);
 			}
 			throwIfCompromised();
 			return result;

@@ -1,3 +1,4 @@
-- Fixed auth file locking through symlinks and preserved the file's permission bits, owner and group during credential updates.
+- Fixed auth file locking through symlinks and preserved the file's permission bits and group access during credential updates.
 - Fixed failed credential saves reporting success or changing cached credentials.
 - Fixed session disposal exiting before an in-flight OAuth refresh finishes saving its rotated token.
+- Changed credential saves to fail and leave auth.json unchanged when the file gives its group access and its group or owner cannot be kept.
