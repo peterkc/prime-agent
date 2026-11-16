@@ -4184,7 +4184,7 @@ export class InteractiveMode {
 			}
 		}
 		if (dialogs.length > 0) this.showTopExtensionDialog();
-		// Hidden dialogs never settle; a new list keeps their late answers from removing newer dialogs.
+		// Only abort may settle reset dialogs; a new list keeps late answers from removing newer dialogs.
 		this.openDialogs = [];
 		this.reportProgramStatus();
 		for (const removeOverlay of [...this.extensionOverlays.values()].reverse()) removeOverlay();
@@ -4386,10 +4386,17 @@ export class InteractiveMode {
 
 	private showQuestionnaire(form: QuestionnaireForm, signal?: AbortSignal): Promise<QuestionnaireOutcome> {
 		if (signal?.aborted) return Promise.resolve({ status: "cancelled", answers: {} });
-		return this.showExtensionCustom(
+		const shown = this.showExtensionCustom<QuestionnaireOutcome>(
 			(_tui, _theme, _kb, done) =>
 				new QuestionnaireComponent(form, done, { signal, getRows: () => this.ui.terminal.rows }),
 		);
+		if (!signal) return shown;
+		let onAbort: () => void = () => {};
+		const aborted = new Promise<QuestionnaireOutcome>((resolve) => {
+			onAbort = () => resolve({ status: "cancelled", answers: {} });
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+		return Promise.race([shown, aborted]).finally(() => signal.removeEventListener("abort", onAbort));
 	}
 
 	private createExtensionUIContext(): ExtensionUIContext {
@@ -4483,13 +4490,14 @@ export class InteractiveMode {
 				return;
 			}
 
-			const finish = (option: string | undefined) => {
-				if (!this.removeExtensionDialog(selector)) return;
+			const finish = (option: string | undefined, aborted = false) => {
+				const removed = this.removeExtensionDialog(selector);
+				if (!removed && !aborted) return;
 				opts?.signal?.removeEventListener("abort", onAbort);
-				selector.dispose();
+				if (removed) selector.dispose();
 				resolve(option);
 			};
-			const onAbort = () => finish(undefined);
+			const onAbort = () => finish(undefined, true);
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			const selector = new ExtensionSelectorComponent(
@@ -4532,13 +4540,14 @@ export class InteractiveMode {
 				return;
 			}
 
-			const finish = (value: string | undefined) => {
-				if (!this.removeExtensionDialog(input)) return;
+			const finish = (value: string | undefined, aborted = false) => {
+				const removed = this.removeExtensionDialog(input);
+				if (!removed && !aborted) return;
 				opts?.signal?.removeEventListener("abort", onAbort);
-				input.dispose();
+				if (removed) input.dispose();
 				resolve(value);
 			};
-			const onAbort = () => finish(undefined);
+			const onAbort = () => finish(undefined, true);
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			const input = new ExtensionInputComponent(
