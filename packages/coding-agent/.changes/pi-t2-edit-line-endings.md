@@ -1,0 +1,2 @@
+- Fixed edits changing untouched line endings and failing after a write when diffing large files.
+- Changed fuzzy edits to rewrite only matched lines, leaving characters and trailing spaces on untouched lines unchanged.
