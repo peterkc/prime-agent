@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync,
 	closeSync,
+	fchmodSync,
 	fsyncSync,
 	openSync,
 	readlinkSync,
@@ -44,6 +44,8 @@ export interface WriteFileAtomicOptions {
 	fsync?: boolean;
 	/** Best-effort directory fsync after the rename. */
 	fsyncDir?: boolean;
+	/** Runs on the written temp descriptor before it is closed (ownership, mode). */
+	beforeClose?: (descriptor: number) => void;
 	/** Runs on the written temp file before it replaces the destination (validation, ownership). */
 	beforeRename?: (tempPath: string) => void;
 }
@@ -63,11 +65,12 @@ export function writeFileAtomicSync(path: string, data: string, options: WriteFi
 				offset += written;
 			}
 			if (options.fsync) fsyncSync(descriptor);
+			// openSync's mode is masked by the umask; enforce the requested bits exactly.
+			if (options.mode !== undefined) fchmodSync(descriptor, options.mode);
+			options.beforeClose?.(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}
-		// openSync's mode is masked by the umask; enforce the requested bits exactly.
-		if (options.mode !== undefined) chmodSync(tempPath, options.mode);
 		options.beforeRename?.(tempPath);
 		renameOntoSync(tempPath, path);
 	} finally {

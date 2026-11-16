@@ -40,6 +40,7 @@ import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import { EventLog } from "../src/core/event-log.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
@@ -659,7 +660,7 @@ function makeDaemonFixture(tempDir: string) {
 		extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 			ReturnType<CreateAgentSessionRuntimeFactory>
 		>["extensionsResult"],
-		services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+		services: { cwd: options.cwd, agentDir: options.agentDir, authStorage: AuthStorage.inMemory() } as Awaited<
 			ReturnType<CreateAgentSessionRuntimeFactory>
 		>["services"],
 		diagnostics: [],

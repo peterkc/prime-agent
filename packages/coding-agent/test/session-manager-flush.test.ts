@@ -3,6 +3,8 @@ import {
 	chmodSync,
 	type chownSync,
 	existsSync,
+	type fchmodSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -20,7 +22,7 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type AppendFileSync = typeof appendFileSync;
-type ChmodSync = typeof chmodSync;
+type FchmodSync = typeof fchmodSync;
 type ChownSync = typeof chownSync;
 type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
@@ -29,8 +31,9 @@ type WriteSync = typeof writeSyncFs;
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
 	actualWriteSync: undefined as WriteSync | undefined,
+	actualFchmodSync: undefined as FchmodSync | undefined,
 	appendFileSync: vi.fn<AppendFileSync>(),
-	chmodSync: vi.fn<ChmodSync>(),
+	fchmodSync: vi.fn<FchmodSync>(),
 	chownSync: vi.fn<ChownSync>(),
 	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
@@ -40,8 +43,9 @@ vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
 	fsMocks.actualWriteSync = actual.writeSync;
+	fsMocks.actualFchmodSync = actual.fchmodSync;
 	fsMocks.appendFileSync.mockImplementation(actual.appendFileSync);
-	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
+	fsMocks.fchmodSync.mockImplementation(actual.fchmodSync);
 	fsMocks.chownSync.mockImplementation(actual.chownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
@@ -49,7 +53,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	return {
 		...actual,
 		appendFileSync: fsMocks.appendFileSync,
-		chmodSync: fsMocks.chmodSync,
+		fchmodSync: fsMocks.fchmodSync,
 		chownSync: fsMocks.chownSync,
 		renameSync: fsMocks.renameSync,
 		writeFileSync: fsMocks.writeFileSync,
@@ -138,7 +142,12 @@ describe("SessionManager.flushNow", () => {
 		const before = statSync(file);
 		fsMocks.chownSync.mockClear();
 		fsMocks.chownSync.mockImplementationOnce(() => undefined);
-		fsMocks.chmodSync.mockClear();
+		fsMocks.fchmodSync.mockClear();
+		let chmodInode: number | undefined;
+		fsMocks.fchmodSync.mockImplementationOnce((descriptor, mode) => {
+			chmodInode = fstatSync(descriptor).ino;
+			fsMocks.actualFchmodSync!(descriptor, mode);
+		});
 		fsMocks.renameSync.mockClear();
 
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
@@ -147,15 +156,16 @@ describe("SessionManager.flushNow", () => {
 		const tempPath = fsMocks.chownSync.mock.calls[0]?.[0];
 		expect(tempPath).toEqual(expect.any(String));
 		expect(fsMocks.chownSync).toHaveBeenCalledWith(tempPath, before.uid, before.gid);
-		expect(fsMocks.chmodSync).toHaveBeenCalledWith(tempPath, before.mode & 0o777);
+		expect(fsMocks.fchmodSync).toHaveBeenCalledWith(expect.any(Number), before.mode & 0o777);
 		expect(fsMocks.renameSync).toHaveBeenCalledWith(tempPath, join(dirname(tempPath as string), basename(file)));
 		expect(fsMocks.chownSync.mock.invocationCallOrder[0]!).toBeLessThan(
 			fsMocks.renameSync.mock.invocationCallOrder[0]!,
 		);
-		expect(fsMocks.chmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
+		expect(fsMocks.fchmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
 			fsMocks.renameSync.mock.invocationCallOrder[0]!,
 		);
 		const after = statSync(file);
+		expect(after.ino).toBe(chmodInode);
 		expect({ mode: after.mode & 0o777, uid: after.uid, gid: after.gid }).toEqual({
 			mode: before.mode & 0o777,
 			uid: before.uid,

@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../src/core/agent-session-config.js";
 import {
@@ -14,6 +15,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import { ModelRegistry } from "../../src/core/model-registry.js";
 import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { createAgentSession } from "../../src/core/sdk.js";
 import {
@@ -36,6 +38,10 @@ import type {
 import { createDefaultRuntimeFactory } from "../../src/main.js";
 import { assistantMsg, createTestResourceLoader, userMsg } from "../utilities.js";
 import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
+
+// These suites use faux providers, not the remote model or plugin catalogs.
+beforeEach(() => vi.stubEnv("PI_OFFLINE", "1"));
+afterEach(() => vi.unstubAllEnvs());
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -174,7 +180,11 @@ describe("AgentSessionRuntime characterization", () => {
 			dispose: disposeSession,
 			disposeAsync: disposeSession,
 		} as unknown as AgentSession;
-		const services = { cwd: "/tmp", agentDir: "/tmp" } as unknown as AgentSessionServices;
+		const services = {
+			cwd: "/tmp",
+			agentDir: "/tmp",
+			authStorage: AuthStorage.inMemory(),
+		} as unknown as AgentSessionServices;
 		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
 			throw new Error("unexpected runtime creation");
 		};
@@ -249,6 +259,95 @@ describe("AgentSessionRuntime characterization", () => {
 
 			expect(runtime.session.sessionManager.getHeader()?.rlmDepth).toBe(2);
 			expect(runtime.session.rlmDepth).toBe(2);
+		},
+	);
+
+	it.each(["rotated", "refresh failure", "dispose failure"])(
+		"disposal waits for a held OAuth refresh: %s (pi #11692)",
+		async (outcome) => {
+			const harness = await createHarness();
+			cleanups.push(() => harness.cleanup());
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(() => {
+					throw new Error("Network forbidden in OAuth disposal tests");
+				}),
+			);
+			cleanups.push(() => {
+				vi.unstubAllGlobals();
+			});
+			const authPath = join(harness.tempDir, "auth.json");
+			const authStorage = AuthStorage.create(authPath);
+			const providerId = "runtime-drain-oauth";
+			authStorage.set(providerId, { type: "oauth", access: "old", refresh: "old-refresh", expires: 0 });
+			const services = await createAgentSessionServices({
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				authStorage,
+				modelRegistry: ModelRegistry.inMemory(authStorage),
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			const unusedFactory: CreateAgentSessionRuntimeFactory = async () => {
+				throw new Error("unused replacement");
+			};
+			const runtime = new AgentSessionRuntime(harness.session, services, unusedFactory);
+			let markStarted!: () => void;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			let respond!: () => void;
+			const response = new Promise<void>((resolve) => {
+				respond = resolve;
+			});
+			const rotated = { access: "rotated", refresh: "rotated-refresh", expires: Date.now() + 60_000 };
+			registerOAuthProvider({
+				id: providerId,
+				name: "Runtime Drain OAuth",
+				login: async () => rotated,
+				refreshToken: async () => {
+					markStarted();
+					await response;
+					if (outcome === "refresh failure") throw new Error("invalid_grant");
+					return rotated;
+				},
+				getApiKey: (credential) => credential.access,
+			});
+			cleanups.push(() => unregisterOAuthProvider(providerId));
+			const disposeError = new Error("invalidate failed");
+			if (outcome === "dispose failure")
+				runtime.setBeforeSessionInvalidate(() => {
+					throw disposeError;
+				});
+			const lookup = authStorage.getApiKeyWithSourceToken(providerId);
+			await started;
+			let disposed = false;
+			const disposing = runtime.dispose();
+			void disposing.then(
+				() => {
+					disposed = true;
+				},
+				() => {
+					disposed = true;
+				},
+			);
+			try {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(disposed).toBe(false);
+			} finally {
+				respond();
+				await Promise.allSettled([lookup, disposing]);
+			}
+			if (outcome === "dispose failure") await expect(disposing).rejects.toBe(disposeError);
+			else await expect(disposing).resolves.toBeUndefined();
+			if (outcome === "refresh failure") {
+				await expect(lookup).resolves.toEqual({});
+				expect(authStorage.drainErrors()).toEqual([new Error(`Failed to refresh OAuth token for ${providerId}`)]);
+			} else {
+				await expect(lookup).resolves.toMatchObject({ apiKey: "rotated" });
+				expect(AuthStorage.create(authPath).get(providerId)).toEqual({ type: "oauth", ...rotated });
+				expect(authStorage.drainErrors()).toEqual([]);
+			}
+			expect(fetch).not.toHaveBeenCalled();
 		},
 	);
 
