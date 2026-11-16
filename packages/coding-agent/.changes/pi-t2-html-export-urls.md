@@ -1,0 +1,1 @@
+- Fixed unsafe Markdown links and images in HTML session exports, including control-character schemes and quoted URL attributes.
