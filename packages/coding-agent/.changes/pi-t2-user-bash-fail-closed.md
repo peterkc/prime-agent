@@ -1,1 +1,1 @@
-- Fixed `user_bash` handlers so errors and invalid results stop the command instead of falling back to local execution.
+- Changed `user_bash` to fail closed: a handler error or any defined result other than one valid `{ operations }` or `{ result }` stops the command instead of running it locally. Return `undefined` to pass.

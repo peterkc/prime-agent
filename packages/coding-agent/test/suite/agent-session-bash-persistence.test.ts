@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UserBashEventResult } from "../../src/core/extensions/types.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
@@ -17,6 +17,7 @@ describe("AgentSession bash and persistence characterization", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -340,20 +341,25 @@ describe("AgentSession bash and persistence characterization", () => {
 		const sentinel = join(harness.tempDir, "local-command-ran");
 		const errors: string[] = [];
 		harness.session.extensionRunner.onError((failure) => errors.push(failure.error));
-		let failure: unknown;
-		try {
-			await harness.session.runUserBash(`printf ran > '${sentinel}'`);
-		} catch (caught) {
-			failure = caught;
-		}
+		const executeBash = vi.spyOn(harness.session, "executeBash");
+		await harness.session.runUserBash(`printf ran > '${sentinel}'`, { runId: "failed-user-bash" });
 
+		expect(executeBash).not.toHaveBeenCalled();
 		expect(existsSync(sentinel)).toBe(false);
 		expect(laterCalls).toBe(0);
 		expect(harness.session.isBashRunning).toBe(false);
 		expect(harness.eventsOfType("bash_start")).toEqual([]);
 		expect(harness.session.messages.filter((message) => message.role === "bashExecution")).toEqual([]);
-		expect(failure).toBeInstanceOf(Error);
-		expect(String(failure)).toContain(error);
+		expect(harness.eventsOfType("bash_end")).toEqual([
+			{
+				type: "bash_end",
+				exitCode: undefined,
+				cancelled: false,
+				truncated: false,
+				errorMessage: expect.stringContaining(error),
+				runId: "failed-user-bash",
+			},
+		]);
 		expect(errors).toEqual([expect.stringContaining(error)]);
 		await harness.session.runUserBash("recover");
 		expect(harness.session.messages.at(-1)).toMatchObject({
@@ -361,6 +367,65 @@ describe("AgentSession bash and persistence characterization", () => {
 			command: "recover",
 			output: "recovered",
 		});
+	});
+
+	it("drains a prompt queued during failing user_bash dispatch (pi #9068)", async () => {
+		let enterDispatch: (() => void) | undefined;
+		let releaseDispatch: (() => void) | undefined;
+		const entered = new Promise<void>((resolve) => {
+			enterDispatch = resolve;
+		});
+		const release = new Promise<void>((resolve) => {
+			releaseDispatch = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) =>
+					pi.on("user_bash", async () => {
+						enterDispatch?.();
+						await release;
+						throw new Error("Routing failed");
+					}),
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("after rejection")]);
+		const prompt =
+			"Agent-to-agent message received.\nSource: agent_message\nMessage id: agentmsg_failed_bash\n\nqueued after rejection";
+		const bashRun = Promise.allSettled([
+			harness.session.runUserBash("blocked", { transient: true, runId: "failed-dispatch" }),
+		]);
+		try {
+			await entered;
+			await harness.session.queueAgentMessagePrompt(prompt, "followUp");
+			await harness.session.waitForSessionInputIdle();
+			expect(harness.session.isBashRunning).toBe(true);
+			expect(harness.session.queuedActionCount).toBe(1);
+
+			releaseDispatch?.();
+			await bashRun;
+			await harness.session.waitForSessionInputIdle();
+
+			expect(harness.session.queuedActionCount).toBe(0);
+			expect(harness.session.messages.filter((message) => message.role === "user").map(getMessageText)).toContain(
+				prompt,
+			);
+			expect(getMessageText(harness.session.messages.at(-1))).toBe("after rejection");
+			expect(harness.eventsOfType("bash_end")).toEqual([
+				{
+					type: "bash_end",
+					exitCode: undefined,
+					cancelled: false,
+					truncated: false,
+					errorMessage: "Routing failed",
+					transient: true,
+					runId: "failed-dispatch",
+				},
+			]);
+		} finally {
+			releaseDispatch?.();
+			await bashRun;
+		}
 	});
 
 	it.each(["undefined", "operations", "result"] as const)(
