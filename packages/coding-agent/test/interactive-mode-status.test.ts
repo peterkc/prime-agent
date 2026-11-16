@@ -1659,6 +1659,33 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.focused).toBe(true);
 	});
 
+	test("pi 91a2f8660 C2 Enter after reset and internal overlay close leaves the reset overlay pending", async () => {
+		const context = createDialogContext();
+		const overlay = new TestComponent("RESET");
+		const settled = vi.fn();
+		void context
+			.showExtensionCustom<string>(
+				(_ui, _theme, _kb, done) => {
+					overlay.handleInput = (data) => {
+						overlay.inputs.push(data);
+						done("unexpected key");
+					};
+					return overlay;
+				},
+				{ overlay: true },
+			)
+			.then(settled);
+		await Promise.resolve();
+		const internal = context.ui.showOverlay(new TestComponent("INTERNAL"));
+		context.resetExtensionUI();
+		internal.hide();
+		context.terminal.sendInput("\r");
+		await Promise.resolve();
+		expect(context.editor.inputs).toEqual(["\r"]);
+		expect(overlay.inputs).toEqual([]);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
 	test("pi 80d4d3c86 reset restores editor focus after two extension overlays", async () => {
 		const context = createDialogContext();
 		for (const title of ["LOWER", "UPPER"]) {
@@ -1701,6 +1728,8 @@ describe("InteractiveMode extension dialog ownership", () => {
 		closeUpper("two");
 		await expect(second).resolves.toBe("two");
 		expect(context.ui.hasOverlay()).toBe(false);
+		context.terminal.sendInput("editor key");
+		expect(context.editor.inputs).toEqual(["editor key"]);
 	});
 
 	test("pi #11166 restores First after Second confirms false, then restores the editor after First confirms true", async () => {
@@ -1959,6 +1988,23 @@ describe("InteractiveMode extension dialog ownership", () => {
 		);
 	});
 
+	test("pi #11166 Enter on a reset editor leaves its answer pending and the current dialog unchanged", async () => {
+		const context = createDialogContext();
+		const settled = vi.fn();
+		void context.showExtensionEditor("Editor", "stale prefill").then(settled);
+		const editor = visible(context);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		editor.handleInput!("\r");
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
 	test("pi #11166 keys and timeout after reset leave old answers unsettled", async () => {
 		const context = createDialogContext();
 		const settled = vi.fn();
@@ -2013,19 +2059,41 @@ describe("InteractiveMode extension dialog ownership", () => {
 		await expect(confirm).resolves.toBe(true);
 	});
 
-	test("pi #9909 ignores a factory rejection after reset without restoring stale editor text", async () => {
+	test("pi #9909 rejects a factory after reset without changing editor text or the current dialog stack", async () => {
 		const context = createDialogContext();
 		const factory = createDeferred<Component>();
-		const settled = vi.fn();
-		void context.showExtensionCustom(() => factory.promise).then(settled, settled);
+		const failed = context.showExtensionCustom(() => factory.promise);
 		context.resetExtensionUI();
 		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
 		const error = new Error("late factory failure");
 		factory.reject(error);
-		await expect(factory.promise).rejects.toBe(error);
+		await expect(failed).rejects.toBe(error);
 		expect(context.editor.getText()).toBe("new draft");
+		expect(visible(context)).toBe(newest);
+		expect(context.extensionDialogs).toEqual([newest]);
+		expect(context.openDialogs.map((dialog) => dialog.title)).toEqual(["New\nnew dialog"]);
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+	});
+
+	test("pi #9909 disposes a component that resolves after done without mounting it", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const component = new TestComponent("LATE");
+		let done!: (value: string) => void;
+		const answer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return factory.promise;
+		});
+		done("early");
+		await expect(answer).resolves.toBe("early");
+		factory.resolve(component);
+		await factory.promise;
+		expect(component.dispose).toHaveBeenCalledOnce();
 		expect(visible(context)).toBe(context.editor);
-		expect(settled).not.toHaveBeenCalled();
+		expect(context.editor.getText()).toBe("draft");
 	});
 
 	test("pi #9909 custom done from its abort listener settles after reset without changing the current UI", async () => {

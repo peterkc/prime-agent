@@ -4822,10 +4822,8 @@ export class InteractiveMode {
 
 			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
 				.then((c) => {
-					if (closed) return;
 					component = c;
-					if (dialogs !== this.extensionDialogs) {
-						closed = true;
+					if (closed || dialogs !== this.extensionDialogs) {
 						disposeComponent();
 						return;
 					}
@@ -4852,7 +4850,11 @@ export class InteractiveMode {
 					}
 				})
 				.catch((err) => {
-					if (closed || dialogs !== this.extensionDialogs) return;
+					if (dialogs !== this.extensionDialogs) {
+						reject(err);
+						return;
+					}
+					if (closed) return;
 					if (!isOverlay) {
 						if (component) this.removeExtensionDialog(component);
 						this.editor.setText(savedText);

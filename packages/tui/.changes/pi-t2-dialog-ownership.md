@@ -1,0 +1,1 @@
+- Fixed keyboard focus returning to a closed overlay when stacked overlays close out of order.
