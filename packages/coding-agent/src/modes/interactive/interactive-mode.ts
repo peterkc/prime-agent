@@ -6440,6 +6440,10 @@ export class InteractiveMode {
 				} else if (event.errorMessage && !event.transient) {
 					// Transient failures surface in the owning client's pane, not here.
 					this.showError(`Bash command failed: ${event.errorMessage}`);
+				} else if (this.sideQuestionBash !== undefined && event.runId === this.sideQuestionBash.runId) {
+					// Dispatch can fail before bash_start mounts the pane component.
+					this.finishSideQuestionBash(event, "");
+					if (event.errorMessage) this.showError(`Bash command failed: ${event.errorMessage}`);
 				}
 				// Seed the side transcript only when our own pane-mounted run ended.
 				if (component !== undefined && component === this.sideQuestionBashComponent) {
