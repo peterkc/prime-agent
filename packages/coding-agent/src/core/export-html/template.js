@@ -541,7 +541,19 @@
       function escapeHtml(text) {
         const div = document.createElement('div');
         div.textContent = text;
-        return div.innerHTML;
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      }
+
+      function sanitizeMarkdownUrl(value) {
+        const href = String(value || '').trim().replace(/[\x00-\x1f\x7f]/g, '');
+        if (!href) return href;
+
+        const scheme = href.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
+        if (scheme && !/^(https?|mailto|tel|ftp)$/i.test(scheme[1])) {
+          return null;
+        }
+
+        return href;
       }
 
       /**
@@ -1427,8 +1439,8 @@
         },
         renderer: {
           link(token) {
-            const href = (token.href || '').trim();
-            if (/^\s*(javascript|vbscript|data):/i.test(href)) {
+            const href = sanitizeMarkdownUrl(token.href);
+            if (href === null) {
               return this.parser.parseInline(token.tokens);
             }
             let out = '<a href="' + escapeHtml(href) + '"';
@@ -1439,8 +1451,8 @@
             return out;
           },
           image(token) {
-            const href = (token.href || '').trim();
-            if (/^\s*(javascript|vbscript|data):/i.test(href)) {
+            const href = sanitizeMarkdownUrl(token.href);
+            if (href === null) {
               return escapeHtml(token.text || '');
             }
             let out = '<img src="' + escapeHtml(href) + '" alt="' + escapeHtml(token.text || '') + '"';
