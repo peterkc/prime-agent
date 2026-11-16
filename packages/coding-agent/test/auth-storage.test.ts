@@ -4,9 +4,11 @@ import {
 	lstatSync,
 	mkdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -894,6 +896,37 @@ describe("AuthStorage", () => {
 			await backend.withLockAsync(async () => ({ result: undefined, next: '{"async":true}' }));
 			expect(readFileSync(authJsonPath, "utf8")).toBe('{"async":true}');
 			expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+		});
+
+		test("a sync save refuses a refresh lock that is 10 to 30 seconds old", async () => {
+			writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+			const backend = new FileAuthStorageBackend(authJsonPath);
+			let lockHeld!: () => void;
+			const held = new Promise<void>((resolve) => {
+				lockHeld = resolve;
+			});
+			let finishRefresh!: () => void;
+			const refreshDone = new Promise<void>((resolve) => {
+				finishRefresh = resolve;
+			});
+			const refresh = backend.withLockAsync(async () => {
+				lockHeld();
+				await refreshDone;
+				return { result: undefined, next: '{"refreshed":true}' };
+			});
+			await held;
+			// A refresh holder renews the lock only every 15 seconds; age it past the 10 second default.
+			const aged = new Date(Date.now() - 12_000);
+			utimesSync(`${realpathSync(authJsonPath)}.lock`, aged, aged);
+			const syncUpdate = vi.fn(() => ({ result: undefined, next: '{"sync":true}' }));
+			try {
+				expect(() => backend.withLock(syncUpdate)).toThrow(expect.objectContaining({ code: "ELOCKED" }));
+				expect(syncUpdate).not.toHaveBeenCalled();
+			} finally {
+				finishRefresh();
+			}
+			await refresh;
+			expect(readFileSync(authJsonPath, "utf8")).toBe('{"refreshed":true}');
 		});
 
 		test("completes a short initial write before loading and saving credentials", () => {

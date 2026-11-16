@@ -1,0 +1,1 @@
+- Fixed a save during a slow OAuth token refresh breaking the refresh's `auth.json` lock after 10 seconds, which could lose a rotated token.
