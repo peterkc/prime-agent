@@ -1,3 +1,4 @@
+import * as diffModule from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -9,6 +10,8 @@ import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { computeEditsDiff } from "../src/core/tools/edit-diff.js";
 import { createEditTool } from "../src/index.js";
 import * as shellModule from "../src/utils/shell.js";
+
+vi.mock("diff", { spy: true });
 
 const editTool = createEditTool(process.cwd());
 const bashTool = createBashTool(process.cwd());
@@ -89,7 +92,10 @@ describe("Coding Agent Tools", () => {
 					path: testFile,
 					edits: [{ oldText: "foo", newText: "bar" }],
 				}),
-			).rejects.toThrow(/Found 3 occurrences/);
+			).rejects.toThrow(
+				`Found 3 occurrences of the text in ${testFile}. The text must be unique. Please provide more context to make it unique.`,
+			);
+			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
 		});
 
 		it("should replace multiple disjoint regions in one call", async () => {
@@ -172,7 +178,10 @@ describe("Coding Agent Tools", () => {
 						{ oldText: "two\nthree\n", newText: "TWO\nTHREE\n" },
 					],
 				}),
-			).rejects.toThrow(/overlap/);
+			).rejects.toThrow(
+				`edits[0] and edits[1] overlap in ${testFile}. Merge them into one edit or target disjoint regions.`,
+			);
+			expect(readFileSync(testFile, "utf-8")).toBe("one\ntwo\nthree\n");
 		});
 
 		it("should not partially apply edits when one edit fails", async () => {
@@ -660,6 +669,16 @@ describe("edit tool fuzzy matching", () => {
 		).rejects.toThrow(/Found 2 occurrences/);
 	});
 
+	it("keeps untouched NFKC characters and trailing spaces during a fuzzy edit (pi #8544)", async () => {
+		const testFile = join(testDir, "fuzzy-untouched.txt");
+		writeFileSync(testFile, "ﬃ  \r\nfoo   \r\nb\n");
+		await editTool.execute("test-fuzzy-untouched", {
+			path: testFile,
+			edits: [{ oldText: "foo\n", newText: "FOO\n" }],
+		});
+		expect(readFileSync(testFile)).toEqual(Buffer.from("ﬃ  \r\nFOO\r\nb\n"));
+	});
+
 	it("should support fuzzy matching in multi-edit mode", async () => {
 		const testFile = join(testDir, "fuzzy-multi.txt");
 		writeFileSync(testFile, "console.log(\u2018hello\u2019);\nhello\u00A0world\n");
@@ -767,6 +786,105 @@ describe("edit tool CRLF handling", () => {
 
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("\uFEFFfirst\r\nSECOND\r\nthird\r\nFOURTH\r\n");
+	});
+
+	it.each([
+		{
+			name: "mixed endings with LF first",
+			original: "a\nb\r\nX = 1\r\n",
+			edits: [{ oldText: "X = 1", newText: "X = 2" }],
+			expected: "a\nb\r\nX = 2\r\n",
+		},
+		{
+			name: "mixed endings with CRLF first and an unterminated last line",
+			original: "a\r\nb\nc",
+			edits: [{ oldText: "c", newText: "C\nD" }],
+			expected: "a\r\nb\nC\nD",
+		},
+		{
+			name: "an unterminated whitespace-only line after a fuzzy match",
+			original: "a   \r\n   ",
+			edits: [{ oldText: "a\n", newText: "A\n" }],
+			expected: "A\r\n   ",
+		},
+		{
+			name: "an untouched lone CR",
+			original: "a\rb\nX = 1\n",
+			edits: [{ oldText: "X = 1", newText: "X = 2" }],
+			expected: "a\rb\nX = 2\n",
+		},
+		{
+			name: "inserted lines in a CR-only file",
+			original: "a\rb\rc",
+			edits: [{ oldText: "b", newText: "B\nmore" }],
+			expected: "a\rB\rmore\rc",
+		},
+		{
+			name: "each replacement's own line ending with reversed input order",
+			original: "lf1\nlf2\ncr1\r\ncr2\r\n",
+			edits: [
+				{ oldText: "cr1\n", newText: "C\nD\n" },
+				{ oldText: "lf1\n", newText: "A\nB\n" },
+			],
+			expected: "A\nB\nlf2\nC\r\nD\r\ncr2\r\n",
+		},
+		{
+			name: "separate line breaks when an insertion follows a kept CR",
+			original: "a\rb\nc",
+			edits: [{ oldText: "b", newText: "\nB" }],
+			expected: "a\r\n\nB\nc",
+		},
+		{
+			name: "separate line breaks when deleting between a CR and LF",
+			original: "a\rb\nc",
+			edits: [{ oldText: "b", newText: "" }],
+			expected: "a\r\n\nc",
+		},
+	])("keeps $name (pi #8544)", async ({ original, edits, expected }) => {
+		const testFile = join(testDir, "endings.txt");
+		writeFileSync(testFile, original);
+
+		await editTool.execute("test-line-endings", { path: testFile, edits });
+
+		expect(readFileSync(testFile)).toEqual(Buffer.from(expected));
+	});
+
+	it("leaves the file unchanged when diff computation fails (pi #8544)", async () => {
+		const testFile = join(testDir, "diff-failure.txt");
+		const original = "a\nb\n";
+		writeFileSync(testFile, original);
+		const diff = vi.spyOn(diffModule, "diffLines").mockImplementationOnce(() => {
+			throw new Error("diff failed");
+		});
+		try {
+			await expect(
+				editTool.execute("test-diff-failure", { path: testFile, edits: [{ oldText: "b", newText: "B" }] }),
+			).rejects.toThrow("diff failed");
+			expect(readFileSync(testFile)).toEqual(Buffer.from(original));
+		} finally {
+			diff.mockRestore();
+		}
+	});
+});
+describe("edit tool no-change refusal", () => {
+	it("refuses an identical replacement without changing bytes (pi #8544)", async () => {
+		const original = "a\nb\r\n";
+		let written = original;
+		const tool = createEditTool(process.cwd(), {
+			operations: {
+				access: async () => {},
+				readFile: async () => Buffer.from(original),
+				writeFile: async (_path, text) => {
+					written = text;
+				},
+			},
+		});
+		await expect(
+			tool.execute("no-change", { path: "f.txt", edits: [{ oldText: "b", newText: "b" }] }),
+		).rejects.toThrow(
+			"No changes made to f.txt. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.",
+		);
+		expect(written).toBe(original);
 	});
 });
 describe("edit tool prepareArguments", () => {

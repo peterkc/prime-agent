@@ -1,0 +1,2 @@
+- Fixed edits changing untouched line endings and failing after a write when diffing large files ([pi #8544](https://github.com/earendil-works/pi/issues/8544)).
+- Changed fuzzy edits to rewrite only matched lines, leaving characters and trailing spaces on untouched lines unchanged. A fuzzy edit that changes only those characters on the matched lines is now written instead of refused as no change.

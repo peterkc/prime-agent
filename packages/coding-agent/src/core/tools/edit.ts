@@ -8,14 +8,13 @@ import { countChangedLines, formatFileChangeSummaryLine } from "../../modes/inte
 import type { ToolDefinition } from "../extensions/types.js";
 import {
 	applyEditsToNormalizedContent,
+	applyReplacementsToOriginal,
 	computeEditsDiff,
-	detectLineEnding,
 	type Edit,
 	type EditDiffError,
 	type EditDiffResult,
-	generateDiffString,
+	generateEditDiff,
 	normalizeToLF,
-	restoreLineEndings,
 	stripBom,
 } from "./edit-diff.js";
 import { withFileMutationQueue } from "./file-mutation-queue.js";
@@ -395,9 +394,8 @@ export function createEditToolDefinition(
 
 								// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 								const { bom, text: content } = stripBom(rawContent);
-								const originalEnding = detectLineEnding(content);
 								const normalizedContent = normalizeToLF(content);
-								const { baseContent, newContent } = applyEditsToNormalizedContent(
+								const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
 									normalizedContent,
 									edits,
 									path,
@@ -407,7 +405,13 @@ export function createEditToolDefinition(
 									return;
 								}
 
-								const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+								// A diff failure must leave the file unchanged.
+								const diffResult = generateEditDiff(baseContent, newContent, replacements);
+								const finalContent =
+									bom +
+									(content === normalizedContent
+										? newContent
+										: applyReplacementsToOriginal(content, replacements));
 								await ops.writeFile(absolutePath, finalContent);
 
 								if (aborted) {
@@ -418,7 +422,6 @@ export function createEditToolDefinition(
 									signal.removeEventListener("abort", onAbort);
 								}
 
-								const diffResult = generateDiffString(baseContent, newContent);
 								resolve({
 									content: [
 										{
