@@ -4176,7 +4176,13 @@ export class InteractiveMode {
 		this.closeHeartbeatManager();
 		const dialogs = this.extensionDialogs;
 		this.extensionDialogs = [];
-		for (const component of dialogs) component.dispose?.();
+		for (const component of dialogs) {
+			try {
+				component.dispose?.();
+			} catch {
+				/* ignore dispose errors */
+			}
+		}
 		if (dialogs.length > 0) this.showTopExtensionDialog();
 		// Hidden dialogs never settle; a new list keeps their late answers from removing newer dialogs.
 		this.openDialogs = [];
@@ -4781,7 +4787,6 @@ export class InteractiveMode {
 
 			const removeOverlay = () => {
 				if (!overlayHandle || !this.extensionOverlays.delete(overlayHandle)) return;
-				closed = true;
 				overlayHandle.hide();
 				disposeComponent();
 			};

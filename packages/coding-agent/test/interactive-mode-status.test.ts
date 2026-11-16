@@ -1655,6 +1655,17 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.focused).toBe(true);
 	});
 
+	test("pi 80d4d3c86 reset restores editor focus after two extension overlays", async () => {
+		const context = createDialogContext();
+		for (const title of ["LOWER", "UPPER"]) {
+			void context.showExtensionCustom(() => new TestComponent(title), { overlay: true });
+		}
+		await Promise.resolve();
+		context.resetExtensionUI();
+		expect(context.ui.hasOverlay()).toBe(false);
+		expect(context.editor.focused).toBe(true);
+	});
+
 	test("pi 80d4d3c86 done removes its own overlay when a newer overlay covers it", async () => {
 		const context = createDialogContext();
 		const lower = new TestComponent("LOWER");
@@ -1849,6 +1860,25 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(visible(context)).toBe(context.editor);
 	});
 
+	test("pi #11166 reset continues after a throwing dispose and removes extension overlays", async () => {
+		const context = createDialogContext();
+		const broken = new TestComponent("BROKEN");
+		broken.dispose.mockImplementation(() => {
+			throw new Error("dispose failed");
+		});
+		const next = new TestComponent("NEXT");
+		const overlay = new TestComponent("OVERLAY");
+		void context.showExtensionCustom(() => broken);
+		void context.showExtensionCustom(() => next);
+		void context.showExtensionCustom(() => overlay, { overlay: true });
+		await Promise.resolve();
+		context.resetExtensionUI();
+		expect(visible(context)).toBe(context.editor);
+		expect(context.ui.hasOverlay()).toBe(false);
+		expect(context.openDialogs).toEqual([]);
+		for (const component of [broken, next, overlay]) expect(component.dispose).toHaveBeenCalledOnce();
+	});
+
 	test("pi #9909 rejects a failed custom factory without closing the dialog below", async () => {
 		const context = createDialogContext();
 		const confirm = context.showExtensionConfirm("Confirm", "keep this dialog");
@@ -1863,6 +1893,45 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.getText()).toBe("draft");
 		context.terminal.sendInput("\r");
 		await expect(confirm).resolves.toBe(true);
+	});
+
+	test("pi #9909 ignores a factory rejection after reset without restoring stale editor text", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const settled = vi.fn();
+		void context.showExtensionCustom(() => factory.promise).then(settled, settled);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const error = new Error("late factory failure");
+		factory.reject(error);
+		await expect(factory.promise).rejects.toBe(error);
+		expect(context.editor.getText()).toBe("new draft");
+		expect(visible(context)).toBe(context.editor);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	test("pi #9909 ignores done after reset before its pending factory resolves", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const component = new TestComponent("STALE");
+		const settled = vi.fn();
+		let done!: (value: string) => void;
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+				done = finish;
+				return factory.promise;
+			})
+			.then(settled);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		done("late");
+		factory.resolve(component);
+		await factory.promise;
+		await Promise.resolve();
+		expect(context.editor.getText()).toBe("new draft");
+		expect(visible(context)).toBe(context.editor);
+		expect(component.dispose).toHaveBeenCalledOnce();
+		expect(settled).not.toHaveBeenCalled();
 	});
 
 	test("pi #9909 ignores an inline factory that completes after reset", async () => {
