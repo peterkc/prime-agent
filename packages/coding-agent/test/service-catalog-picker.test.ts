@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Component, Container, Input, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { McpConnectionStore } from "../src/core/mcp/connection-store.js";
 import type { McpPluginView, McpServiceDescriptor } from "../src/core/mcp/service-catalog.js";
@@ -1438,6 +1439,42 @@ describe("ENG-6108 service catalog picker chain", () => {
 		legacyBuiltin: false,
 		provenance: [{ source: "user" }],
 	};
+
+	it("failed paste save stops before verification and outcome (pi #6223)", async () => {
+		const f = await localCatalogFixture([pasteEntry]);
+		const authPath = join(f.harness.tempDir, "auth.json");
+		const backend = new FileAuthStorageBackend(authPath);
+		const authStorage = AuthStorage.fromStorage(backend);
+		Object.assign(f.harness.session.modelRegistry, { authStorage });
+		const withLock = backend.withLock.bind(backend);
+		const saveFault = vi.spyOn(backend, "withLock").mockImplementation((fn) =>
+			withLock((current) => {
+				const change = fn(current);
+				if (change.next !== undefined) throw new Error("save refused");
+				return change;
+			}),
+		);
+		const done = f.mode.showServiceCatalogPicker("paste-svc");
+		f.picker().handleInput("\r");
+		const panel = await nextPastePanel(f);
+		// Close any erroneous re-entry too, so a broken save cannot leave the test waiting.
+		f.setFocus.mockImplementation((component: Component) => {
+			if (component instanceof ServiceCatalogPickerComponent) component.handleInput("\x1b");
+		});
+		for (const character of "synthetic-pasted-token") panel.handleInput(character);
+		panel.handleInput("\r");
+		try {
+			await done;
+		} finally {
+			saveFault.mockRestore();
+		}
+		expect(f.showError).toHaveBeenCalledWith("MCP connection action did not complete. Try again.");
+		expect(authStorage.has("mcp:paste-svc")).toBe(false);
+		expect(readFileSync(authPath, "utf8")).toBe("{}");
+		expect(f.appendOutcome).not.toHaveBeenCalled();
+		expect(f.store.records()).toEqual([]);
+		expectNoMcpNetwork();
+	});
 
 	it("ENG-6108: a submitted paste token re-enters the accounts menu with the new account", async () => {
 		const f = await localCatalogFixture([pasteEntry]);

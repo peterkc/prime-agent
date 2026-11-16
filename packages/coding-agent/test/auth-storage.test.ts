@@ -1,14 +1,28 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import { createHarness, type Harness, type HarnessOptions } from "./suite/harness.js";
+
+// These suites use faux providers, not the remote model or plugin catalogs.
+beforeEach(() => vi.stubEnv("PI_OFFLINE", "1"));
+afterEach(() => vi.unstubAllEnvs());
 
 const initialWriteFault = vi.hoisted(() => ({ count: -1 }));
 const renameFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
@@ -482,6 +496,58 @@ describe("AuthStorage", () => {
 	});
 
 	describe("oauth lock compromise handling", () => {
+		test.each([false, true])("drains a held OAuth refresh, including failure=%s (pi #11692)", async (fails) => {
+			const providerId = "drain-oauth";
+			let markStarted!: () => void;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			let respond!: () => void;
+			const response = new Promise<void>((resolve) => {
+				respond = resolve;
+			});
+			const rotated = { access: "rotated", refresh: "rotated-refresh", expires: Date.now() + 60_000 };
+			registerOAuthProvider({
+				id: providerId,
+				name: "Drain OAuth",
+				login: async () => rotated,
+				refreshToken: async () => {
+					markStarted();
+					await response;
+					if (fails) throw new Error("invalid_grant");
+					return rotated;
+				},
+				getApiKey: (credential) => credential.access,
+			});
+			writeAuthJson({ [providerId]: { type: "oauth", access: "old", refresh: "old-refresh", expires: 0 } });
+			authStorage = AuthStorage.create(authJsonPath);
+			const lookup = authStorage.getApiKey(providerId);
+			let settling: Promise<void> | undefined;
+			let settled = false;
+			try {
+				await started;
+				settling = authStorage.settleOAuthRefreshes().then(() => {
+					settled = true;
+				});
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(settled).toBe(false);
+			} finally {
+				respond();
+				await lookup;
+				await settling;
+				unregisterOAuthProvider(providerId);
+			}
+			await expect(lookup).resolves.toBe(fails ? undefined : "rotated");
+			if (fails) {
+				expect(authStorage.drainErrors()).toEqual([new Error(`Failed to refresh OAuth token for ${providerId}`)]);
+				expect(AuthStorage.create(authJsonPath).get(providerId)).toMatchObject({ refresh: "old-refresh" });
+			} else {
+				expect(AuthStorage.create(authJsonPath).get(providerId)).toEqual({ type: "oauth", ...rotated });
+			}
+			await authStorage.settleOAuthRefreshes();
+			expect(authStorage.drainErrors()).toEqual([]);
+		});
+
 		test("returns undefined on compromised lock and allows a later retry", async () => {
 			const providerId = `test-oauth-provider-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 			registerOAuthProvider({
@@ -531,6 +597,128 @@ describe("AuthStorage", () => {
 	});
 
 	describe("persistence semantics", () => {
+		test.each(["malformed", "locked"])(
+			"failed %s saves keep credentials and listeners unchanged (pi #6223)",
+			async (failure) => {
+				const providerId = "save-oauth";
+				registerOAuthProvider({
+					id: providerId,
+					name: "Save OAuth",
+					login: async () => ({ access: "new-access", refresh: "new-refresh", expires: Date.now() + 60_000 }),
+					refreshToken: async () => {
+						throw new Error("unused refresh");
+					},
+					getApiKey: (credential) => credential.access,
+				});
+				writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+				authStorage = AuthStorage.create(authJsonPath);
+				expect(authStorage.markAuthStale("anthropic")).toBe(true);
+				const changed = vi.fn();
+				const unsubscribe = authStorage.onChange(changed);
+				const release = failure === "locked" ? lockfile.lockSync(authJsonPath) : undefined;
+				if (failure === "malformed") {
+					writeFileSync(authJsonPath, "{invalid-json");
+					authStorage.reload();
+				}
+				const before = readFileSync(authJsonPath, "utf8");
+				const expectedError =
+					failure === "malformed"
+						? "Cannot update auth storage because it could not be loaded"
+						: expect.objectContaining({ code: "ELOCKED" });
+				try {
+					expect(() => authStorage.set("openai", { type: "api_key", key: "new-key" })).toThrow(expectedError);
+					expect(() => authStorage.remove("anthropic")).toThrow(expectedError);
+					await expect(authStorage.login(providerId, { onAuth() {}, onPrompt: async () => "" })).rejects.toThrow(
+						expectedError,
+					);
+					expect(readFileSync(authJsonPath, "utf8")).toBe(before);
+					expect(authStorage.has("openai")).toBe(false);
+					expect(authStorage.has(providerId)).toBe(false);
+					expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "stored" });
+					expect(authStorage.getAuthStatus("anthropic").source).toBe("stale");
+					expect(changed).not.toHaveBeenCalled();
+				} finally {
+					release?.();
+					unsubscribe();
+					unregisterOAuthProvider(providerId);
+				}
+				if (failure === "malformed") writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+				const stop = authStorage.onChange(changed);
+				try {
+					authStorage.set("openai", { type: "api_key", key: "saved-key" });
+					expect(AuthStorage.create(authJsonPath).get("openai")).toEqual({ type: "api_key", key: "saved-key" });
+					expect(authStorage.has("openai")).toBe(true);
+					expect(changed).toHaveBeenCalledOnce();
+				} finally {
+					stop();
+				}
+			},
+		);
+
+		test("sync writes keep managed mode 0660 (pi #7779)", () => {
+			const mode = 0o660;
+			writeAuthJson({});
+			chmodSync(authJsonPath, mode);
+			authStorage = AuthStorage.create(authJsonPath);
+			authStorage.set("openai", { type: "api_key", key: "new-key" });
+			expect(statSync(authJsonPath).mode & 0o777).toBe(mode);
+			expect(AuthStorage.create(authJsonPath).get("openai")).toEqual({ type: "api_key", key: "new-key" });
+		});
+
+		test.each([0o660, 0o600])("OAuth refresh writes keep mode %s (pi #7779)", async (mode) => {
+			const providerId = "mode-oauth";
+			const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
+			const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
+			registerOAuthProvider({
+				id: providerId,
+				name: "Mode OAuth",
+				login: async () => expired,
+				refreshToken: async () => rotated,
+				getApiKey: (credential) => credential.access,
+			});
+			try {
+				authStorage = AuthStorage.create(authJsonPath);
+				authStorage.set(providerId, expired);
+				if (mode === 0o660) chmodSync(authJsonPath, mode);
+				await expect(authStorage.getApiKey(providerId)).resolves.toBe("rotated");
+				expect(statSync(authJsonPath).mode & 0o777).toBe(mode);
+				expect(AuthStorage.create(authJsonPath).get(providerId)).toEqual(rotated);
+			} finally {
+				unregisterOAuthProvider(providerId);
+			}
+		});
+
+		test("symlink aliases share the real auth lock (pi #11655)", async () => {
+			writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+			const before = readFileSync(authJsonPath, "utf8");
+			const alias = join(tempDir, "alias.json");
+			symlinkSync(authJsonPath, alias);
+			const backend = new FileAuthStorageBackend(alias);
+			const syncUpdate = vi.fn(() => ({ result: undefined, next: "{}" }));
+			const asyncUpdate = vi.fn(async () => ({ result: undefined, next: "{}" }));
+			const release = await lockfile.lock(authJsonPath);
+			const realLock = lockfile.lock.bind(lockfile);
+			// Retry scheduling is unchanged; refuse contention immediately in this probe.
+			const lockSpy = vi
+				.spyOn(lockfile, "lock")
+				.mockImplementationOnce((path, options) => realLock(path, { ...options, retries: 0 }));
+			try {
+				expect(() => backend.withLock(syncUpdate)).toThrow(expect.objectContaining({ code: "ELOCKED" }));
+				await expect(backend.withLockAsync(asyncUpdate)).rejects.toMatchObject({ code: "ELOCKED" });
+				expect(syncUpdate).not.toHaveBeenCalled();
+				expect(asyncUpdate).not.toHaveBeenCalled();
+				expect(readFileSync(authJsonPath, "utf8")).toBe(before);
+			} finally {
+				lockSpy.mockRestore();
+				await release();
+			}
+			backend.withLock(() => ({ result: undefined, next: '{"sync":true}' }));
+			expect(readFileSync(authJsonPath, "utf8")).toBe('{"sync":true}');
+			await backend.withLockAsync(async () => ({ result: undefined, next: '{"async":true}' }));
+			expect(readFileSync(authJsonPath, "utf8")).toBe('{"async":true}');
+			expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+		});
+
 		test("completes a short initial write before loading and saving credentials", () => {
 			initialWriteFault.count = 1;
 			try {
@@ -638,7 +826,8 @@ describe("AuthStorage", () => {
 			renameFault.error = new Error("disk full");
 
 			try {
-				authStorage.set("anthropic", { type: "api_key", key: "new-key" });
+				expect(() => authStorage.set("anthropic", { type: "api_key", key: "new-key" })).toThrow("disk full");
+				expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "old-key" });
 			} finally {
 				renameFault.error = undefined;
 			}
@@ -683,7 +872,10 @@ describe("AuthStorage", () => {
 			writeFileSync(authJsonPath, "{invalid-json", "utf-8");
 
 			authStorage.reload();
-			authStorage.set("openai", { type: "api_key", key: "openai-key" });
+			expect(() => authStorage.set("openai", { type: "api_key", key: "openai-key" })).toThrow(
+				"Cannot update auth storage because it could not be loaded",
+			);
+			expect(authStorage.has("openai")).toBe(false);
 
 			const raw = readFileSync(authJsonPath, "utf-8");
 			expect(raw).toBe("{invalid-json");

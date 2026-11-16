@@ -821,6 +821,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			disposeError ??= error;
 		}
 		try {
+			await this.services.authStorage.settleOAuthRefreshes();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		try {
 			if (disposeError) {
 				throw disposeError;
 			}

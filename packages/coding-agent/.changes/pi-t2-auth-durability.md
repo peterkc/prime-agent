@@ -1,0 +1,3 @@
+- Fixed auth file locking through symlinks and preserved managed permission bits during credential updates.
+- Fixed failed credential saves reporting success or changing cached credentials.
+- Fixed session disposal exiting before an in-flight OAuth refresh finishes saving its rotated token.

@@ -15,7 +15,7 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, writeSync } from "fs";
+import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
@@ -133,7 +133,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		let descriptor: number;
 		try {
 			// Exclusive create: a racing initializer must never replace saved credentials.
-			descriptor = openSync(this.authPath, "wx", 0o600);
+			descriptor = openSync(realpathIfPresentSync(this.authPath), "wx", 0o600);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
 				throw error;
@@ -163,7 +163,6 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
 				const release = lockfile.lockSync(path, {
-					realpath: false,
 					onCompromised: (error) => {
 						compromisedError ??= error;
 					},
@@ -203,7 +202,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, { mode: 0o600 });
+				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
+					mode: statSync(this.authPath).mode & 0o7777,
+				});
 			}
 			return result;
 		} finally {
@@ -247,7 +248,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
-				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, { mode: 0o600 });
+				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
+					mode: statSync(this.authPath).mode & 0o7777,
+				});
 			}
 			throwIfCompromised();
 			return result;
@@ -291,6 +294,7 @@ export class AuthStorage {
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
 	private changeListeners = new Set<() => void>();
+	private pendingOAuthRefreshes = new Set<Promise<unknown>>();
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -686,13 +690,20 @@ export class AuthStorage {
 		}
 	}
 
-	private persistProviderChange(provider: string, credential: AuthCredential | undefined): void {
+	private persistProviderChange(provider: string, credential: AuthCredential | undefined): AuthStorageData {
 		if (this.loadError) {
-			return;
+			this.reload();
+		}
+		if (this.loadError) {
+			const error = new Error(
+				`Cannot update auth storage because it could not be loaded: ${this.loadError.message}`,
+			);
+			this.recordError(error);
+			throw error;
 		}
 
 		try {
-			this.storage.withLock((current) => {
+			const persistedData = this.storage.withLock((current) => {
 				const currentData = this.parseStorageData(current);
 				const merged: AuthStorageData = { ...currentData };
 				if (credential) {
@@ -700,10 +711,13 @@ export class AuthStorage {
 				} else {
 					delete merged[provider];
 				}
-				return { result: undefined, next: JSON.stringify(merged, null, 2) };
+				return { result: merged, next: JSON.stringify(merged, null, 2) };
 			});
+			this.loadError = null;
+			return persistedData;
 		} catch (error) {
 			this.recordError(error);
+			throw error;
 		}
 	}
 
@@ -718,9 +732,8 @@ export class AuthStorage {
 	 * Set credential for a provider.
 	 */
 	set(provider: string, credential: AuthCredential): void {
+		this.data = this.persistProviderChange(provider, credential);
 		this.clearStaleAuthSource(provider, "stored");
-		this.data[provider] = credential;
-		this.persistProviderChange(provider, credential);
 		this.notifyChanged();
 	}
 
@@ -728,9 +741,8 @@ export class AuthStorage {
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): void {
+		this.data = this.persistProviderChange(provider, undefined);
 		this.clearStaleAuthSource(provider, "stored");
-		delete this.data[provider];
-		this.persistProviderChange(provider, undefined);
 		this.notifyChanged();
 	}
 
@@ -1009,7 +1021,7 @@ export class AuthStorage {
 			return null;
 		}
 
-		const result = await this.storage.withLockAsync(async (current) => {
+		const refresh = this.storage.withLockAsync(async (current) => {
 			const currentData = this.parseStorageData(current);
 			this.data = currentData;
 			this.loadError = null;
@@ -1044,7 +1056,17 @@ export class AuthStorage {
 			return { result: refreshed, next: JSON.stringify(merged, null, 2) };
 		});
 
-		return result;
+		this.pendingOAuthRefreshes.add(refresh);
+		try {
+			return await refresh;
+		} finally {
+			this.pendingOAuthRefreshes.delete(refresh);
+		}
+	}
+
+	/** Wait for started OAuth refreshes to be saved or fail before process exit. */
+	async settleOAuthRefreshes(): Promise<void> {
+		await Promise.allSettled(this.pendingOAuthRefreshes);
 	}
 
 	/**
