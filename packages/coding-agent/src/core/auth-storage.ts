@@ -125,6 +125,9 @@ type AuthApiKeyResult = {
 	credentialType?: AuthCredential["type"];
 };
 
+// proper-lockfile judges staleness with the acquirer's option, so both locks must agree.
+const AUTH_LOCK_STALE_MS = 30_000;
+
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
 	withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
@@ -194,6 +197,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
 				const release = lockfile.lockSync(path, {
+					stale: AUTH_LOCK_STALE_MS,
 					onCompromised: (error) => {
 						compromisedError ??= error;
 					},
@@ -265,7 +269,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 					maxTimeout: 10000,
 					randomize: true,
 				},
-				stale: 30000,
+				stale: AUTH_LOCK_STALE_MS,
 				onCompromised: (err) => {
 					lockCompromised = true;
 					lockCompromisedError = err;
