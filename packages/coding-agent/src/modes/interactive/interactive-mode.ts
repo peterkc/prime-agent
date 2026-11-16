@@ -4184,7 +4184,7 @@ export class InteractiveMode {
 			}
 		}
 		if (dialogs.length > 0) this.showTopExtensionDialog();
-		// Only abort may settle reset dialogs; a new list keeps late answers from removing newer dialogs.
+		// A new list keeps reset dialogs' late answers from changing the current UI.
 		this.openDialogs = [];
 		this.reportProgramStatus();
 		for (const removeOverlay of [...this.extensionOverlays.values()].reverse()) removeOverlay();
@@ -4804,7 +4804,11 @@ export class InteractiveMode {
 			};
 
 			const close = (result: T) => {
-				if (closed || dialogs !== this.extensionDialogs) return;
+				if (dialogs !== this.extensionDialogs) {
+					resolve(result);
+					return;
+				}
+				if (closed) return;
 				if (!isOverlay && component && !this.removeExtensionDialog(component)) return;
 				closed = true;
 				if (isOverlay) removeOverlay();

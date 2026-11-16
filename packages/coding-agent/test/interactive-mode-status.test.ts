@@ -1822,7 +1822,7 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.focused).toBe(true);
 	});
 
-	test("pi #11166 reset disposes the whole stack and ignores late answers, but abort settles a reset request", async () => {
+	test("pi #11166 reset disposes the whole stack; abort and custom done settle without changing the new UI", async () => {
 		const context = createDialogContext();
 		const controller = new AbortController();
 		const settled = vi.fn();
@@ -1834,12 +1834,10 @@ describe("InteractiveMode extension dialog ownership", () => {
 		const disposeInput = vi.spyOn(input as Component & { dispose(): void }, "dispose");
 		const custom = new TestComponent("CUSTOM");
 		let done!: (value: string) => void;
-		void context
-			.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
-				done = finish;
-				return custom;
-			})
-			.then(settled);
+		const customAnswer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return custom;
+		});
 		await Promise.resolve();
 		context.resetExtensionUI();
 		expect(context.extensionDialogs).toEqual([]);
@@ -1861,6 +1859,7 @@ describe("InteractiveMode extension dialog ownership", () => {
 		context.terminal.sendInput("\r");
 		await expect(current).resolves.toBe(true);
 		await expect(selectAnswer).resolves.toBeUndefined();
+		await expect(customAnswer).resolves.toBe("late");
 		expect(settled).not.toHaveBeenCalled();
 		expect(visible(context)).toBe(context.editor);
 	});
@@ -1960,27 +1959,18 @@ describe("InteractiveMode extension dialog ownership", () => {
 		);
 	});
 
-	test("pi #11166 keys, timeout and done after reset leave old answers unsettled", async () => {
+	test("pi #11166 keys and timeout after reset leave old answers unsettled", async () => {
 		const context = createDialogContext();
 		const settled = vi.fn();
 		void context.showExtensionSelector("Select", ["one"], { timeout: 1000 }).then(settled);
 		const select = visible(context);
 		const countdown = (select as Component & { countdown: { onExpire(): void } }).countdown;
-		let done!: (value: string) => void;
-		void context
-			.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
-				done = finish;
-				return new TestComponent("CUSTOM");
-			})
-			.then(settled);
-		await Promise.resolve();
 		context.resetExtensionUI();
 		context.editor.setText("new draft");
 		const current = context.showExtensionConfirm("New", "new dialog");
 		const newest = visible(context);
 		select.handleInput!("\r");
 		countdown.onExpire();
-		done("late");
 		expect(visible(context)).toBe(newest);
 		expect(context.editor.getText()).toBe("new draft");
 		context.terminal.sendInput("\r");
@@ -2038,28 +2028,62 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(settled).not.toHaveBeenCalled();
 	});
 
-	test("pi #9909 ignores done after reset before its pending factory resolves", async () => {
+	test("pi #9909 custom done from its abort listener settles after reset without changing the current UI", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const component = new TestComponent("CUSTOM");
+		const returned = vi.fn();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				controller.signal.addEventListener("abort", () => done("cancelled"), { once: true });
+				return component;
+			})
+			.then(returned);
+		context.resetExtensionUI();
+		await Promise.resolve();
+		expect(component.dispose).toHaveBeenCalledOnce();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		const internalHandle = context.ui.showOverlay(new TestComponent("INTERNAL"));
+		const renders = vi.mocked(context.ui.requestRender).mock.calls.length;
+		controller.abort();
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		expect(internalHandle.isFocused()).toBe(true);
+		expect(vi.mocked(context.ui.requestRender).mock.calls).toHaveLength(renders);
+		internalHandle.hide();
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(returned).toHaveBeenCalledExactlyOnceWith("cancelled");
+		expect(component.dispose).toHaveBeenCalledOnce();
+	});
+
+	test("pi #9909 done after reset settles once before its pending factory resolves without restoring stale text", async () => {
 		const context = createDialogContext();
 		const factory = createDeferred<Component>();
 		const component = new TestComponent("STALE");
 		const settled = vi.fn();
 		let done!: (value: string) => void;
-		void context
-			.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
-				done = finish;
-				return factory.promise;
-			})
-			.then(settled);
+		const answer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return factory.promise;
+		});
+		void answer.then(settled);
 		context.resetExtensionUI();
 		context.editor.setText("new draft");
 		done("late");
 		factory.resolve(component);
 		await factory.promise;
-		await Promise.resolve();
+		await expect(answer).resolves.toBe("late");
 		expect(context.editor.getText()).toBe("new draft");
 		expect(visible(context)).toBe(context.editor);
 		expect(component.dispose).toHaveBeenCalledOnce();
-		expect(settled).not.toHaveBeenCalled();
+		expect(settled).toHaveBeenCalledExactlyOnceWith("late");
+		done("second");
+		await Promise.resolve();
+		expect(settled).toHaveBeenCalledExactlyOnceWith("late");
+		expect(context.editor.getText()).toBe("new draft");
 	});
 
 	test("pi #9909 ignores an inline factory that completes after reset", async () => {
