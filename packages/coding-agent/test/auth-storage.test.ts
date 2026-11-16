@@ -699,9 +699,15 @@ describe("AuthStorage", () => {
 			}
 		});
 
-		test.each(["sync", "oauth"])(
-			"failed %s ownership preservation keeps file and cache intact (pi #7779)",
-			async (writer) => {
+		test.each([
+			{ writer: "sync", mode: 0o660, owner: "current" },
+			{ writer: "oauth", mode: 0o660, owner: "current" },
+			{ writer: "sync", mode: 0o604, owner: "current" },
+			{ writer: "oauth", mode: 0o604, owner: "current" },
+			{ writer: "sync", mode: 0o600, owner: "different" },
+		])(
+			"failed $writer ownership preservation (mode $mode, owner $owner) keeps file and cache intact (pi #7779)",
+			async ({ writer, mode, owner }) => {
 				const providerId = "ownership-oauth";
 				const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
 				const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
@@ -712,12 +718,14 @@ describe("AuthStorage", () => {
 					refreshToken: async () => rotated,
 					getApiKey: (credential) => credential.access,
 				});
+				const uidSpy = vi.spyOn(process, "getuid");
 				try {
 					writeAuthJson({ [providerId]: expired });
-					chmodSync(authJsonPath, 0o660);
+					chmodSync(authJsonPath, mode);
 					authStorage = AuthStorage.create(authJsonPath);
 					const before = readFileSync(authJsonPath, "utf8");
 					const metadata = statSync(authJsonPath);
+					if (owner === "different") uidSpy.mockReturnValue(metadata.uid + 1);
 					const failure = Object.assign(new Error("cannot preserve auth ownership"), { code: "EPERM" });
 					ownershipFault.error = failure;
 					if (writer === "sync") expect(() => authStorage.set(providerId, rotated)).toThrow(failure);
@@ -735,12 +743,13 @@ describe("AuthStorage", () => {
 				} finally {
 					ownershipFault.error = undefined;
 					ownershipFault.tempMode = undefined;
+					uidSpy.mockRestore();
 					unregisterOAuthProvider(providerId);
 				}
 			},
 		);
 
-		test("private current-owner files save without preserving the group (pi #7779)", async () => {
+		test.each([0o600, 0o644])("current-owner mode %s saves without preserving the group (pi #7779)", async (mode) => {
 			const providerId = "private-ownership-oauth";
 			const expired = { type: "oauth" as const, access: "old", refresh: "old-refresh", expires: 0 };
 			const rotated = { ...expired, access: "rotated", refresh: "new-refresh", expires: Date.now() + 60_000 };
@@ -753,7 +762,7 @@ describe("AuthStorage", () => {
 			});
 			try {
 				writeAuthJson({ [providerId]: expired, openai: { type: "api_key", key: "old-key" } });
-				chmodSync(authJsonPath, 0o600);
+				chmodSync(authJsonPath, mode);
 				authStorage = AuthStorage.create(authJsonPath);
 				ownershipFault.error = Object.assign(new Error("cannot preserve auth ownership"), { code: "EPERM" });
 				const apiKey = { type: "api_key" as const, key: "new-key" };
@@ -763,6 +772,7 @@ describe("AuthStorage", () => {
 				await expect(authStorage.getApiKey(providerId)).resolves.toBe("rotated");
 				expect(AuthStorage.create(authJsonPath).get(providerId)).toEqual(rotated);
 				expect(authStorage.get(providerId)).toEqual(rotated);
+				expect(statSync(authJsonPath).mode & 0o7777).toBe(mode);
 				expect(authStorage.drainErrors()).toEqual([]);
 			} finally {
 				ownershipFault.error = undefined;

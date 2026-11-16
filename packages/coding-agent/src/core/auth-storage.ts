@@ -170,8 +170,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, {
 			mode: 0o600,
 			beforeRename: (tempPath) => {
-				// A private file owned by this user may have a group we cannot preserve.
-				if ((mode & 0o070) !== 0 || uid !== process.getuid?.()) chownSync(tempPath, uid, gid);
+				// The group only matters when its bits differ from the bits everyone else gets.
+				const groupMatters = ((mode >> 3) & 0o7) !== (mode & 0o7);
+				if (groupMatters || uid !== process.getuid?.()) chownSync(tempPath, uid, gid);
 				chmodSync(tempPath, mode & 0o7777);
 			},
 		});
