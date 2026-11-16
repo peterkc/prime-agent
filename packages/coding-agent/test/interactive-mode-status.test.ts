@@ -2096,6 +2096,35 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.getText()).toBe("draft");
 	});
 
+	test("pi #9909 a surviving raw overlay cannot return keys to a reset custom dialog", async () => {
+		const context = createDialogContext();
+		const component = new TestComponent("RESET CUSTOM");
+		const settled = vi.fn();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				component.handleInput = (data) => {
+					component.inputs.push(data);
+					done("unexpected key");
+				};
+				return component;
+			})
+			.then(settled);
+		await Promise.resolve();
+		const raw = context.ui.showOverlay(new TestComponent("RAW EXTENSION"));
+		context.resetExtensionUI();
+		raw.focus();
+		raw.hide();
+		context.terminal.sendInput("\r");
+		const resetComponentKeptFocus = component.focused;
+		const current = context.showExtensionConfirm("New", "new dialog");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(settled).not.toHaveBeenCalled();
+		expect(component.inputs).toEqual([]);
+		expect(resetComponentKeptFocus).toBe(false);
+		expect(context.editor.inputs).toEqual([]);
+	});
+
 	test("pi #9909 custom done from its abort listener settles after reset without changing the current UI", async () => {
 		const context = createDialogContext();
 		const controller = new AbortController();

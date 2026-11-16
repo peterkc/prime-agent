@@ -4827,6 +4827,16 @@ export class InteractiveMode {
 						disposeComponent();
 						return;
 					}
+					if (!isOverlay && component.handleInput) {
+						const handleInput = component.handleInput.bind(component);
+						component.handleInput = (data) => {
+							if (dialogs !== this.extensionDialogs) {
+								this.showTopExtensionDialog();
+								return;
+							}
+							handleInput(data);
+						};
+					}
 					if (isOverlay) {
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
