@@ -4386,6 +4386,7 @@ export class InteractiveMode {
 
 	private showQuestionnaire(form: QuestionnaireForm, signal?: AbortSignal): Promise<QuestionnaireOutcome> {
 		if (signal?.aborted) return Promise.resolve({ status: "cancelled", answers: {} });
+		const dialogs = this.extensionDialogs;
 		const shown = this.showExtensionCustom<QuestionnaireOutcome>(
 			(_tui, _theme, _kb, done) =>
 				new QuestionnaireComponent(form, done, { signal, getRows: () => this.ui.terminal.rows }),
@@ -4393,7 +4394,9 @@ export class InteractiveMode {
 		if (!signal) return shown;
 		let onAbort: () => void = () => {};
 		const aborted = new Promise<QuestionnaireOutcome>((resolve) => {
-			onAbort = () => resolve({ status: "cancelled", answers: {} });
+			onAbort = () => {
+				if (dialogs !== this.extensionDialogs) resolve({ status: "cancelled", answers: {} });
+			};
 			signal.addEventListener("abort", onAbort, { once: true });
 		});
 		return Promise.race([shown, aborted]).finally(() => signal.removeEventListener("abort", onAbort));

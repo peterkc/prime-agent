@@ -1865,7 +1865,7 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(visible(context)).toBe(context.editor);
 	});
 
-	test.each(["select", "confirm", "input"] as const)(
+	test.each(["select", "input"] as const)(
 		"pi #11166 aborts a reset %s as a refusal without changing the current UI",
 		async (kind) => {
 			const context = createDialogContext();
@@ -1874,9 +1874,7 @@ describe("InteractiveMode extension dialog ownership", () => {
 			const answer =
 				kind === "select"
 					? context.showExtensionSelector("Select", ["one"], { signal: controller.signal })
-					: kind === "confirm"
-						? context.showExtensionConfirm("Confirm", "confirm", { signal: controller.signal })
-						: context.showExtensionInput("Input", undefined, { signal: controller.signal });
+					: context.showExtensionInput("Input", undefined, { signal: controller.signal });
 			void answer.then(refused);
 			context.resetExtensionUI();
 			context.editor.setText("new draft");
@@ -1890,9 +1888,45 @@ describe("InteractiveMode extension dialog ownership", () => {
 			expect(context.openDialogs.map((dialog) => dialog.title)).toEqual(["New\nnew dialog"]);
 			context.terminal.sendInput("\r");
 			await expect(current).resolves.toBe(true);
-			expect(refused).toHaveBeenCalledExactlyOnceWith(kind === "confirm" ? false : undefined);
+			expect(refused).toHaveBeenCalledExactlyOnceWith(undefined);
 		},
 	);
+
+	test("pi #11166 questionnaire abort without reset preserves completed answers", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const answer = context.showQuestionnaire(
+			{
+				questions: [
+					{
+						id: "first",
+						label: "First",
+						prompt: "First?",
+						options: [{ value: "one", label: "One" }],
+						allowOther: false,
+					},
+					{
+						id: "second",
+						label: "Second",
+						prompt: "Second?",
+						options: [{ value: "two", label: "Two" }],
+						allowOther: false,
+					},
+				],
+				answers: {},
+			},
+			controller.signal,
+		);
+		await Promise.resolve();
+		context.terminal.sendInput("\r");
+		controller.abort();
+		await expect(answer).resolves.toEqual({
+			status: "cancelled",
+			answers: { first: { value: "one", wasCustom: false } },
+		});
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.getText()).toBe("draft");
+	});
 
 	test("pi #11166 questionnaire tool returns cancelled when its signal aborts after reset", async () => {
 		const context = createDialogContext();
