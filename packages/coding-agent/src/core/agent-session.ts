@@ -8824,9 +8824,9 @@ export class AgentSession {
 
 	async cycleModel(
 		direction: "forward" | "backward" = "forward",
-		options: ModelSelectOptions & ModelChangeOptions = {},
+		options: ModelSelectOptions = {},
 	): Promise<ModelCycleResult | undefined> {
-		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
+		const persist = this.settingsManager.getSaveModelChangesAsDefault();
 		if (this._scopedModels.length > 0) {
 			return this._cycleScopedModel(direction, options, persist);
 		}
@@ -8835,7 +8835,7 @@ export class AgentSession {
 
 	private async _cycleScopedModel(
 		direction: "forward" | "backward",
-		options: ModelSelectOptions & ModelChangeOptions,
+		options: ModelSelectOptions,
 		persist: boolean,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
@@ -8859,7 +8859,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		if (persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
-		} else if (options.persist === undefined) {
+		} else {
 			this.settingsManager.recordModelUse(next.model.provider, next.model.id);
 		}
 
@@ -8883,7 +8883,7 @@ export class AgentSession {
 
 	private async _cycleAvailableModel(
 		direction: "forward" | "backward",
-		options: ModelSelectOptions & ModelChangeOptions,
+		options: ModelSelectOptions,
 		persist: boolean,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
@@ -8904,7 +8904,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
-		} else if (options.persist === undefined) {
+		} else {
 			this.settingsManager.recordModelUse(nextModel.provider, nextModel.id);
 		}
 
@@ -9004,8 +9004,7 @@ export class AgentSession {
 		});
 	}
 
-	cycleThinkingLevel(options: ModelChangeOptions = {}): ThinkingLevel | undefined {
-		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
+	cycleThinkingLevel(): ThinkingLevel | undefined {
 		if (!this.supportsThinking()) return undefined;
 
 		const levels = this.getAvailableThinkingLevels();
@@ -9013,7 +9012,7 @@ export class AgentSession {
 		const nextIndex = (currentIndex + 1) % levels.length;
 		const nextLevel = levels[nextIndex];
 
-		this.setThinkingLevel(nextLevel, { persist });
+		this.setThinkingLevel(nextLevel);
 		return nextLevel;
 	}
 

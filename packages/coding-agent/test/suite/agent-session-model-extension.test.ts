@@ -676,17 +676,18 @@ describe("AgentSession model and extension characterization", () => {
 		expect([h.settingsManager.getDefaultProvider(), h.settingsManager.getDefaultModel()]).toEqual(
 			saveDefault ? [h.getModel().provider, "faux-2"] : ["original", "original"],
 		);
-		await h.session.cycleModel("forward", options);
+		await h.session.cycleModel("forward");
 		expect(h.session.model?.id).toBe("faux-3");
 		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-3" : "original");
 		h.session.setScopedModels([{ model: h.getModel() }, { model: h.getModel("faux-2")! }]);
-		await h.session.cycleModel("forward", options);
+		await h.session.cycleModel("forward");
 		expect(h.session.model?.id).toBe("faux-2");
 		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-2" : "original");
 		expect(modelEvents).toEqual([saveDefault, saveDefault, saveDefault]);
-		expect(h.settingsManager.getRecentModels()).toEqual(
-			mode === "explicit session" ? [] : [`${h.getModel().provider}/faux-2`, `${h.getModel().provider}/faux-3`],
-		);
+		expect(h.settingsManager.getRecentModels()).toEqual([
+			`${h.getModel().provider}/faux-2`,
+			`${h.getModel().provider}/faux-3`,
+		]);
 		expect(
 			h.sessionManager
 				.getEntries()
