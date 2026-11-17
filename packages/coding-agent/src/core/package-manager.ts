@@ -1,6 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -1248,6 +1258,9 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const gitParsed = parseGitUrl(source);
 		if (gitParsed) {
+			if (gitParsed.ref?.startsWith("-")) {
+				throw new Error("Git package ref must not start with '-'");
+			}
 			return gitParsed;
 		}
 
@@ -1315,6 +1328,7 @@ export class DefaultPackageManager implements PackageManager {
 			return false;
 		}
 
+		await this.assertGitRepositoryRoot(installedPath);
 		try {
 			const localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
 				cwd: installedPath,
@@ -1580,7 +1594,8 @@ export class DefaultPackageManager implements PackageManager {
 
 		await this.runCommand("git", ["clone", source.repo, targetDir]);
 		if (source.ref) {
-			await this.runCommand("git", ["checkout", source.ref], { cwd: targetDir });
+			await this.assertGitRepositoryRoot(targetDir);
+			await this.runCommand("git", ["checkout", source.ref, "--"], { cwd: targetDir });
 		}
 		const packageJsonPath = join(targetDir, "package.json");
 		if (existsSync(packageJsonPath)) {
@@ -1595,6 +1610,7 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
+		await this.assertGitRepositoryRoot(targetDir);
 		const target = await this.getLocalGitUpdateTarget(targetDir);
 
 		await this.runCommand("git", target.fetchArgs, { cwd: targetDir });
@@ -1611,7 +1627,7 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
-		await this.runCommand("git", ["reset", "--hard", target.ref], { cwd: targetDir });
+		await this.runCommand("git", ["reset", "--hard", target.ref, "--"], { cwd: targetDir });
 
 		// Extension checkouts must be pristine after an update.
 		await this.runCommand("git", ["clean", "-fdx"], { cwd: targetDir });
@@ -1635,9 +1651,32 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	private async assertGitRepositoryRoot(targetDir: string): Promise<void> {
+		const message = `Refusing to use git package path that is not a repository top level: ${targetDir}`;
+		let topLevel: string;
+		try {
+			topLevel = await this.runCommandCapture("git", ["rev-parse", "--show-toplevel"], {
+				cwd: targetDir,
+				timeoutMs: NETWORK_TIMEOUT_MS,
+			});
+		} catch (error) {
+			throw new Error(message, { cause: error });
+		}
+		if (realpathSync(topLevel) !== realpathSync(targetDir)) {
+			throw new Error(message);
+		}
+	}
+
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (!existsSync(targetDir)) return;
+		const installRoot = this.getGitInstallRoot(scope) ?? join(this.agentDir, "tmp", "extensions");
+		const realRoot = realpathSync(installRoot);
+		const realTarget = realpathSync(targetDir);
+		if (!realTarget.startsWith(`${realRoot}${sep}`)) {
+			throw new Error(`Refusing to use path outside package install root: ${targetDir}`);
+		}
+		await this.assertGitRepositoryRoot(targetDir);
 		rmSync(targetDir, { recursive: true, force: true });
 		this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
 	}
