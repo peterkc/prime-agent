@@ -1169,10 +1169,10 @@ Content`,
 			expect(readFileSync(join(target, "release"), "utf8")).toBe("tracked path");
 		});
 
-		it("updates and removes a real checkout through an in-root alias", async () => {
+		it.each(["user", "project"] as const)("updates and removes %s via an alias", async (scope) => {
 			const remote = join(tempDir, "remote");
 			createFixtureRepo(remote);
-			const root = join(agentDir, "git");
+			const root = scope === "project" ? join(tempDir, ".prime", "agent", "git") : join(agentDir, "git");
 			const host = join(root, "actual-host");
 			mkdirSync(join(host, "group"), { recursive: true });
 			symlinkSync(host, join(root, "gitlab.com"), process.platform === "win32" ? "junction" : "dir");
@@ -1180,16 +1180,17 @@ Content`,
 			const manager = packageManager as unknown as GitPackageManagerInternals;
 			await manager.installGit(
 				{ type: "git", repo: remote, host: "gitlab.com", path: "group/repo", ref: "main", pinned: true },
-				"user",
+				scope,
 			);
 			const source = "git:git@gitlab.com:group/repo";
-			settingsManager.setPackages([source]);
+			if (scope === "project") settingsManager.setProjectPackages([source]);
+			else settingsManager.setPackages([source]);
 			commitFixture(remote, "remote update");
 			writeFileSync(join(target, "tracked"), "local edits");
 			writeFileSync(join(target, "untracked"), "remove me");
 
 			expect(await packageManager.checkForAvailableUpdates()).toEqual([
-				{ source, displayName: "gitlab.com/group/repo", type: "git", scope: "user" },
+				{ source, displayName: "gitlab.com/group/repo", type: "git", scope },
 			]);
 			await packageManager.update(source);
 			expect(readFileSync(join(target, "tracked"), "utf8")).toBe("remote update");
@@ -1198,8 +1199,11 @@ Content`,
 			writeFileSync(join(target, "untracked"), "preserve on no-op");
 			await packageManager.update(source);
 			expect(readFileSync(join(target, "untracked"), "utf8")).toBe("preserve on no-op");
-			await packageManager.remove(source);
+			expect(await packageManager.removeAndPersist(source, { local: scope === "project" })).toBe(true);
 			expect(existsSync(target)).toBe(false);
+			const settings =
+				scope === "project" ? settingsManager.getProjectSettings() : settingsManager.getGlobalSettings();
+			expect(settings.packages).toEqual([]);
 			await packageManager.remove(source);
 		});
 	});
