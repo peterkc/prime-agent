@@ -763,6 +763,29 @@ describe("AgentSession model and extension characterization", () => {
 		},
 	);
 
+	it("session-model extension setModel keeps an implicit session-only effort out of the defaults", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high");
+		await h.session.setModel(h.getModel("faux-2")!, { persist: true });
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-2",
+			"low",
+		]);
+	});
+
+	it("session-model explicit session-only effort stays out of the defaults on a clamping cycle", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high", { persist: false });
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		const clamped = { ...h.getModel("faux-2")!, thinkingLevelMap: { high: null } };
+		vi.spyOn(h.session.modelRegistry, "refreshAvailableModels").mockResolvedValue([h.getModel(), clamped]);
+		await h.session.cycleModel();
+		expect([h.session.thinkingLevel, h.settingsManager.getDefaultThinkingLevel()]).toEqual(["medium", "low"]);
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-2");
+	});
+
 	it.each([false, true])(
 		"session-model first scoped cycle uses its own effort without unintended saving (save=%s)",
 		async (save) => {

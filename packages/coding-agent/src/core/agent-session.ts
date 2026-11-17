@@ -8788,7 +8788,7 @@ export class AgentSession {
 		}
 
 		this.setThinkingLevel(thinkingLevel, {
-			persist: this._thinkingLevelPreference?.persist === false ? false : options.persist,
+			persist: this._thinkingLevelPreference ? this._thinkingLevelPreference.persist : options.persist,
 		});
 		this._clampServiceTierForModel(serviceTier);
 

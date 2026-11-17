@@ -8707,7 +8707,7 @@ export class InteractiveMode {
 					},
 					onSaveModelChangesAsDefaultChange: (enabled) => {
 						this.settingsManager.setSaveModelChangesAsDefault(enabled);
-						this.showStatus("Run /reload to apply this setting to the running session.");
+						this.showStatus("In a daemon session, run /reload to apply this setting.");
 					},
 					onIdleEvictionMinutesChange: (value) => {
 						this.settingsManager.setIdleEvictionMinutes(value);
