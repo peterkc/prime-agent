@@ -8754,8 +8754,9 @@ export class AgentSession {
 		return promise;
 	}
 
-	/** Change the session model and history; persist global defaults unless explicitly disabled. */
+	/** Change the session model and history; follow saveModelChangesAsDefault unless persist is explicit. */
 	async setModel(model: Model<any>, options: ModelSelectOptions & ModelChangeOptions = {}): Promise<void> {
+		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
 		// Explicit selection recovers from a stale-auth lockout, but only a fully
 		// validated switch commits the clear (single owner): failed selections never unlock.
 		const staleOnly =
@@ -8780,16 +8781,18 @@ export class AgentSession {
 		this.agent.state.model = model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
-		if (options.persist !== false) {
+		if (persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		} else if (options.persist === undefined) {
+			this.settingsManager.recordModelUse(model.provider, model.id);
 		}
 
 		this.setThinkingLevel(thinkingLevel, {
-			persist: options.persist !== false && this._thinkingLevelPreference === undefined,
+			persist: persist && this._thinkingLevelPreference === undefined,
 		});
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set", options.persist !== false);
+		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set", persist);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8821,17 +8824,19 @@ export class AgentSession {
 
 	async cycleModel(
 		direction: "forward" | "backward" = "forward",
-		options: ModelSelectOptions = {},
+		options: ModelSelectOptions & ModelChangeOptions = {},
 	): Promise<ModelCycleResult | undefined> {
+		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
 		if (this._scopedModels.length > 0) {
-			return this._cycleScopedModel(direction, options);
+			return this._cycleScopedModel(direction, options, persist);
 		}
-		return this._cycleAvailableModel(direction, options);
+		return this._cycleAvailableModel(direction, options, persist);
 	}
 
 	private async _cycleScopedModel(
 		direction: "forward" | "backward",
-		options: ModelSelectOptions,
+		options: ModelSelectOptions & ModelChangeOptions,
+		persist: boolean,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		const scopedModels = this._scopedModels.filter((scoped) =>
@@ -8852,12 +8857,16 @@ export class AgentSession {
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		if (persist) {
+			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+		} else if (options.persist === undefined) {
+			this.settingsManager.recordModelUse(next.model.provider, next.model.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
+		this.setThinkingLevel(thinkingLevel, { persist: persist && this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", true);
+		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle", persist);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8874,7 +8883,8 @@ export class AgentSession {
 
 	private async _cycleAvailableModel(
 		direction: "forward" | "backward",
-		options: ModelSelectOptions,
+		options: ModelSelectOptions & ModelChangeOptions,
+		persist: boolean,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		if (availableModels.length <= 1) return undefined;
@@ -8892,12 +8902,16 @@ export class AgentSession {
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		if (persist) {
+			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+		} else if (options.persist === undefined) {
+			this.settingsManager.recordModelUse(nextModel.provider, nextModel.id);
+		}
 
-		this.setThinkingLevel(thinkingLevel, { persist: this._thinkingLevelPreference === undefined });
+		this.setThinkingLevel(thinkingLevel, { persist: persist && this._thinkingLevelPreference === undefined });
 		this._clampServiceTierForModel(serviceTier);
 
-		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", true);
+		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle", persist);
 		if (this._shouldWaitForModelSelectEmit(options)) {
 			await emitPromise;
 		} else {
@@ -8913,10 +8927,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Change the clamped session level and history; persist the global default unless persist: false.
+	 * Change the clamped session level and history; follow saveModelChangesAsDefault unless persist is explicit.
 	 * A later xai metadata refresh persists a capability clamp only when no session-only level is set.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelChangeOptions = {}): void {
+		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -8925,16 +8940,12 @@ export class AgentSession {
 		const hadPreference = this._thinkingLevelPreference !== undefined;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
-		this._thinkingLevelPreference = options.persist === false ? level : undefined;
+		this._thinkingLevelPreference = persist ? undefined : level;
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 		}
-		if (
-			options.persist !== false &&
-			(isChanging || hadPreference) &&
-			(this.supportsThinking() || effectiveLevel !== "off")
-		) {
+		if (persist && (isChanging || hadPreference) && (this.supportsThinking() || effectiveLevel !== "off")) {
 			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 		}
 		if (isChanging) {
@@ -8993,7 +9004,8 @@ export class AgentSession {
 		});
 	}
 
-	cycleThinkingLevel(): ThinkingLevel | undefined {
+	cycleThinkingLevel(options: ModelChangeOptions = {}): ThinkingLevel | undefined {
+		const persist = options.persist ?? this.settingsManager.getSaveModelChangesAsDefault();
 		if (!this.supportsThinking()) return undefined;
 
 		const levels = this.getAvailableThinkingLevels();
@@ -9001,7 +9013,7 @@ export class AgentSession {
 		const nextIndex = (currentIndex + 1) % levels.length;
 		const nextLevel = levels[nextIndex];
 
-		this.setThinkingLevel(nextLevel);
+		this.setThinkingLevel(nextLevel, { persist });
 		return nextLevel;
 	}
 

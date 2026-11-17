@@ -114,6 +114,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.model.select` | `ctrl+l` | Open model selector |
+| `app.model.saveDefault` | `ctrl+alt+s` | Select model and save model and effort defaults |
 | `app.model.toggleScope` | `alt+s` | Toggle between all and scoped models |
 
 ### Configuration Pickers

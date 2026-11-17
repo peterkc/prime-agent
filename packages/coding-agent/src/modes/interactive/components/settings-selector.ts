@@ -39,6 +39,7 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	saveModelChangesAsDefault: boolean;
 	idleEvictionMinutes: IdleEvictionMinutes;
 	showImages: boolean;
 	autoResizeImages: boolean;
@@ -70,6 +71,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onSaveModelChangesAsDefaultChange: (enabled: boolean) => void;
 	onIdleEvictionMinutesChange: (value: IdleEvictionMinutes) => void;
 	onShowImagesChange: (enabled: boolean) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -302,6 +304,13 @@ export class SettingsSelectorComponent extends Container {
 					),
 			},
 			{
+				id: "save-model-changes-as-default",
+				label: "Save model changes as default",
+				description: "Use model and thinking changes as defaults for new sessions",
+				currentValue: config.saveModelChangesAsDefault ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
 				id: "thinking",
 				label: "Thinking level",
 				description: "Reasoning depth for thinking-capable models",
@@ -493,6 +502,9 @@ export class SettingsSelectorComponent extends Container {
 			getSettingsListTheme(),
 			(id, newValue) => {
 				switch (id) {
+					case "save-model-changes-as-default":
+						callbacks.onSaveModelChangesAsDefaultChange(newValue === "true");
+						break;
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
 						break;

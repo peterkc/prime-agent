@@ -625,7 +625,7 @@ describe("AgentSession model and extension characterization", () => {
 			const h = await createHarness({
 				provider: "xai",
 				models: MODELS.slice(0, 2),
-				settings: { defaultThinkingLevel: "low" },
+				settings: { defaultThinkingLevel: "low", saveModelChangesAsDefault: true },
 			});
 			harnesses.push(h);
 			h.session.setThinkingLevel("high", { persist });
@@ -643,9 +643,123 @@ describe("AgentSession model and extension characterization", () => {
 			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
 		},
 	);
+	it.each(["session", "default", "explicit session"])("session model changes follow persistence=%s", async (mode) => {
+		const saveDefault = mode === "default";
+		const options = mode === "explicit session" ? { persist: false } : {};
+		const modelEvents: boolean[] = [];
+		const h = await createHarness({
+			models: MODELS,
+			persistSession: true,
+			settings: {
+				defaultProvider: "original",
+				defaultModel: "original",
+				defaultThinkingLevel: "high",
+				...(saveDefault ? { saveModelChangesAsDefault: true } : {}),
+			},
+			extensionFactories: [
+				(pi) => {
+					pi.on("model_select", (event) => {
+						modelEvents.push(event.persisted);
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		h.sessionManager.appendMessage(fauxAssistantMessage("saved"));
+		const before = h.sessionManager.getEntries().length;
+		await h.session.setModel(h.getModel("faux-2")!, options);
+		expect(h.settingsManager.getRecentModels()).toEqual(
+			mode === "explicit session" ? [] : [`${h.getModel().provider}/faux-2`],
+		);
+		expect(h.session.model?.id).toBe("faux-2");
+		expect(h.sessionManager.getEntries().slice(before)).toMatchObject([{ type: "model_change", modelId: "faux-2" }]);
+		expect([h.settingsManager.getDefaultProvider(), h.settingsManager.getDefaultModel()]).toEqual(
+			saveDefault ? [h.getModel().provider, "faux-2"] : ["original", "original"],
+		);
+		await h.session.cycleModel("forward", options);
+		expect(h.session.model?.id).toBe("faux-3");
+		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-3" : "original");
+		h.session.setScopedModels([{ model: h.getModel() }, { model: h.getModel("faux-2")! }]);
+		await h.session.cycleModel("forward", options);
+		expect(h.session.model?.id).toBe("faux-2");
+		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-2" : "original");
+		expect(modelEvents).toEqual([saveDefault, saveDefault, saveDefault]);
+		expect(h.settingsManager.getRecentModels()).toEqual(
+			mode === "explicit session" ? [] : [`${h.getModel().provider}/faux-2`, `${h.getModel().provider}/faux-3`],
+		);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "model_change")
+				.map((e) => e.modelId),
+		).toEqual(["faux-2", "faux-3", "faux-2"]);
+		h.session.setThinkingLevel("low");
+		expect(h.session.thinkingLevel).toBe("low");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe(saveDefault ? "low" : "high");
+		expect(h.session.cycleThinkingLevel()).toBe("medium");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe(saveDefault ? "medium" : "high");
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "thinking_level_change")
+				.map((e) => e.thinkingLevel),
+		).toEqual(["low", "medium"]);
+		const resumed = await secretSdkSession(h, {
+			model: undefined,
+			sessionManager: SessionManager.open(h.session.sessionFile!),
+		});
+		try {
+			expect([resumed.model?.id, resumed.thinkingLevel]).toEqual(["faux-2", "medium"]);
+		} finally {
+			resumed.dispose();
+		}
+	});
+
+	it("takes the next persistence setting and explicit overrides without restarting", async () => {
+		const h = await createHarness({
+			models: MODELS,
+			settings: { defaultModel: "original", defaultThinkingLevel: "high" },
+		});
+		harnesses.push(h);
+		await h.session.setModel(h.getModel("faux-2")!, { persist: true });
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-2");
+		h.session.setThinkingLevel("low", { persist: true });
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("low");
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		await h.session.cycleModel();
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-3");
+		h.session.cycleThinkingLevel();
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("medium");
+		await h.session.setModel(h.getModel()!, { persist: false });
+		h.session.setThinkingLevel("high", { persist: false });
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-3",
+			"medium",
+		]);
+		h.settingsManager.setSaveModelChangesAsDefault(false);
+		await h.session.cycleModel();
+		h.session.cycleThinkingLevel();
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-3",
+			"medium",
+		]);
+	});
+
+	it("keeps a clamped session-only effort preference for a later capable model", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "medium" } });
+		harnesses.push(h);
+		await h.session.setModel({ ...h.getModel("faux-2")!, reasoning: false });
+		h.session.setThinkingLevel("high");
+		expect(h.session.thinkingLevel).toBe("off");
+		await h.session.setModel(h.getModel()!);
+		expect(h.session.thinkingLevel).toBe("high");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("medium");
+	});
+
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
 		const harness = await createHarness({
+			settings: { saveModelChangesAsDefault: true },
 			models: MODELS.slice(0, 2),
 			extensionFactories: [
 				(pi) => {
@@ -928,6 +1042,7 @@ describe("AgentSession model and extension characterization", () => {
 
 	it("cycles through scoped models and clamps thinking to model capabilities", async () => {
 		const harness = await createHarness({
+			settings: { saveModelChangesAsDefault: true },
 			models: [
 				{ id: "faux-1", name: "One", reasoning: true },
 				{ id: "faux-2", name: "Two", reasoning: false },

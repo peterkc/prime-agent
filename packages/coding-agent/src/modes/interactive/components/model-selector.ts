@@ -115,6 +115,10 @@ function scoreModelSearch(item: ModelItem, query: string): ModelSearchMatch | nu
 	return fuzzyScore === null ? null : { quality: ModelSearchMatchQuality.Fuzzy, score: fuzzyScore };
 }
 
+export interface ModelSelectionOptions {
+	readonly saveAsDefault?: boolean;
+}
+
 export interface ModelSelectorOptions {
 	availableModels?: ReadonlyArray<Model<any>>;
 	configuredProviders?: ReadonlySet<string>;
@@ -179,7 +183,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private searchQuery = "";
 	private currentModel?: Model<any>;
 	private modelRegistry: ModelRegistry;
-	private onSelectCallback: (model: Model<any>, thinkingLevel?: ModelThinkingLevel) => void;
+	private onSelectCallback: (
+		model: Model<any>,
+		thinkingLevel?: ModelThinkingLevel,
+		options?: ModelSelectionOptions,
+	) => void;
 	private onCancelCallback: () => void;
 	private availableModels?: ReadonlyArray<Model<any>>;
 	private configuredProviders?: ReadonlySet<string>;
@@ -216,7 +224,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		currentModel: Model<any> | undefined,
 		modelRegistry: ModelRegistry,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
-		onSelect: (model: Model<any>, thinkingLevel?: ModelThinkingLevel) => void,
+		onSelect: (model: Model<any>, thinkingLevel?: ModelThinkingLevel, options?: ModelSelectionOptions) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
 		options: ModelSelectorOptions = {},
@@ -559,7 +567,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private getScopeHintText(): string {
-		return keyHint("app.model.toggleScope", "scope") + theme.fg("muted", " (all/scoped)");
+		const saveHint = keyHint("app.model.saveDefault", "save default");
+		return this.scopeText
+			? `${keyHint("app.model.toggleScope", "scope")}${theme.fg("muted", " (all/scoped) · ")}${saveHint}`
+			: saveHint;
 	}
 
 	private setScope(scope: ModelScope): void {
@@ -701,6 +712,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		if (kb.matches(keyData, "app.model.saveDefault")) {
+			this.handleConfirm({ saveAsDefault: true });
+			return;
+		}
 		if (kb.matches(keyData, "app.model.toggleScope", { optionComposed: true })) {
 			if (this.scopedModelItems.length > 0) {
 				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
@@ -768,13 +783,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 	}
 
-	private handleConfirm(): void {
+	private handleConfirm(options?: ModelSelectionOptions): void {
 		const selectedModel = this.filteredModels[this.selectedIndex];
 		if (selectedModel) {
 			const effort = this.editedEffortModels.has(this.getModelKey(selectedModel))
 				? this.getEffort(selectedModel)
 				: undefined;
-			this.onSelectCallback(selectedModel.model, effort);
+			if (options) this.onSelectCallback(selectedModel.model, effort, options);
+			else this.onSelectCallback(selectedModel.model, effort);
 			return;
 		}
 	}
@@ -790,15 +806,16 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private updateResponsiveLayout(): void {
 		if (this.inline) {
 			this.headerHelpContainer.clear();
-			const scopeRows = this.scopeText ? 1 : 0;
-			if (this.scopeText) {
-				this.headerHelpContainer.addChild({
-					render: (width) => [
-						truncateToWidth(theme.fg("muted", `${this.getScopeText()} · ${this.getScopeHintText()}`), width),
-					],
-					invalidate: () => {},
-				});
-			}
+			const scopeRows = 1;
+			this.headerHelpContainer.addChild({
+				render: (width) => [
+					truncateToWidth(
+						theme.fg("muted", `${this.scopeText ? `${this.getScopeText()} · ` : ""}${this.getScopeHintText()}`),
+						width,
+					),
+				],
+				invalidate: () => {},
+			});
 			const detailRows = this.getInlineDetailRows();
 			this.listLayout = getMenuListLayout({
 				getRows: this.viewport.getRows,
@@ -822,7 +839,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				headerHelpRows += 2;
 			} else if (this.warningText) {
 				this.headerHelpContainer.addChild(this.warningText);
-				headerHelpRows += 1;
+				this.headerHelpContainer.addChild(new Text(this.getScopeHintText(), 0, 0));
+				headerHelpRows += 2;
 			}
 			this.headerHelpContainer.addChild(new Spacer(1));
 			headerHelpRows += 1;
@@ -859,7 +877,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private getInlineDetailRows(): number {
 		const detailRows = this.renderWidth >= 58 ? 4 : 5;
-		return this.hasRows(this.getHeaderRows() + 5 + (this.scopeText ? 1 : 0) + detailRows) ? detailRows : 0;
+		return this.hasRows(this.getHeaderRows() + 6 + detailRows) ? detailRows : 0;
 	}
 
 	private renderInlineModelDetails(item: ModelItem, width: number): string[] {

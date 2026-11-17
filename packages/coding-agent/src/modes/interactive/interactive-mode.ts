@@ -8668,6 +8668,7 @@ export class InteractiveMode {
 			const selector = new SettingsSelectorComponent(
 				{
 					autoCompact: state.autoCompactionEnabled,
+					saveModelChangesAsDefault: this.settingsManager.getSaveModelChangesAsDefault(),
 					idleEvictionMinutes: this.settingsManager.getIdleEvictionMinutes(),
 					showImages: this.settingsManager.getShowImages(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -8704,6 +8705,8 @@ export class InteractiveMode {
 						});
 						this.footer.setAutoCompactEnabled(enabled);
 					},
+					onSaveModelChangesAsDefaultChange: (enabled) =>
+						this.settingsManager.setSaveModelChangesAsDefault(enabled),
 					onIdleEvictionMinutesChange: (value) => {
 						this.settingsManager.setIdleEvictionMinutes(value);
 					},
@@ -8887,7 +8890,11 @@ export class InteractiveMode {
 		) {
 			return;
 		}
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		if (this.settingsManager.getSaveModelChangesAsDefault()) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		} else {
+			this.settingsManager.recordModelUse(model.provider, model.id);
+		}
 		this.applyModelSwitchUiState(state, model);
 	}
 
@@ -9434,7 +9441,7 @@ export class InteractiveMode {
 				requestRender: () => this.ui.requestRender(),
 				onSelectProvider: (provider) => authenticate(provider, "providers"),
 				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
-				onSelectModel: (model, thinkingLevel) => {
+				onSelectModel: (model, thinkingLevel, options) => {
 					if (settled || busy) return;
 					busy = true;
 					void (async () => {
@@ -9455,7 +9462,15 @@ export class InteractiveMode {
 							const selection = (async () => {
 								await this.completeModelSelection(model);
 								if (settled) return false;
-								return thinkingLevel === undefined || (await this.applyThinkingLevel(thinkingLevel));
+								if (thinkingLevel !== undefined && !(await this.applyThinkingLevel(thinkingLevel)))
+									return false;
+								if (options?.saveAsDefault) {
+									const state = await this.agentConnection.getState();
+									this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+									this.settingsManager.setDefaultThinkingLevel(state.thinkingLevel);
+									this.showStatus(`Saved default: ${model.id} (${state.thinkingLevel})`);
+								}
+								return true;
 							})();
 							selectionInFlight = selection.then(
 								() => {},

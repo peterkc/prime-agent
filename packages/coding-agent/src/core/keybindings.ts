@@ -19,6 +19,7 @@ export interface AppKeybindings {
 	"app.suspend": true;
 	"app.model.select": true;
 	"app.model.toggleScope": true;
+	"app.model.saveDefault": true;
 	"app.model.cycleForward": true;
 	"app.model.cycleBackward": true;
 	"app.tools.expand": true;
@@ -84,6 +85,7 @@ export const KEYBINDINGS = {
 		description: "Suspend to background",
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
+	"app.model.saveDefault": { defaultKeys: "ctrl+alt+s", description: "Select model and save defaults" },
 	"app.model.toggleScope": { defaultKeys: "alt+s", description: "Toggle model selector scope" },
 	"app.model.cycleForward": { defaultKeys: "alt+m", description: "Cycle to the next scoped model" },
 	"app.model.cycleBackward": { defaultKeys: "shift+alt+m", description: "Cycle to the previous scoped model" },

@@ -17,6 +17,7 @@ Edit directly or use `/settings` for common options.
 |---------|------|---------|-------------|
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
+| `saveModelChangesAsDefault` | boolean | `false` | Global-only opt-in to save model and thinking changes as defaults for new sessions |
 | `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
 | `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
 | `decisionApi.systemOneModel` | string | none | Decision model reference (`"provider/model-id"` or a bare id) using `api: "systemone"` |
@@ -24,6 +25,10 @@ Edit directly or use `/settings` for common options.
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
 `subagentDefaultModel` applies only to spawned subagents whose `rlm.spawn` call omits `model=`. An explicit `model=` per spawn always wins, and an unset setting keeps the inherit-parent behavior. If the configured default is unavailable, unauthenticated, or expired, the spawn fails with that error instead of silently falling back.
+
+Model and thinking changes apply only to the current session by default and survive resume. Enable **Save model changes as default** in `/settings` to save later changes globally. In `/model`, press `ctrl+alt+s` (`app.model.saveDefault`) to select a model and save its resulting effort as the default once. Enter follows `saveModelChangesAsDefault`. Extensions still save defaults unless they pass `persist: false`.
+
+In a running daemon session, use `/reload` after changing this toggle to apply it before the next model or effort change.
 
 When `defaultThinkingLevel` is unset, new sessions start at `"medium"` reasoning, clamped to the levels each model supports.
 

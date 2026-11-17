@@ -1369,7 +1369,7 @@ export type RefreshToolsHandler = () => void;
 
 /** Persistence policy for explicit model and thinking-level changes. */
 export interface ModelChangeOptions {
-	/** Update global defaults (and recent models for model changes). Defaults to true. */
+	/** Update global defaults (and recent models). Extensions default to true; sessions follow saveModelChangesAsDefault. */
 	readonly persist?: boolean;
 }
 

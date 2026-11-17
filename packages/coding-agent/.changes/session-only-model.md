@@ -1,0 +1,1 @@
+- Changed model and effort selection to affect only the current session by default, with an opt-in setting and `ctrl+alt+s` in `/model` to save defaults.

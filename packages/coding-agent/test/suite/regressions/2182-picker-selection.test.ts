@@ -3,6 +3,7 @@ import { Container, Input, setKeybindings, type TUI } from "@earendil-works/pi-t
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { KEYBINDINGS, KeybindingsManager } from "../../../src/core/keybindings.js";
+import { SettingsManager } from "../../../src/core/settings-manager.js";
 import type { ConfigurationMenuComponent } from "../../../src/modes/interactive/components/configuration-menu.js";
 import { ModelSelectorComponent } from "../../../src/modes/interactive/components/model-selector.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
@@ -211,6 +212,67 @@ it("refreshes a fresh model catalog when the picker opens without a search", asy
 	f.menu().handleInput("\x1b");
 	await done;
 });
+
+it.each(["enter", "save", "rebound save", "failed save", "save untouched"])(
+	"picker default action: %s",
+	async (action) => {
+		const f = await fixture();
+		const settings = SettingsManager.inMemory();
+		f.harness.settingsManager.setDefaultThinkingLevel("medium");
+		settings.setDefaultModelAndProvider("original", "original");
+		settings.setDefaultThinkingLevel("medium");
+		const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+		const switched = deferred();
+		const setModel = vi.fn(async () => {
+			if (action === "failed save") throw new Error("model unavailable");
+			await f.harness.session.setModel(f.model);
+		});
+		Object.assign(f.mode, {
+			uiServices: { modelRegistry: f.harness.session.modelRegistry, settingsManager: settings },
+			completeModelSelection: prototype.completeModelSelection,
+			agentConnection: {
+				setModel,
+				getState: async () => ({
+					model: f.harness.session.model,
+					thinkingLevel: f.harness.session.thinkingLevel,
+					availableThinkingLevels: ["off", "low", "medium", "high"],
+				}),
+				setThinkingLevel: async (level: ModelThinkingLevel) => f.harness.session.setThinkingLevel(level),
+			},
+			applyModelSwitchUiState: vi.fn(),
+			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+			checkDaxnutsEasterEgg: vi.fn(),
+			showError: () => switched.resolve(),
+		});
+		if (action === "rebound save") setKeybindings(new KeybindingsManager({ "app.model.saveDefault": "ctrl+x" }));
+		const done = f.mode.showConfigurationMenu("models");
+		if (action !== "save untouched") f.menu().handleInput("\x1b[C");
+		const key = action === "enter" ? "\r" : action === "rebound save" ? "\x18" : "\x1b[115;7u";
+		f.menu().handleInput(key);
+		if (action === "failed save") {
+			await switched.promise;
+			f.menu().handleInput("\x1b");
+		}
+		await done;
+		if (action === "enter" || action === "failed save") {
+			expect([
+				settings.getDefaultProvider(),
+				settings.getDefaultModel(),
+				settings.getDefaultThinkingLevel(),
+			]).toEqual(["original", "original", "medium"]);
+		} else {
+			expect([
+				settings.getDefaultProvider(),
+				settings.getDefaultModel(),
+				settings.getDefaultThinkingLevel(),
+			]).toEqual([f.model.provider, "reason", action === "save untouched" ? "medium" : "high"]);
+		}
+		expect(settings.getRecentModels()).toEqual(
+			action === "failed save" ? ["original/original"] : [`${f.model.provider}/${f.model.id}`, "original/original"],
+		);
+		expect(setModel).toHaveBeenCalledExactlyOnceWith(f.model.provider, f.model.id);
+	},
+);
 
 it("does not publish the removed configuration tab action", () => {
 	expect(Object.keys(KEYBINDINGS)).not.toContain("app.configuration.previousTab");
