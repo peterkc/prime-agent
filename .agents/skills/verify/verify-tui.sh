@@ -57,15 +57,17 @@ start)
 	args=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		--cwd | --session-dir | --session | --daemon-socket | --socket | --resume | -r | --fork)
+		--cwd | --session-dir | --session | --daemon-socket | --socket | --resume | -r | --fork | \
+			--cwd=* | --session-dir=* | --session=* | --daemon-socket=* | --socket=* | --resume=* | -r?* | --fork=*)
 			echo "verify-tui: $1 is not allowed; a run uses only its scratch root" >&2
 			exit 2
 			;;
 		-e | --extension)
 			[[ $# -ge 2 ]] || usage
-			# The TUI runs in <root>/work, so make extension paths absolute here.
+			# The TUI runs in <root>/work, so make local extension paths absolute here.
+			# Consuming the value here also keeps `-e --cwd` from reaching prime-agent as a flag.
 			ext="$2"
-			[[ "$ext" == /* ]] || ext="$PWD/$ext"
+			[[ "$ext" == /* || "$ext" == *:* ]] || ext="$PWD/$ext"
 			args+=("$1" "$ext")
 			shift 2
 			;;
@@ -168,7 +170,7 @@ stop)
 		status=1
 	elif ! wait "$pid"; then
 		echo "verify-tui: daemon shutdown failed:" >&2
-		cat "$VERIFY_ROOT/shutdown.log" >&2
+		cat "$VERIFY_ROOT/shutdown.log" >&2 || true
 		status=1
 	fi
 	# Then end leftover processes whose command line names this root, such as the

@@ -42,8 +42,8 @@ repository root.
    start removes its root and prints no export line. Options: `--cols N --rows N`
    (default 120 x 40) and `--repo DIR` to run another checkout of this
    repository. After `--`, other `prime-agent` arguments are passed on, for
-   example `-- -e my-extension.ts`; a relative `-e` path resolves against the
-   folder where you run `start`.
+   example `-- -e my-extension.ts`; a relative local `-e` path resolves against
+   the folder where you run `start`.
 3. Wait for the prompt: `VERIFY_ROOT=... $V wait 'model faux' 60`.
 4. Drive the path your diff changes, and only that path:
    - `$V type 'text'` types literal text.
