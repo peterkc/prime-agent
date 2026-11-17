@@ -1,0 +1,1 @@
+- Fixed missing final output when a program exited while the link was backed up.

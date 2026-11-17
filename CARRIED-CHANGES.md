@@ -5,7 +5,8 @@ carry only the differences the fork needs. Every PR that adds or changes a carri
 difference must update its entry in the same PR.
 
 Each entry gives its **files**, **reason**, **kind** (`upstreamable hook`,
-`required integration` or `intentional difference`) and **removal condition**.
+`required integration`, `intentional difference` or `upstream backport`) and
+**removal condition**.
 New fork-only files are not changes to pi-owned files.
 
 ## Fork development rules
@@ -36,3 +37,27 @@ New fork-only files are not changes to pi-owned files.
 - **Kind:** required integration
 - **Removal condition:** Remove the appended checks when pi supplies equivalent
   checks, or the fork owner retires the corresponding policy or guard.
+
+## Together Kimi K3 catalog expectation
+
+- **Files:** `packages/ai/test/together-models.test.ts`
+- **Reason:** Backport pi commit `0a25dd15e1685e98472d58cc526ec73f8a789ecd`.
+  Fork CI used a catalog with a 1,048,576-token output limit while the test
+  still expected 131,072.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `0a25dd15e1685e98472d58cc526ec73f8a789ecd`.
+
+## Drain output while the link holds readers
+
+- **Files:** `packages/env/daemon/src/exec.rs`,
+  `packages/env/daemon/src/output.rs`, `packages/env/daemon/src/process.rs`,
+  `packages/env/daemon/src/pty.rs`, `packages/env/test/process.test.ts`
+- **Reason:** Backport pi commit `b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
+  Fork CI lost final output when the exit grace elapsed while the link held a
+  reader up. The upstream changelog bullet uses a fork `.changes` fragment.
+  Two `test-policy: allow` comments name the upstream commit and preserve its
+  client-stall timer and failure timeout. Behavior and assertions stay unchanged.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
