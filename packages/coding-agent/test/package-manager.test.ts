@@ -1,5 +1,17 @@
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { PassThrough } from "node:stream";
@@ -8,6 +20,22 @@ import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { shouldUseWindowsShell } from "../src/utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../src/utils/git.js";
+
+function runFixtureGit(cwd: string, args: string[]): string {
+	return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function commitFixture(cwd: string, content: string): void {
+	writeFileSync(join(cwd, "tracked"), content);
+	runFixtureGit(cwd, ["add", "tracked"]);
+	runFixtureGit(cwd, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", content]);
+}
+
+function createFixtureRepo(cwd: string): void {
+	mkdirSync(cwd, { recursive: true });
+	runFixtureGit(cwd, ["init", "-b", "main"]);
+	commitFixture(cwd, "initial");
+}
 
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -29,7 +57,7 @@ interface GitPackageManagerInternals extends PackageManagerCommands {
 	installGit(source: GitSource, scope: GitScope): Promise<void>;
 	updateGit(source: GitSource, scope: GitScope): Promise<void>;
 	removeGit(source: GitSource, scope: GitScope): Promise<void>;
-	runCommandCapture(command: string, args: string[]): Promise<string>;
+	runCommandCapture(command: string, args: string[], options?: { cwd?: string }): Promise<string>;
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -678,6 +706,7 @@ Content`,
 
 			vi.spyOn(packageManager as any, "runCommandCapture").mockImplementation(async (...callArgs: unknown[]) => {
 				const [_command, args] = callArgs as [string, string[]];
+				if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return realpathSync(targetDir);
 				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref" && args[2] === "@{upstream}")
 					return "origin/main";
 				if (args[0] === "rev-parse" && args[1] === "@{upstream}") return "remote-head";
@@ -968,6 +997,214 @@ Content`,
 			expect(manager.getGitInstallPath(source, "temporary")).toBe(
 				join(agentDir, "tmp", "extensions", `git-${host}`, hash, path),
 			);
+		});
+	});
+
+	describe("git checkout boundaries", () => {
+		it.each(["update", "removeAndPersist", "checkForAvailableUpdates"] as const)(
+			"preserves a non-repository target during %s",
+			async (operation) => {
+				const remote = join(tempDir, "remote");
+				const enclosing = join(tempDir, "enclosing");
+				createFixtureRepo(remote);
+				runFixtureGit(tempDir, ["clone", remote, enclosing]);
+				agentDir = join(enclosing, "agent");
+				packageManager = new DefaultPackageManager({
+					cwd: enclosing,
+					agentDir,
+					settingsManager,
+					bundledSkillsDir: null,
+				});
+				const source = "git:git@gitlab.com:group/subgroup";
+				const target = join(agentDir, "git", "gitlab.com", "group", "subgroup");
+				mkdirSync(target, { recursive: true });
+				const child = join(target, "repo");
+				runFixtureGit(tempDir, ["clone", remote, child]);
+				writeFileSync(join(child, "tracked"), "child edits");
+				writeFileSync(join(child, "untracked"), "child untracked");
+				writeFileSync(join(enclosing, "tracked"), "enclosing edits");
+				writeFileSync(join(enclosing, "untracked"), "enclosing untracked");
+				const healthySource = "git:git@gitlab.com:group/healthy";
+				const healthy = join(agentDir, "git", "gitlab.com", "group", "healthy");
+				if (operation === "checkForAvailableUpdates") {
+					runFixtureGit(tempDir, ["clone", remote, healthy]);
+				}
+				const before = runFixtureGit(enclosing, ["status", "--porcelain", "--untracked-files=all"]);
+				commitFixture(remote, "remote update");
+				settingsManager.setPackages(operation === "checkForAvailableUpdates" ? [source, healthySource] : [source]);
+				const manager = packageManager as unknown as GitPackageManagerInternals;
+				const command = vi.spyOn(manager, "runCommand");
+				const capture = vi.spyOn(manager, "runCommandCapture");
+				const events: ProgressEvent[] = [];
+				packageManager.setProgressCallback((event) => events.push(event));
+
+				if (operation === "checkForAvailableUpdates") {
+					expect(await packageManager.checkForAvailableUpdates()).toEqual([
+						{ source: healthySource, displayName: "gitlab.com/group/healthy", type: "git", scope: "user" },
+					]);
+					expect(
+						capture.mock.calls.filter(([, args, options]) => args[0] === "ls-remote" && options?.cwd === target),
+					).toEqual([]);
+				} else if (operation === "removeAndPersist") {
+					expect(await packageManager.removeAndPersist(source)).toBe(true);
+					expect(settingsManager.getGlobalSettings().packages).toEqual([]);
+					expect(
+						events.some(
+							(event) =>
+								event.type === "start" &&
+								event.action === "remove" &&
+								event.message?.includes("Left folder in place"),
+						),
+					).toBe(true);
+				} else {
+					await expect(packageManager.update(source)).rejects.toThrow("not a repository top level");
+					expect(command).not.toHaveBeenCalled();
+				}
+
+				expect(runFixtureGit(enclosing, ["status", "--porcelain", "--untracked-files=all"])).toBe(before);
+				expect(readFileSync(join(enclosing, "tracked"), "utf8")).toBe("enclosing edits");
+				expect(readFileSync(join(enclosing, "untracked"), "utf8")).toBe("enclosing untracked");
+				expect(readFileSync(join(child, "tracked"), "utf8")).toBe("child edits");
+				expect(readFileSync(join(child, "untracked"), "utf8")).toBe("child untracked");
+				expect(runFixtureGit(child, ["rev-parse", "HEAD"])).toBe(runFixtureGit(remote, ["rev-parse", "HEAD~1"]));
+			},
+		);
+
+		it("rejects a leading-hyphen ref before any git call", async () => {
+			const source = "git:git@gitlab.com:group/repo@--orphan";
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			const command = vi.spyOn(manager, "runCommand").mockResolvedValue(undefined);
+			let error: unknown;
+			try {
+				await packageManager.install(source);
+			} catch (caught) {
+				error = caught;
+			}
+
+			expect(command).not.toHaveBeenCalled();
+			expect(error instanceof Error ? error.message : "").toContain(source);
+			expect(existsSync(join(agentDir, "git", "gitlab.com", "group", "repo"))).toBe(false);
+		});
+
+		it("leaves an external checkout in place when removing through a host symlink", async () => {
+			const external = join(tempDir, "external");
+			const target = join(external, "group", "repo");
+			createFixtureRepo(target);
+			const root = join(agentDir, "git");
+			mkdirSync(root, { recursive: true });
+			symlinkSync(external, join(root, "gitlab.com"), process.platform === "win32" ? "junction" : "dir");
+			const source = "git:git@gitlab.com:group/repo";
+			settingsManager.setPackages([source]);
+			const events: ProgressEvent[] = [];
+			packageManager.setProgressCallback((event) => events.push(event));
+
+			expect(await packageManager.removeAndPersist(source)).toBe(true);
+
+			expect(settingsManager.getGlobalSettings().packages).toEqual([]);
+			expect(events.some((event) => event.type === "start" && event.message?.includes("Left folder in place"))).toBe(
+				true,
+			);
+			expect(readFileSync(join(target, "tracked"), "utf8")).toBe("initial");
+			expect(runFixtureGit(target, ["status", "--porcelain"])).toBe("");
+		});
+
+		it("refuses updating an external checkout but removes only its symlink leaf", async () => {
+			const remote = join(tempDir, "remote");
+			const external = join(tempDir, "external");
+			createFixtureRepo(remote);
+			runFixtureGit(tempDir, ["clone", remote, external]);
+			const source = "git:git@gitlab.com:group/repo";
+			const target = join(agentDir, "git", "gitlab.com", "group", "repo");
+			mkdirSync(dirname(target), { recursive: true });
+			symlinkSync(external, target, process.platform === "win32" ? "junction" : "dir");
+			settingsManager.setPackages([source]);
+			commitFixture(remote, "remote update");
+			writeFileSync(join(external, "tracked"), "external edits");
+			writeFileSync(join(external, "untracked"), "external untracked");
+			const before = runFixtureGit(external, ["status", "--porcelain", "--untracked-files=all"]);
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			const command = vi.spyOn(manager, "runCommand");
+			const capture = vi.spyOn(manager, "runCommandCapture");
+
+			await expect(packageManager.update(source)).rejects.toThrow("outside package install root");
+			expect(command).not.toHaveBeenCalled();
+			expect(await packageManager.checkForAvailableUpdates()).toEqual([]);
+			expect(capture.mock.calls.filter(([, args]) => args[0] === "ls-remote")).toEqual([]);
+			expect(await packageManager.removeAndPersist(source)).toBe(true);
+
+			expect(existsSync(target)).toBe(false);
+			expect(settingsManager.getGlobalSettings().packages).toEqual([]);
+			expect(readFileSync(join(external, "tracked"), "utf8")).toBe("external edits");
+			expect(readFileSync(join(external, "untracked"), "utf8")).toBe("external untracked");
+			expect(runFixtureGit(external, ["status", "--porcelain", "--untracked-files=all"])).toBe(before);
+		});
+
+		it("installs and updates a pinned branch whose name is also a tracked path", async () => {
+			const remote = join(tempDir, "remote");
+			createFixtureRepo(remote);
+			writeFileSync(join(remote, "release"), "tracked path");
+			writeFileSync(join(remote, "@{upstream}"), "upstream path");
+			runFixtureGit(remote, ["add", "release", "@{upstream}"]);
+			commitFixture(remote, "main");
+			runFixtureGit(remote, ["checkout", "-b", "release"]);
+			commitFixture(remote, "release branch");
+			runFixtureGit(remote, ["checkout", "main", "--"]);
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			await manager.installGit(
+				{ type: "git", repo: remote, host: "gitlab.com", path: "group/repo", ref: "release", pinned: true },
+				"user",
+			);
+			const target = join(agentDir, "git", "gitlab.com", "group", "repo");
+			expect(runFixtureGit(target, ["branch", "--show-current"])).toBe("release");
+			expect(readFileSync(join(target, "tracked"), "utf8")).toBe("release branch");
+			runFixtureGit(remote, ["checkout", "release", "--"]);
+			commitFixture(remote, "release update");
+			const source = "git:git@gitlab.com:group/repo";
+			settingsManager.setPackages([source]);
+
+			await packageManager.update(source);
+
+			expect(runFixtureGit(target, ["branch", "--show-current"])).toBe("release");
+			expect(readFileSync(join(target, "tracked"), "utf8")).toBe("release update");
+			expect(readFileSync(join(target, "release"), "utf8")).toBe("tracked path");
+		});
+
+		it.each(["user", "project"] as const)("updates and removes %s via an alias", async (scope) => {
+			const remote = join(tempDir, "remote");
+			createFixtureRepo(remote);
+			const root = scope === "project" ? join(tempDir, ".prime", "agent", "git") : join(agentDir, "git");
+			const host = join(root, "actual-host");
+			mkdirSync(join(host, "group"), { recursive: true });
+			symlinkSync(host, join(root, "gitlab.com"), process.platform === "win32" ? "junction" : "dir");
+			const target = join(root, "gitlab.com", "group", "repo");
+			const manager = packageManager as unknown as GitPackageManagerInternals;
+			await manager.installGit(
+				{ type: "git", repo: remote, host: "gitlab.com", path: "group/repo", ref: "main", pinned: true },
+				scope,
+			);
+			const source = "git:git@gitlab.com:group/repo";
+			if (scope === "project") settingsManager.setProjectPackages([source]);
+			else settingsManager.setPackages([source]);
+			commitFixture(remote, "remote update");
+			writeFileSync(join(target, "tracked"), "local edits");
+			writeFileSync(join(target, "untracked"), "remove me");
+
+			expect(await packageManager.checkForAvailableUpdates()).toEqual([
+				{ source, displayName: "gitlab.com/group/repo", type: "git", scope },
+			]);
+			await packageManager.update(source);
+			expect(readFileSync(join(target, "tracked"), "utf8")).toBe("remote update");
+			expect(existsSync(join(target, "untracked"))).toBe(false);
+			expect(await packageManager.checkForAvailableUpdates()).toEqual([]);
+			writeFileSync(join(target, "untracked"), "preserve on no-op");
+			await packageManager.update(source);
+			expect(readFileSync(join(target, "untracked"), "utf8")).toBe("preserve on no-op");
+			expect(await packageManager.removeAndPersist(source, { local: scope === "project" })).toBe(true);
+			expect(existsSync(target)).toBe(false);
+			const settings =
+				scope === "project" ? settingsManager.getProjectSettings() : settingsManager.getGlobalSettings();
+			expect(settings.packages).toEqual([]);
+			await packageManager.remove(source);
 		});
 	});
 
