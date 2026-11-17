@@ -9467,7 +9467,17 @@ export class InteractiveMode {
 								if (thinkingLevel !== undefined && !(await this.applyThinkingLevel(thinkingLevel)))
 									return false;
 								if (options?.saveAsDefault) {
-									const state = await this.agentConnection.getState();
+									const connection = this.agentConnection;
+									const sessionId = this.connectionState?.sessionId;
+									const state = await connection.getState();
+									if (settled) return false;
+									if (
+										this.agentConnection !== connection ||
+										this.connectionState?.sessionId !== sessionId ||
+										(sessionId !== undefined && state.sessionId !== sessionId)
+									) {
+										return true;
+									}
 									this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 									if (model.reasoning) this.settingsManager.setDefaultThinkingLevel(state.thinkingLevel);
 									const effort = model.reasoning ? ` (${state.thinkingLevel})` : "";

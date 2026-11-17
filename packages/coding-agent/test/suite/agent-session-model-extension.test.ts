@@ -774,6 +774,15 @@ describe("AgentSession model and extension characterization", () => {
 		]);
 	});
 
+	it("session-model setModel with explicit persist false keeps an implicit effort out with saving on", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high");
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		await h.session.setModel(h.getModel("faux-2")!, { persist: false });
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("low");
+	});
+
 	it("session-model explicit session-only effort stays out of the defaults on a clamping cycle", async () => {
 		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
 		harnesses.push(h);
