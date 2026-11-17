@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -852,7 +853,10 @@ export class DefaultPackageManager implements PackageManager {
 				return;
 			}
 			if (parsed.type === "git") {
-				await this.removeGit(parsed, scope);
+				const message = await this.removeGit(parsed, scope);
+				if (message) {
+					this.emitProgress({ type: "start", action: "remove", source, message });
+				}
 				return;
 			}
 			if (parsed.type === "local") {
@@ -1046,7 +1050,7 @@ export class DefaultPackageManager implements PackageManager {
 				if (!existsSync(installedPath)) {
 					return undefined;
 				}
-				const hasUpdate = await this.gitHasAvailableUpdate(installedPath);
+				const hasUpdate = await this.gitHasAvailableUpdate(installedPath, entry.scope);
 				if (!hasUpdate) {
 					return undefined;
 				}
@@ -1259,7 +1263,7 @@ export class DefaultPackageManager implements PackageManager {
 		const gitParsed = parseGitUrl(source);
 		if (gitParsed) {
 			if (gitParsed.ref?.startsWith("-")) {
-				throw new Error("Git package ref must not start with '-'");
+				throw new Error(`Git package ref must not start with '-': ${source}`);
 			}
 			return gitParsed;
 		}
@@ -1323,13 +1327,13 @@ export class DefaultPackageManager implements PackageManager {
 		return JSON.parse(raw);
 	}
 
-	private async gitHasAvailableUpdate(installedPath: string): Promise<boolean> {
+	private async gitHasAvailableUpdate(installedPath: string, scope: InstalledSourceScope): Promise<boolean> {
 		if (isOfflineModeEnabled()) {
 			return false;
 		}
 
-		await this.assertGitRepositoryRoot(installedPath);
 		try {
+			await this.assertGitPackageTarget(installedPath, scope);
 			const localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
 				cwd: installedPath,
 				timeoutMs: NETWORK_TIMEOUT_MS,
@@ -1594,7 +1598,6 @@ export class DefaultPackageManager implements PackageManager {
 
 		await this.runCommand("git", ["clone", source.repo, targetDir]);
 		if (source.ref) {
-			await this.assertGitRepositoryRoot(targetDir);
 			await this.runCommand("git", ["checkout", source.ref, "--"], { cwd: targetDir });
 		}
 		const packageJsonPath = join(targetDir, "package.json");
@@ -1610,7 +1613,7 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
-		await this.assertGitRepositoryRoot(targetDir);
+		await this.assertGitPackageTarget(targetDir, scope);
 		const target = await this.getLocalGitUpdateTarget(targetDir);
 
 		await this.runCommand("git", target.fetchArgs, { cwd: targetDir });
@@ -1651,7 +1654,13 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async assertGitRepositoryRoot(targetDir: string): Promise<void> {
+	private async assertGitPackageTarget(targetDir: string, scope: SourceScope): Promise<void> {
+		const installRoot = this.getGitInstallRoot(scope) ?? this.getTemporaryRoot();
+		const realRoot = realpathSync.native(installRoot);
+		const realTarget = realpathSync.native(targetDir);
+		if (!realTarget.startsWith(`${realRoot}${sep}`)) {
+			throw new Error(`Refusing to use path outside package install root: ${targetDir}`);
+		}
 		const message = `Refusing to use git package path that is not a repository top level: ${targetDir}`;
 		let topLevel: string;
 		try {
@@ -1662,23 +1671,25 @@ export class DefaultPackageManager implements PackageManager {
 		} catch (error) {
 			throw new Error(message, { cause: error });
 		}
-		if (realpathSync(topLevel) !== realpathSync(targetDir)) {
+		if (realpathSync.native(topLevel) !== realTarget) {
 			throw new Error(message);
 		}
 	}
 
-	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
+	private async removeGit(source: GitSource, scope: SourceScope): Promise<string | undefined> {
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (!existsSync(targetDir)) return;
-		const installRoot = this.getGitInstallRoot(scope) ?? join(this.agentDir, "tmp", "extensions");
-		const realRoot = realpathSync(installRoot);
-		const realTarget = realpathSync(targetDir);
-		if (!realTarget.startsWith(`${realRoot}${sep}`)) {
-			throw new Error(`Refusing to use path outside package install root: ${targetDir}`);
+		if (!lstatSync(targetDir).isSymbolicLink()) {
+			try {
+				await this.assertGitPackageTarget(targetDir, scope);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				return `Left folder in place: ${targetDir}. It may contain another package. ${reason}`;
+			}
 		}
-		await this.assertGitRepositoryRoot(targetDir);
 		rmSync(targetDir, { recursive: true, force: true });
 		this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
+		return undefined;
 	}
 
 	private pruneEmptyGitParents(targetDir: string, installRoot: string | undefined): void {
@@ -1783,10 +1794,15 @@ export class DefaultPackageManager implements PackageManager {
 		return join(this.agentDir, "git");
 	}
 
-	private getTemporaryDir(prefix: string, suffix?: string): string {
+	private getTemporaryRoot(): string {
 		const root = join(this.agentDir, "tmp", "extensions");
 		mkdirSync(root, { recursive: true, mode: 0o700 });
 		chmodSync(root, 0o700);
+		return root;
+	}
+
+	private getTemporaryDir(prefix: string, suffix?: string): string {
+		const root = this.getTemporaryRoot();
 		const hash = createHash("sha256")
 			.update(`${prefix}-${suffix ?? ""}`)
 			.digest("hex")

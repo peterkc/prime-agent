@@ -1,1 +1,1 @@
-- Fixed unsafe git package updates and removal by rejecting non-checkout targets, removal paths that escape the install root through symlinks, and refs starting with `-`.
+- Fixed unsafe git package updates and removal by rejecting non-checkout targets, update paths that escape the install root through symlinks, and refs starting with `-`; refused removals now leave the folder in place and remove its settings entry.
