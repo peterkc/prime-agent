@@ -864,6 +864,26 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.sessionFile).toBeDefined();
 	});
 
+	it.each(["persisted", "in-memory", "root"])(
+		"session-model forks before the first prompt keep the current model and effort (%s)",
+		async (mode) => {
+			const { runtime, faux } = await createRuntimeForTest(() => {}, {
+				inMemory: mode === "in-memory",
+				bootstrapModel: false,
+			});
+			if (mode === "root") runtime.session.sessionManager.newSession();
+			const rootEntry =
+				mode === "root" ? runtime.session.sessionManager.appendMessage(userMsg("fork here")) : undefined;
+			await runtime.session.setModel({ ...faux.getModel("faux-2")!, reasoning: true });
+			runtime.session.setThinkingLevel("high");
+			if (rootEntry) runtime.session.sessionManager.appendMessage(fauxAssistantMessage("saved"));
+			else await runtime.session.prompt("fork here");
+			await runtime.fork(rootEntry ?? runtime.session.getUserMessagesForForking()[0]!.entryId);
+			expect([runtime.session.model?.id, runtime.session.thinkingLevel]).toEqual(["faux-2", "high"]);
+			expect(conversationMessages(runtime.session)).toEqual([]);
+		},
+	);
+
 	it("forks before the first prompt in-memory and preserves its selection metadata", async () => {
 		const { runtime } = await createRuntimeForTest(() => {}, { inMemory: true });
 		await runtime.session.prompt("Say one");

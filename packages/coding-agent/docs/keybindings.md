@@ -117,6 +117,8 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.model.saveDefault` | `ctrl+alt+s` | Select model and save model and effort defaults |
 | `app.model.toggleScope` | `alt+s` | Toggle between all and scoped models |
 
+`ctrl+alt+s` requires a terminal that sends Option/Alt as Meta. On macOS without Option-as-Meta, it can arrive as `ctrl+s`, which stashes the prompt. Rebind `app.model.saveDefault` in `keybindings.json` if needed.
+
 ### Configuration Pickers
 
 Models, Providers, and MCP Connections open as separate pickers. Use `escape` to close a picker. Left and right edit a nonempty search field; with an empty model search, they adjust the highlighted model's effort.

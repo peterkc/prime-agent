@@ -708,7 +708,8 @@ pi.on("model_select", async (event, ctx) => {
   // event.model - newly selected model
   // event.previousModel - previous model (undefined if first selection)
   // event.source - "set" | "cycle" | "restore"
-  // event.persisted - whether this selection updates global model defaults and recent models
+  // event.persisted - whether this selection was saved as the global model default
+  // Session-only built-in picks still update recent models.
 
   const prev = event.previousModel
     ? `${event.previousModel.provider}/${event.previousModel.id}`
@@ -1632,7 +1633,7 @@ if (model) {
 
 Get or set the thinking level. Level is clamped to model capabilities (non-reasoning models always use "off"). Changes emit `thinking_level_select`.
 
-Pass `{ persist: false }` to leave the global thinking default unchanged. The session level and history still change. Omitting the option, or passing `{ persist: true }`, keeps the default persistence behavior for both setters. While a session-only level is set, later model switches keep it unless a scoped cycle supplies its own thinking level, and leave the thinking default unchanged. A persisting `setThinkingLevel` clears it. A later xai metadata refresh persists a capability clamp only when no session-only level is set.
+Pass `{ persist: false }` to leave the global thinking default unchanged. The session level and history still change. Omitting the option, or passing `{ persist: true }`, keeps the default persistence behavior for both setters. While a session-only level is set, later model switches keep it unless a scoped cycle supplies its own thinking level, and leave the thinking default unchanged. A persisting `setThinkingLevel` clears it. A later xai metadata refresh leaves an explicit session-only level unsaved. Otherwise it follows `saveModelChangesAsDefault`, which defaults to `false`, including after resume.
 
 ```typescript
 const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"

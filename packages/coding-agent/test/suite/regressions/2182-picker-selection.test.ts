@@ -213,11 +213,12 @@ it("refreshes a fresh model catalog when the picker opens without a search", asy
 	await done;
 });
 
-it.each(["enter", "save", "rebound save", "failed save", "save untouched"])(
+it.each(["enter", "enter default", "save", "rebound save", "failed save", "save untouched", "save plain"])(
 	"picker default action: %s",
 	async (action) => {
 		const f = await fixture();
-		const settings = SettingsManager.inMemory();
+		const settings = SettingsManager.inMemory({ saveModelChangesAsDefault: action === "enter default" });
+		const model = action === "save plain" ? f.harness.getModel("plain")! : f.model;
 		f.harness.settingsManager.setDefaultThinkingLevel("medium");
 		settings.setDefaultModelAndProvider("original", "original");
 		settings.setDefaultThinkingLevel("medium");
@@ -225,10 +226,11 @@ it.each(["enter", "save", "rebound save", "failed save", "save untouched"])(
 		const switched = deferred();
 		const setModel = vi.fn(async () => {
 			if (action === "failed save") throw new Error("model unavailable");
-			await f.harness.session.setModel(f.model);
+			await f.harness.session.setModel(model);
 		});
 		Object.assign(f.mode, {
 			uiServices: { modelRegistry: f.harness.session.modelRegistry, settingsManager: settings },
+			getCachedModelCandidates: () => [model],
 			completeModelSelection: prototype.completeModelSelection,
 			agentConnection: {
 				setModel,
@@ -246,8 +248,9 @@ it.each(["enter", "save", "rebound save", "failed save", "save untouched"])(
 		});
 		if (action === "rebound save") setKeybindings(new KeybindingsManager({ "app.model.saveDefault": "ctrl+x" }));
 		const done = f.mode.showConfigurationMenu("models");
-		if (action !== "save untouched") f.menu().handleInput("\x1b[C");
-		const key = action === "enter" ? "\r" : action === "rebound save" ? "\x18" : "\x1b[115;7u";
+		if (action !== "save untouched" && action !== "save plain" && action !== "enter default")
+			f.menu().handleInput("\x1b[C");
+		const key = action.startsWith("enter") ? "\r" : action === "rebound save" ? "\x18" : "\x1b[115;7u";
 		f.menu().handleInput(key);
 		if (action === "failed save") {
 			await switched.promise;
@@ -265,12 +268,16 @@ it.each(["enter", "save", "rebound save", "failed save", "save untouched"])(
 				settings.getDefaultProvider(),
 				settings.getDefaultModel(),
 				settings.getDefaultThinkingLevel(),
-			]).toEqual([f.model.provider, "reason", action === "save untouched" ? "medium" : "high"]);
+			]).toEqual([
+				model.provider,
+				model.id,
+				action === "save untouched" || action === "save plain" || action === "enter default" ? "medium" : "high",
+			]);
 		}
 		expect(settings.getRecentModels()).toEqual(
-			action === "failed save" ? ["original/original"] : [`${f.model.provider}/${f.model.id}`, "original/original"],
+			action === "failed save" ? ["original/original"] : [`${model.provider}/${model.id}`, "original/original"],
 		);
-		expect(setModel).toHaveBeenCalledExactlyOnceWith(f.model.provider, f.model.id);
+		expect(setModel).toHaveBeenCalledExactlyOnceWith(model.provider, model.id);
 	},
 );
 

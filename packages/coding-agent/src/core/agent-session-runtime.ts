@@ -579,6 +579,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			selectedText = extractUserMessageText(selectedEntry.message.content);
 		}
 
+		const sessionOptions =
+			targetLeafId && this.session.sessionManager.getBranch(targetLeafId).some((entry) => entry.type === "message")
+				? undefined
+				: { model: this.session.model, thinkingLevel: this.session.thinkingLevel };
 		const previousSessionFile = this.session.sessionFile;
 		if (this.session.sessionManager.isPersisted()) {
 			const currentSessionFile = this.session.sessionFile;
@@ -608,6 +612,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 									previousSessionFile,
 								},
 								sessionConfig: this.sessionConfig,
+								sessionOptions,
 							}),
 						),
 					lease,
@@ -637,6 +642,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 								previousSessionFile,
 							},
 							sessionConfig: this.sessionConfig,
+							sessionOptions,
 						}),
 					),
 				lease,
@@ -670,6 +676,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 							previousSessionFile,
 						},
 						sessionConfig: this.sessionConfig,
+						sessionOptions,
 					}),
 				),
 			lease,

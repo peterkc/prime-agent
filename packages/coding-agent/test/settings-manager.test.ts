@@ -25,6 +25,11 @@ describe("SettingsManager", () => {
 	const readSettings = (path: string): Record<string, unknown> =>
 		JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 
+	it.each(["false", "true", 1])("session-model save-model policy accepts only boolean true: %s", (value) => {
+		writeSettings(globalPath, { saveModelChangesAsDefault: value });
+		expect(SettingsManager.create(projectDir, agentDir).getSaveModelChangesAsDefault()).toBe(false);
+	});
+
 	it("save-model default policy is global-only, defaults off and persists toggles", async () => {
 		writeSettings(projectPath, { saveModelChangesAsDefault: true });
 		const manager = SettingsManager.create(projectDir, agentDir);

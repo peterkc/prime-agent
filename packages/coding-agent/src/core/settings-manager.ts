@@ -932,7 +932,7 @@ export class SettingsManager {
 	}
 
 	getSaveModelChangesAsDefault(): boolean {
-		return this.globalSettings.saveModelChangesAsDefault ?? false;
+		return this.globalSettings.saveModelChangesAsDefault === true;
 	}
 
 	setSaveModelChangesAsDefault(enabled: boolean): void {

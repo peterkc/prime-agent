@@ -8705,8 +8705,10 @@ export class InteractiveMode {
 						});
 						this.footer.setAutoCompactEnabled(enabled);
 					},
-					onSaveModelChangesAsDefaultChange: (enabled) =>
-						this.settingsManager.setSaveModelChangesAsDefault(enabled),
+					onSaveModelChangesAsDefaultChange: (enabled) => {
+						this.settingsManager.setSaveModelChangesAsDefault(enabled);
+						this.showStatus("Run /reload to apply this setting to the running session.");
+					},
 					onIdleEvictionMinutesChange: (value) => {
 						this.settingsManager.setIdleEvictionMinutes(value);
 					},
@@ -9467,8 +9469,9 @@ export class InteractiveMode {
 								if (options?.saveAsDefault) {
 									const state = await this.agentConnection.getState();
 									this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-									this.settingsManager.setDefaultThinkingLevel(state.thinkingLevel);
-									this.showStatus(`Saved default: ${model.id} (${state.thinkingLevel})`);
+									if (model.reasoning) this.settingsManager.setDefaultThinkingLevel(state.thinkingLevel);
+									const effort = model.reasoning ? ` (${state.thinkingLevel})` : "";
+									this.showStatus(`Saved default: ${model.id}${effort}`);
 								}
 								return true;
 							})();

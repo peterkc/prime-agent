@@ -765,7 +765,7 @@ export interface ModelSelectEvent {
 	model: Model<any>;
 	previousModel: Model<any> | undefined;
 	source: ModelSelectSource;
-	/** Whether this selection updates the global model defaults and recent models. */
+	/** Whether this selection was saved as the global model default. Session-only picks may still update recent models. */
 	persisted: boolean;
 }
 

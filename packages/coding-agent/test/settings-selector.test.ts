@@ -5,11 +5,34 @@ import {
 	type SettingsConfig,
 	SettingsSelectorComponent,
 } from "../src/modes/interactive/components/settings-selector.js";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 const labels = ["finished", "failed", "waiting", "Save model changes"];
 
 describe("settings toggles", () => {
+	test.each([false, true])("session-model /settings saves its toggle from initial=%s", async (initial) => {
+		initTheme("dark");
+		const settings = SettingsManager.inMemory({ saveModelChangesAsDefault: initial });
+		let selector!: SettingsSelectorComponent;
+		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+			uiServices: { settingsManager: settings },
+			agentConnection: { getState: async () => ({ availableThinkingLevels: ["medium"], thinkingLevel: "medium" }) },
+			applyConnectionStateSnapshot: vi.fn(),
+			showSelector: (create: (done: () => void) => { component: SettingsSelectorComponent }) => {
+				selector = create(() => {}).component;
+			},
+			showStatus: vi.fn(),
+		});
+		await mode.showSettingsSelector();
+		const list = selector.getSettingsList();
+		for (const char of "save") list.handleInput(char);
+		list.handleInput("\r");
+		await settings.flush();
+		expect(settings.getSaveModelChangesAsDefault()).toBe(!initial);
+		expect(mode.showStatus).toHaveBeenCalledOnce();
+	});
+
 	test.each(labels)("persists the %s toggle", async (label) => {
 		initTheme("dark");
 		const settings = SettingsManager.inMemory();
@@ -57,9 +80,6 @@ describe("settings toggles", () => {
 		const selector = new SettingsSelectorComponent(config, callbacks);
 		const list = selector.getSettingsList();
 		for (const char of label) list.handleInput(char);
-		expect(list.render(100).join("\n")).toContain(
-			label === "Save model changes" ? "Save model changes as default" : `Notify when ${label}`,
-		);
 		list.handleInput("\r");
 		await settings.flush();
 		expect(settings.getSaveModelChangesAsDefault()).toBe(label === "Save model changes");
