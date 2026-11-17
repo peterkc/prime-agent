@@ -32,12 +32,12 @@ function countLines(text) {
 function resolveBase() {
 	const index = process.argv.indexOf("--base");
 	if (index !== -1) return git(["merge-base", "HEAD", process.argv[index + 1]]);
-	for (const ref of ["fork/main", "origin/main"]) {
+	for (const ref of ["fork/next", "origin/next"]) {
 		try {
 			return git(["merge-base", "HEAD", ref]);
 		} catch {}
 	}
-	throw new Error("Neither fork/main nor origin/main exists; pass --base <ref>.");
+	throw new Error("Neither fork/next nor origin/next exists; pass --base <ref>.");
 }
 
 function kindOf(path) {

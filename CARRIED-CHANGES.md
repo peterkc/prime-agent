@@ -20,7 +20,7 @@ New fork-only files are not changes to pi-owned files.
 
 ## Dependency release age
 
-- **Files:** `.npmrc`
+- **Files:** `.npmrc`, `README.md`
 - **Reason:** Set a seven-day release age while keeping `save-exact=true` and the
   approved `@cotal-ai/core` and `@earendil-works/*` exemptions.
 - **Kind:** intentional difference

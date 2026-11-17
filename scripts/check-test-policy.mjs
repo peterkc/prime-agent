@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
 const testFilePattern =
@@ -34,20 +34,6 @@ function resolveBase() {
 		if (base) return base;
 	}
 	throw new Error("No test-policy base: neither fork/next nor origin/next has a merge base with HEAD.");
-}
-
-function walkFiles(dir, out = []) {
-	for (const entry of readdirSync(dir)) {
-		if (["node_modules", ".git", "dist"].includes(entry)) continue;
-		const path = resolve(dir, entry);
-		const stat = statSync(path);
-		if (stat.isDirectory()) walkFiles(path, out);
-		else {
-			const rel = relative(root, path).replaceAll("\\", "/");
-			if (testFilePattern.test(rel)) out.push(rel);
-		}
-	}
-	return out;
 }
 
 function maskJsSyntax(content) {
@@ -291,7 +277,6 @@ function directObjectProperties(argument) {
 }
 
 function changedTestFiles(base) {
-	if (!base) return [...walkFiles(resolve(root, "packages")), ...walkFiles(resolve(root, "prime-agent-runtime", "test"))];
 	const roots = ["packages", "prime-agent-runtime/test", "scripts"];
 	const tracked = git(["diff", "--name-only", "--diff-filter=ACMR", base, "--", ...roots]);
 	const untracked = git(["ls-files", "--others", "--exclude-standard", "--", ...roots], true);
@@ -569,7 +554,7 @@ const base = resolveBase();
 const failures = [];
 for (const path of changedTestFiles(base)) {
 	const current = scan(readFileSync(resolve(root, path), "utf8"), path);
-	const oldContent = base ? git(["show", `${base}:${path}`], true) : "";
+	const oldContent = git(["show", `${base}:${path}`], true);
 	const allowed = counts(oldContent ? scan(oldContent, path) : []);
 	const seen = new Map();
 	for (const violation of current) {
@@ -585,4 +570,4 @@ if (failures.length > 0) {
 	console.error("\nUse a deterministic signal, deferred promise, fake timer, or unconditional local fixture instead.");
 	process.exit(1);
 }
-console.log(`Test policy check passed${base ? ` against ${base}` : ""}.`);
+console.log(`Test policy check passed against ${base}.`);

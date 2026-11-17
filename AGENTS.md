@@ -53,7 +53,6 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
   - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
-- When regressions tests for fixing a github issue, add a comment with the github issue number next to the test.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 - Never commit unless the user asks.
 
@@ -68,7 +67,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 - Tests using subprocesses, sockets, concurrency, or shared process state must bind port `0`, use unique temporary paths, restore environment/cwd/globals/fake timers, and close every resource in `finally`.
 - Run every modified test file directly. For concurrency, process, timer, or ordering changes, also run the focused suite repeatedly with multiple shuffle seeds. Stop on the first failure; repeated runs are evidence, never retries.
 - Keep tests as short as the behavior allows: share setup through small named helpers instead of copying it. Each added test or table row must cover a behavior that no other test covers; delete any that does not. When a change adds more test lines than source lines, or a test-only change adds more test lines than it deletes, the PR text names the behaviors the extra tests cover.
-- After `npm run check`, run `node scripts/fork-pr-check.mjs --base fork/next`. It reports the counts for the line rule above, including new files, and runs each changed test file with shuffle seeds 17, 43 and 101.
+- After `npm run check`, run `node scripts/fork-pr-check.mjs --base fork/next`. It reports the counts for the line rule above, including new files, and runs each changed test file with shuffle seeds 17, 43 and 101. These seeded runs stay local; CI uses `--no-run` for the line rule only.
 - Regressions go in the existing suite for the module that broke, with the issue number in the test name. Never create one file per issue. One test file per source module; repeated cases belong in an `it.each` table.
 - Deleting code deletes its tests. A flaky test is made deterministic or deleted, never skipped or retried.
 
@@ -76,11 +75,12 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 
 - A 7-day minimum release age applies to dependency updates. `.npmrc` sets `min-release-age=7`; `@cotal-ai/core` and `@earendil-works/*` are exempt. Their other dependencies keep the cooldown.
 - Enforcement requires npm >= 11.10; use a current npm when updating dependencies.
-- For an urgent security patch younger than 7 days, override explicitly: `npm install --min-release-age=0 <pkg>`.
+- For an urgent security patch younger than 7 days, override explicitly: `npm install --ignore-scripts --min-release-age=0 <pkg>`.
 
 - Treat npm dep and lockfile changes as reviewed code. Direct registry deps, including internal workspace deps, stay pinned to exact versions.
 - When updating `undici`, you MUST read its changelog/release notes for the target version and evaluate whether any changes may affect functionality before applying the update.
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
+- After installing, run `git config core.hooksPath .husky` in each clone or worktree; `--ignore-scripts` skips Husky's prepare step.
 - If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
 - If `packages/coding-agent/install-lock/` needs regen, run `node scripts/generate-coding-agent-install-lock.mjs` (verify with `--check` or `npm run check`). New deps with lifecycle scripts require review and an explicit allowlist entry in that script; never add one silently.
 - Pre-commit blocks lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1`. Don't bypass unless the user wants the lockfile change committed.
@@ -149,6 +149,8 @@ For testing pi's interactive mode, load and follow [.pi/skills/interactive-testi
 
 Location: `packages/<pkg>/.changes/<slug>.md` (one fragment file per PR per touched package)
 
+This fragment rule overrides changelog instructions in `.pi/prompts/cl.md`, `.pi/prompts/wr.md`, `.pi/prompts/pr.md`, `.pi/skills/github-work.md`, `.pi/skills/add-llm-provider.md` and `.pi/skills/release.md`.
+
 ### Format
 
 Do NOT edit `packages/*/CHANGELOG.md` directly. Instead, add a fragment file `packages/<pkg>/.changes/<slug>.md` (slug = kebab-case, branch- or ticket-derived, e.g. `eng-1234-fix-resize.md`) containing exactly the bullet line(s) for the change. Bullets are plain `- ...` lines with no `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation. Folding fragments into releases stays with the fork release owner.
@@ -163,7 +165,6 @@ Example fragment (`packages/coding-agent/.changes/eng-1234-effort-command.md`):
 
 - One fragment file per PR per touched package; a fragment may contain multiple bullets
 - NEVER modify already-released version sections in CHANGELOG.md (e.g., `## [0.2.1]`) — each is immutable once released
-- Purely internal changes may opt out via the `no-changelog` PR label
 
 ### Attribution
 

@@ -8,10 +8,11 @@ import test from "node:test";
 const script = new URL("./check-test-policy.mjs", import.meta.url);
 
 function git(root, ...args) {
-	return execFileSync("git", ["-C", root, "-c", "user.name=Policy test", "-c", "user.email=policy@example.invalid", ...args], {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-	}).trim();
+	return execFileSync(
+		"git",
+		["-C", root, "-c", "user.name=Policy test", "-c", "user.email=policy@example.invalid", "-c", "commit.gpgsign=false", ...args],
+		{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+	).trim();
 }
 
 async function fixture(t) {
@@ -55,6 +56,24 @@ test("uses next merge bases, rejects a new skip, and resolves refs again after r
 	assert.match(fallback.stdout, new RegExp(`against ${git(root, "rev-parse", "HEAD")}`));
 	git(root, "update-ref", "refs/remotes/fork/next", base);
 	assert.equal(check(root).status, 1, "re-added fork/next restores the older baseline");
+});
+
+test("uses the shared ancestor when HEAD and next diverge, without allowing next-side violations on HEAD", async (t) => {
+	const { root, base } = await fixture(t);
+	git(root, "checkout", "-b", "next-side");
+	await writeFile(join(root, "packages/example/test/policy.test.ts"), 'it.skip("diverged skip", () => {});\n');
+	git(root, "add", "packages/example/test/policy.test.ts");
+	git(root, "commit", "-m", "Next-side violation");
+	git(root, "update-ref", "refs/remotes/fork/next", "HEAD");
+	git(root, "checkout", "policy");
+	git(root, "commit", "--allow-empty", "-m", "Diverged HEAD");
+	const initial = check(root);
+	assert.equal(initial.status, 0, initial.stderr);
+	await writeFile(join(root, "packages/example/test/policy.test.ts"), 'it.skip("diverged skip", () => {});\n');
+	const rejected = check(root);
+	assert.equal(rejected.status, 1);
+	assert.match(rejected.stderr, /packages\/example\/test\/policy\.test\.ts:1.*diverged skip: \.skip/);
+	assert.match(initial.stdout, new RegExp(`against ${base}`));
 });
 
 test("rejects missing next refs even when origin/main and HEAD parent exist", async (t) => {
