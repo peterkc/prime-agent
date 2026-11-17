@@ -4462,6 +4462,15 @@ export class InteractiveMode {
 	}
 
 	private pushExtensionDialog(component: ExtensionDialogComponent): void {
+		const dialogs = this.extensionDialogs;
+		const handleInput = component.handleInput?.bind(component);
+		if (handleInput) {
+			// A reset dialog can regain focus from a surviving overlay; drop its key and restore current focus.
+			component.handleInput = (data) => {
+				if (dialogs === this.extensionDialogs || this.extensionDialogs.includes(component)) handleInput(data);
+				else this.showTopExtensionDialog();
+			};
+		}
 		this.extensionDialogs.push(component);
 		this.showTopExtensionDialog();
 	}
@@ -4827,16 +4836,6 @@ export class InteractiveMode {
 						disposeComponent();
 						return;
 					}
-					if (!isOverlay && component.handleInput) {
-						const handleInput = component.handleInput.bind(component);
-						component.handleInput = (data) => {
-							if (dialogs !== this.extensionDialogs) {
-								this.showTopExtensionDialog();
-								return;
-							}
-							handleInput(data);
-						};
-					}
 					if (isOverlay) {
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
@@ -4860,12 +4859,8 @@ export class InteractiveMode {
 					}
 				})
 				.catch((err) => {
-					if (dialogs !== this.extensionDialogs) {
-						reject(err);
-						return;
-					}
 					if (closed) return;
-					if (!isOverlay) {
+					if (!isOverlay && dialogs === this.extensionDialogs) {
 						if (component) this.removeExtensionDialog(component);
 						this.editor.setText(savedText);
 						this.ui.requestRender();

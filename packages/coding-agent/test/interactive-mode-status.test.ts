@@ -2096,33 +2096,89 @@ describe("InteractiveMode extension dialog ownership", () => {
 		expect(context.editor.getText()).toBe("draft");
 	});
 
-	test("pi #9909 a surviving raw overlay cannot return keys to a reset custom dialog", async () => {
+	test.each(["select", "confirm", "input", "editor", "custom"] as const)(
+		"pi #9909 a surviving raw overlay cannot keep focus on a reset %s dialog",
+		async (kind) => {
+			const context = createDialogContext();
+			const settled = vi.fn();
+			let answer: Promise<unknown>;
+			switch (kind) {
+				case "select":
+					answer = context.showExtensionSelector("Select", ["one"]);
+					break;
+				case "confirm":
+					answer = context.showExtensionConfirm("Confirm", "confirm");
+					break;
+				case "input":
+					answer = context.showExtensionInput("Input");
+					break;
+				case "editor":
+					answer = context.showExtensionEditor("Editor", "stale");
+					break;
+				case "custom":
+					answer = context.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+						const component = new TestComponent("CUSTOM");
+						component.handleInput = () => done("unexpected key");
+						return component;
+					});
+					break;
+				default:
+					throw new Error(`Unexpected dialog kind: ${kind satisfies never}`);
+			}
+			void answer.then(settled);
+			await Promise.resolve();
+			const raw = context.ui.showOverlay(new TestComponent("RAW EXTENSION"));
+			context.resetExtensionUI();
+			raw.focus();
+			raw.hide();
+			context.terminal.sendInput("\r");
+			context.terminal.sendInput("x");
+			const editorRegainedFocus = context.editor.focused;
+			const current = context.showExtensionConfirm("New", "new dialog");
+			context.terminal.sendInput("\r");
+			await expect(current).resolves.toBe(true);
+			expect(settled).not.toHaveBeenCalled();
+			expect(editorRegainedFocus).toBe(true);
+			expect(context.editor.inputs).toEqual(["x"]);
+		},
+	);
+
+	test("pi #9909 a class component reused inline after reset takes keys and settles only its new caller", async () => {
+		class ReusableComponent extends TestComponent {
+			onKey = () => {};
+			override handleInput(data: string): void {
+				this.inputs.push(data);
+				this.onKey();
+			}
+		}
 		const context = createDialogContext();
-		const component = new TestComponent("RESET CUSTOM");
-		const settled = vi.fn();
+		const component = new ReusableComponent("REUSED");
+		const oldSettled = vi.fn();
+		const newSettled = vi.fn();
 		void context
 			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
-				component.handleInput = (data) => {
-					component.inputs.push(data);
-					done("unexpected key");
-				};
+				component.onKey = () => done("old");
 				return component;
 			})
-			.then(settled);
+			.then(oldSettled);
 		await Promise.resolve();
-		const raw = context.ui.showOverlay(new TestComponent("RAW EXTENSION"));
 		context.resetExtensionUI();
-		raw.focus();
-		raw.hide();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				component.onKey = () => done("key");
+				return component;
+			})
+			.then(newSettled);
+		await Promise.resolve();
 		context.terminal.sendInput("\r");
-		const resetComponentKeptFocus = component.focused;
+		const editorRegainedFocus = context.editor.focused && visible(context) === context.editor;
 		const current = context.showExtensionConfirm("New", "new dialog");
 		context.terminal.sendInput("\r");
 		await expect(current).resolves.toBe(true);
-		expect(settled).not.toHaveBeenCalled();
-		expect(component.inputs).toEqual([]);
-		expect(resetComponentKeptFocus).toBe(false);
-		expect(context.editor.inputs).toEqual([]);
+		expect(newSettled).toHaveBeenCalledExactlyOnceWith("key");
+		expect(oldSettled).not.toHaveBeenCalled();
+		expect(component.inputs).toEqual(["\r"]);
+		expect(editorRegainedFocus).toBe(true);
 	});
 
 	test("pi #9909 custom done from its abort listener settles after reset without changing the current UI", async () => {
