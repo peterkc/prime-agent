@@ -321,6 +321,25 @@ describe("TUI overlays", () => {
 			});
 		});
 
+		it("pi 91a2f8660 removed focused child overlay does not become parent overlay fallback", async () => {
+			await withTui(async ({ terminal, tui, editor, flush }) => {
+				const child = new FocusableOverlay(["CHILD"]);
+				const parent = new FocusableOverlay(["PARENT"]);
+				const childHandle = tui.showOverlay(child, { nonCapturing: true });
+				childHandle.focus();
+				const parentHandle = tui.showOverlay(parent);
+				assert.strictEqual(parent.focused, true);
+				childHandle.hide();
+				parentHandle.hide();
+				terminal.sendInput("x");
+				await flush();
+				assert.deepStrictEqual(editor.inputs, ["x"]);
+				assert.deepStrictEqual(child.inputs, []);
+				assert.deepStrictEqual(parent.inputs, []);
+				assert.strictEqual(editor.focused, true);
+			});
+		});
+
 		it("restores focus and input to the editor after a sub-overlay and its parent close", async () => {
 			await withTui(async ({ terminal, tui, editor, flush }) => {
 				const timer = new FocusableOverlay(["TIMER"]);

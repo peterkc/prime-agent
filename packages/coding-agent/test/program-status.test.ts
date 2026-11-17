@@ -172,7 +172,7 @@ function fakeMode() {
 		isAgentStreaming: () => fields.streaming,
 		getRetryAttempt: () => mode.connectionState?.retryAttempt ?? fields.retryAttempt,
 		...{ startCompactionLoader: proto.startCompactionLoader, interruptOrClearInput: proto.interruptOrClearInput },
-		...{ resetExtensionUI: proto.resetExtensionUI, extensionSelector: undefined, extensionInput: undefined },
+		...{ resetExtensionUI: proto.resetExtensionUI, extensionDialogs: [], extensionOverlays: new Map() },
 	};
 	const mode: any = new Proxy(fields, {
 		get: (target, key) => (key in target ? target[key] : own.has(key as string) ? proto[key as string] : ignore),

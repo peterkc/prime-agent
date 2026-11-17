@@ -503,6 +503,10 @@ export class TUI extends Container {
 			hide: () => {
 				const index = this.overlayStack.indexOf(entry);
 				if (index !== -1) {
+					// pi 91a2f8660: keep other overlays from restoring focus to this removed component.
+					for (const other of this.overlayStack) {
+						if (other !== entry && other.preFocus === component) other.preFocus = entry.preFocus;
+					}
 					this.overlayStack.splice(index, 1);
 					// Restore focus if this overlay had focus
 					if (this.focusedComponent === component) {

@@ -1,0 +1,3 @@
+- Fixed reloads and session switches leaving extension overlays on screen or closing one of Prime's own overlays instead.
+- Fixed concurrent extension dialogs replacing each other instead of restoring the dialog below.
+- Changed extension dialogs closed by a reload or session switch to settle as a cancellation when their abort signal fires, or with the value a custom component passes to done(); other answers to them are ignored.

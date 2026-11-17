@@ -1,12 +1,20 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
-import { Container } from "@earendil-works/pi-tui";
+import { type Component, Container, type OverlayHandle, Text, TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { ExtensionUIDialogOptions } from "../src/core/extensions/index.js";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import { emptyGoalState } from "../src/core/goals.js";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
+import {
+	createQuestionnaireToolDefinition,
+	type QuestionnaireForm,
+	type QuestionnaireOutcome,
+} from "../src/core/tools/questionnaire.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type {
 	AgentConnectionExtensionUiRequest,
@@ -1508,5 +1516,763 @@ describe("InteractiveMode Fast mode concurrency", () => {
 			expect(context.patchConnectionState).not.toHaveBeenCalled();
 			expect(context.showError).toHaveBeenCalledOnce();
 		}
+	});
+});
+
+describe("InteractiveMode extension dialog ownership", () => {
+	class TestComponent extends Text {
+		focused = false;
+		draftText = "draft";
+		inputs: string[] = [];
+		dispose = vi.fn();
+		getText(): string {
+			return this.draftText;
+		}
+		setText(text: string): void {
+			this.draftText = text;
+		}
+		handleInput(data: string): void {
+			this.inputs.push(data);
+		}
+	}
+
+	type DialogHarness = {
+		editor: TestComponent;
+		editorContainer: Container;
+		ui: TUI;
+		terminal: VirtualTerminal;
+		extensionDialogs: Component[];
+		extensionOverlays: Map<OverlayHandle, () => void>;
+		openDialogs: { title: string }[];
+		sendRunNotification: ReturnType<typeof vi.fn>;
+		showExtensionSelector(
+			title: string,
+			options: string[],
+			opts?: ExtensionUIDialogOptions,
+		): Promise<string | undefined>;
+		showExtensionConfirm(title: string, message: string, opts?: ExtensionUIDialogOptions): Promise<boolean>;
+		showExtensionInput(
+			title: string,
+			placeholder?: string,
+			opts?: ExtensionUIDialogOptions,
+		): Promise<string | undefined>;
+		showExtensionEditor(title: string, prefill?: string): Promise<string | undefined>;
+		showExtensionCustom<T>(
+			factory: (
+				tui: TUI,
+				theme: unknown,
+				keybindings: unknown,
+				done: (result: T) => void,
+			) => Component | Promise<Component>,
+			options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void },
+		): Promise<T>;
+		showQuestionnaire(form: QuestionnaireForm, signal?: AbortSignal): Promise<QuestionnaireOutcome>;
+		resetExtensionUI(): void;
+	};
+	const contexts: DialogHarness[] = [];
+
+	function createDialogContext(): DialogHarness {
+		const terminal = new VirtualTerminal(80, 24);
+		const ui = new TUI(terminal);
+		vi.spyOn(ui, "requestRender").mockImplementation(() => {});
+		const editor = new TestComponent("EDITOR");
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		ui.addChild(editorContainer);
+		ui.setFocus(editor);
+		ui.start();
+		const context = Object.assign(Object.create(InteractiveMode.prototype), {
+			editor,
+			defaultEditor: editor,
+			editorContainer,
+			ui,
+			terminal,
+			keybindings: KeybindingsManager.create(),
+			extensionDialogs: [],
+			extensionOverlays: new Map(),
+			openDialogs: [],
+			runStatus: { state: "working" },
+			sendRunNotification: vi.fn(),
+			reportProgramStatus: vi.fn(),
+			inlineAuthPanelClosers: [],
+			cancelActiveConnectionExtensionUiRequests: vi.fn(),
+			closeHeartbeatManager: vi.fn(),
+			clearExtensionTerminalInputListeners: vi.fn(),
+			setExtensionFooter: vi.fn(),
+			setExtensionHeader: vi.fn(),
+			clearExtensionWidgets: vi.fn(),
+			footerDataProvider: { clearExtensionStatuses: vi.fn() },
+			footer: { invalidate: vi.fn() },
+			setCustomEditorComponent: vi.fn(),
+			setupAutocompleteProvider: vi.fn(),
+			updateTerminalTitle: vi.fn(),
+			refreshTopBarCost: vi.fn(),
+			setWorkingIndicator: vi.fn(),
+		});
+		contexts.push(context);
+		return context;
+	}
+
+	function visible(context: DialogHarness): Component {
+		expect(context.editorContainer.children).toHaveLength(1);
+		return context.editorContainer.children[0]!;
+	}
+
+	function expectVisible(context: DialogHarness, title: string): void {
+		expect(renderAll(context.editorContainer)).toContain(title);
+	}
+
+	beforeAll(() => initTheme("dark"));
+	afterEach(() => {
+		for (const context of contexts.splice(0)) context.ui.stop();
+	});
+
+	test("pi 80d4d3c86 resets every extension overlay, including hidden ones, without closing internal overlays", async () => {
+		const context = createDialogContext();
+		const internal = new TestComponent("INTERNAL");
+		const internalHandle = context.ui.showOverlay(internal);
+		const components = [new TestComponent("LOWER"), new TestComponent("HIDDEN"), new TestComponent("UPPER")];
+		const done: Array<(result: string) => void> = [];
+		const handles: OverlayHandle[] = [];
+		for (const component of components) {
+			void context.showExtensionCustom<string>(
+				(_ui, _theme, _kb, finish) => {
+					done.push(finish);
+					return component;
+				},
+				{ overlay: true, onHandle: (handle) => handles.push(handle) },
+			);
+			await Promise.resolve();
+		}
+		handles[1]!.setHidden(true);
+		expect(components[2]!.focused).toBe(true);
+		context.resetExtensionUI();
+		context.resetExtensionUI();
+		for (const finish of done) finish("late");
+		for (const component of components) expect(component.dispose).toHaveBeenCalledOnce();
+		expect(internalHandle.isFocused()).toBe(true);
+		context.terminal.sendInput("x");
+		expect(internal.inputs).toEqual(["x"]);
+		for (const component of components) expect(component.inputs).toEqual([]);
+		internalHandle.hide();
+		expect(context.ui.hasOverlay()).toBe(false);
+		expect(context.editor.focused).toBe(true);
+	});
+
+	test("pi 91a2f8660 C2 Enter after reset and internal overlay close leaves the reset overlay pending", async () => {
+		const context = createDialogContext();
+		const overlay = new TestComponent("RESET");
+		const settled = vi.fn();
+		void context
+			.showExtensionCustom<string>(
+				(_ui, _theme, _kb, done) => {
+					overlay.handleInput = (data) => {
+						overlay.inputs.push(data);
+						done("unexpected key");
+					};
+					return overlay;
+				},
+				{ overlay: true },
+			)
+			.then(settled);
+		await Promise.resolve();
+		const internal = context.ui.showOverlay(new TestComponent("INTERNAL"));
+		context.resetExtensionUI();
+		internal.hide();
+		context.terminal.sendInput("\r");
+		await Promise.resolve();
+		expect(context.editor.inputs).toEqual(["\r"]);
+		expect(overlay.inputs).toEqual([]);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	test("pi 80d4d3c86 reset restores editor focus after two extension overlays", async () => {
+		const context = createDialogContext();
+		for (const title of ["LOWER", "UPPER"]) {
+			void context.showExtensionCustom(() => new TestComponent(title), { overlay: true });
+		}
+		await Promise.resolve();
+		context.resetExtensionUI();
+		expect(context.ui.hasOverlay()).toBe(false);
+		expect(context.editor.focused).toBe(true);
+	});
+
+	test("pi 80d4d3c86 done removes its own overlay when a newer overlay covers it", async () => {
+		const context = createDialogContext();
+		const lower = new TestComponent("LOWER");
+		const upper = new TestComponent("UPPER");
+		let closeLower!: (value: string) => void;
+		let closeUpper!: (value: string) => void;
+		const first = context.showExtensionCustom<string>(
+			(_ui, _theme, _kb, done) => {
+				closeLower = done;
+				return lower;
+			},
+			{ overlay: true },
+		);
+		const second = context.showExtensionCustom<string>(
+			(_ui, _theme, _kb, done) => {
+				closeUpper = done;
+				return upper;
+			},
+			{ overlay: true },
+		);
+		await Promise.resolve();
+		closeLower("one");
+		await expect(first).resolves.toBe("one");
+		expect(lower.dispose).toHaveBeenCalledOnce();
+		expect(upper.dispose).not.toHaveBeenCalled();
+		context.terminal.sendInput("x");
+		expect(upper.inputs).toEqual(["x"]);
+		expect(upper.focused).toBe(true);
+		closeUpper("two");
+		await expect(second).resolves.toBe("two");
+		expect(context.ui.hasOverlay()).toBe(false);
+		context.terminal.sendInput("editor key");
+		expect(context.editor.inputs).toEqual(["editor key"]);
+	});
+
+	test("pi #11166 restores First after Second confirms false, then restores the editor after First confirms true", async () => {
+		const context = createDialogContext();
+		const first = context.showExtensionConfirm("First", "first dialog");
+		const second = context.showExtensionConfirm("Second", "second dialog");
+		expectVisible(context, "Second");
+		context.terminal.sendInput("\x1b");
+		await expect(second).resolves.toBe(false);
+		expectVisible(context, "First");
+		context.terminal.sendInput("\r");
+		await expect(first).resolves.toBe(true);
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.focused).toBe(true);
+		expect(context.editor.getText()).toBe("draft");
+		expect(context.openDialogs).toEqual([]);
+		expect(context.sendRunNotification.mock.calls).toEqual([["ask"], ["ask"]]);
+	});
+
+	test("pi #11166 aborts a hidden First confirm without closing Second", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const first = context.showExtensionConfirm("First", "first dialog", { signal: controller.signal });
+		const second = context.showExtensionConfirm("Second", "second dialog");
+		controller.abort();
+		await expect(first).resolves.toBe(false);
+		expectVisible(context, "Second");
+		context.terminal.sendInput("\r");
+		await expect(second).resolves.toBe(true);
+		expect(visible(context)).toBe(context.editor);
+	});
+
+	test("pi #9909 restores an inline custom component after its nested confirm", async () => {
+		const context = createDialogContext();
+		let done!: (value: string) => void;
+		const component = new TestComponent("CUSTOM");
+		const custom = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return component;
+		});
+		await Promise.resolve();
+		let confirmed!: Promise<boolean>;
+		component.handleInput = () => {
+			confirmed = context.showExtensionConfirm("Discard?", "discard changes");
+		};
+		context.terminal.sendInput("x");
+		expectVisible(context, "Discard?");
+		context.terminal.sendInput("\x1b");
+		await expect(confirmed).resolves.toBe(false);
+		expect(visible(context)).toBe(component);
+		expect(component.focused).toBe(true);
+		done("kept");
+		await expect(custom).resolves.toBe("kept");
+		expect(component.dispose).toHaveBeenCalledOnce();
+		expect(context.editor.getText()).toBe("draft");
+	});
+
+	test("pi #9909 closes only the chosen inline custom component out of order", async () => {
+		const context = createDialogContext();
+		const done: Array<(value: string) => void> = [];
+		const components = [new TestComponent("ONE"), new TestComponent("TWO")];
+		const answers = components.map((component) =>
+			context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+				done.push(finish);
+				return component;
+			}),
+		);
+		await Promise.resolve();
+		done[0]!("one");
+		await expect(answers[0]).resolves.toBe("one");
+		expect(visible(context)).toBe(components[1]);
+		expect(components[1]!.focused).toBe(true);
+		done[1]!("two");
+		await expect(answers[1]).resolves.toBe("two");
+		expect(visible(context)).toBe(context.editor);
+	});
+
+	test("pi #11166 keeps a select's selection when an input above it submits", async () => {
+		const context = createDialogContext();
+		const select = context.showExtensionSelector("Select", ["one", "two"]);
+		context.terminal.sendInput("\x1b[B");
+		const selected = visible(context);
+		const input = context.showExtensionInput("Input");
+		context.terminal.sendInput("typed input");
+		context.terminal.sendInput("\r");
+		await expect(input).resolves.toBe("typed input");
+		expect(visible(context)).toBe(selected);
+		context.terminal.sendInput("\r");
+		await expect(select).resolves.toBe("two");
+		expect(visible(context)).toBe(context.editor);
+	});
+
+	test("pi #11166 keeps a confirm's selection when an editor above it submits edited prefill", async () => {
+		const context = createDialogContext();
+		const confirm = context.showExtensionConfirm("Confirm", "choose No");
+		context.terminal.sendInput("\x1b[B");
+		const selected = visible(context);
+		const editor = context.showExtensionEditor("Editor", "prefill");
+		context.terminal.sendInput(" changed");
+		context.terminal.sendInput("\r");
+		await expect(editor).resolves.toBe("prefill changed");
+		expect(visible(context)).toBe(selected);
+		context.terminal.sendInput("\r");
+		await expect(confirm).resolves.toBe(false);
+		expect(context.editor.getText()).toBe("draft");
+	});
+
+	test.each(["select", "confirm", "input"] as const)("pi #11166 does not show an already-aborted %s", async (kind) => {
+		const context = createDialogContext();
+		const signal = AbortSignal.abort();
+		const result =
+			kind === "select"
+				? context.showExtensionSelector("Select", ["one"], { signal })
+				: kind === "confirm"
+					? context.showExtensionConfirm("Confirm", "confirm", { signal })
+					: context.showExtensionInput("Input", undefined, { signal });
+		await expect(result).resolves.toBe(kind === "confirm" ? false : undefined);
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.focused).toBe(true);
+	});
+
+	test("pi #11166 reset disposes the whole stack; abort and custom done settle without changing the new UI", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const settled = vi.fn();
+		const selectAnswer = context.showExtensionSelector("Select", ["one"], { signal: controller.signal });
+		const select = visible(context);
+		const disposeSelect = vi.spyOn(select as Component & { dispose(): void }, "dispose");
+		void context.showExtensionInput("Input").then(settled);
+		const input = visible(context);
+		const disposeInput = vi.spyOn(input as Component & { dispose(): void }, "dispose");
+		const custom = new TestComponent("CUSTOM");
+		let done!: (value: string) => void;
+		const customAnswer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return custom;
+		});
+		await Promise.resolve();
+		context.resetExtensionUI();
+		expect(context.extensionDialogs).toEqual([]);
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.focused).toBe(true);
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		controller.abort();
+		select.handleInput!("\r");
+		input.handleInput!("\r");
+		done("late");
+		await Promise.resolve();
+		expect(settled).not.toHaveBeenCalled();
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		expect(context.openDialogs.map((dialog) => dialog.title)).toEqual(["New\nnew dialog"]);
+		for (const dispose of [disposeSelect, disposeInput, custom.dispose]) expect(dispose).toHaveBeenCalledOnce();
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		await expect(selectAnswer).resolves.toBeUndefined();
+		await expect(customAnswer).resolves.toBe("late");
+		expect(settled).not.toHaveBeenCalled();
+		expect(visible(context)).toBe(context.editor);
+	});
+
+	test.each(["select", "input"] as const)(
+		"pi #11166 aborts a reset %s as a refusal without changing the current UI",
+		async (kind) => {
+			const context = createDialogContext();
+			const controller = new AbortController();
+			const refused = vi.fn();
+			const answer =
+				kind === "select"
+					? context.showExtensionSelector("Select", ["one"], { signal: controller.signal })
+					: context.showExtensionInput("Input", undefined, { signal: controller.signal });
+			void answer.then(refused);
+			context.resetExtensionUI();
+			context.editor.setText("new draft");
+			const current = context.showExtensionConfirm("New", "new dialog");
+			const newest = visible(context);
+			const renders = vi.mocked(context.ui.requestRender).mock.calls.length;
+			controller.abort();
+			expect(visible(context)).toBe(newest);
+			expect(context.editor.getText()).toBe("new draft");
+			expect(vi.mocked(context.ui.requestRender).mock.calls).toHaveLength(renders);
+			expect(context.openDialogs.map((dialog) => dialog.title)).toEqual(["New\nnew dialog"]);
+			context.terminal.sendInput("\r");
+			await expect(current).resolves.toBe(true);
+			expect(refused).toHaveBeenCalledExactlyOnceWith(undefined);
+		},
+	);
+
+	test("pi #11166 questionnaire abort without reset preserves completed answers", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const answer = context.showQuestionnaire(
+			{
+				questions: [
+					{
+						id: "first",
+						label: "First",
+						prompt: "First?",
+						options: [{ value: "one", label: "One" }],
+						allowOther: false,
+					},
+					{
+						id: "second",
+						label: "Second",
+						prompt: "Second?",
+						options: [{ value: "two", label: "Two" }],
+						allowOther: false,
+					},
+				],
+				answers: {},
+			},
+			controller.signal,
+		);
+		await Promise.resolve();
+		context.terminal.sendInput("\r");
+		controller.abort();
+		await expect(answer).resolves.toEqual({
+			status: "cancelled",
+			answers: { first: { value: "one", wasCustom: false } },
+		});
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.getText()).toBe("draft");
+	});
+
+	test("pi #11166 questionnaire tool returns cancelled when its signal aborts after reset", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const tool = createQuestionnaireToolDefinition(".");
+		const questions = [
+			{ id: "q", label: "Scope", prompt: "Scope?", options: [{ value: "one", label: "One" }], allowOther: false },
+		];
+		const ctx = {
+			hasUI: true,
+			sessionManager: { getBranch: () => [] },
+			ui: {
+				questionnaire: (form: QuestionnaireForm, opts?: ExtensionUIDialogOptions) =>
+					context.showQuestionnaire(form, opts?.signal),
+			},
+		} as unknown as Parameters<typeof tool.execute>[4];
+		const returned = vi.fn();
+		void tool.execute("form", { questions }, controller.signal, undefined, ctx).then(returned);
+		await Promise.resolve();
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		controller.abort();
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(returned).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ details: { questions, answers: [], cancelled: true } }),
+		);
+	});
+
+	test("pi #11166 Enter on a reset editor leaves its answer pending and the current dialog unchanged", async () => {
+		const context = createDialogContext();
+		const settled = vi.fn();
+		void context.showExtensionEditor("Editor", "stale prefill").then(settled);
+		const editor = visible(context);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		editor.handleInput!("\r");
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	test("pi #11166 keys and timeout after reset leave old answers unsettled", async () => {
+		const context = createDialogContext();
+		const settled = vi.fn();
+		void context.showExtensionSelector("Select", ["one"], { timeout: 1000 }).then(settled);
+		const select = visible(context);
+		const countdown = (select as Component & { countdown: { onExpire(): void } }).countdown;
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		select.handleInput!("\r");
+		countdown.onExpire();
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	test("pi #11166 reset continues after a throwing dispose and removes extension overlays", async () => {
+		const context = createDialogContext();
+		const broken = new TestComponent("BROKEN");
+		broken.dispose.mockImplementation(() => {
+			throw new Error("dispose failed");
+		});
+		const next = new TestComponent("NEXT");
+		const overlay = new TestComponent("OVERLAY");
+		void context.showExtensionCustom(() => broken);
+		void context.showExtensionCustom(() => next);
+		void context.showExtensionCustom(() => overlay, { overlay: true });
+		await Promise.resolve();
+		context.resetExtensionUI();
+		expect(visible(context)).toBe(context.editor);
+		expect(context.ui.hasOverlay()).toBe(false);
+		expect(context.openDialogs).toEqual([]);
+		for (const component of [broken, next, overlay]) expect(component.dispose).toHaveBeenCalledOnce();
+	});
+
+	test("pi #9909 rejects a failed custom factory without closing the dialog below", async () => {
+		const context = createDialogContext();
+		const confirm = context.showExtensionConfirm("Confirm", "keep this dialog");
+		const selected = visible(context);
+		const error = new Error("factory failed");
+		const failed = context.showExtensionCustom(() => {
+			context.editor.setText("temporary");
+			return Promise.reject(error);
+		});
+		await expect(failed).rejects.toBe(error);
+		expect(visible(context)).toBe(selected);
+		expect(context.editor.getText()).toBe("draft");
+		context.terminal.sendInput("\r");
+		await expect(confirm).resolves.toBe(true);
+	});
+
+	test("pi #9909 rejects a factory after reset without changing editor text or the current dialog stack", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const failed = context.showExtensionCustom(() => factory.promise);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		const error = new Error("late factory failure");
+		factory.reject(error);
+		await expect(failed).rejects.toBe(error);
+		expect(context.editor.getText()).toBe("new draft");
+		expect(visible(context)).toBe(newest);
+		expect(context.extensionDialogs).toEqual([newest]);
+		expect(context.openDialogs.map((dialog) => dialog.title)).toEqual(["New\nnew dialog"]);
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+	});
+
+	test("pi #9909 disposes a component that resolves after done without mounting it", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const component = new TestComponent("LATE");
+		let done!: (value: string) => void;
+		const answer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return factory.promise;
+		});
+		done("early");
+		await expect(answer).resolves.toBe("early");
+		factory.resolve(component);
+		await factory.promise;
+		expect(component.dispose).toHaveBeenCalledOnce();
+		expect(visible(context)).toBe(context.editor);
+		expect(context.editor.getText()).toBe("draft");
+	});
+
+	test.each(["select", "confirm", "input", "editor", "custom"] as const)(
+		"pi #9909 a surviving raw overlay cannot keep focus on a reset %s dialog",
+		async (kind) => {
+			const context = createDialogContext();
+			const settled = vi.fn();
+			let answer: Promise<unknown>;
+			switch (kind) {
+				case "select":
+					answer = context.showExtensionSelector("Select", ["one"]);
+					break;
+				case "confirm":
+					answer = context.showExtensionConfirm("Confirm", "confirm");
+					break;
+				case "input":
+					answer = context.showExtensionInput("Input");
+					break;
+				case "editor":
+					answer = context.showExtensionEditor("Editor", "stale");
+					break;
+				case "custom":
+					answer = context.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+						const component = new TestComponent("CUSTOM");
+						component.handleInput = () => done("unexpected key");
+						return component;
+					});
+					break;
+				default:
+					throw new Error(`Unexpected dialog kind: ${kind satisfies never}`);
+			}
+			void answer.then(settled);
+			await Promise.resolve();
+			const raw = context.ui.showOverlay(new TestComponent("RAW EXTENSION"));
+			context.resetExtensionUI();
+			raw.focus();
+			raw.hide();
+			context.terminal.sendInput("\r");
+			context.terminal.sendInput("x");
+			const editorRegainedFocus = context.editor.focused;
+			const current = context.showExtensionConfirm("New", "new dialog");
+			context.terminal.sendInput("\r");
+			await expect(current).resolves.toBe(true);
+			expect(settled).not.toHaveBeenCalled();
+			expect(editorRegainedFocus).toBe(true);
+			expect(context.editor.inputs).toEqual(["x"]);
+		},
+	);
+
+	test("pi #9909 a class component reused inline after reset takes keys and settles only its new caller", async () => {
+		class ReusableComponent extends TestComponent {
+			onKey = () => {};
+			override handleInput(data: string): void {
+				this.inputs.push(data);
+				this.onKey();
+			}
+		}
+		const context = createDialogContext();
+		const component = new ReusableComponent("REUSED");
+		const oldSettled = vi.fn();
+		const newSettled = vi.fn();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				component.onKey = () => done("old");
+				return component;
+			})
+			.then(oldSettled);
+		await Promise.resolve();
+		context.resetExtensionUI();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				component.onKey = () => done("key");
+				return component;
+			})
+			.then(newSettled);
+		await Promise.resolve();
+		context.terminal.sendInput("\r");
+		const editorRegainedFocus = context.editor.focused && visible(context) === context.editor;
+		const current = context.showExtensionConfirm("New", "new dialog");
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(newSettled).toHaveBeenCalledExactlyOnceWith("key");
+		expect(oldSettled).not.toHaveBeenCalled();
+		expect(component.inputs).toEqual(["\r"]);
+		expect(editorRegainedFocus).toBe(true);
+	});
+
+	test("pi #9909 custom done from its abort listener settles after reset without changing the current UI", async () => {
+		const context = createDialogContext();
+		const controller = new AbortController();
+		const component = new TestComponent("CUSTOM");
+		const returned = vi.fn();
+		void context
+			.showExtensionCustom<string>((_ui, _theme, _kb, done) => {
+				controller.signal.addEventListener("abort", () => done("cancelled"), { once: true });
+				return component;
+			})
+			.then(returned);
+		context.resetExtensionUI();
+		await Promise.resolve();
+		expect(component.dispose).toHaveBeenCalledOnce();
+		context.editor.setText("new draft");
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		const internalHandle = context.ui.showOverlay(new TestComponent("INTERNAL"));
+		const renders = vi.mocked(context.ui.requestRender).mock.calls.length;
+		controller.abort();
+		expect(visible(context)).toBe(newest);
+		expect(context.editor.getText()).toBe("new draft");
+		expect(internalHandle.isFocused()).toBe(true);
+		expect(vi.mocked(context.ui.requestRender).mock.calls).toHaveLength(renders);
+		internalHandle.hide();
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(returned).toHaveBeenCalledExactlyOnceWith("cancelled");
+		expect(component.dispose).toHaveBeenCalledOnce();
+	});
+
+	test("pi #9909 done after reset settles once before its pending factory resolves without restoring stale text", async () => {
+		const context = createDialogContext();
+		const factory = createDeferred<Component>();
+		const component = new TestComponent("STALE");
+		const settled = vi.fn();
+		let done!: (value: string) => void;
+		const answer = context.showExtensionCustom<string>((_ui, _theme, _kb, finish) => {
+			done = finish;
+			return factory.promise;
+		});
+		void answer.then(settled);
+		context.resetExtensionUI();
+		context.editor.setText("new draft");
+		done("late");
+		factory.resolve(component);
+		await factory.promise;
+		await expect(answer).resolves.toBe("late");
+		expect(context.editor.getText()).toBe("new draft");
+		expect(visible(context)).toBe(context.editor);
+		expect(component.dispose).toHaveBeenCalledOnce();
+		expect(settled).toHaveBeenCalledExactlyOnceWith("late");
+		done("second");
+		await Promise.resolve();
+		expect(settled).toHaveBeenCalledExactlyOnceWith("late");
+		expect(context.editor.getText()).toBe("new draft");
+	});
+
+	test("pi #9909 ignores an inline factory that completes after reset", async () => {
+		const context = createDialogContext();
+		const component = new TestComponent("STALE");
+		const factory = createDeferred<Component>();
+		const settled = vi.fn();
+		void context.showExtensionCustom(() => factory.promise).then(settled);
+		context.resetExtensionUI();
+		const current = context.showExtensionConfirm("New", "new dialog");
+		const newest = visible(context);
+		factory.resolve(component);
+		await factory.promise;
+		expect(visible(context)).toBe(newest);
+		expect(component.dispose).toHaveBeenCalledOnce();
+		expect(settled).not.toHaveBeenCalled();
+		context.terminal.sendInput("\r");
+		await expect(current).resolves.toBe(true);
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	test("pi #9909 preserves questionnaire cancellation after a confirm above it closes", async () => {
+		const context = createDialogContext();
+		const answer = context.showQuestionnaire({
+			questions: [
+				{ id: "q", label: "Scope", prompt: "Scope?", options: [{ value: "one", label: "One" }], allowOther: false },
+			],
+			answers: {},
+		});
+		await Promise.resolve();
+		const questionnaire = visible(context);
+		const confirm = context.showExtensionConfirm("Confirm", "above form");
+		context.terminal.sendInput("\x1b");
+		await expect(confirm).resolves.toBe(false);
+		expect(visible(context)).toBe(questionnaire);
+		context.terminal.sendInput("\x1b");
+		await expect(answer).resolves.toEqual({ status: "cancelled", answers: {} });
 	});
 });
