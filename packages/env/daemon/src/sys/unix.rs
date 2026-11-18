@@ -455,21 +455,9 @@ mod tests {
     fn pr94_configure_refuses_a_child_when_setsid_fails() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 0"]);
-        // SAFETY: setpgid is async-signal-safe and only changes the forked child's group.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
         configure(&mut command, &[], &Map::new(), true);
-        // Reap an unexpectedly started child before reporting the failed assertion.
-        let error = command
-            .spawn()
-            .map(|mut child| child.wait().unwrap())
-            .unwrap_err();
+        let error = command.status().unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 

@@ -59,14 +59,24 @@ New fork-only files are not changes to pi-owned files.
   Two `test-policy: allow` comments name the upstream commit and preserve its
   client-stall timer and failure timeout. Its behavior and assertions stay unchanged.
 - **Kind:** upstream backport
-- **Removal condition:** Remove when next moves to a pi release that contains
-  `b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
+- **Removal condition:** Remove the backport when next moves to a pi release that
+  contains `b48c675a912f7852810e5f8c9f8ca6887b5b851b`. Keep the two fork-only
+  `test-policy: allow` comments in `packages/env/test/process.test.ts` until pi's
+  file or the fork's test policy makes them unnecessary; the retained upstream
+  test still needs those exceptions.
 
-The forced-end fork behavior was removed at the user's request (D16). The daemon's
-response shares the output backlog, so stopping readers drops output without
-bringing the response forward. `exec.rs`, `process.rs` and `pty.rs` now equal
-`b48c675a912f7852810e5f8c9f8ca6887b5b851b`. These test rows and their test-only
-observers were deleted because the behavior they tested was removed (D16):
+The user chose to restore upstream forced-end handling on next and keep only the
+group-only kill (D16). The daemon's response shares the output backlog. Stopping
+readers drops output, but the client cannot receive the result while the link is
+stalled. `exec.rs`, `process.rs` and `pty.rs` now equal
+`b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
+
+The accepted loss is that, even on a healthy link, a timeout, cancel or kill can
+keep waiting for a descendant that called `setsid` and keeps writing to the
+inherited pipe: each output message resets the exit grace. This is upstream
+behavior. The seven rows below covered only a stalled link, not this healthy-link
+case. They and their test-only observers were deleted because the user chose to
+remove the forced-end fork behavior:
 
 - `exec::tests::pr94_cancel_after_exit_stops_stalled_readers`: removed behavior.
 - `exec::tests::pr94_kill_after_exit_stops_stalled_readers`: removed behavior.
@@ -89,9 +99,8 @@ observers were deleted because the behavior they tested was removed (D16):
   fails to spawn with the OS error. Fork CI runs the daemon's format, lint and
   unit tests in the `other` job.
 - **Kind:** intentional difference
-- **Removal condition:** Remove when pi's `kill_tree` no longer signals a bare
-  pid and `configure` checks `setsid`, or when next moves to a pi release with
-  both fixes.
+- **Removal condition:** Remove when next adopts a pi version whose `kill_tree`
+  no longer signals a bare pid and whose `configure` checks `setsid`.
 
 ## Build the daemon used by env tests
 
