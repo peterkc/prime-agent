@@ -1,8 +1,19 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../src/config.ts";
+import { restoreStdout } from "../src/core/output-guard.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { main } from "../src/main.ts";
 import * as migrations from "../src/migrations.ts";
@@ -41,27 +52,37 @@ describe("startup in a deleted working directory", () => {
 });
 
 describe("startup with the project and user configuration in the same folder", () => {
-	const cases = ["home start", "home auth help", "home alias", "missing agent under project alias"] as const;
+	const cases = [
+		"home start",
+		"home auth help",
+		"home alias",
+		"missing agent under project alias",
+		"case-only agent alias",
+	] as const;
 	for (const override of ["cleared", "explicit"] as const) {
-		test.each(cases)(`refuses %s with ${override} agent override before settings or migrations`, async (scenario) => {
+		test.for(cases)(`refuses %s with ${override} agent override before settings or migrations`, async (name, ctx) => {
 			const root = mkdtempSync(join(tmpdir(), "pi-config-collision-"));
 			try {
 				const home = join(root, "home");
 				const agentDir = join(home, CONFIG_DIR_NAME);
 				mkdirSync(join(home, ".prime"), { recursive: true });
-				if (scenario !== "missing agent under project alias") mkdirSync(agentDir, { recursive: true });
+				if (name !== "missing agent under project alias") mkdirSync(agentDir, { recursive: true });
 				writeFileSync(join(home, "sentinel"), "unchanged");
-				let cwd = home;
-				if (scenario === "home alias") {
+				// test-policy: allow conditional-or-disabled-test -- Case-only aliases do not exist on case-sensitive filesystems.
+				if (name === "case-only agent alias" && !existsSync(home.toUpperCase())) ctx.skip();
+				let cwd = name === "case-only agent alias" && override === "cleared" ? home.toUpperCase() : home;
+				if (name === "home alias") {
 					cwd = join(root, "home-alias");
 					symlinkSync(home, cwd, "dir");
-				} else if (scenario === "missing agent under project alias") {
+				} else if (name === "missing agent under project alias") {
 					cwd = join(root, "project");
 					mkdirSync(cwd);
 					symlinkSync(join(home, ".prime"), join(cwd, ".prime"), "dir");
 				}
+				const selectedAgentDir =
+					name === "case-only agent alias" && override === "explicit" ? agentDir.toUpperCase() : agentDir;
 				vi.stubEnv("HOME", home);
-				vi.stubEnv(ENV_AGENT_DIR, override === "explicit" ? agentDir : undefined);
+				vi.stubEnv(ENV_AGENT_DIR, override === "explicit" ? selectedAgentDir : undefined);
 				vi.spyOn(process, "cwd").mockReturnValue(cwd);
 				const settings = vi.spyOn(SettingsManager, "create").mockImplementation(() => {
 					throw new Error("settings created before refusal");
@@ -73,11 +94,9 @@ describe("startup with the project and user configuration in the same folder", (
 					throw new Error(`process.exit(${code})`);
 				}) as typeof process.exit);
 				const before = readdirSync(root, { recursive: true }).sort();
-				await expect(main(scenario === "home auth help" ? ["auth", "--help"] : [])).rejects.toThrow(
-					"process.exit(1)",
-				);
+				await expect(main(name === "home auth help" ? ["auth", "--help"] : [])).rejects.toThrow("process.exit(1)");
 				expect(exit).toHaveBeenCalledWith(1);
-				expect(stderr.mock.calls.map(([message]) => String(message)).join("\n")).toContain(agentDir);
+				expect(stderr.mock.calls.map(([message]) => String(message)).join("\n")).toContain(selectedAgentDir);
 				expect(stderr.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
 					"Start in a project folder",
 				);
@@ -92,6 +111,50 @@ describe("startup with the project and user configuration in the same folder", (
 			}
 		});
 	}
+
+	test.each(["cleared", "explicit"] as const)(
+		"refuses a HOME session resumed from a project with %s agent override before HOME settings or migrations",
+		async (override) => {
+			const root = mkdtempSync(join(tmpdir(), "pi-config-resume-"));
+			try {
+				const home = join(root, "home");
+				const project = join(home, "project");
+				const agentDir = join(home, CONFIG_DIR_NAME);
+				mkdirSync(project, { recursive: true });
+				mkdirSync(agentDir, { recursive: true });
+				writeFileSync(join(home, "sentinel"), "unchanged");
+				const session = SessionManager.create(home, join(root, "sessions"));
+				session.appendMessage({ role: "user", content: "existing message", timestamp: Date.now() });
+				const sessionFile = session.getSessionFile()!;
+				const sourceSession = readFileSync(sessionFile, "utf8");
+				vi.stubEnv("HOME", home);
+				vi.stubEnv(ENV_AGENT_DIR, override === "explicit" ? agentDir : undefined);
+				vi.stubEnv("PI_OFFLINE", "1");
+				vi.stubEnv("PI_SKIP_VERSION_CHECK", "1");
+				vi.spyOn(process, "cwd").mockReturnValue(project);
+				const settings = vi.spyOn(SettingsManager, "create").mockImplementation((cwd) => {
+					if (cwd === home) throw new Error("HOME settings created before refusal");
+					return SettingsManager.inMemory();
+				});
+				const migrate = vi.spyOn(migrations, "runMigrations");
+				const before = readdirSync(home, { recursive: true }).sort();
+				await expect(main(["--no-extensions", "--session", sessionFile, "--print", "not sent"])).rejects.toThrow(
+					agentDir,
+				);
+				expect(settings).toHaveBeenCalledWith(project, agentDir, { projectTrusted: false });
+				expect(settings.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
+				expect(migrate.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
+				expect(readdirSync(home, { recursive: true }).sort()).toEqual(before);
+				expect(readFileSync(join(home, "sentinel"), "utf8")).toBe("unchanged");
+				expect(readFileSync(sessionFile, "utf8")).toBe(sourceSession);
+			} finally {
+				restoreStdout();
+				vi.restoreAllMocks();
+				vi.unstubAllEnvs();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test.each(["cleared", "explicit"] as const)(
 		"keeps a project below HOME working with %s agent override",

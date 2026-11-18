@@ -5,7 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
@@ -81,7 +81,7 @@ import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-schema.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
-import { canonicalizePath, isLocalPath, normalizePath, pathsEqual, resolvePath } from "./utils/paths.ts";
+import { isLocalPath, normalizePath, pathsEqual, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
@@ -628,7 +628,7 @@ function resolveConfigFolder(path: string): string {
 		missing.unshift(basename(ancestor));
 		ancestor = parent;
 	}
-	return join(canonicalizePath(ancestor), ...missing);
+	return join(realpathSync.native(ancestor), ...missing);
 }
 
 export async function main(args: string[], options?: MainOptions) {
@@ -828,6 +828,11 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
+		if (pathsEqual(resolveConfigFolder(join(cwd, CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) {
+			throw new Error(
+				`The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`,
+			);
+		}
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);

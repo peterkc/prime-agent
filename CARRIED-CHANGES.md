@@ -16,6 +16,8 @@ New fork-only files are not changes to pi-owned files.
   - `packages/coding-agent/package.json`
   - `packages/coding-agent/src/config.ts`
   - `packages/coding-agent/src/index.ts`
+  - `packages/coding-agent/src/cli/auth-command.ts`
+  - `packages/coding-agent/src/extensions/mcp/index.ts`
   - `packages/coding-agent/test/auth-login.test.ts`
   - `packages/coding-agent/test/auth-logout.test.ts`
   - `packages/coding-agent/test/config.test.ts`
@@ -77,9 +79,11 @@ New fork-only files are not changes to pi-owned files.
   removes its source file. Source, bootstrap copy and session folder stay distinct.
   Remove this fix when pi adopts the same marker-bound removal condition.
 - **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
-  project configuration folder resolves to the user folder, including existing
-  symlink ancestors of not-yet-created folders. SDK callers passing their own cwd
-  and agent folder are not covered.
+  project configuration folder resolves to the user folder, including case-only
+  aliases and existing symlink ancestors of not-yet-created folders. The shared
+  runtime factory repeats the check for the selected session cwd before its settings
+  or migrations, covering resumes from another project and later session switches.
+  SDK callers passing their own cwd and agent folder are not covered.
 - **Recorded exceptions and stage-2 limits:**
   - FR-8 display-only exceptions: `.pi` paths in
     `test/interactive-mode-status.test.ts` and
@@ -100,9 +104,8 @@ New fork-only files are not changes to pi-owned files.
     `~/.prime/agent/agent`: `src/cli/args.ts:415,462`,
     `src/package-manager-cli.ts:313`, `src/extensions/mcp/cli.ts:43` and
     `src/modes/interactive/components/config-selector.ts:206`.
-  - Under R5, `.pi/mcp.json` hints, `src/cli/auth-command.ts:48` and docs that name
-    `PI_` variables still describe pi. This is display/documentation naming, not
-    the configured runtime paths. Stage 2 owns these corrections.
+  - MCP empty-state hints and auth credential help now use the configured folders.
+    Docs that name `PI_` variables still describe pi; stage 2 owns those corrections.
   - Known unconverted identity consumers remain follow-ups for stage 2 under R5:
     `.github/workflows/issue-analysis.yml`, `apps/p2`,
     `scripts/cost.ts`, `scripts/stats.ts`, `scripts/tool-stats.ts`,

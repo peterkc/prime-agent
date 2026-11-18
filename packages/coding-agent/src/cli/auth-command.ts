@@ -1,5 +1,5 @@
 import type { AuthResult } from "@earendil-works/pi-ai";
-import { APP_NAME } from "../config.ts";
+import { APP_NAME, getAgentDir } from "../config.ts";
 import type { Args } from "./args.ts";
 
 export type AuthCommandKind = "check" | "api_key" | "bearer_token";
@@ -45,7 +45,7 @@ export function printAuthCommandHelp(): void {
   pi auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
 
 Log in to and out of model providers, print their credentials for external clients, or check that they are ready.
-Credentials are stored in ~/.pi/agent/auth.json.
+Credentials are stored in ${getAgentDir()}/auth.json.
 
 Commands:
   login <provider>        Sign in with an account in the browser, or save an API key, then exit

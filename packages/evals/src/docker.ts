@@ -65,7 +65,7 @@ function environment(name: string, value: string): string[] {
 }
 
 export function requireEvalAuthFile(provider: string): string {
-	const path = join(getAgentDir(), "auth.json");
+	const path = resolve(getAgentDir(), "auth.json");
 	if (!existsSync(path) || !statSync(path).isFile())
 		throw new Error(`Eval authentication file does not exist: ${path}`);
 	let credentials: unknown;

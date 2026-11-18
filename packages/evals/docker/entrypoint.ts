@@ -4,7 +4,6 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENV_AGENT_DIR } from "@earendil-works/pi-coding-agent";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const variant = process.env.PI_EVAL_VARIANT;
@@ -105,6 +104,11 @@ const codingAgentEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-c
 if (codingAgentEntry !== "/repo/node_modules/@earendil-works/pi-coding-agent/dist/index.js") {
 	throw new Error(`Eval does not resolve pi-coding-agent from dist: ${codingAgentEntry}`);
 }
+const piConfig: { name?: string } | undefined = JSON.parse(
+	readFileSync(resolve(dirname(codingAgentEntry), "../package.json"), "utf8"),
+).piConfig;
+const envPrefix = (piConfig?.name || "pi").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "PI";
+const ENV_AGENT_DIR = `${envPrefix}_CODING_AGENT_DIR`;
 
 const agentDir = join(tmpdir(), "pi-eval-host-agent");
 mkdirSync(agentDir, { recursive: true });
