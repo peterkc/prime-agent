@@ -619,10 +619,10 @@ pub(crate) mod tests {
         };
         // These timers only bound failure; the Exit observer determines readiness.
         let observed = exit.recv_timeout(Duration::from_secs(5));
-        if observed.is_ok() {
-            if let Some(kill) = kill {
-                control.cancel(kill);
-            }
+        if observed.is_ok()
+            && let Some(kill) = kill
+        {
+            control.cancel(kill);
         }
         let finished = result.recv_timeout(Duration::from_secs(3));
         output.close();

@@ -52,21 +52,32 @@ New fork-only files are not changes to pi-owned files.
 
 - **Files:** `packages/env/daemon/src/exec.rs`,
   `packages/env/daemon/src/output.rs`, `packages/env/daemon/src/process.rs`,
-  `packages/env/daemon/src/pty.rs`, `packages/env/daemon/src/sys/unix.rs`,
-  `packages/env/test/process.test.ts`, `.github/workflows/fork-ci.yml`
+  `packages/env/daemon/src/pty.rs`, `packages/env/test/process.test.ts`
 - **Reason:** Backport pi commit `b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
   Fork CI lost final output when the exit grace elapsed while the link held a
   reader up. The upstream changelog bullet uses a fork `.changes` fragment.
   Two `test-policy: allow` comments name the upstream commit and preserve its
   client-stall timer and failure timeout. Its behavior and assertions stay unchanged.
 - **Fork fix:** A separate commit on top, "Bound forced output drain and signal
-  only process groups", fixes two defects introduced by the backport. In `exec.rs`,
-  `process.rs` and `pty.rs`, a forced end stops readers and cannot extend the exit
-  grace while the link holds them. In `packages/env/daemon/src/sys/unix.rs`, kills
-  signal only the process group, never a bare PID that may have been reaped and
-  reused. Regression tests stay in those source modules; a `#[cfg(test)]`-only
-  `Control` observer signals consumed exits for deterministic test coordination.
-  `.github/workflows/fork-ci.yml` runs the daemon's Rust tests in the `other` job.
+  only process groups", fixes a defect the backport introduced: in `exec.rs`,
+  `process.rs` and `pty.rs`, a forced end (timeout, cancel or kill) now stops
+  readers and cannot extend the exit grace while the link holds them. Its
+  regression tests stay in those source modules; a `#[cfg(test)]`-only `Control`
+  observer signals consumed exits for deterministic test coordination. Fork CI
+  runs the daemon's format, lint and unit tests in the `other` job.
 - **Kind:** upstream backport
 - **Removal condition:** Remove when next moves to a pi release that contains
-  `b48c675a912f7852810e5f8c9f8ca6887b5b851b` and an equivalent fix for both defects.
+  `b48c675a912f7852810e5f8c9f8ca6887b5b851b` and an equivalent fix for the forced-end drain.
+
+## Signal only process groups
+
+- **Files:** `packages/env/daemon/src/sys/unix.rs`
+- **Reason:** pi's `kill_tree` falls back to `kill(pid)` when the process group
+  is gone. After the child was reaped, that pid may belong to another process.
+  The backported exit grace made that window much longer. Every caller's child
+  gets its own group or session before spawn returns, so the fork signals only
+  the group. A regression test in the same module checks that no bare pid is
+  signaled.
+- **Kind:** intentional difference
+- **Removal condition:** Remove when pi's `kill_tree` no longer signals a bare
+  pid, or when next moves to a pi release with an equivalent fix.

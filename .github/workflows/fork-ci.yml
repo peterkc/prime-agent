@@ -112,9 +112,14 @@ jobs:
         if: matrix.name == 'other'
         run: npm run build:daemon --workspace packages/env
 
-      - name: Test the pi-env daemon
+      # Mirrors pi's env.yml daemon step, which is disabled on this fork.
+      - name: Daemon format, lint and unit tests
         if: matrix.name == 'other'
-        run: cargo test --manifest-path packages/env/daemon/Cargo.toml --locked
+        working-directory: packages/env/daemon
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
 
       - name: Install uv
         if: matrix.name == 'coding-agent'
