@@ -58,16 +58,23 @@ New fork-only files are not changes to pi-owned files.
   reader up. The upstream changelog bullet uses a fork `.changes` fragment.
   Two `test-policy: allow` comments name the upstream commit and preserve its
   client-stall timer and failure timeout. Its behavior and assertions stay unchanged.
-- **Fork fix:** A separate commit on top, "Bound forced output drain and signal
-  only process groups", fixes a defect the backport introduced: in `exec.rs`,
-  `process.rs` and `pty.rs`, a forced end (timeout, cancel or kill) now stops
-  readers and cannot extend the exit grace while the link holds them. Its
-  regression tests stay in those source modules; a `#[cfg(test)]`-only `Control`
-  observer signals consumed exits for deterministic test coordination. Fork CI
-  runs the daemon's format, lint and unit tests in the `other` job.
 - **Kind:** upstream backport
 - **Removal condition:** Remove when next moves to a pi release that contains
-  `b48c675a912f7852810e5f8c9f8ca6887b5b851b` and an equivalent fix for the forced-end drain.
+  `b48c675a912f7852810e5f8c9f8ca6887b5b851b`.
+
+The forced-end fork behavior was removed at the user's request (D16). The daemon's
+response shares the output backlog, so stopping readers drops output without
+bringing the response forward. `exec.rs`, `process.rs` and `pty.rs` now equal
+`b48c675a912f7852810e5f8c9f8ca6887b5b851b`. These test rows and their test-only
+observers were deleted because the behavior they tested was removed (D16):
+
+- `exec::tests::pr94_cancel_after_exit_stops_stalled_readers`: removed behavior.
+- `exec::tests::pr94_kill_after_exit_stops_stalled_readers`: removed behavior.
+- `exec::tests::pr94_timeout_after_exit_stops_stalled_readers`: removed behavior.
+- `process::tests::pr94_cancel_after_exit_stops_stalled_readers`: removed behavior.
+- `process::tests::pr94_kill_after_exit_stops_stalled_readers`: removed behavior.
+- `pty::tests::pr94_cancel_after_exit_stops_stalled_readers`: removed behavior.
+- `pty::tests::pr94_kill_after_exit_stops_stalled_readers`: removed behavior.
 
 ## Signal only process groups
 
@@ -76,11 +83,15 @@ New fork-only files are not changes to pi-owned files.
   is gone. After the child was reaped, that pid may belong to another process.
   The backported exit grace made that window much longer. Every caller's child
   gets its own group or session before spawn returns, so the fork signals only
-  the group. A regression test in the same module checks that no bare pid is
-  signaled.
+  the group. `configure` returns the `setsid` error if the child cannot establish
+  its session, as the pty path already does. Regression tests in the same module
+  check that no bare pid is signaled and that an existing process-group leader
+  fails to spawn with the OS error. Fork CI runs the daemon's format, lint and
+  unit tests in the `other` job.
 - **Kind:** intentional difference
 - **Removal condition:** Remove when pi's `kill_tree` no longer signals a bare
-  pid, or when next moves to a pi release with an equivalent fix.
+  pid and `configure` checks `setsid`, or when next moves to a pi release with
+  both fixes.
 
 ## Build the daemon used by env tests
 

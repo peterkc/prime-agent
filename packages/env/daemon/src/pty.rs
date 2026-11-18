@@ -234,7 +234,6 @@ pub fn run(
     let mut aborted = false;
     let mut killed = false;
     let kill = |killed: &mut bool| {
-        stop.store(true, Ordering::SeqCst);
         if !*killed {
             *killed = true;
             kill_group(pid);
@@ -252,7 +251,7 @@ pub fn run(
                 let now = Instant::now();
                 if now < idle {
                     idle - now
-                } else if !stop.load(Ordering::SeqCst) && gate.held() {
+                } else if gate.held() {
                     // Silence while the link holds the reader up is not the end of the output.
                     idle_until = Some(now + EXIT_GRACE);
                     EXIT_GRACE
@@ -277,8 +276,6 @@ pub fn run(
             Ok(Message::Exit(exit)) => {
                 status = Some(Ok(exit));
                 idle_until = Some(Instant::now() + EXIT_GRACE);
-                #[cfg(test)]
-                control.observe_exit();
             }
             Ok(Message::WaitFailed(error)) => {
                 status = Some(Err(error));
@@ -550,43 +547,5 @@ mod unix {
             }
         }
         true
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    fn after_exit(kill: bool) -> Result<Value, Failure> {
-        crate::exec::tests::forced_end_after_exit(
-            |output, control| {
-                let request = PtyRequest::from_json(&json!({
-                    "cwd": std::env::temp_dir(),
-                    "argv": ["/bin/sh", "-c", "printf x"],
-                    "cols": 80,
-                    "rows": 24,
-                }))
-                .unwrap();
-                run(
-                    1,
-                    request,
-                    &output,
-                    &control,
-                    &Groups::default(),
-                    &Terminals::default(),
-                )
-            },
-            Some(kill),
-        )
-    }
-
-    #[test]
-    fn pr94_cancel_after_exit_stops_stalled_readers() {
-        assert_eq!(after_exit(false).unwrap_err().code, "aborted");
-    }
-
-    #[test]
-    fn pr94_kill_after_exit_stops_stalled_readers() {
-        assert_eq!(after_exit(true).unwrap()["exitCode"], 0);
     }
 }

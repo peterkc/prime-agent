@@ -43,8 +43,6 @@ pub struct Control {
     pub aborted: AtomicBool,
     pub killed: AtomicBool,
     sender: Mutex<Option<Sender<Message>>>,
-    #[cfg(test)]
-    exit_observer: Mutex<Option<Sender<()>>>,
 }
 
 impl Control {
@@ -62,13 +60,6 @@ impl Control {
 
     pub fn attach(&self, sender: Sender<Message>) {
         *self.sender.lock().unwrap() = Some(sender);
-    }
-
-    #[cfg(test)]
-    pub fn observe_exit(&self) {
-        if let Some(observer) = self.exit_observer.lock().unwrap().take() {
-            let _ = observer.send(());
-        }
     }
 }
 
@@ -467,7 +458,6 @@ pub fn run(
     let mut aborted = false;
     let mut killed = false;
     let kill = |killed: &mut bool| {
-        stop.store(true, Ordering::SeqCst);
         if !*killed {
             *killed = true;
             kill_group(pid);
@@ -488,7 +478,7 @@ pub fn run(
         }
         if idle_until.is_some_and(|idle| now >= idle) {
             // Silence while the link holds a reader up is not the end of the output: the pipe may hold more.
-            if !stop.load(Ordering::SeqCst) && gate.as_ref().is_some_and(Gate::held) {
+            if gate.as_ref().is_some_and(Gate::held) {
                 idle_until = Some(now + EXIT_STDIO_GRACE);
             } else {
                 // A descendant may hold the pipes open after the process exited; stop waiting for it.
@@ -533,8 +523,6 @@ pub fn run(
             Ok(Message::Exit(exit)) => {
                 status = Some(Ok(exit));
                 idle_until = Some(Instant::now() + EXIT_STDIO_GRACE);
-                #[cfg(test)]
-                control.observe_exit();
             }
             Ok(Message::WaitFailed(error)) => {
                 status = Some(Err(error));
@@ -592,72 +580,4 @@ pub fn run(
         result["spillPath"] = json!(path);
     }
     Ok(result)
-}
-
-#[cfg(all(test, unix))]
-pub(crate) mod tests {
-    use super::*;
-
-    /// A link that never drains; close it before joining even when an assertion will fail.
-    pub fn forced_end_after_exit(
-        run: impl FnOnce(Arc<Output>, Arc<Control>) -> Result<Value, Failure> + Send + 'static,
-        kill: Option<bool>,
-    ) -> Result<Value, Failure> {
-        let output = Arc::new(Output::default());
-        output.bulk(
-            Frame::with_payload(EVENT, 0, json!({}), vec![0; 4 * 1024 * 1024 + 1]),
-            None,
-        );
-        let (exited, exit) = mpsc::channel();
-        let control = Arc::new(Control::default());
-        *control.exit_observer.lock().unwrap() = Some(exited);
-        let (done, result) = mpsc::channel();
-        let worker = {
-            let output = output.clone();
-            let control = control.clone();
-            thread::spawn(move || done.send(run(output, control)).unwrap())
-        };
-        // These timers only bound failure; the Exit observer determines readiness.
-        let observed = exit.recv_timeout(Duration::from_secs(5));
-        if observed.is_ok()
-            && let Some(kill) = kill
-        {
-            control.cancel(kill);
-        }
-        let finished = result.recv_timeout(Duration::from_secs(3));
-        output.close();
-        worker.join().unwrap();
-        observed.expect("the run did not observe the child's exit");
-        finished.expect("forced end waited for the stalled link to drain")
-    }
-
-    fn exec_after_exit(kill: Option<bool>) -> Result<Value, Failure> {
-        forced_end_after_exit(
-            move |output, control| {
-                let request = ExecRequest::from_json(&json!({
-                    "cwd": std::env::temp_dir(),
-                    "argv": ["/bin/sh", "-c", "printf x"],
-                    "timeoutMs": if kill.is_none() { json!(1000) } else { Value::Null },
-                }))
-                .unwrap();
-                run(1, request, "", &output, &control, &Groups::default())
-            },
-            kill,
-        )
-    }
-
-    #[test]
-    fn pr94_cancel_after_exit_stops_stalled_readers() {
-        assert_eq!(exec_after_exit(Some(false)).unwrap_err().code, "aborted");
-    }
-
-    #[test]
-    fn pr94_kill_after_exit_stops_stalled_readers() {
-        assert_eq!(exec_after_exit(Some(true)).unwrap()["exitCode"], 0);
-    }
-
-    #[test]
-    fn pr94_timeout_after_exit_stops_stalled_readers() {
-        assert_eq!(exec_after_exit(None).unwrap_err().code, "timeout");
-    }
 }

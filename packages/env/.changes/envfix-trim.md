@@ -1,0 +1,2 @@
+- Removed forced-end output dropping so exec, process and terminal commands preserve output while the link is stalled.
+- Fixed Unix command spawning to return an error when it cannot establish its own session.
