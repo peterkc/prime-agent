@@ -9,6 +9,51 @@ Each entry gives its **files**, **reason**, **kind** (`upstreamable hook`,
 **removal condition**.
 New fork-only files are not changes to pi-owned files.
 
+## Change #0: Prime identity
+
+- **Files:**
+  - `CARRIED-CHANGES.md`
+  - `packages/coding-agent/package.json`
+  - `packages/coding-agent/src/config.ts`
+  - `packages/coding-agent/src/index.ts`
+  - `packages/coding-agent/test/auth-login.test.ts`
+  - `packages/coding-agent/test/auth-logout.test.ts`
+  - `packages/coding-agent/test/config.test.ts`
+  - `packages/coding-agent/test/credential-print.test.ts`
+  - `packages/coding-agent/test/first-time-setup.test.ts`
+  - `packages/coding-agent/test/interactive-mode-bug-report-hint.test.ts`
+  - `packages/coding-agent/test/mcp-command.test.ts`
+  - `packages/coding-agent/test/mcp-extension.test.ts`
+  - `packages/coding-agent/test/mcp-oauth-refresh.test.ts`
+  - `packages/coding-agent/test/package-command-paths.test.ts`
+  - `packages/coding-agent/test/package-manager.test.ts`
+  - `packages/coding-agent/test/program-status-reporter.test.ts`
+  - `packages/coding-agent/test/resource-loader.test.ts`
+  - `packages/coding-agent/test/rpc.test.ts`
+  - `packages/coding-agent/test/session-file-invalid.test.ts`
+  - `packages/coding-agent/test/session-manager/file-operations.test.ts`
+  - `packages/coding-agent/test/settings-manager-bug.test.ts`
+  - `packages/coding-agent/test/settings-manager.test.ts`
+  - `packages/coding-agent/test/stdout-cleanliness.test.ts`
+  - `packages/coding-agent/test/suite/agent-session-mcp-oauth.test.ts`
+  - `packages/coding-agent/test/suite/regressions/2781-skill-collision-precedence.test.ts`
+  - `packages/coding-agent/test/suite/regressions/2791-fswatch-error-crash.test.ts`
+  - `packages/coding-agent/test/suite/regressions/8337-utf8-bom-parsing.test.ts`
+  - `packages/coding-agent/test/theme-export.test.ts`
+  - `packages/coding-agent/test/theme-picker.test.ts`
+  - `packages/coding-agent/test/trust-manager.test.ts`
+- **Reason:** Give the coding agent the Prime name and keep both user and project
+  configuration in `.prime/agent`. Normalize the product name for environment
+  variables and export the identity names for integrations. Tests follow the
+  configured folders, variable names and product-name text. The managed-update
+  fixtures create the executable named by `APP_NAME`. The distribution-specific
+  rows assert Prime's existing first-time-setup and MCP OAuth safeguards; their
+  production code stays unchanged. Identity regression rows use exact variable
+  names to check the public contract, including the old name's absence of effect.
+- **Kind:** intentional difference
+- **Removal condition:** Remove when pi offers separate product-identity and folder
+  settings that preserve both Prime configuration folders and normalized names.
+
 ## Fork development rules
 
 - **Files:** `AGENTS.md`

@@ -236,23 +236,23 @@ describe("MCP OAuth client ID metadata documents", () => {
 	});
 
 	// #11426
-	it("uses pi's document by default when authorization responses name their issuer", async () => {
+	it("registers dynamically by default for Prime when authorization responses name their issuer", async () => {
 		const { server, store, signIn } = await startServer({ cimd: true, issParameter: true });
 		await signIn({});
 		const [authorization] = server.authorizations;
-		expect(authorization.get("client_id")).toBe("https://pi.dev/oauth/client.json");
+		expect(authorization.get("client_id")).toBe("client-1");
 		const redirect = new URL(authorization.get("redirect_uri") ?? "");
 		expect(`${redirect.hostname}${redirect.pathname}`).toBe("127.0.0.1/callback");
 		expect(redirect.port).not.toBe("");
-		expect(server.registrations).toEqual([]);
-		expect(server.tokenRequests[0].get("client_id")).toBe("https://pi.dev/oauth/client.json");
+		expect(server.registrations).toHaveLength(1);
+		expect(server.tokenRequests[0].get("client_id")).toBe("client-1");
 		expect(server.tokenRequests[0].get("redirect_uri")).toBe(redirect.href);
-		// The document is not stored, so signing in again refreshes the tokens instead of discarding them.
-		expect((await store.load())?.clientInformation).toBeUndefined();
+		// The registered client is stored, so signing in again refreshes its tokens.
+		expect((await store.load())?.clientInformation?.client_id).toBe("client-1");
 		await signIn({});
 		expect(server.authorizations).toHaveLength(1);
 		expect(server.tokenRequests[1].get("grant_type")).toBe("refresh_token");
-		expect(server.tokenRequests[1].get("client_id")).toBe("https://pi.dev/oauth/client.json");
+		expect(server.tokenRequests[1].get("client_id")).toBe("client-1");
 	});
 
 	// #11426

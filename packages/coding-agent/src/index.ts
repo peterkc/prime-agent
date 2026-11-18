@@ -4,7 +4,10 @@ export { type Args, parseArgs } from "./cli/args.ts";
 
 // Config paths
 export {
+	APP_NAME,
 	CONFIG_DIR_NAME,
+	ENV_AGENT_DIR,
+	ENV_PREFIX,
 	getAgentDir,
 	getDocsPath,
 	getExamplesPath,

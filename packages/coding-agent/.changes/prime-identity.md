@@ -1,0 +1,2 @@
+- Changed the coding agent identity to Prime, with `.prime/agent` configuration folders and `PRIME_AGENT` folder overrides.
+- Added package exports for the product name and environment-variable names.
