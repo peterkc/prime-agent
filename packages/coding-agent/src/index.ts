@@ -371,6 +371,7 @@ export {
 	keyHint,
 	keyText,
 	LoginDialogComponent,
+	type ModelSelectionOptions,
 	ModelSelectorComponent,
 	OAuthSelectorComponent,
 	type RenderDiffOptions,

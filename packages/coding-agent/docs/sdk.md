@@ -87,9 +87,10 @@ interface AgentSession {
   sessionFile: string | undefined;
   sessionId: string;
 
-  // Model control
-  setModel(model: Model): Promise<void>;
-  setThinkingLevel(level: ThinkingLevel): void;
+  // Model control: defaults stay unchanged unless saveModelChangesAsDefault is true.
+  // These two setters accept an explicit persist override; cycle methods follow the setting.
+  setModel(model: Model, options?: ModelChangeOptions): Promise<void>;
+  setThinkingLevel(level: ThinkingLevel, options?: ModelChangeOptions): void;
   cycleModel(): Promise<ModelCycleResult | undefined>;
   cycleThinkingLevel(): ThinkingLevel | undefined;
 

@@ -3,6 +3,7 @@ import { Container, Input, setKeybindings, type TUI } from "@earendil-works/pi-t
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { KEYBINDINGS, KeybindingsManager } from "../../../src/core/keybindings.js";
+import { SettingsManager } from "../../../src/core/settings-manager.js";
 import type { ConfigurationMenuComponent } from "../../../src/modes/interactive/components/configuration-menu.js";
 import { ModelSelectorComponent } from "../../../src/modes/interactive/components/model-selector.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
@@ -65,6 +66,8 @@ async function fixture(scoped = false) {
 		showError: vi.fn(),
 	}) as unknown as {
 		showConfigurationMenu(tab: "models"): Promise<void>;
+		closeConfigurationMenu(): void;
+		configurationModelSelection: Promise<void>;
 		completeModelSelection: ReturnType<typeof vi.fn<() => Promise<void>>>;
 		ui: { setFocus: ReturnType<typeof vi.fn> };
 		showError: ReturnType<typeof vi.fn>;
@@ -211,6 +214,125 @@ it("refreshes a fresh model catalog when the picker opens without a search", asy
 	f.menu().handleInput("\x1b");
 	await done;
 });
+
+it.each([
+	"enter",
+	"enter default",
+	"save",
+	"rebound save",
+	"failed save",
+	"save untouched",
+	"save plain",
+	"save replaced",
+])("picker default action: %s", async (action) => {
+	const f = await fixture();
+	const settings = SettingsManager.inMemory({ saveModelChangesAsDefault: action === "enter default" });
+	const model = action === "save plain" ? f.harness.getModel("plain")! : f.model;
+	f.harness.settingsManager.setDefaultThinkingLevel("medium");
+	settings.setDefaultModelAndProvider("original", "original");
+	settings.setDefaultThinkingLevel("medium");
+	const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+	const switched = deferred();
+	const setModel = vi.fn(async () => {
+		if (action === "failed save") throw new Error("model unavailable");
+		await f.harness.session.setModel(model);
+	});
+	Object.assign(f.mode, {
+		uiServices: { modelRegistry: f.harness.session.modelRegistry, settingsManager: settings },
+		getCachedModelCandidates: () => [model],
+		completeModelSelection: prototype.completeModelSelection,
+		agentConnection: {
+			setModel,
+			getState: async () => ({
+				sessionId: action === "save replaced" ? "replacement" : undefined,
+				model: f.harness.session.model,
+				thinkingLevel: f.harness.session.thinkingLevel,
+				availableThinkingLevels: ["off", "low", "medium", "high"],
+			}),
+			setThinkingLevel: async (level: ModelThinkingLevel) => f.harness.session.setThinkingLevel(level),
+		},
+		applyModelSwitchUiState: vi.fn(),
+		maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+		checkDaxnutsEasterEgg: vi.fn(),
+		showError: () => switched.resolve(),
+		connectionState: { thinkingLevel: "off", sessionId: action === "save replaced" ? "source" : undefined },
+	});
+	if (action === "rebound save") setKeybindings(new KeybindingsManager({ "app.model.saveDefault": "ctrl+x" }));
+	const done = f.mode.showConfigurationMenu("models");
+	if (action !== "save untouched" && action !== "save plain" && action !== "enter default")
+		f.menu().handleInput("\x1b[C");
+	const key = action.startsWith("enter") ? "\r" : action === "rebound save" ? "\x18" : "\x1b[115;7u";
+	f.menu().handleInput(key);
+	if (action === "failed save") {
+		await switched.promise;
+		f.menu().handleInput("\x1b");
+	}
+	await done;
+	if (action === "enter" || action === "failed save" || action === "save replaced") {
+		expect([settings.getDefaultProvider(), settings.getDefaultModel(), settings.getDefaultThinkingLevel()]).toEqual([
+			"original",
+			"original",
+			"medium",
+		]);
+	} else {
+		expect([settings.getDefaultProvider(), settings.getDefaultModel(), settings.getDefaultThinkingLevel()]).toEqual([
+			model.provider,
+			model.id,
+			action === "save untouched" || action === "save plain" || action === "enter default" ? "medium" : "high",
+		]);
+	}
+	expect(settings.getRecentModels()).toEqual(
+		action === "failed save" || action === "save replaced"
+			? ["original/original"]
+			: [`${model.provider}/${model.id}`, "original/original"],
+	);
+	expect(setModel).toHaveBeenCalledExactlyOnceWith(model.provider, model.id);
+});
+
+it.each(["cancelled", "session changed", "replacement queued"])(
+	"PR #57 does not save defaults when %s while picker state is pending",
+	async (change) => {
+		const f = await fixture();
+		const settings = SettingsManager.inMemory({
+			defaultProvider: "original",
+			defaultModel: "original",
+			defaultThinkingLevel: "medium",
+		});
+		const stateRequested = deferred();
+		const releaseState = deferred();
+		const mode = Object.assign(f.mode, {
+			uiServices: { modelRegistry: f.harness.session.modelRegistry, settingsManager: settings },
+			connectionState: { sessionId: "source", thinkingLevel: "off" },
+			sessionEventGeneration: 0,
+			agentConnection: {
+				getState: async () => {
+					stateRequested.resolve();
+					await releaseState.promise;
+					return { sessionId: "source", thinkingLevel: "high" };
+				},
+			},
+		});
+		const done = mode.showConfigurationMenu("models");
+		f.menu().handleInput("\x1b[115;7u");
+		await stateRequested.promise;
+		const selection = mode.configurationModelSelection;
+		try {
+			if (change === "cancelled") mode.closeConfigurationMenu();
+			else if (change === "session changed") mode.connectionState.sessionId = "replacement";
+			// session_replaced advances this before the queued UI state change.
+			else mode.sessionEventGeneration++;
+		} finally {
+			releaseState.resolve();
+			await selection;
+			await done;
+		}
+		expect([settings.getDefaultProvider(), settings.getDefaultModel(), settings.getDefaultThinkingLevel()]).toEqual([
+			"original",
+			"original",
+			"medium",
+		]);
+	},
+);
 
 it("does not publish the removed configuration tab action", () => {
 	expect(Object.keys(KEYBINDINGS)).not.toContain("app.configuration.previousTab");

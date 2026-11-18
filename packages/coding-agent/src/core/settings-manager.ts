@@ -210,6 +210,7 @@ export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
+	saveModelChangesAsDefault?: boolean; // global opt-in; default: false
 	subagentDefaultModel?: string; // "provider/id" for rlm.spawn without a pinned model; unset inherits the parent model
 	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
@@ -876,6 +877,12 @@ export class SettingsManager {
 		return this.settings.recentModels ?? [];
 	}
 
+	recordModelUse(provider: string, modelId: string): void {
+		this.recordModelUseInternal(provider, modelId);
+		this.markModified("recentModels");
+		this.save();
+	}
+
 	private recordModelUseInternal(provider: string, modelId: string): void {
 		const key = `${provider}/${modelId}`;
 		const next = [key, ...this.getRecentModels().filter((k) => k !== key)];
@@ -921,6 +928,16 @@ export class SettingsManager {
 	setUpdateChannel(channel: "stable" | "nightly"): void {
 		this.globalSettings.updateChannel = channel;
 		this.markModified("updateChannel");
+		this.save();
+	}
+
+	getSaveModelChangesAsDefault(): boolean {
+		return this.globalSettings.saveModelChangesAsDefault === true;
+	}
+
+	setSaveModelChangesAsDefault(enabled: boolean): void {
+		this.globalSettings.saveModelChangesAsDefault = enabled;
+		this.markModified("saveModelChangesAsDefault");
 		this.save();
 	}
 

@@ -25,6 +25,36 @@ describe("SettingsManager", () => {
 	const readSettings = (path: string): Record<string, unknown> =>
 		JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 
+	it.each(["false", "true", 1])("session-model save-model policy accepts only boolean true: %s", (value) => {
+		writeSettings(globalPath, { saveModelChangesAsDefault: value });
+		expect(SettingsManager.create(projectDir, agentDir).getSaveModelChangesAsDefault()).toBe(false);
+	});
+
+	it("save-model default policy is global-only, defaults off and persists toggles", async () => {
+		writeSettings(projectPath, { saveModelChangesAsDefault: true });
+		const manager = SettingsManager.create(projectDir, agentDir);
+		expect(manager.getSaveModelChangesAsDefault()).toBe(false);
+		manager.setSaveModelChangesAsDefault(true);
+		await manager.flush();
+		expect(readSettings(globalPath).saveModelChangesAsDefault).toBe(true);
+		expect(SettingsManager.create(projectDir, agentDir).getSaveModelChangesAsDefault()).toBe(true);
+		manager.setSaveModelChangesAsDefault(false);
+		await manager.flush();
+		expect(SettingsManager.create(projectDir, agentDir).getSaveModelChangesAsDefault()).toBe(false);
+		writeSettings(globalPath, { saveModelChangesAsDefault: false, defaultProvider: "other", defaultModel: "other" });
+		manager.recordModelUse("provider", "model");
+		await manager.flush();
+		expect(readSettings(globalPath)).toEqual({
+			saveModelChangesAsDefault: false,
+			defaultProvider: "other",
+			defaultModel: "other",
+			recentModels: ["provider/model"],
+		});
+		writeSettings(globalPath, { saveModelChangesAsDefault: true });
+		await manager.reload();
+		expect(manager.getSaveModelChangesAsDefault()).toBe(true);
+	});
+
 	it.each([
 		["default", {}, true],
 		["off", { agentMessageCanWait: false }, false],

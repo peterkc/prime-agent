@@ -617,6 +617,46 @@ describe("AgentSession model and extension characterization", () => {
 		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
 	});
 	it.each([
+		["draft model and effort", true, true, false, "faux-2", "high"],
+		["draft model only", true, false, false, "faux-2", "low"],
+		["draft effort only", false, true, false, "faux-1", "low"],
+		["brand-new session", false, false, false, "faux-1", "low"],
+		["explicit model and effort", true, true, true, "faux-3", "medium"],
+	] as const)(
+		"PR #57 restores %s without messages or duplicate creation entries",
+		async (_name, hasModel, hasThinking, explicit, expectedModel, expectedThinking) => {
+			const h = await createHarness({ models: MODELS });
+			harnesses.push(h);
+			h.settingsManager.setDefaultModelAndProvider(h.getModel().provider, "faux-1");
+			h.settingsManager.setDefaultThinkingLevel("low");
+			const draft = SessionManager.create(h.tempDir, join(h.tempDir, "sessions"));
+			if (hasModel) draft.appendModelChange(h.getModel().provider, "faux-2");
+			if (hasThinking) draft.appendThinkingLevelChange("high");
+			draft.flushNow();
+			const manager = SessionManager.open(draft.getSessionFile()!);
+			expect(manager.buildSessionContext().messages).toEqual([]);
+			const resumed = await secretSdkSession(h, {
+				model: explicit ? h.getModel("faux-3") : undefined,
+				thinkingLevel: explicit ? "medium" : undefined,
+				sessionManager: manager,
+			});
+			try {
+				expect([resumed.model?.id, resumed.thinkingLevel]).toEqual([expectedModel, expectedThinking]);
+				expect(
+					manager.getBranch().flatMap((entry) => (entry.type === "model_change" ? [entry.modelId] : [])),
+				).toEqual(hasModel ? ["faux-2"] : ["faux-1"]);
+				expect(
+					manager
+						.getBranch()
+						.flatMap((entry) => (entry.type === "thinking_level_change" ? [entry.thinkingLevel] : [])),
+				).toEqual(hasThinking && !hasModel ? ["high", "low"] : [hasThinking ? "high" : "low"]);
+			} finally {
+				resumed.dispose();
+			}
+		},
+	);
+
+	it.each([
 		[false, "low", "high"],
 		[true, "medium", "medium"],
 	] as const)(
@@ -625,7 +665,7 @@ describe("AgentSession model and extension characterization", () => {
 			const h = await createHarness({
 				provider: "xai",
 				models: MODELS.slice(0, 2),
-				settings: { defaultThinkingLevel: "low" },
+				settings: { defaultThinkingLevel: "low", saveModelChangesAsDefault: true },
 			});
 			harnesses.push(h);
 			h.session.setThinkingLevel("high", { persist });
@@ -643,9 +683,218 @@ describe("AgentSession model and extension characterization", () => {
 			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(expectedDefault);
 		},
 	);
+	it("session-model resume then metadata refresh keeps a clamp session-only when saving is off", async () => {
+		const h = await createHarness({
+			provider: "xai",
+			models: MODELS,
+			persistSession: true,
+			settings: { defaultThinkingLevel: "low" },
+		});
+		harnesses.push(h);
+		h.sessionManager.appendMessage(fauxAssistantMessage("saved"));
+		h.session.setThinkingLevel("high");
+		const resumed = await secretSdkSession(h, {
+			model: undefined,
+			sessionManager: SessionManager.open(h.session.sessionFile!),
+		});
+		try {
+			expect(resumed.thinkingLevel).toBe("high");
+			vi.spyOn(resumed.modelRegistry, "getModelForCurrentAuth").mockReturnValue({
+				...h.getModel(),
+				thinkingLevelMap: { high: null },
+			});
+			resumed.refreshModelMetadata();
+			expect(resumed.thinkingLevel).toBe("medium");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe("low");
+		} finally {
+			resumed.dispose();
+		}
+	});
+
+	it.each(["session", "default", "explicit session"])("session model changes follow persistence=%s", async (mode) => {
+		const saveDefault = mode === "default";
+		const options = mode === "explicit session" ? { persist: false } : {};
+		const modelEvents: boolean[] = [];
+		const h = await createHarness({
+			models: MODELS,
+			persistSession: true,
+			settings: {
+				defaultProvider: "original",
+				defaultModel: "original",
+				defaultThinkingLevel: "high",
+				...(saveDefault ? { saveModelChangesAsDefault: true } : {}),
+			},
+			extensionFactories: [
+				(pi) => {
+					pi.on("model_select", (event) => {
+						modelEvents.push(event.persisted);
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		h.sessionManager.appendMessage(fauxAssistantMessage("saved"));
+		const before = h.sessionManager.getEntries().length;
+		await h.session.setModel(h.getModel("faux-2")!, options);
+		expect(h.settingsManager.getRecentModels()).toEqual(
+			mode === "explicit session" ? [] : [`${h.getModel().provider}/faux-2`],
+		);
+		expect(h.session.model?.id).toBe("faux-2");
+		expect(h.sessionManager.getEntries().slice(before)).toMatchObject([{ type: "model_change", modelId: "faux-2" }]);
+		expect([h.settingsManager.getDefaultProvider(), h.settingsManager.getDefaultModel()]).toEqual(
+			saveDefault ? [h.getModel().provider, "faux-2"] : ["original", "original"],
+		);
+		await h.session.cycleModel("forward");
+		expect(h.session.model?.id).toBe("faux-3");
+		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-3" : "original");
+		h.session.setScopedModels([{ model: h.getModel() }, { model: h.getModel("faux-2")! }]);
+		await h.session.cycleModel("forward");
+		expect(h.session.model?.id).toBe("faux-2");
+		expect(h.settingsManager.getDefaultModel()).toBe(saveDefault ? "faux-2" : "original");
+		expect(modelEvents).toEqual([saveDefault, saveDefault, saveDefault]);
+		expect(h.settingsManager.getRecentModels()).toEqual([
+			`${h.getModel().provider}/faux-2`,
+			`${h.getModel().provider}/faux-3`,
+		]);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "model_change")
+				.map((e) => e.modelId),
+		).toEqual(["faux-2", "faux-3", "faux-2"]);
+		h.session.setThinkingLevel("low");
+		expect(h.session.thinkingLevel).toBe("low");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe(saveDefault ? "low" : "high");
+		expect(h.session.cycleThinkingLevel()).toBe("medium");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe(saveDefault ? "medium" : "high");
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "thinking_level_change")
+				.map((e) => e.thinkingLevel),
+		).toEqual(["low", "medium"]);
+		const resumed = await secretSdkSession(h, {
+			model: undefined,
+			sessionManager: SessionManager.open(h.session.sessionFile!),
+		});
+		try {
+			expect([resumed.model?.id, resumed.thinkingLevel]).toEqual(["faux-2", "medium"]);
+		} finally {
+			resumed.dispose();
+		}
+	});
+
+	it.each(["set", "available cycle", "scoped cycle"])(
+		"session-model hot toggle saves a clamped implicit effort through %s",
+		async (action) => {
+			const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+			harnesses.push(h);
+			h.session.setThinkingLevel("high");
+			h.settingsManager.setSaveModelChangesAsDefault(true);
+			const clamped = { ...h.getModel("faux-2")!, thinkingLevelMap: { high: null } };
+			vi.spyOn(h.session.modelRegistry, "refreshAvailableModels").mockResolvedValue([h.getModel(), clamped]);
+			if (action === "set") await h.session.setModel(clamped);
+			else {
+				if (action === "scoped cycle") h.session.setScopedModels([{ model: h.getModel() }, { model: clamped }]);
+				await h.session.cycleModel();
+			}
+			expect([h.session.thinkingLevel, h.settingsManager.getDefaultThinkingLevel()]).toEqual(["medium", "medium"]);
+			expect(h.settingsManager.getDefaultModel()).toBe("faux-2");
+		},
+	);
+
+	it("session-model extension setModel keeps an implicit session-only effort out of the defaults", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high");
+		await h.session.setModel(h.getModel("faux-2")!, { persist: true });
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-2",
+			"low",
+		]);
+	});
+
+	it("session-model setModel with explicit persist false keeps an implicit effort out with saving on", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high");
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		await h.session.setModel(h.getModel("faux-2")!, { persist: false });
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("low");
+	});
+
+	it("session-model explicit session-only effort stays out of the defaults on a clamping cycle", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "low" } });
+		harnesses.push(h);
+		h.session.setThinkingLevel("high", { persist: false });
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		const clamped = { ...h.getModel("faux-2")!, thinkingLevelMap: { high: null } };
+		vi.spyOn(h.session.modelRegistry, "refreshAvailableModels").mockResolvedValue([h.getModel(), clamped]);
+		await h.session.cycleModel();
+		expect([h.session.thinkingLevel, h.settingsManager.getDefaultThinkingLevel()]).toEqual(["medium", "low"]);
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-2");
+	});
+
+	it.each([false, true])(
+		"session-model first scoped cycle uses its own effort without unintended saving (save=%s)",
+		async (save) => {
+			const h = await createHarness({
+				models: MODELS,
+				settings: { defaultThinkingLevel: "high", saveModelChangesAsDefault: save },
+			});
+			harnesses.push(h);
+			h.session.setScopedModels([{ model: h.getModel() }, { model: h.getModel("faux-2")!, thinkingLevel: "low" }]);
+			await h.session.cycleModel();
+			expect(h.session.thinkingLevel).toBe("low");
+			expect(h.settingsManager.getDefaultThinkingLevel()).toBe(save ? "low" : "high");
+		},
+	);
+
+	it("takes the next persistence setting and explicit overrides without restarting", async () => {
+		const h = await createHarness({
+			models: MODELS,
+			settings: { defaultModel: "original", defaultThinkingLevel: "high" },
+		});
+		harnesses.push(h);
+		await h.session.setModel(h.getModel("faux-2")!, { persist: true });
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-2");
+		h.session.setThinkingLevel("low", { persist: true });
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("low");
+		h.settingsManager.setSaveModelChangesAsDefault(true);
+		await h.session.cycleModel();
+		expect(h.settingsManager.getDefaultModel()).toBe("faux-3");
+		h.session.cycleThinkingLevel();
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("medium");
+		await h.session.setModel(h.getModel()!, { persist: false });
+		h.session.setThinkingLevel("high", { persist: false });
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-3",
+			"medium",
+		]);
+		h.settingsManager.setSaveModelChangesAsDefault(false);
+		await h.session.cycleModel();
+		h.session.cycleThinkingLevel();
+		expect([h.settingsManager.getDefaultModel(), h.settingsManager.getDefaultThinkingLevel()]).toEqual([
+			"faux-3",
+			"medium",
+		]);
+	});
+
+	it("keeps a clamped session-only effort preference for a later capable model", async () => {
+		const h = await createHarness({ models: MODELS, settings: { defaultThinkingLevel: "medium" } });
+		harnesses.push(h);
+		await h.session.setModel({ ...h.getModel("faux-2")!, reasoning: false });
+		h.session.setThinkingLevel("high");
+		expect(h.session.thinkingLevel).toBe("off");
+		await h.session.setModel(h.getModel()!);
+		expect(h.session.thinkingLevel).toBe("high");
+		expect(h.settingsManager.getDefaultThinkingLevel()).toBe("medium");
+	});
+
 	it("setModel saves the model and emits model_select", async () => {
 		const modelEvents: string[] = [];
 		const harness = await createHarness({
+			settings: { saveModelChangesAsDefault: true },
 			models: MODELS.slice(0, 2),
 			extensionFactories: [
 				(pi) => {
@@ -928,6 +1177,7 @@ describe("AgentSession model and extension characterization", () => {
 
 	it("cycles through scoped models and clamps thinking to model capabilities", async () => {
 		const harness = await createHarness({
+			settings: { saveModelChangesAsDefault: true },
 			models: [
 				{ id: "faux-1", name: "One", reasoning: true },
 				{ id: "faux-2", name: "Two", reasoning: false },

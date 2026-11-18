@@ -260,6 +260,8 @@ When the target closes, RPC emits `observed_session_closed`. Stop watching expli
 
 ### Model
 
+`set_model` and `cycle_model` follow the global `saveModelChangesAsDefault` setting (`false` by default). They change only the current session unless saving is enabled. RPC and ACP model and thinking controls have no per-call `persist` override.
+
 #### set_model
 
 Switch to a specific model.
@@ -323,6 +325,8 @@ Response contains an array of full [Model](#model) objects:
 ```
 
 ### Thinking
+
+`set_thinking_level` and `cycle_thinking_level` follow `saveModelChangesAsDefault`. By default, they change the session level and history without saving the global thinking default.
 
 #### set_thinking_level
 

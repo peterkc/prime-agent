@@ -5,15 +5,41 @@ import {
 	type SettingsConfig,
 	SettingsSelectorComponent,
 } from "../src/modes/interactive/components/settings-selector.js";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
-describe("notification settings toggles", () => {
-	test.each(["finished", "failed", "waiting"])("persists the %s notification toggle", async (label) => {
+const labels = ["finished", "failed", "waiting", "Save model changes"];
+
+describe("settings toggles", () => {
+	test.each([false, true])("session-model /settings saves its toggle from initial=%s", async (initial) => {
+		initTheme("dark");
+		const settings = SettingsManager.inMemory({ saveModelChangesAsDefault: initial });
+		let selector!: SettingsSelectorComponent;
+		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+			uiServices: { settingsManager: settings },
+			agentConnection: { getState: async () => ({ availableThinkingLevels: ["medium"], thinkingLevel: "medium" }) },
+			applyConnectionStateSnapshot: vi.fn(),
+			showSelector: (create: (done: () => void) => { component: SettingsSelectorComponent }) => {
+				selector = create(() => {}).component;
+			},
+			showStatus: vi.fn(),
+		});
+		await mode.showSettingsSelector();
+		const list = selector.getSettingsList();
+		for (const char of "save") list.handleInput(char);
+		list.handleInput("\r");
+		await settings.flush();
+		expect(settings.getSaveModelChangesAsDefault()).toBe(!initial);
+		expect(mode.showStatus).toHaveBeenCalledOnce();
+	});
+
+	test.each(labels)("persists the %s toggle", async (label) => {
 		initTheme("dark");
 		const settings = SettingsManager.inMemory();
 		const ignore = vi.fn();
 		const config: SettingsConfig = {
 			autoCompact: true,
+			saveModelChangesAsDefault: false,
 			idleEvictionMinutes: 90,
 			showImages: true,
 			autoResizeImages: true,
@@ -44,6 +70,7 @@ describe("notification settings toggles", () => {
 		};
 		const callbacks = new Proxy(
 			{
+				onSaveModelChangesAsDefaultChange: (enabled: boolean) => settings.setSaveModelChangesAsDefault(enabled),
 				onNotifyOnCompletionChange: (enabled: boolean) => settings.setNotifyOnCompletion(enabled),
 				onNotifyOnErrorChange: (enabled: boolean) => settings.setNotifyOnError(enabled),
 				onNotifyOnInputChange: (enabled: boolean) => settings.setNotifyOnInput(enabled),
@@ -55,9 +82,11 @@ describe("notification settings toggles", () => {
 		for (const char of label) list.handleInput(char);
 		list.handleInput("\r");
 		await settings.flush();
+		expect(settings.getSaveModelChangesAsDefault()).toBe(label === "Save model changes");
 		const values = () => [settings.getNotifyOnCompletion(), settings.getNotifyOnError(), settings.getNotifyOnInput()];
 		expect(values()).toEqual(["finished", "failed", "waiting"].map((name) => name !== label));
 		list.handleInput("\r");
 		expect(values()).toEqual([true, true, true]);
+		expect(settings.getSaveModelChangesAsDefault()).toBe(false);
 	});
 });

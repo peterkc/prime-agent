@@ -765,7 +765,10 @@ export interface ModelSelectEvent {
 	model: Model<any>;
 	previousModel: Model<any> | undefined;
 	source: ModelSelectSource;
-	/** Whether this selection updates the global model defaults and recent models. */
+	/**
+	 * Whether this selection was saved as the global model default. Session-only picks may still update recent models.
+	 * A session-only ctrl+alt+s pick emits persisted=false, then saves the default right after.
+	 */
 	persisted: boolean;
 }
 
@@ -1369,7 +1372,10 @@ export type RefreshToolsHandler = () => void;
 
 /** Persistence policy for explicit model and thinking-level changes. */
 export interface ModelChangeOptions {
-	/** Update global defaults (and recent models for model changes). Defaults to true. */
+	/**
+	 * Update global defaults (and recent models). Extensions default to true; sessions follow saveModelChangesAsDefault.
+	 * An omitted value that resolves to session-only still records recent models; only an explicit false skips them.
+	 */
 	readonly persist?: boolean;
 }
 

@@ -4,7 +4,7 @@ import type { AuthStorage } from "../../../core/auth-storage.js";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
-import { ModelSelectorComponent } from "./model-selector.js";
+import { type ModelSelectionOptions, ModelSelectorComponent } from "./model-selector.js";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./oauth-selector.js";
 
 export const CONFIGURATION_MENU_TABS = ["providers", "models", "mcp-connections"] as const;
@@ -33,7 +33,7 @@ export interface ConfigurationMenuOptions {
 	requestRender: () => void;
 	onSelectProvider: (provider: AuthSelectorProvider) => void;
 	onSelectMcpConnection: (provider: AuthSelectorProvider) => void;
-	onSelectModel: (model: Model<Api>, thinkingLevel?: ModelThinkingLevel) => void;
+	onSelectModel: (model: Model<Api>, thinkingLevel?: ModelThinkingLevel, options?: ModelSelectionOptions) => void;
 	onCancel: () => void;
 }
 
