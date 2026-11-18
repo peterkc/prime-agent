@@ -1,0 +1,1 @@
+- Fixed task changes deep in an ownership chain within one conversation taking time proportional to the chain depth; each nested owned conversation still adds one step.

@@ -1,0 +1,1 @@
+- Fixed env tests running a stale daemon by building the current daemon before the tests.
