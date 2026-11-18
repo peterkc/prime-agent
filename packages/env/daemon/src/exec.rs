@@ -4,7 +4,7 @@
 use crate::decode::StreamDecoder;
 use crate::errors::Failure;
 use crate::frame::{EVENT, Frame};
-use crate::output::Output;
+use crate::output::{Gate, Output};
 use crate::sys;
 use crate::window::{Pending, Window};
 use serde_json::{Map, Value, json};
@@ -43,6 +43,8 @@ pub struct Control {
     pub aborted: AtomicBool,
     pub killed: AtomicBool,
     sender: Mutex<Option<Sender<Message>>>,
+    #[cfg(test)]
+    exit_observer: Mutex<Option<Sender<()>>>,
 }
 
 impl Control {
@@ -60,6 +62,13 @@ impl Control {
 
     pub fn attach(&self, sender: Sender<Message>) {
         *self.sender.lock().unwrap() = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub fn observe_exit(&self) {
+        if let Some(observer) = self.exit_observer.lock().unwrap().take() {
+            let _ = observer.send(());
+        }
     }
 }
 
@@ -297,22 +306,22 @@ pub fn running<T>(
         .ok_or_else(|| Failure::new("EBADF", format!("no running {what} with this id")))
 }
 
-/// Read one pipe on its own thread until it ends or `stop` is set. With `output`, reading waits while too much output
-/// is unsent.
+/// Read one pipe on its own thread until it ends or `stop` is set. With `gate`, reading waits while too much output is
+/// unsent.
 pub fn spawn_reader(
     stream: usize,
     pipe: impl sys::Pipe + Send + 'static,
     sender: Sender<Message>,
     stop: Arc<AtomicBool>,
-    output: Option<Arc<Output>>,
+    gate: Option<Gate>,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new().spawn(move || {
         sys::read_pipe(pipe, &stop, |bytes| {
-            let delivered = sender.send(Message::Data(stream, bytes.to_vec())).is_ok();
-            if let Some(output) = &output {
-                output.wait_for_room(&stop);
+            let deliver = || sender.send(Message::Data(stream, bytes.to_vec())).is_ok();
+            match &gate {
+                Some(gate) => gate.pass(&stop, deliver),
+                None => deliver(),
             }
-            delivered
         });
         let _ = sender.send(Message::Eof(stream));
     })
@@ -392,7 +401,7 @@ pub fn run(
     let stop = Arc::new(AtomicBool::new(false));
     // Without a window, output is not coalesced; reading then waits for the link.
     let gate = if request.window.is_none() {
-        Some(output.clone())
+        Some(Gate::new(output))
     } else {
         None
     };
@@ -412,7 +421,7 @@ pub fn run(
         return Err(abandon(child, error));
     }
     let stderr = child.stderr.take().unwrap();
-    if let Err(error) = spawn_reader(1, stderr, sender.clone(), stop.clone(), gate) {
+    if let Err(error) = spawn_reader(1, stderr, sender.clone(), stop.clone(), gate.clone()) {
         return Err(abandon(child, error));
     }
     if let Err((child, error)) = start_waiter(child, None, sender.clone()) {
@@ -458,6 +467,7 @@ pub fn run(
     let mut aborted = false;
     let mut killed = false;
     let kill = |killed: &mut bool| {
+        stop.store(true, Ordering::SeqCst);
         if !*killed {
             *killed = true;
             kill_group(pid);
@@ -477,8 +487,13 @@ pub fn run(
             break;
         }
         if idle_until.is_some_and(|idle| now >= idle) {
-            // A descendant may hold the pipes open after the process exited; stop waiting for it.
-            break;
+            // Silence while the link holds a reader up is not the end of the output: the pipe may hold more.
+            if !stop.load(Ordering::SeqCst) && gate.as_ref().is_some_and(Gate::held) {
+                idle_until = Some(now + EXIT_STDIO_GRACE);
+            } else {
+                // A descendant may hold the pipes open after the process exited; stop waiting for it.
+                break;
+            }
         }
         if let Some(pending) = &mut pending
             && !pending.is_empty()
@@ -518,6 +533,8 @@ pub fn run(
             Ok(Message::Exit(exit)) => {
                 status = Some(Ok(exit));
                 idle_until = Some(Instant::now() + EXIT_STDIO_GRACE);
+                #[cfg(test)]
+                control.observe_exit();
             }
             Ok(Message::WaitFailed(error)) => {
                 status = Some(Err(error));
@@ -575,4 +592,72 @@ pub fn run(
         result["spillPath"] = json!(path);
     }
     Ok(result)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A link that never drains; close it before joining even when an assertion will fail.
+    pub fn forced_end_after_exit(
+        run: impl FnOnce(Arc<Output>, Arc<Control>) -> Result<Value, Failure> + Send + 'static,
+        kill: Option<bool>,
+    ) -> Result<Value, Failure> {
+        let output = Arc::new(Output::default());
+        output.bulk(
+            Frame::with_payload(EVENT, 0, json!({}), vec![0; 4 * 1024 * 1024 + 1]),
+            None,
+        );
+        let (exited, exit) = mpsc::channel();
+        let control = Arc::new(Control::default());
+        *control.exit_observer.lock().unwrap() = Some(exited);
+        let (done, result) = mpsc::channel();
+        let worker = {
+            let output = output.clone();
+            let control = control.clone();
+            thread::spawn(move || done.send(run(output, control)).unwrap())
+        };
+        // These timers only bound failure; the Exit observer determines readiness.
+        let observed = exit.recv_timeout(Duration::from_secs(5));
+        if observed.is_ok()
+            && let Some(kill) = kill
+        {
+            control.cancel(kill);
+        }
+        let finished = result.recv_timeout(Duration::from_secs(3));
+        output.close();
+        worker.join().unwrap();
+        observed.expect("the run did not observe the child's exit");
+        finished.expect("forced end waited for the stalled link to drain")
+    }
+
+    fn exec_after_exit(kill: Option<bool>) -> Result<Value, Failure> {
+        forced_end_after_exit(
+            move |output, control| {
+                let request = ExecRequest::from_json(&json!({
+                    "cwd": std::env::temp_dir(),
+                    "argv": ["/bin/sh", "-c", "printf x"],
+                    "timeoutMs": if kill.is_none() { json!(1000) } else { Value::Null },
+                }))
+                .unwrap();
+                run(1, request, "", &output, &control, &Groups::default())
+            },
+            kill,
+        )
+    }
+
+    #[test]
+    fn pr94_cancel_after_exit_stops_stalled_readers() {
+        assert_eq!(exec_after_exit(Some(false)).unwrap_err().code, "aborted");
+    }
+
+    #[test]
+    fn pr94_kill_after_exit_stops_stalled_readers() {
+        assert_eq!(exec_after_exit(Some(true)).unwrap()["exitCode"], 0);
+    }
+
+    #[test]
+    fn pr94_timeout_after_exit_stops_stalled_readers() {
+        assert_eq!(exec_after_exit(None).unwrap_err().code, "timeout");
+    }
 }

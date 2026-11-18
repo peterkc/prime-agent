@@ -112,6 +112,15 @@ jobs:
         if: matrix.name == 'other'
         run: npm run build:daemon --workspace packages/env
 
+      # Mirrors pi's env.yml daemon step, which is disabled on this fork.
+      - name: Daemon format, lint and unit tests
+        if: matrix.name == 'other'
+        working-directory: packages/env/daemon
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
       - name: Install uv
         if: matrix.name == 'coding-agent'
         uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7

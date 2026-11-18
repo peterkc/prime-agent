@@ -1,0 +1,2 @@
+- Fixed missing final output when a program exited while the link was backed up.
+- Fixed killing a process whose group was already gone: the daemon no longer signals a bare process ID that may belong to another program.

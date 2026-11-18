@@ -1,0 +1,1 @@
+- Fixed the Together Kimi K3 model test to match the catalog output limit.
