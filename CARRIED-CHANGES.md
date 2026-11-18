@@ -93,7 +93,10 @@ New fork-only files are not changes to pi-owned files.
   still run and no assertion changes.
 - **Kind:** upstream backport
 - **Removal condition:** Remove when next moves to a pi release that contains
-  `97096b4cb937034bfc1615107a949ca9b5c7892c`.
+  `97096b4cb937034bfc1615107a949ca9b5c7892c`. The `test-policy: allow` comment
+  in `packages/env/test/build-daemon.ts` is fork-only: after that release, keep it
+  as a fork difference until pi's file or the fork's test policy makes it
+  unnecessary.
 
 ## Keep lock-test socket paths short
 
