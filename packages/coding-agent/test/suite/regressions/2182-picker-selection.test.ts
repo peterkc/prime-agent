@@ -66,6 +66,8 @@ async function fixture(scoped = false) {
 		showError: vi.fn(),
 	}) as unknown as {
 		showConfigurationMenu(tab: "models"): Promise<void>;
+		closeConfigurationMenu(): void;
+		configurationModelSelection: Promise<void>;
 		completeModelSelection: ReturnType<typeof vi.fn<() => Promise<void>>>;
 		ui: { setFocus: ReturnType<typeof vi.fn> };
 		showError: ReturnType<typeof vi.fn>;
@@ -286,6 +288,51 @@ it.each([
 	);
 	expect(setModel).toHaveBeenCalledExactlyOnceWith(model.provider, model.id);
 });
+
+it.each(["cancelled", "session changed", "replacement queued"])(
+	"PR #57 does not save defaults when %s while picker state is pending",
+	async (change) => {
+		const f = await fixture();
+		const settings = SettingsManager.inMemory({
+			defaultProvider: "original",
+			defaultModel: "original",
+			defaultThinkingLevel: "medium",
+		});
+		const stateRequested = deferred();
+		const releaseState = deferred();
+		const mode = Object.assign(f.mode, {
+			uiServices: { modelRegistry: f.harness.session.modelRegistry, settingsManager: settings },
+			connectionState: { sessionId: "source", thinkingLevel: "off" },
+			sessionEventGeneration: 0,
+			agentConnection: {
+				getState: async () => {
+					stateRequested.resolve();
+					await releaseState.promise;
+					return { sessionId: "source", thinkingLevel: "high" };
+				},
+			},
+		});
+		const done = mode.showConfigurationMenu("models");
+		f.menu().handleInput("\x1b[115;7u");
+		await stateRequested.promise;
+		const selection = mode.configurationModelSelection;
+		try {
+			if (change === "cancelled") mode.closeConfigurationMenu();
+			else if (change === "session changed") mode.connectionState.sessionId = "replacement";
+			// session_replaced advances this before the queued UI state change.
+			else mode.sessionEventGeneration++;
+		} finally {
+			releaseState.resolve();
+			await selection;
+			await done;
+		}
+		expect([settings.getDefaultProvider(), settings.getDefaultModel(), settings.getDefaultThinkingLevel()]).toEqual([
+			"original",
+			"original",
+			"medium",
+		]);
+	},
+);
 
 it("does not publish the removed configuration tab action", () => {
 	expect(Object.keys(KEYBINDINGS)).not.toContain("app.configuration.previousTab");

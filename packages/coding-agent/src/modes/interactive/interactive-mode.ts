@@ -9469,10 +9469,11 @@ export class InteractiveMode {
 								if (options?.saveAsDefault) {
 									const connection = this.agentConnection;
 									const sessionId = this.connectionState?.sessionId;
+									const sessionGeneration = this.sessionEventGeneration;
 									const state = await connection.getState();
 									if (settled) return false;
 									if (
-										this.agentConnection !== connection ||
+										this.sessionEventGeneration !== sessionGeneration ||
 										this.connectionState?.sessionId !== sessionId ||
 										(sessionId !== undefined && state.sessionId !== sessionId)
 									) {

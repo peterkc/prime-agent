@@ -839,17 +839,16 @@ async function prepareRuntimeServices(options: {
 	const modelPatterns = config.models ?? settingsManager.getEnabledModels();
 	const scopedModels =
 		modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
+	const existingSession = sessionManager.buildSessionContext();
+	const hasExistingSession =
+		existingSession.messages.length > 0 ||
+		existingSession.model !== null ||
+		sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 	const {
 		options: sessionOptions,
 		cliThinkingFromModel,
 		diagnostics: sessionOptionDiagnostics,
-	} = buildSessionOptions(
-		config,
-		scopedModels,
-		sessionManager.buildSessionContext().messages.length > 0,
-		modelRegistry,
-		settingsManager,
-	);
+	} = buildSessionOptions(config, scopedModels, hasExistingSession, modelRegistry, settingsManager);
 	diagnostics.push(...sessionOptionDiagnostics);
 
 	const effectiveSessionModel = options.sessionOptionsOverride?.model ?? sessionOptions.model;
@@ -880,7 +879,10 @@ async function resolvePreparedStartupModel(options: {
 	const { prepared, sessionManager } = options;
 	const { modelRegistry, settingsManager } = prepared.services;
 	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
+	const hasExistingSession =
+		existingSession.messages.length > 0 ||
+		existingSession.model !== null ||
+		sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
 	let model = prepared.sessionOptions.model;
 	let modelFallbackMessage: string | undefined;

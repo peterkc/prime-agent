@@ -561,6 +561,61 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.deleteRlmSubagentRuntime("lineage-child", childRuntime.session);
 	});
 
+	it.each([false, true])(
+		"PR #57 restores a draft through the production factory with CLI overrides=%s",
+		async (explicit) => {
+			const h = await createHarness({
+				models: [
+					{ id: "faux-1", reasoning: true },
+					{ id: "faux-2", reasoning: true },
+				],
+			});
+			cleanups.push(h.cleanup);
+			const provider = h.getModel().provider;
+			writeFileSync(
+				join(h.tempDir, "settings.json"),
+				JSON.stringify({ defaultProvider: provider, defaultModel: "faux-1", defaultThinkingLevel: "low" }),
+			);
+			const draft = SessionManager.create(h.tempDir, join(h.tempDir, "sessions"));
+			draft.appendModelChange(provider, "faux-2");
+			draft.appendThinkingLevelChange("high");
+			draft.flushNow();
+			const factory = createDefaultRuntimeFactory(
+				{
+					models: [`${provider}/faux-1:low`],
+					model: explicit ? `${provider}/faux-1:low` : undefined,
+					thinking: explicit ? "medium" : undefined,
+					noTools: true,
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					noContextFiles: true,
+					telemetryDisabled: true,
+				},
+				[
+					(pi) =>
+						pi.registerProvider(provider, {
+							baseUrl: h.getModel().baseUrl,
+							apiKey: "faux-key",
+							api: h.faux.api,
+							models: h.models,
+						}),
+				],
+			);
+			const created = await factory({
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				sessionManager: SessionManager.open(draft.getSessionFile()!),
+				sessionStartEvent: { type: "session_start", reason: "resume" },
+				sessionOptions: { rlmDepth: 1 },
+			});
+			cleanups.push(() => created.session.dispose());
+			expect([created.session.model?.id, created.session.thinkingLevel]).toEqual(
+				explicit ? ["faux-1", "medium"] : ["faux-2", "high"],
+			);
+		},
+	);
+
 	it("keeps semantic spawn lineage through the production runtime factory", async () => {
 		const tempDir = join(tmpdir(), `pi-runtime-factory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		vi.stubEnv("HOME", tempDir);

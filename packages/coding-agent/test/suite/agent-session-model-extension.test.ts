@@ -617,6 +617,46 @@ describe("AgentSession model and extension characterization", () => {
 		expect([fresh.thinkingLevel, settingsManager.getDefaultThinkingLevel()]).toEqual(["low", "medium"]);
 	});
 	it.each([
+		["draft model and effort", true, true, false, "faux-2", "high"],
+		["draft model only", true, false, false, "faux-2", "low"],
+		["draft effort only", false, true, false, "faux-1", "high"],
+		["brand-new session", false, false, false, "faux-1", "low"],
+		["explicit model and effort", true, true, true, "faux-3", "medium"],
+	] as const)(
+		"PR #57 restores %s without messages or duplicate creation entries",
+		async (_name, hasModel, hasThinking, explicit, expectedModel, expectedThinking) => {
+			const h = await createHarness({ models: MODELS });
+			harnesses.push(h);
+			h.settingsManager.setDefaultModelAndProvider(h.getModel().provider, "faux-1");
+			h.settingsManager.setDefaultThinkingLevel("low");
+			const draft = SessionManager.create(h.tempDir, join(h.tempDir, "sessions"));
+			if (hasModel) draft.appendModelChange(h.getModel().provider, "faux-2");
+			if (hasThinking) draft.appendThinkingLevelChange("high");
+			draft.flushNow();
+			const manager = SessionManager.open(draft.getSessionFile()!);
+			expect(manager.buildSessionContext().messages).toEqual([]);
+			const resumed = await secretSdkSession(h, {
+				model: explicit ? h.getModel("faux-3") : undefined,
+				thinkingLevel: explicit ? "medium" : undefined,
+				sessionManager: manager,
+			});
+			try {
+				expect([resumed.model?.id, resumed.thinkingLevel]).toEqual([expectedModel, expectedThinking]);
+				expect(
+					manager.getBranch().flatMap((entry) => (entry.type === "model_change" ? [entry.modelId] : [])),
+				).toEqual(hasModel ? ["faux-2"] : hasThinking ? [] : ["faux-1"]);
+				expect(
+					manager
+						.getBranch()
+						.flatMap((entry) => (entry.type === "thinking_level_change" ? [entry.thinkingLevel] : [])),
+				).toEqual([hasThinking ? "high" : "low"]);
+			} finally {
+				resumed.dispose();
+			}
+		},
+	);
+
+	it.each([
 		[false, "low", "high"],
 		[true, "medium", "medium"],
 	] as const)(

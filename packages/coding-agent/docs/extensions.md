@@ -709,6 +709,7 @@ pi.on("model_select", async (event, ctx) => {
   // event.previousModel - previous model (undefined if first selection)
   // event.source - "set" | "cycle" | "restore"
   // event.persisted - whether this selection was saved as the global model default
+  // A session-only ctrl+alt+s pick emits model_select with persisted=false, then saves the default right after.
   // Session-only built-in picks still update recent models.
 
   const prev = event.previousModel
