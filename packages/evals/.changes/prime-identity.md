@@ -1,0 +1,1 @@
+- Changed eval isolation to follow the configured coding-agent identity and remove only the container bootstrap credential copy, never a host source selected by sandbox IDs alone.

@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getAgentDir } from "../../coding-agent/src/config.ts";
 import type { DocumentationVariant, EvalTask } from "./plan.ts";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -65,10 +65,7 @@ function environment(name: string, value: string): string[] {
 }
 
 export function requireEvalAuthFile(provider: string): string {
-	const path = join(
-		process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), ".pi", "agent"),
-		"auth.json",
-	);
+	const path = join(getAgentDir(), "auth.json");
 	if (!existsSync(path) || !statSync(path).isFile())
 		throw new Error(`Eval authentication file does not exist: ${path}`);
 	let credentials: unknown;

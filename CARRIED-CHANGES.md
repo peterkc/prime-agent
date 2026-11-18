@@ -39,17 +39,81 @@ New fork-only files are not changes to pi-owned files.
   - `packages/coding-agent/test/suite/regressions/2781-skill-collision-precedence.test.ts`
   - `packages/coding-agent/test/suite/regressions/2791-fswatch-error-crash.test.ts`
   - `packages/coding-agent/test/suite/regressions/8337-utf8-bom-parsing.test.ts`
+  - `packages/coding-agent/test/fixtures/subagent-child.mjs`
+  - `packages/coding-agent/test/suite/regressions/8261-subagent-project-trust.test.ts`
+  - `packages/coding-agent/test/utilities.ts`
   - `packages/coding-agent/test/theme-export.test.ts`
   - `packages/coding-agent/test/theme-picker.test.ts`
   - `packages/coding-agent/test/trust-manager.test.ts`
+  - `packages/coding-agent/src/main.ts`
+  - `packages/coding-agent/test/deleted-cwd.test.ts`
+  - `packages/evals/src/harness.ts`
+  - `packages/evals/src/docker.ts`
+  - `packages/evals/docker/entrypoint.ts`
+  - `packages/evals/test/harness.test.ts`
+  - `scripts/smoke-test-codemode-binary.mjs`
+  - `scripts/profile-coding-agent-node.mjs`
+  - `scripts/coding-agent-smoke.mjs`
 - **Reason:** Give the coding agent the Prime name and keep both user and project
   configuration in `.prime/agent`. Normalize the product name for environment
   variables and export the identity names for integrations. Tests follow the
-  configured folders, variable names and product-name text. The managed-update
-  fixtures create the executable named by `APP_NAME`. The distribution-specific
-  rows assert Prime's existing first-time-setup and MCP OAuth safeguards; their
-  production code stays unchanged. Identity regression rows use exact variable
-  names to check the public contract, including the old name's absence of effect.
+  configured folders, variable names and product-name text. Credential test helpers
+  resolve their folder through `getAgentDir()`. Test-only config mocks retain pi's
+  official setup, OAuth and managed-update branch coverage; separate rows assert
+  Prime's existing setup and OAuth safeguards. The managed npm fixture creates the
+  executable from the real package bin manifest (`pi`), not from `APP_NAME`.
+  Production safeguards stay unchanged. The subagent fixture publishes its PID
+  only after installing its SIGTERM handler and emitting its partial message, so
+  the lifecycle test's readiness signal means both are ready. Identity regression
+  rows use exact variable names to check the public contract, including the old
+  name's absence of effect. The eval harness, container bootstrap and smoke/profile
+  scripts follow the configured identity too. Plain-Node scripts derive the same
+  variable name from the tested manifest through the fork-only
+  `scripts/agent-dir-env.mjs`; the profiler keeps its non-isolated default.
+- **Credential removal fix (upstreamable fix):** The harness captures the container
+  marker and host path before environment isolation. It removes a credential only
+  for a marked container whose path is the entrypoint's bootstrap copy destination
+  and whose sandbox IDs are configured. A host run with sandbox IDs alone never
+  removes its source file. Source, bootstrap copy and session folder stay distinct.
+  Remove this fix when pi adopts the same marker-bound removal condition.
+- **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
+  project configuration folder resolves to the user folder, including existing
+  symlink ancestors of not-yet-created folders. SDK callers passing their own cwd
+  and agent folder are not covered.
+- **Recorded exceptions and stage-2 limits:**
+  - FR-8 display-only exceptions: `.pi` paths in
+    `test/interactive-mode-status.test.ts` and
+    `test/tool-execution-component.test.ts` are supplied display text, not config
+    discovery paths. These fixtures do not access those paths.
+  - FR-8 caller-supplied tilde-expansion exception:
+    `test/skills.test.ts:375-389` passes explicit `~/.pi/agent/skills` paths to
+    compare tilde expansion with the absolute path. It accesses that caller-supplied
+    path, not config-folder resolution; checks use a disposable `HOME`.
+  - Test-only official-distribution mocks deliberately supply `pi` and `.pi` to
+    exercise pi's guarded branches. Prime behavior has separate assertions.
+  - Under risk R5, managed self-update is not reachable for Prime on `next` with
+    the current package manifest: verification looks for `prime-agent`, the real
+    bin is `pi`, and the managed marker/release service still names pi.dev. The
+    managed-update rows exercise pi's official identity, not a fictional Prime
+    install. Stage 2 must resolve this before use.
+  - Under R5, help/UI still shows the extra `agent` segment, producing
+    `~/.prime/agent/agent`: `src/cli/args.ts:415,462`,
+    `src/package-manager-cli.ts:313`, `src/extensions/mcp/cli.ts:43` and
+    `src/modes/interactive/components/config-selector.ts:206`.
+  - Under R5, `.pi/mcp.json` hints, `src/cli/auth-command.ts:48` and docs that name
+    `PI_` variables still describe pi. This is display/documentation naming, not
+    the configured runtime paths. Stage 2 owns these corrections.
+  - Known unconverted identity consumers remain follow-ups for stage 2 under R5:
+    `.github/workflows/issue-analysis.yml`, `apps/p2`,
+    `scripts/cost.ts`, `scripts/stats.ts`, `scripts/tool-stats.ts`,
+    `scripts/session-transcripts.ts`, `scripts/edit-tool-stats.mjs`,
+    `scripts/read-tool-stats.mjs`, `scripts/session-context-stats.mjs` and
+    `packages/evals/evals/prompt-templates.docs.eval.ts`.
+  - Docker evals now select `~/.prime/agent/auth.json` by default and bind-mount it
+    read-only, as pi's Docker design does. Stage 1 runs no Docker or paid eval.
+  - Without `piConfig`, the folder fallback is `~/.pi` on this branch, not
+    fork/main's `~/.prime/agent`. `next` always ships `piConfig`; changing that
+    fallback was not carried under D7.
 - **Kind:** intentional difference
 - **Removal condition:** Remove when pi offers separate product-identity and folder
   settings that preserve both Prime configuration folders and normalized names.

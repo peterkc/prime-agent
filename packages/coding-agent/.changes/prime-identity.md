@@ -1,2 +1,3 @@
-- Changed the coding agent identity to Prime, with `.prime/agent` configuration folders and `PRIME_AGENT` folder overrides.
+- Changed the coding agent identity to Prime, with user and project `.prime/agent` folders and `PRIME_AGENT_CODING_AGENT_DIR` and `PRIME_AGENT_CODING_AGENT_SESSION_DIR` overrides. `PI_CODING_AGENT_DIR` and `~/.pi/agent` are no longer read for these folders; the live build's `PRIME_AGENT_SESSION_DIR` name was not carried.
 - Added package exports for the product name and environment-variable names.
+- Added a CLI startup refusal when the project configuration folder is the user agent folder, including symlink aliases.

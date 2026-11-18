@@ -9,7 +9,7 @@ import {
 	type OAuthChallenge,
 	OAuthIssuerMismatchError,
 } from "@earendil-works/pi-mcp/oauth";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAuthStorageBackend } from "../src/core/auth-storage.ts";
 import {
 	createMcpAuthProvider,
@@ -18,6 +18,25 @@ import {
 	signInMcpServer,
 } from "../src/extensions/mcp/oauth.ts";
 import { startOAuthMcpServer } from "./suite/mcp-oauth-server.ts";
+
+const identity = vi.hoisted(() => ({ official: true }));
+
+vi.mock("../src/config.ts", async (importOriginal) => {
+	const actual = await importOriginal<{ APP_NAME: string; CONFIG_DIR_NAME: string }>();
+	return {
+		...actual,
+		get APP_NAME() {
+			return identity.official ? "pi" : actual.APP_NAME;
+		},
+		get CONFIG_DIR_NAME() {
+			return identity.official ? ".pi" : actual.CONFIG_DIR_NAME;
+		},
+	};
+});
+
+beforeEach(() => {
+	identity.official = true;
+});
 
 describe("MCP OAuth refresh", () => {
 	const cleanups: (() => Promise<void> | void)[] = [];
@@ -236,23 +255,32 @@ describe("MCP OAuth client ID metadata documents", () => {
 	});
 
 	// #11426
-	it("registers dynamically by default for Prime when authorization responses name their issuer", async () => {
+	it("uses pi's document by default when authorization responses name their issuer", async () => {
 		const { server, store, signIn } = await startServer({ cimd: true, issParameter: true });
 		await signIn({});
 		const [authorization] = server.authorizations;
-		expect(authorization.get("client_id")).toBe("client-1");
+		expect(authorization.get("client_id")).toBe("https://pi.dev/oauth/client.json");
 		const redirect = new URL(authorization.get("redirect_uri") ?? "");
 		expect(`${redirect.hostname}${redirect.pathname}`).toBe("127.0.0.1/callback");
 		expect(redirect.port).not.toBe("");
-		expect(server.registrations).toHaveLength(1);
-		expect(server.tokenRequests[0].get("client_id")).toBe("client-1");
+		expect(server.registrations).toEqual([]);
+		expect(server.tokenRequests[0].get("client_id")).toBe("https://pi.dev/oauth/client.json");
 		expect(server.tokenRequests[0].get("redirect_uri")).toBe(redirect.href);
-		// The registered client is stored, so signing in again refreshes its tokens.
-		expect((await store.load())?.clientInformation?.client_id).toBe("client-1");
+		// The document is not stored, so signing in again refreshes the tokens instead of discarding them.
+		expect((await store.load())?.clientInformation).toBeUndefined();
 		await signIn({});
 		expect(server.authorizations).toHaveLength(1);
 		expect(server.tokenRequests[1].get("grant_type")).toBe("refresh_token");
-		expect(server.tokenRequests[1].get("client_id")).toBe("client-1");
+		expect(server.tokenRequests[1].get("client_id")).toBe("https://pi.dev/oauth/client.json");
+	});
+
+	it("registers dynamically by default for Prime when the server supports documents", async () => {
+		identity.official = false;
+		const { server, signIn } = await startServer({ cimd: true, issParameter: true });
+		await signIn({});
+		expect(server.registrations).toHaveLength(1);
+		expect(server.authorizations[0].get("client_id")).toBe("client-1");
+		expect(server.tokenRequests[0].get("client_id")).toBe("client-1");
 	});
 
 	// #11426

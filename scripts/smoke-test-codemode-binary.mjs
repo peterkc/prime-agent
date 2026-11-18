@@ -4,7 +4,8 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { extname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
+import { agentDirEnvName } from "./agent-dir-env.mjs";
 
 const WORKER_MARKER = "PI_CODEMODE_WORKER_OK";
 const SUCCESS_MARKER = "PI_CODEMODE_BINARY_SMOKE_OK";
@@ -54,6 +55,7 @@ async function main() {
 		throw new Error("Usage: node scripts/smoke-test-codemode-binary.mjs <pi-binary>");
 	}
 	const binary = resolve(binaryArg);
+	const agentDirVariable = agentDirEnvName(join(dirname(binary), "package.json"));
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-codemode-binary-smoke-"));
 	let requestCount = 0;
 	const server = createServer(async (request, response) => {
@@ -133,7 +135,7 @@ async function main() {
 			cwd: tempDir,
 			env: {
 				...process.env,
-				PI_CODING_AGENT_DIR: tempDir,
+				[agentDirVariable]: tempDir,
 				PI_OFFLINE: "1",
 			},
 			stdio: ["ignore", "pipe", "pipe"],

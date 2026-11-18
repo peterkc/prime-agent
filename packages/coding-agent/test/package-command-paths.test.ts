@@ -25,6 +25,21 @@ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
+const identity = vi.hoisted(() => ({ official: false }));
+
+vi.mock("../src/config.ts", async (importOriginal) => {
+	const actual = await importOriginal<{ APP_NAME: string; CONFIG_DIR_NAME: string }>();
+	return {
+		...actual,
+		get APP_NAME() {
+			return identity.official ? "pi" : actual.APP_NAME;
+		},
+		get CONFIG_DIR_NAME() {
+			return identity.official ? ".pi" : actual.CONFIG_DIR_NAME;
+		},
+	};
+});
+
 describe("package commands", () => {
 	let tempDir: string;
 	let agentDir: string;
@@ -46,6 +61,7 @@ describe("package commands", () => {
 		targetVersion: string,
 		npmExitCode = 0,
 	): { managedRoot: string; npmRecordPath: string } {
+		identity.official = true;
 		const managedRoot = join(agentDir, "install");
 		const activeRelease = join(managedRoot, "releases", VERSION);
 		const selfPackageDir = join(activeRelease, "node_modules", ...PACKAGE_NAME.split("/"));
@@ -57,6 +73,10 @@ describe("package commands", () => {
 			`${JSON.stringify({ kind: "pi-managed-install", schemaVersion: 1, layout: "releases-v1" })}\n`,
 		);
 
+		const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+			bin: Record<string, string>;
+		};
+		const [packageBin] = Object.keys(manifest.bin);
 		const binDir = join(tempDir, "managed-bin");
 		const fakeNpmPath = join(tempDir, "managed-npm.cjs");
 		const npmRecordPath = join(tempDir, "managed-npm-record.json");
@@ -70,7 +90,7 @@ fs.writeFileSync(${JSON.stringify(npmRecordPath)}, JSON.stringify(args));
 if (${npmExitCode} !== 0) process.exit(${npmExitCode});
 const binDir = path.join(process.cwd(), "node_modules", ".bin");
 fs.mkdirSync(binDir, { recursive: true });
-const piPath = path.join(binDir, process.platform === "win32" ? "${APP_NAME}.cmd" : "${APP_NAME}");
+const piPath = path.join(binDir, process.platform === "win32" ? "${packageBin}.cmd" : "${packageBin}");
 fs.writeFileSync(
 	piPath,
 	process.platform === "win32"
@@ -136,6 +156,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 	}
 
 	beforeEach(() => {
+		identity.official = false;
 		allowNetwork();
 		tempDir = join(tmpdir(), `pi-package-commands-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");

@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { agentDirEnvName } from "./agent-dir-env.mjs";
+
 export const codingAgentName = "@earendil-works/pi-coding-agent";
 
 export function smokeTestCodingAgent(directory, runtime = process.execPath) {
@@ -18,7 +20,7 @@ export function smokeTestCodingAgent(directory, runtime = process.execPath) {
 		LOCALAPPDATA: home,
 		XDG_CONFIG_HOME: home,
 		XDG_CACHE_HOME: home,
-		PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+		[agentDirEnvName(join(packageDir, "package.json"))]: join(home, "agent"),
 		PI_OFFLINE: "1",
 		PI_TELEMETRY: "0",
 	};
