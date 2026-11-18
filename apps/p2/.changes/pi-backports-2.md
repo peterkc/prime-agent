@@ -1,0 +1,1 @@
+- Updated `undici` to 8.12.4 for redirect, cache replay, and integrity-verification security fixes.

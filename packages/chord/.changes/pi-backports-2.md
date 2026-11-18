@@ -1,0 +1,2 @@
+- Fixed lock-test socket paths exceeding the macOS limit under a deep temporary directory.
+- Fixed the tutorial sometimes missing a newly added plugin while its base watcher starts on macOS.

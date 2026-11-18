@@ -1,0 +1,1 @@
+- Fixed task changes deep in an ownership chain taking time proportional to the chain depth.

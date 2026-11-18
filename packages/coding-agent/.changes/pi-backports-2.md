@@ -1,0 +1,1 @@
+- Updated `undici` to 8.12.4 for security advisories GHSA-mqg3-3v4r-cm32, GHSA-7xg3-fphp-28hg, GHSA-5rm8-gv32-r954, GHSA-9v6h-8rgp-m69f, GHSA-3g9m-rv3r-w5w2, and GHSA-r4pc-4jcp-7pqc.

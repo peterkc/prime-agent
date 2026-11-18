@@ -81,3 +81,63 @@ New fork-only files are not changes to pi-owned files.
 - **Kind:** intentional difference
 - **Removal condition:** Remove when pi's `kill_tree` no longer signals a bare
   pid, or when next moves to a pi release with an equivalent fix.
+
+## Build the daemon used by env tests
+
+- **Files:** `packages/env/test/build-daemon.ts`, `packages/env/vitest.config.ts`, `test.sh`
+- **Reason:** Backport pi commit `97096b4cb937034bfc1615107a949ca9b5c7892c`.
+  Build the current daemon before env tests so a stale binary cannot fail process
+  capability checks. Keep the installed Rust and Cargo locations in test.sh's
+  isolated environment. No toolchain is installed. One `test-policy: allow`
+  comment preserves the upstream explicit prebuilt-daemon override; all tests
+  still run and no assertion changes.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `97096b4cb937034bfc1615107a949ca9b5c7892c`.
+
+## Keep lock-test socket paths short
+
+- **Files:** `packages/chord/test/node/workers/lock.test.ts`
+- **Reason:** Backport pi commit `65c43bb520edf53f11923f7a927aefd05475c6af`.
+  Create socket files under `/tmp` on Unix so a deep temporary directory does not
+  exceed macOS's 103-byte socket-path limit. Windows keeps its temporary directory.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `65c43bb520edf53f11923f7a927aefd05475c6af`.
+
+## Wait for the tutorial's base watcher
+
+- **Files:** `packages/chord/test/examples/61-tutorial/main.ts`
+- **Reason:** Backport pi commit `f2bd84a519a57cf2f4e0fd99958fed9556d071f8`.
+  Wait for the base watcher before adding a plugin so macOS's FSEvents watch
+  rebuild does not drop the plugin-directory event.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `f2bd84a519a57cf2f4e0fd99958fed9556d071f8`.
+
+## Find affected conversations without walking every owner task
+
+- **Files:** `packages/durable/src/harness/scheduler.ts`
+- **Reason:** Backport pi commit `628d8ab52ce218b21a3d8f22f087c6f5728f15d1`.
+  Start from a changed task's conversation, then follow conversation owners,
+  instead of walking every owner task. This removes quadratic work for deep
+  task chains. The upstream changelog bullet uses a fork `.changes` fragment.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `628d8ab52ce218b21a3d8f22f087c6f5728f15d1`.
+
+## Update undici for six security advisories
+
+- **Files:** `packages/coding-agent/package.json`, `apps/p2/package.json`,
+  `package-lock.json`, `packages/coding-agent/install-lock/package-lock.json`
+- **Reason:** Backport pi commit `efbcd5adb4bc89f66a9694093be5785511e3eef6`.
+  Update undici from 8.12.3 to 8.12.4 for GHSA-mqg3-3v4r-cm32 (redirect cache
+  poisoning), GHSA-7xg3-fphp-28hg (credential-dependent redirect caching),
+  GHSA-5rm8-gv32-r954 (cross-origin cache revalidation), GHSA-9v6h-8rgp-m69f
+  (redirect credential stripping), GHSA-3g9m-rv3r-w5w2 (cache-replay exceptions),
+  and GHSA-r4pc-4jcp-7pqc (integrity metadata whitespace). The version was
+  published on 2026-11-05 and meets the seven-day minimum release age.
+  The upstream changelog bullet uses a fork `.changes` fragment.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `efbcd5adb4bc89f66a9694093be5785511e3eef6`.
