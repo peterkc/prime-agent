@@ -840,10 +840,7 @@ async function prepareRuntimeServices(options: {
 	const scopedModels =
 		modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
 	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession =
-		existingSession.messages.length > 0 ||
-		existingSession.model !== null ||
-		sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const hasExistingSession = existingSession.messages.length > 0 || existingSession.model !== null;
 	const {
 		options: sessionOptions,
 		cliThinkingFromModel,
@@ -879,10 +876,7 @@ async function resolvePreparedStartupModel(options: {
 	const { prepared, sessionManager } = options;
 	const { modelRegistry, settingsManager } = prepared.services;
 	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession =
-		existingSession.messages.length > 0 ||
-		existingSession.model !== null ||
-		sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const hasExistingSession = existingSession.messages.length > 0 || existingSession.model !== null;
 
 	let model = prepared.sessionOptions.model;
 	let modelFallbackMessage: string | undefined;

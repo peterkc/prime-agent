@@ -619,7 +619,7 @@ describe("AgentSession model and extension characterization", () => {
 	it.each([
 		["draft model and effort", true, true, false, "faux-2", "high"],
 		["draft model only", true, false, false, "faux-2", "low"],
-		["draft effort only", false, true, false, "faux-1", "high"],
+		["draft effort only", false, true, false, "faux-1", "low"],
 		["brand-new session", false, false, false, "faux-1", "low"],
 		["explicit model and effort", true, true, true, "faux-3", "medium"],
 	] as const)(
@@ -644,12 +644,12 @@ describe("AgentSession model and extension characterization", () => {
 				expect([resumed.model?.id, resumed.thinkingLevel]).toEqual([expectedModel, expectedThinking]);
 				expect(
 					manager.getBranch().flatMap((entry) => (entry.type === "model_change" ? [entry.modelId] : [])),
-				).toEqual(hasModel ? ["faux-2"] : hasThinking ? [] : ["faux-1"]);
+				).toEqual(hasModel ? ["faux-2"] : ["faux-1"]);
 				expect(
 					manager
 						.getBranch()
 						.flatMap((entry) => (entry.type === "thinking_level_change" ? [entry.thinkingLevel] : [])),
-				).toEqual([hasThinking ? "high" : "low"]);
+				).toEqual(hasThinking && !hasModel ? ["high", "low"] : [hasThinking ? "high" : "low"]);
 			} finally {
 				resumed.dispose();
 			}
