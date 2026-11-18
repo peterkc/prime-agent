@@ -185,6 +185,7 @@ pub fn run(
     let mut aborted = false;
     let mut killed = false;
     let kill = |killed: &mut bool| {
+        stop.store(true, Ordering::SeqCst);
         if !*killed {
             *killed = true;
             // Only while the program is in `groups`: the waiter removes it under this lock before reaping it.
@@ -206,7 +207,7 @@ pub fn run(
                 let now = Instant::now();
                 if now < idle {
                     idle - now
-                } else if gate.held() {
+                } else if !stop.load(Ordering::SeqCst) && gate.held() {
                     // Silence while the link holds a reader up is not the end of the output: the pipe may hold more.
                     idle_until = Some(now + EXIT_STDIO_GRACE);
                     EXIT_STDIO_GRACE
@@ -238,6 +239,8 @@ pub fn run(
                 killed = true;
                 status = Some(Ok(exit));
                 idle_until = Some(Instant::now() + EXIT_STDIO_GRACE);
+                #[cfg(test)]
+                control.observe_exit();
             }
             Ok(Message::WaitFailed(error)) => {
                 status = Some(Err(error));
@@ -267,5 +270,41 @@ pub fn run(
             "spawn_error",
             "process did not report its exit",
         )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn after_exit(kill: bool) -> Result<Value, Failure> {
+        crate::exec::tests::forced_end_after_exit(
+            |output, control| {
+                let request = ProcessRequest::from_json(&json!({
+                    "cwd": std::env::temp_dir(),
+                    "argv": ["/bin/sh", "-c", "printf x"],
+                }))
+                .unwrap();
+                run(
+                    1,
+                    request,
+                    &output,
+                    &control,
+                    &Groups::default(),
+                    &Processes::default(),
+                )
+            },
+            Some(kill),
+        )
+    }
+
+    #[test]
+    fn pr94_cancel_after_exit_stops_stalled_readers() {
+        assert_eq!(after_exit(false).unwrap_err().code, "aborted");
+    }
+
+    #[test]
+    fn pr94_kill_after_exit_stops_stalled_readers() {
+        assert_eq!(after_exit(true).unwrap()["exitCode"], 0);
     }
 }
