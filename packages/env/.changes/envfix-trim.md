@@ -1,0 +1,1 @@
+- Fixed Unix command spawning to return an error when it cannot establish its own session.

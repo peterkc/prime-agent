@@ -304,7 +304,10 @@ pub fn configure(
     unsafe {
         command.pre_exec(|| {
             // A new session, so a kill reaches every descendant; default signal handling and an empty mask, as libuv sets.
-            libc::setsid();
+            // `kill_tree` signals only the group, so a child that is not a group leader must not start.
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
             for signal in 1..32 {
                 if signal != libc::SIGKILL && signal != libc::SIGSTOP {
                     libc::signal(signal, libc::SIG_DFL);
@@ -446,6 +449,16 @@ mod tests {
         );
         assert!(output.status.success());
         assert_eq!(output.stdout, b"alive");
+    }
+
+    #[test]
+    fn pr94_configure_refuses_a_child_when_setsid_fails() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        command.process_group(0);
+        configure(&mut command, &[], &Map::new(), true);
+        let error = command.status().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]
