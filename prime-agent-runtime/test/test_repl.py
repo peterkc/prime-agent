@@ -2111,12 +2111,12 @@ class RestoreApplyShieldTest(unittest.TestCase):
         real_loads = repl._load_snapshot_value
         calls = {"n": 0}
 
-        def loads_then_sigint(blob):
+        def loads_then_sigint(blob, **kwargs):
             calls["n"] += 1
             if calls["n"] == 2:
                 # Synchronous SIGINT mid-deserialize: nothing may have touched ns yet.
                 signal.raise_signal(signal.SIGINT)
-            return real_loads(blob)
+            return real_loads(blob, **kwargs)
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_snapshot(tmp, {"a": 1, "b": 2})
@@ -2358,6 +2358,67 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
                     restore({}, self.path)
                     self.assertFalse(target.exists())
                     target.write_bytes(b"keep")
+
+    def _main_function(self):
+        # A __main__ function is saved by value, as a code object.
+        scope = {"__name__": "__main__"}
+        exec("def bump(n):\n    return n + 1", scope)
+        return scope["bump"]
+
+    def _rewrite_header(self, header):
+        from rlm.repl import _SNAPSHOT_MAGIC
+
+        with open(self.path, "rb") as fh:
+            records = fh.read()[len(_SNAPSHOT_MAGIC):]
+        with open(self.path, "wb") as fh:
+            fh.write(header + records)
+
+    def test_snapshot_header_names_the_writer_python(self):
+        self.assertNotIn("error", self._snap({"x": 1}))
+        tag = f"{sys.version_info.major}.{sys.version_info.minor}"
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.readline(), f"PRIME-AGENT-KERNEL-SNAPSHOT-V3 py{tag}\n".encode())
+
+    def test_restore_keeps_functions_saved_by_the_same_python(self):
+        from rlm.repl import _restore_state
+
+        self.assertNotIn("error", self._snap({"x": 1, "bump": self._main_function()}))
+        ns = {}
+        result = _restore_state(ns, self.path)
+        self.assertEqual((result["restored"], result["failed"]), (["bump", "x"], []))
+        self.assertEqual(ns["bump"](ns["x"]), 2)
+
+    def test_restore_refuses_functions_saved_by_another_python(self):
+        from rlm.repl import _restore_state
+
+        tag = f"{sys.version_info.major}.{sys.version_info.minor}"
+        cases = {
+            "other version": (b"PRIME-AGENT-KERNEL-SNAPSHOT-V3 py3.0\n", "Python 3.0"),
+            "v2 without a version": (b"PRIME-AGENT-KERNEL-SNAPSHOT-V2\n", "an older runtime"),
+        }
+        for label, (header, writer) in cases.items():
+            with self.subTest(label):
+                self.assertNotIn("error", self._snap({"x": 1, "bump": self._main_function()}))
+                self._rewrite_header(header)
+                ns = {}
+                result = _restore_state(ns, self.path)
+                self.assertEqual(result["restored"], ["x"])
+                self.assertEqual(ns, {"x": 1})
+                reason = f"ValueError: functions and classes saved by {writer} are not restored on Python {tag}"
+                self.assertEqual(result["failed"], [{"name": "bump", "reason": reason}])
+
+    def test_restore_refuses_functions_in_a_legacy_payload(self):
+        import dill
+
+        from rlm.repl import _restore_state
+
+        dill.settings["recurse"] = True
+        with open(self.path, "wb") as fh:
+            dill.dump({"x": dill.dumps(1), "bump": dill.dumps(self._main_function())}, fh)
+        ns = {}
+        result = _restore_state(ns, self.path)
+        self.assertEqual(result["restored"], ["x"])
+        self.assertEqual([f["name"] for f in result["failed"]], ["bump"])
 
     def test_snapshot_skips_wrapped_files(self):
         with tempfile.TemporaryFile() as wrapped:

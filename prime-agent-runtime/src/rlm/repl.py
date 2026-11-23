@@ -34,9 +34,15 @@ PROTOCOL_VERSION = 3
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
-# Plain ASCII, never a pickle start: _restore_state sniffs it to tell v2 framed
-# payloads from legacy (single dill-pickled dict) ones.
-_SNAPSHOT_MAGIC = b"PRIME-AGENT-KERNEL-SNAPSHOT-V2\n"
+# Plain ASCII, never a pickle start: _restore_state sniffs it to tell framed
+# payloads from legacy (single dill-pickled dict) ones. The v3 header names the
+# writer's Python (major.minor): dill saves functions and classes by value, as
+# bytecode, and bytecode from another Python version can crash this one when it runs.
+_PYTHON_TAG = f"{sys.version_info.major}.{sys.version_info.minor}"
+_SNAPSHOT_MAGIC_V3_PREFIX = b"PRIME-AGENT-KERNEL-SNAPSHOT-V3 py"
+_SNAPSHOT_MAGIC = _SNAPSHOT_MAGIC_V3_PREFIX + _PYTHON_TAG.encode("ascii") + b"\n"
+_SNAPSHOT_MAGIC_V2 = b"PRIME-AGENT-KERNEL-SNAPSHOT-V2\n"
+_SNAPSHOT_HEADER_MAX = 64
 
 # Stream writes must fit one protocol frame: the host buffers whole lines
 # before its per-execution truncation, and raw fd writes already arrive as
@@ -685,12 +691,24 @@ class _CappedWriter:
         return size
 
 
-def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
+def _parse_snapshot_header(head: bytes) -> tuple[int, str | None] | None:
+    """Return (records offset, writer's Python tag) for a framed payload, or None for a legacy one.
+    A v2 payload carries no tag, so its writer's Python is unknown."""
+    if head.startswith(_SNAPSHOT_MAGIC_V2):
+        return len(_SNAPSHOT_MAGIC_V2), None
+    if head.startswith(_SNAPSHOT_MAGIC_V3_PREFIX):
+        end = head.find(b"\n", len(_SNAPSHOT_MAGIC_V3_PREFIX))
+        if end != -1:
+            return end + 1, head[len(_SNAPSHOT_MAGIC_V3_PREFIX) : end].decode("ascii", "replace")
+    return None
+
+
+def _read_snapshot_records(fh: Any, offset: int) -> dict[str, bytes]:
     """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
     Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge allocation."""
     fh.seek(0, os.SEEK_END)
     size = fh.tell()
-    fh.seek(len(_SNAPSHOT_MAGIC))
+    fh.seek(offset)
     records: dict[str, bytes] = {}
     while fh.tell() < size:
         header = fh.read(4)
@@ -725,7 +743,8 @@ def _dump_snapshot_value(value: Any, writer: Any) -> None:
     SnapshotPickler(writer, protocol=dill.settings["protocol"]).dump(value)
 
 
-def _load_snapshot_value(blob: bytes) -> Any:
+def _load_snapshot_value(blob: bytes, *, refuse_code: str | None = None) -> Any:
+    """refuse_code, when set, is the reason to reject every saved code object."""
     import dill
 
     class SnapshotUnpickler(dill.Unpickler):
@@ -737,6 +756,13 @@ def _load_snapshot_value(blob: bytes) -> Any:
                 and name == "_create_filehandle"
             ):
                 raise ValueError("file and stream objects are not restored")
+            # Bytecode from another Python version can crash this interpreter when it runs.
+            if (
+                refuse_code is not None
+                and module in {"dill._dill", "dill.dill"}
+                and name == "_create_code"
+            ):
+                raise ValueError(refuse_code)
             return super().find_class(module, name)
 
     return SnapshotUnpickler(io.BytesIO(blob)).load()
@@ -996,6 +1022,14 @@ def _revive_with_live_globals(
     return rebound
 
 
+def _code_refusal(writer_python: str | None) -> str | None:
+    """Return why saved code cannot run here, or None when the writer ran this Python version."""
+    if writer_python == _PYTHON_TAG:
+        return None
+    writer = f"Python {writer_python}" if writer_python else "an older runtime"
+    return f"functions and classes saved by {writer} are not restored on Python {_PYTHON_TAG}"
+
+
 def _restore_state(
     ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -1007,12 +1041,15 @@ def _restore_state(
         return {"error": f"dill unavailable: {err}"}
     try:
         with open(path, "rb") as fh:
-            if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
-                payload = _read_snapshot_records(fh)
+            header = _parse_snapshot_header(fh.read(_SNAPSHOT_HEADER_MAX))
+            writer_python = header[1] if header is not None else None
+            refuse_code = _code_refusal(writer_python)
+            if header is not None:
+                payload = _read_snapshot_records(fh, header[0])
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
-                payload = _load_snapshot_value(fh.read())
+                payload = _load_snapshot_value(fh.read(), refuse_code=refuse_code)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -1024,7 +1061,7 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = _load_snapshot_value(blob)
+            staged[name] = _load_snapshot_value(blob, refuse_code=refuse_code)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     # Revive every staged name before parking: a failure must never abort the
