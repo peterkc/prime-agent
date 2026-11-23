@@ -10,6 +10,7 @@ import {
 	type Context,
 	calculateCost,
 	createAssistantMessageEventStream,
+	formatStreamFailureMessage,
 	type Model,
 	recordStreamFailure,
 	type SimpleStreamOptions,
@@ -439,7 +440,7 @@ export class ClaudeSdkProvider {
 			}
 		} catch (error) {
 			msg.stopReason = ctrl.signal.aborted ? "aborted" : "error";
-			msg.errorMessage = error instanceof Error ? error.message : String(error);
+			msg.errorMessage = formatStreamFailureMessage(error);
 			recordStreamFailure(model, msg, error);
 			stream.push({ type: "error", reason: msg.stopReason, error: msg });
 		} finally {

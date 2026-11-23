@@ -121,6 +121,14 @@ describe("ModelRegistry", () => {
 		expect(getModelsForProvider(registry, "copy")).toEqual(before);
 	});
 
+	it("rejects modelsFrom that names the provider itself", () => {
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		expect(() =>
+			registry.registerProvider("copy", { modelsFrom: "copy", api: "copy-api", streamSimple: vi.fn() }),
+		).toThrow(/modelsFrom/);
+		expect(getModelsForProvider(registry, "copy")).toEqual([]);
+	});
+
 	describe("models.json discovery (pi-3ctln)", () => {
 		let server: Server;
 		let baseUrl: string;

@@ -1256,7 +1256,7 @@ export interface ExtensionAPI {
 }
 /** Configuration for registering a provider via pi.registerProvider(). */
 export interface ProviderConfig {
-	/** Copy the named provider's current models, including after catalog reloads. */
+	/** Copy the named provider's current models, including after catalog reloads. The source must be built in, from models.json, or registered before this provider. */
 	modelsFrom?: string;
 	/** Display name for the provider in UI. */
 	name?: string;

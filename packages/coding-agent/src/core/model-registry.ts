@@ -2036,6 +2036,9 @@ export class ModelRegistry {
 		) {
 			throw new Error(`Provider ${providerName}: models and modelsFrom cannot be combined.`);
 		}
+		if (config.modelsFrom === providerName) {
+			throw new Error(`Provider ${providerName}: modelsFrom cannot name the provider itself.`);
+		}
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
