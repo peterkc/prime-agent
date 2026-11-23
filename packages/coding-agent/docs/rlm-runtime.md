@@ -83,7 +83,7 @@ The managed environment includes Python 3.14, `prime-agent-runtime`, `dill`, and
 
 Startup spawns `python -m rlm.repl` and exchanges newline-delimited JSON over stdio: the runtime announces itself with a single `ready` event, then requests and events flow one JSON object per line (see `prime-agent-runtime/src/rlm/repl.md`).
 
-The manager owns the child process and a bounded stderr tail. Shutdown sends a `shutdown` request, waits for the process to exit, and terminates it as a fallback. Persistent sessions may snapshot the kernel namespace into their session artifact directory for revival. Saved functions and classes revive only under the Python version that saved them; other values revive under any version.
+The manager owns the child process and a bounded stderr tail. Shutdown sends a `shutdown` request, waits for the process to exit, and terminates it as a fallback. Persistent sessions may snapshot the kernel namespace into their session artifact directory for revival. A saved value that contains functions or classes defined in the session, such as an instance or a list holding a function, revives only when the snapshot was written by the same Python version with the current runtime; other values revive regardless.
 
 ## Stdio Transport
 

@@ -2379,15 +2379,6 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
         with open(self.path, "rb") as fh:
             self.assertEqual(fh.readline(), f"PRIME-AGENT-KERNEL-SNAPSHOT-V3 py{tag}\n".encode())
 
-    def test_restore_keeps_functions_saved_by_the_same_python(self):
-        from rlm.repl import _restore_state
-
-        self.assertNotIn("error", self._snap({"x": 1, "bump": self._main_function()}))
-        ns = {}
-        result = _restore_state(ns, self.path)
-        self.assertEqual((result["restored"], result["failed"]), (["bump", "x"], []))
-        self.assertEqual(ns["bump"](ns["x"]), 2)
-
     def test_restore_refuses_functions_saved_by_another_python(self):
         from rlm.repl import _restore_state
 

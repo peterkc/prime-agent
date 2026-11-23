@@ -42,11 +42,11 @@ function writeExecutable(filePath: string, content: string): void {
 	chmodSync(filePath, 0o755);
 }
 
-function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPythonSkill[] = []): void {
+function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPythonSkill[] = [], schema = 10): void {
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 10,
+			schema,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -457,16 +457,7 @@ describe("kernel bootstrap", () => {
 			rebuilds: true,
 			prepare: (venv: string, python: string) => {
 				writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
-				writeFileSync(
-					join(venv, ".bootstrap-version"),
-					`${JSON.stringify({
-						schema: 9,
-						runtime: runtimeIdentity,
-						snapshot: "dill",
-						extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-						pythonSkills: [],
-					})}\n`,
-				);
+				writeBootstrapVersion(venv, [], 9);
 			},
 		},
 		{

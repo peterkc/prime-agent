@@ -1,0 +1,2 @@
+- Changed the managed Python kernel to Python 3.14; the kernel environment is rebuilt once on the first start after updating.
+- Changed kernel restore to skip saved values that contain functions or classes from another Python version or an older Prime Agent, such as those saved by earlier sessions; other values still restore.

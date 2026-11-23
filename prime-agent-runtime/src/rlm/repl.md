@@ -166,10 +166,12 @@ snapshot (and nothing is pruned).
 `restore` loads the payload and revives each name independently; a missing
 file yields an ok empty restore with `reason:"snapshot not found"`, a corrupt
 file fails with a `reason`, and per-name failures are listed in `failed`.
-The payload header names the writer's Python version (major.minor). Saved
-functions and classes contain bytecode for that version, so restore lists them
-in `failed` when the header names another version or none (payloads from
-older runtimes); other values still restore.
+The payload header names the writer's Python version (major.minor). Functions
+and classes defined in the session are saved as bytecode for that version, so
+when the header names another version or none (payloads from older runtimes),
+restore lists every name whose saved value contains such code in `failed`:
+functions, classes, their instances, `functools.partial` and bound methods,
+and containers that hold any of them. Other values still restore.
 Names `In`, `Out`, and `get_ipython` in a payload are never restored. `dill` is imported lazily; when unavailable, snapshot and restore
 fail with `status:"error"` and a `reason`.
 

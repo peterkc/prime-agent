@@ -1641,7 +1641,7 @@ confirm_kernel_runtime_setup() {
 
 	if prime_agent_prompt_yes_no \
 		"Prepare Python runtime now?" \
-		"Installs uv, Python 3.11, and the Prime Agent runtime." \
+		"Installs uv, Python 3.14, and the Prime Agent runtime." \
 		"Prepare? [Y/n]"; then
 		prime_agent_bootstrap_kernel_on_install=1
 		return
