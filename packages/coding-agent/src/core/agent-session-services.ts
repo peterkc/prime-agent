@@ -10,6 +10,7 @@ import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
+import { ClaudeSdkProvider } from "./extensions/builtin/claude-agent-sdk.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import observationPackExtension from "./extensions/builtin/observation-pack.js";
 import type { ExtensionFactory, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
@@ -193,6 +194,9 @@ export async function createAgentSessionServices(
 	const builtinExtensionFactories: ExtensionFactory[] = options.resourceLoaderOptions?.noExtensions
 		? []
 		: [
+				(pi) => {
+					if (settingsManager.getEnableBuiltinExtensions()) new ClaudeSdkProvider(agentDir).extension(pi);
+				},
 				(pi) => {
 					if (
 						settingsManager.getEnableBuiltinExtensions() &&

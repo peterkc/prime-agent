@@ -1,0 +1,1 @@
+- Added the `claude-sdk` provider to use Prime tools and Anthropic catalog models through an installed Claude Code CLI.

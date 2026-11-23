@@ -138,8 +138,15 @@ To share extensions via npm or git as Prime Agent packages, see [packages.md](pa
 
 ## Built-in Extensions
 
-Prime Agent ships two built-in extensions, enabled by default:
+Prime Agent ships these built-in extensions, enabled by default:
 
+- **Claude Agent SDK** lists the Anthropic catalog under `claude-sdk`. Select
+  `claude-sdk/<model ID>` to use your installed Claude Code CLI with Prime tools.
+  Run `claude auth login` in your terminal before your first turn. Prime loads the
+  SDK on that turn, not when it lists models. By default Prime looks for `claude`
+  on `PATH`. To select another executable, set `claudePath` in the global agent
+  folder's `claude-sdk.json`, for example `{"claudePath":"/opt/bin/claude"}`.
+  Project settings do not override this file. Displayed cost uses catalog rates.
 - **Observation-pack** archives text-only, successful tool results larger than
   10,240 UTF-8 bytes when compaction keeps them for a new context cycle. With
   `ipython` active, the model sees a stable placeholder with complete-line
@@ -149,7 +156,7 @@ Prime Agent ships two built-in extensions, enabled by default:
 - **Herdr agent state** reports lifecycle state inside a Herdr pane. It defers
   to Herdr's file-based integration when that extension file is enabled.
 
-Set `enableBuiltinExtensions: false` to disable both, or disable one with
+Set `enableBuiltinExtensions: false` to disable all built-ins. To disable only Observation-pack or Herdr, use
 `bundledExtensions.observationPack` or `bundledExtensions.herdrAgentState`.
 Each switch defaults to `true` and takes effect on `/reload`. Disabling one
 keeps existing archives and session entries. User extension factories are not

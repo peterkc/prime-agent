@@ -2029,6 +2029,13 @@ export class ModelRegistry {
 	}
 
 	private validateProviderConfig(providerName: string, config: ProviderConfigInput): void {
+		const previous = this.registeredProviders.get(providerName);
+		if (
+			(config.models ?? previous?.models) !== undefined &&
+			(config.modelsFrom ?? previous?.modelsFrom) !== undefined
+		) {
+			throw new Error(`Provider ${providerName}: models and modelsFrom cannot be combined.`);
+		}
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
@@ -2075,7 +2082,17 @@ export class ModelRegistry {
 
 		this.storeProviderRequestConfig(providerName, config, true);
 
-		if (config.models && config.models.length > 0) {
+		if (config.modelsFrom !== undefined) {
+			const rows = this.models.filter((row) => row.provider === config.modelsFrom);
+			this.models = this.models.filter((row) => row.provider !== providerName);
+			for (const row of rows)
+				this.models.push({
+					...row,
+					provider: providerName,
+					api: config.api ?? row.api,
+					baseUrl: config.baseUrl ?? row.baseUrl,
+				});
+		} else if (config.models && config.models.length > 0) {
 			this.models = this.models.filter((m) => m.provider !== providerName);
 
 			for (const modelDef of config.models) {
@@ -2120,6 +2137,7 @@ export class ModelRegistry {
  * Input type for registerProvider API.
  */
 export interface ProviderConfigInput {
+	modelsFrom?: string;
 	name?: string;
 	baseUrl?: string;
 	apiKey?: string;
