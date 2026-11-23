@@ -46,7 +46,7 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 9,
+			schema: 10,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -222,8 +222,8 @@ describe("kernel bootstrap", () => {
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(venv, "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
-		expect(log).toContain("python install 3.11");
-		expect(log).toContain(`venv ${venv} --python 3.11`);
+		expect(log).toContain("python install 3.14");
+		expect(log).toContain(`venv ${venv} --python 3.14`);
 		expect(log).not.toContain("--seed");
 		expect(log).toContain("pip install --python");
 		expect(log).not.toContain("ipykernel");
@@ -237,7 +237,7 @@ describe("kernel bootstrap", () => {
 		// The on-disk manifest is what every later warm-start decision reads.
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version).toEqual({
-			schema: 9,
+			schema: 10,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -443,8 +443,25 @@ describe("kernel bootstrap", () => {
 				writeFileSync(
 					join(venv, ".bootstrap-version"),
 					`${JSON.stringify({
-						schema: 9,
+						schema: 10,
 						runtime: "sha256:stale",
+						snapshot: "dill",
+						extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+						pythonSkills: [],
+					})}\n`,
+				);
+			},
+		},
+		{
+			name: "rebuilds a current venv recorded by the Python 3.11 bootstrap (schema 9)",
+			rebuilds: true,
+			prepare: (venv: string, python: string) => {
+				writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+				writeFileSync(
+					join(venv, ".bootstrap-version"),
+					`${JSON.stringify({
+						schema: 9,
+						runtime: runtimeIdentity,
 						snapshot: "dill",
 						extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 						pythonSkills: [],
@@ -503,7 +520,7 @@ describe("kernel bootstrap", () => {
 
 		// A warm venv that needs no work never runs uv, so the log may not exist at all.
 		const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-		expect(log.includes(`venv ${venv} --python 3.11`)).toBe(rebuilds);
+		expect(log.includes(`venv ${venv} --python 3.14`)).toBe(rebuilds);
 		if (rebuilds) {
 			expect(JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8")).runtime).toBe(runtimeIdentity);
 		}
