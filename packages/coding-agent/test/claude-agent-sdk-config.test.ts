@@ -27,3 +27,14 @@ it.each(["global only", "malformed", "relative", "~/claude"])("reads claudePath:
 		process.chdir(previous);
 	}
 });
+
+it.each([
+	[{}, 300],
+	[{ idleTimeoutSeconds: 17 }, 17],
+	[{ idleTimeoutSeconds: 0 }, "invalid"],
+] as const)("reads idleTimeoutSeconds from %j", (settings, expected) => {
+	const path = join(getAgentDir(), "claude-sdk.json");
+	writeFileSync(path, JSON.stringify(settings));
+	if (expected === "invalid") expect(() => readClaudeSettings(getAgentDir())).toThrow(/idleTimeoutSeconds/);
+	else expect(readClaudeSettings(getAgentDir())).toMatchObject({ idleTimeoutSeconds: expected });
+});

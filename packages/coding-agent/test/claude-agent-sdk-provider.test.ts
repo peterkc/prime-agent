@@ -164,7 +164,7 @@ it.each(["tool list"])("preserves the MCP %s and refuses direct calls", async ()
 			await client.close();
 			await server.instance.close();
 		}
-		yield result();
+		yield* textTurn("end_turn");
 	});
 	expect((await f.provider.streamSimple(model, { ...context, tools }).result()).stopReason).toBe("stop");
 });
@@ -341,13 +341,15 @@ it.each(["allowlist"])("restricts the child environment by %s", async () => {
 	let env: Options["env"];
 	const f = fixture(async function* ({ options }) {
 		env = options.env;
-		yield result();
+		yield* textTurn("end_turn");
 	});
 	await f.provider.streamSimple(model, context).result();
 	expect(env).toMatchObject({ LC_FIXTURE: "kept", DISABLE_AUTO_COMPACT: "1" });
 	expect(
 		Object.keys(env ?? {}).filter(
 			(k) =>
+				!Object.hasOwn(quietEnvironment, k) &&
+				k !== "CLAUDE_CODE_MAX_OUTPUT_TOKENS" &&
 				!/^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TERM|LANG|LC_.*|TZ|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|CLAUDE_CONFIG_DIR|DISABLE_AUTO_COMPACT)$/.test(
 					k,
 				),
@@ -361,7 +363,7 @@ it.each(["images"])("retains user and tool-result %s", async () => {
 		for await (const user of prompt) {
 			if (Array.isArray(user.message.content)) blocks.push(...user.message.content);
 		}
-		yield result();
+		yield* textTurn("end_turn");
 	});
 	const pic = (mimeType: string) => ({ type: "image" as const, mimeType, data: "YQ==" });
 	await f.provider
@@ -840,7 +842,7 @@ it.each(["in memory", "disk round trip"])("forks the tool checkpoint: %s", async
 		calls.push(options);
 		prompts.push(await collectPrompt(prompt));
 		yield { type: "assistant", uuid: checkpointAt, session_id: forkedSession };
-		yield result();
+		yield* textTurn("end_turn");
 	});
 	const reply = await f.provider.streamSimple(model, history).result();
 	expect(calls[0]).toMatchObject({ resume: sourceSession, resumeSessionAt: checkpointAt, forkSession: true });
@@ -895,7 +897,7 @@ it.each([
 	const f = fixture(async function* ({ options, prompt }) {
 		opts = options;
 		users = await collectPrompt(prompt);
-		yield result();
+		yield* textTurn("end_turn");
 	});
 	expect((await f.provider.streamSimple(selected, history).result()).stopReason).toBe("stop");
 	expect(opts?.resume).toBeUndefined();
@@ -961,7 +963,7 @@ it.each([
 			if (calls.length === 1) {
 				if (late) yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "partial" } });
 				yield { type: "result", subtype: "error_during_execution", errors: [error] };
-			} else yield result();
+			} else yield* textTurn("end_turn");
 		} finally {
 			order.push("closed");
 		}
@@ -981,4 +983,246 @@ it.each([
 			]),
 		);
 	} else expect(reply.errorMessage).toContain(error);
+});
+
+it.each(["arguments and pre-hook rejection"])("AC-20 repairs hook %s without salvaging a rejected tool", async () => {
+	const tool = {
+		name: "repair",
+		description: "repair fixture",
+		parameters: Type.Object({
+			file_path: Type.String(),
+			object: Type.Object({}),
+			array: Type.Array(Type.Number()),
+			literal: Type.String(),
+			count: Type.Number(),
+		}),
+	};
+	const input = { filePath: "project", object: '{"enabled":true}', array: "[1,2]", literal: "[1,2]", count: "7" };
+	let calls = 0;
+	const f = fixture(async function* ({ options }) {
+		const id = `call-${++calls}`;
+		const name = "mcp__prime__repair";
+		await options.hooks?.PreToolUse?.[0].hooks[0](
+			{ hook_event_name: "PreToolUse", tool_name: name, tool_input: input } as HookInput,
+			id,
+			{ signal: new AbortController().signal },
+		);
+		if (calls === 2) {
+			yield raw("content_block_start", {
+				index: 0,
+				content_block: { type: "tool_use", id: "rejected", name, input: {} },
+			});
+			yield raw("content_block_stop", { index: 0 });
+		}
+		yield { type: "result", subtype: "error_max_turns", is_error: true, errors: [] };
+	});
+	const ctx = { ...context, tools: [tool] };
+	const repaired = await f.provider.streamSimple(model, ctx).result();
+	const rejected = await f.provider.streamSimple(model, ctx).result();
+	expect(rejected.stopReason).toBe("error");
+	expect(rejected.content.filter((block) => block.type === "toolCall")).toEqual([]);
+	expect(calls).toBe(2);
+	expect(repaired.stopReason).toBe("toolUse");
+	expect(repaired.content).toEqual([
+		{
+			type: "toolCall",
+			id: "call-1",
+			name: "repair",
+			arguments: { file_path: "project", object: { enabled: true }, array: [1, 2], literal: "[1,2]", count: "7" },
+		},
+	]);
+});
+
+const quietEnvironment = {
+	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+	DISABLE_TELEMETRY: "1",
+	DISABLE_ERROR_REPORTING: "1",
+	DISABLE_FEEDBACK_COMMAND: "1",
+	CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
+	DISABLE_AUTOUPDATER: "1",
+	CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+	CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+	ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+};
+it.each(["quiet switches"])("AC-21 fixes the %s and drops other Claude and Anthropic variables", async () => {
+	for (const key of Object.keys(quietEnvironment)) vi.stubEnv(key, "altered");
+	vi.stubEnv("CLAUDE_UNRELATED", "sentinel");
+	vi.stubEnv("ANTHROPIC_UNRELATED", "sentinel");
+	vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
+	let options: Options | undefined;
+	const f = fixture(async function* (args) {
+		options = args.options;
+		yield* textTurn("end_turn");
+	});
+	await f.provider.streamSimple(model, context, { maxTokens: 64 }).result();
+	expect(options).toMatchObject({
+		env: { ...quietEnvironment, CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64" },
+		strictMcpConfig: true,
+		settingSources: [],
+		settings: { disableClaudeAiConnectors: true },
+	});
+	expect(
+		Object.keys(options?.env ?? {})
+			.filter((key) => /^(CLAUDE|ANTHROPIC)_/.test(key))
+			.sort(),
+	).toEqual(
+		[
+			...Object.keys(quietEnvironment).filter((key) => key.startsWith("CLAUDE_")),
+			"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+		].sort(),
+	);
+});
+
+it.each(["no output", "thinking with empty text"])("AC-22 rejects an empty turn with %s", async (kind) => {
+	let calls = 0;
+	const f = fixture(async function* () {
+		calls++;
+		if (kind === "thinking with empty text") {
+			yield raw("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "hmm" } });
+			yield raw("content_block_stop", { index: 0 });
+			yield raw("content_block_start", { index: 1, content_block: { type: "text", text: "" } });
+			yield raw("content_block_stop", { index: 1 });
+		}
+		yield result();
+	});
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(msg.stopReason).toBe("error");
+	expect(msg.errorMessage).toMatch(/Claude returned nothing/i);
+	expect(calls).toBe(1);
+});
+
+it.each(["keepalives"])("AC-22 aborts and closes a query stalled on %s", async () => {
+	vi.useFakeTimers();
+	const waitForClose = createDeferred();
+	const releaseClose = createDeferred();
+	const nextPing = createDeferred();
+	const pending = createDeferred();
+	let calls = 0;
+	let signal: AbortSignal | undefined;
+	let completed = false;
+	let closed = false;
+	const f = fixture(async function* ({ options }) {
+		calls++;
+		signal = options.abortController?.signal;
+		signal?.addEventListener("abort", () => waitForClose.resolve(), { once: true });
+		try {
+			yield raw("ping");
+			await nextPing.promise;
+			yield raw("ping");
+			pending.resolve();
+			await waitForClose.promise;
+		} finally {
+			await releaseClose.promise;
+			closed = true;
+		}
+	});
+	writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ claudePath: f.path, idleTimeoutSeconds: 2 }));
+	const response = f.provider
+		.streamSimple(model, context)
+		.result()
+		.then((message) => {
+			completed = true;
+			return message;
+		});
+	try {
+		await vi.advanceTimersByTimeAsync(1_000);
+		nextPing.resolve();
+		await pending.promise;
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(signal?.aborted).toBe(true);
+		expect(completed).toBe(false);
+		releaseClose.resolve();
+		const message = await response;
+		expect(closed).toBe(true);
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toMatch(/timed out/i);
+		expect(calls).toBe(1);
+	} finally {
+		nextPing.resolve();
+		waitForClose.resolve();
+		releaseClose.resolve();
+		await response;
+		vi.useRealTimers();
+	}
+});
+
+it.each(["max_tokens result", "CLI cap error result", "CLI cap exception"])(
+	"AC-22 discards the partial tool call on %s",
+	async (terminal) => {
+		let calls = 0;
+		let cap: string | undefined;
+		const f = fixture(async function* ({ options }) {
+			calls++;
+			cap = options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+			yield raw("content_block_start", {
+				index: 0,
+				content_block: { type: "tool_use", id: "cut", name: "mcp__prime__one", input: {} },
+			});
+			yield raw("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"nest' } });
+			const capExceeded = "API Error: Claude's response exceeded the 64 output token maximum.";
+			if (terminal === "CLI cap exception") throw Error(`Claude Code returned an error result: ${capExceeded}`);
+			if (terminal === "CLI cap error result") {
+				yield { type: "result", subtype: "error_during_execution", is_error: true, errors: [capExceeded] };
+			} else yield result("max_tokens");
+		});
+		const msg = await f.provider.streamSimple(model, { ...context, tools }, { maxTokens: 64 }).result();
+		expect({ stop: msg.stopReason, calls, cap }).toEqual({ stop: "length", calls: 1, cap: "64" });
+		expect(msg.content.filter((b) => b.type === "toolCall")).toEqual([]);
+	},
+);
+
+it.each(["long and colliding names"])("AC-23 aliases %s and replays the original names", async () => {
+	const originals = ["read", "mcp__prime__read", "long-".repeat(16)];
+	const collidingTools = originals.map((name, i) => ({ name, description: `tool ${i}`, parameters: Type.Object({}) }));
+	const listed: string[] = [];
+	const f = fixture(async function* ({ options }) {
+		const server = options.mcpServers?.prime;
+		if (server?.type !== "sdk") throw Error("missing server");
+		const client = new Client({ name: "fixture", version: "1" });
+		const [a, b] = InMemoryTransport.createLinkedPair();
+		await server.instance.connect(a);
+		try {
+			await client.connect(b);
+			const available = (await client.listTools()).tools;
+			for (const [i, tool] of collidingTools.entries()) {
+				const alias = available.find((entry) => entry.description === tool.description)?.name;
+				if (!alias) throw Error(`missing ${tool.description}`);
+				listed.push(`mcp__prime__${alias}`);
+				await options.hooks?.PreToolUse?.[0].hooks[0](
+					{ hook_event_name: "PreToolUse", tool_name: listed[i], tool_input: {} } as HookInput,
+					`alias-${i}`,
+					{ signal: new AbortController().signal },
+				);
+			}
+		} finally {
+			await client.close();
+			await server.instance.close();
+		}
+		yield result();
+	});
+	const ctx = { ...context, tools: collidingTools };
+	const msg = await f.provider.streamSimple(model, ctx).result();
+	const captured = msg.content.filter((block) => block.type === "toolCall");
+	let replay: SDKUserMessage[] = [];
+	const replaying = fixture(async function* ({ prompt }) {
+		replay = await collectPrompt(prompt);
+		yield* textTurn("end_turn");
+	});
+	await replaying.provider.streamSimple(model, { ...ctx, messages: [...ctx.messages, msg] }).result();
+	expect(captured.map((call) => call.name)).toEqual(originals);
+	expect(new Set(listed).size).toBe(3);
+	expect(listed[0]).toBe("mcp__prime__read");
+	for (const name of listed) {
+		expect(name).toMatch(/^mcp__prime__(?!mcp__prime__)[a-z0-9_-]+$/i);
+		expect(name.length).toBeLessThanOrEqual(64);
+	}
+	expect(replay[0]?.message.content).toEqual([
+		{ type: "text", text: "user:" },
+		{ type: "text", text: "Hello" },
+		{ type: "text", text: "assistant:" },
+		...originals.map((name, i) => ({
+			type: "text",
+			text: JSON.stringify({ type: "toolCall", id: `alias-${i}`, name, arguments: {} }),
+		})),
+	]);
 });
