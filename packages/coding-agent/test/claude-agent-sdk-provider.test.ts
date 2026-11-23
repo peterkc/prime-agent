@@ -1043,6 +1043,7 @@ const quietEnvironment = {
 	CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
 	CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
 	ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+	CLAUDE_CODE_MAX_RETRIES: "0",
 };
 it.each(["quiet switches"])("AC-21 fixes the %s and drops other Claude and Anthropic variables", async () => {
 	for (const key of Object.keys(quietEnvironment)) vi.stubEnv(key, "altered");

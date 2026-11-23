@@ -90,6 +90,7 @@ function childEnv(maxTokens: number) {
 		CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
 		CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
 		ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+		CLAUDE_CODE_MAX_RETRIES: "0",
 		CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxTokens),
 	};
 	for (const key of Object.keys(process.env))
