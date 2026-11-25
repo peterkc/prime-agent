@@ -272,6 +272,8 @@ interface ProviderRequestConfig {
 	apiKey?: string;
 	headers?: Record<string, string>;
 	authHeader?: boolean;
+	/** Set for configs an extension registered: their header values are sent as written. */
+	fromExtension?: boolean;
 }
 
 type ProviderRequestAuthSource = {
@@ -548,7 +550,7 @@ export class ModelRegistry {
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
 	private staleProviderRequestAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private lastProviderAuthSourceTokens: Map<string, AuthSourceToken> = new Map();
-	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
+	private modelRequestHeaders: Map<string, { headers: Record<string, string>; fromExtension: boolean }> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private authorizedPrivatePrimeInferenceModelIds = new Set<string>();
 	private authorizedPrivatePrimeInferenceModels: Model<"openai-completions">[] = [];
@@ -1771,6 +1773,7 @@ export class ModelRegistry {
 			headers?: Record<string, string>;
 			authHeader?: boolean;
 		},
+		fromExtension = false,
 	): void {
 		if (!config.apiKey && !config.headers && !config.authHeader) {
 			return;
@@ -1780,16 +1783,22 @@ export class ModelRegistry {
 			apiKey: config.apiKey,
 			headers: config.headers,
 			authHeader: config.authHeader,
+			fromExtension,
 		});
 	}
 
-	private storeModelHeaders(providerName: string, modelId: string, headers?: Record<string, string>): void {
+	private storeModelHeaders(
+		providerName: string,
+		modelId: string,
+		headers?: Record<string, string>,
+		fromExtension = false,
+	): void {
 		const key = this.getModelRequestKey(providerName, modelId);
 		if (!headers || Object.keys(headers).length === 0) {
 			this.modelRequestHeaders.delete(key);
 			return;
 		}
-		this.modelRequestHeaders.set(key, headers);
+		this.modelRequestHeaders.set(key, { headers, fromExtension });
 	}
 
 	private async getProviderRequestAuth(provider: string) {
@@ -1839,11 +1848,17 @@ export class ModelRegistry {
 				}
 			}
 
-			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
+			const providerHeaders = resolveHeadersOrThrow(
+				providerConfig?.headers,
+				`provider "${model.provider}"`,
+				providerConfig?.fromExtension,
+			);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
+			const storedModelHeaders = this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id));
 			const modelHeaders = resolveHeadersOrThrow(
-				this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id)),
+				storedModelHeaders?.headers,
 				`model "${model.provider}/${model.id}"`,
+				storedModelHeaders?.fromExtension,
 			);
 
 			let headers =
@@ -2058,14 +2073,14 @@ export class ModelRegistry {
 			);
 		}
 
-		this.storeProviderRequestConfig(providerName, config);
+		this.storeProviderRequestConfig(providerName, config, true);
 
 		if (config.models && config.models.length > 0) {
 			this.models = this.models.filter((m) => m.provider !== providerName);
 
 			for (const modelDef of config.models) {
 				const api = modelDef.api || config.api;
-				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
+				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers, true);
 
 				this.models.push({
 					id: modelDef.id,

@@ -118,14 +118,20 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
 	throw new Error(`Failed to resolve ${description}`);
 }
 
+/**
+ * Resolve request header values as config values ("!" command, environment variable or literal).
+ * With literal true (headers an extension set at runtime, which may carry session data), values
+ * are sent as written: no command runs and no environment variable is read.
+ */
 export function resolveHeadersOrThrow(
 	headers: Record<string, string> | undefined,
 	description: string,
+	literal = false,
 ): Record<string, string> | undefined {
 	if (!headers) return undefined;
 	const resolved: Record<string, string> = {};
 	for (const [key, value] of Object.entries(headers)) {
-		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`);
+		resolved[key] = literal ? value : resolveConfigValueOrThrow(value, `${description} header "${key}"`);
 	}
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }

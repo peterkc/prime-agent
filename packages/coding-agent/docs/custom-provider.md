@@ -82,7 +82,7 @@ pi.registerProvider("openai", {
 pi.registerProvider("google", {
   baseUrl: "https://ai-gateway.corp.com/google",
   headers: {
-    "X-Corp-Auth": "CORP_AUTH_TOKEN"  // env var or literal
+    "X-Corp-Auth": process.env.CORP_AUTH_TOKEN ?? ""  // sent as written
   }
 });
 ```
@@ -563,7 +563,7 @@ interface ProviderConfig {
     options?: SimpleStreamOptions
   ) => AssistantMessageEventStream;
 
-  /** Custom headers to include in requests. Values can be env var names. */
+  /** Custom headers to include in requests. Values are sent as written: unlike models.json, they are never environment variable names or "!" commands. */
   headers?: Record<string, string>;
 
   /** If true, adds Authorization: Bearer header with the resolved API key. */
