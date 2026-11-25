@@ -628,7 +628,11 @@ function resolveConfigFolder(path: string): string {
 		missing.unshift(basename(ancestor));
 		ancestor = parent;
 	}
-	return join(realpathSync.native(ancestor), ...missing);
+	try {
+		return join(realpathSync.native(ancestor), ...missing);
+	} catch {
+		return join(ancestor, ...missing);
+	}
 }
 
 export async function main(args: string[], options?: MainOptions) {
@@ -773,6 +777,14 @@ export async function main(args: string[], options?: MainOptions) {
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	if (pathsEqual(resolveConfigFolder(join(sessionManager.getCwd(), CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) {
+		console.error(
+			chalk.red(
+				`Error: The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`,
+			),
+		);
+		process.exit(1);
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {

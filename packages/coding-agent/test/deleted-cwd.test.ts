@@ -1,9 +1,11 @@
+import { spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -11,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../src/config.ts";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR, getPackageDir } from "../src/config.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -58,6 +60,7 @@ describe("startup with the project and user configuration in the same folder", (
 		"home alias",
 		"missing agent under project alias",
 		"case-only agent alias",
+		"realpath failure",
 	] as const;
 	for (const override of ["cleared", "explicit"] as const) {
 		test.for(cases)(`refuses %s with ${override} agent override before settings or migrations`, async (name, ctx) => {
@@ -84,6 +87,11 @@ describe("startup with the project and user configuration in the same folder", (
 				vi.stubEnv("HOME", home);
 				vi.stubEnv(ENV_AGENT_DIR, override === "explicit" ? selectedAgentDir : undefined);
 				vi.spyOn(process, "cwd").mockReturnValue(cwd);
+				if (name === "realpath failure") {
+					vi.spyOn(realpathSync, "native").mockImplementation(() => {
+						throw new Error("EACCES");
+					});
+				}
 				const settings = vi.spyOn(SettingsManager, "create").mockImplementation(() => {
 					throw new Error("settings created before refusal");
 				});
@@ -137,10 +145,16 @@ describe("startup with the project and user configuration in the same folder", (
 					return SettingsManager.inMemory();
 				});
 				const migrate = vi.spyOn(migrations, "runMigrations");
+				const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+				const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+					throw new Error(`process.exit(${code})`);
+				}) as typeof process.exit);
 				const before = readdirSync(home, { recursive: true }).sort();
 				await expect(main(["--no-extensions", "--session", sessionFile, "--print", "not sent"])).rejects.toThrow(
-					agentDir,
+					"process.exit(1)",
 				);
+				expect(exit).toHaveBeenCalledWith(1);
+				expect(stderr.mock.calls.map(([message]) => String(message)).join("\n")).toContain(agentDir);
 				expect(settings).toHaveBeenCalledWith(project, agentDir, { projectTrusted: false });
 				expect(settings.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
 				expect(migrate.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
@@ -155,6 +169,54 @@ describe("startup with the project and user configuration in the same folder", (
 			}
 		},
 	);
+
+	test("refuses --session HOME --name before changing the session file and without a stack trace", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-config-named-resume-"));
+		try {
+			const home = join(root, "home");
+			const project = join(home, "project");
+			const agentDir = join(home, CONFIG_DIR_NAME);
+			mkdirSync(project, { recursive: true });
+			const session = SessionManager.create(home, join(root, "sessions"));
+			session.appendMessage({ role: "user", content: "existing message", timestamp: Date.now() });
+			const sessionFile = session.getSessionFile()!;
+			const before = readFileSync(sessionFile, "utf8");
+			const result = spawnSync(
+				process.execPath,
+				[
+					join(getPackageDir(), "src", "cli.ts"),
+					"--offline",
+					"--no-extensions",
+					"--session",
+					sessionFile,
+					"--name",
+					"x",
+					"--print",
+					"not sent",
+				],
+				{
+					cwd: project,
+					env: {
+						PATH: process.env.PATH,
+						USER: process.env.USER,
+						HOME: home,
+						TMPDIR: root,
+						[ENV_AGENT_DIR]: agentDir,
+					},
+					encoding: "utf8",
+					timeout: 10_000,
+				},
+			);
+			if (result.error) throw result.error;
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain(agentDir);
+			expect(result.stderr).toContain("Start in a project folder");
+			expect.soft(readFileSync(sessionFile, "utf8")).toBe(before);
+			expect(result.stderr).not.toMatch(/^\s+at /m);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	test.each(["cleared", "explicit"] as const)(
 		"keeps a project below HOME working with %s agent override",
