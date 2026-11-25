@@ -79,19 +79,22 @@ New fork-only files are not changes to pi-owned files.
   removes its source file. Source, bootstrap copy and session folder stay distinct.
   Remove this fix when pi adopts the same marker-bound removal condition.
 - **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
-  project configuration folder resolves to the user folder, including case-only
+  project configuration folder resolves to the user agent folder, including case-only
   aliases and existing symlink ancestors of not-yet-created folders. Startup session
-  selection also refuses a HOME-cwd session before `--name` or runtime setup. The
-  runtime factory repeats the check before loading the selected cwd as a project.
+  selection also applies the check before `--name` or runtime setup. The runtime
+  factory repeats the check before loading the selected cwd as a project. The
+  comparison uses the configured agent folder, including an agent-dir override.
   SDK callers passing their own cwd and agent folder are not covered.
-- **Recorded in-session limit:** For switches to a HOME-cwd session through
-  interactive `/resume`, RPC `switch_session` or extension `ctx.switchSession`, the
-  refusal fires after the current session is torn down. Interactive mode reports a
-  fatal runtime error and exits; RPC is left with a disposed session. `/import` of a
-  HOME-cwd file leaves its copy behind. None of these paths reads or writes the user
-  folder as a project folder. A check before teardown in
-  `core/agent-session-runtime.ts` would remove this limit. It is not carried, to keep
-  the guard in `main.ts`.
+- **Recorded in-session limit:** Switching to a session whose project configuration
+  folder resolves to the user agent folder refuses after the current session is
+  torn down. Interactive `/resume` and `/import` report a fatal runtime error,
+  record it as a crash report and exit. RPC `switch_session` is left with a disposed
+  session. A print-mode extension command calling `ctx.switchSession` reports an
+  extension error but still finishes with exit code 0 after teardown. `/import`
+  also leaves its copied session file behind. None of these paths reads or writes
+  the user agent folder as project configuration. A check before teardown in
+  `packages/coding-agent/src/core/agent-session-runtime.ts` would remove this limit.
+  It is not carried, to keep the guard in `packages/coding-agent/src/main.ts`.
 - **Recorded exceptions and stage-2 limits:**
   - FR-8 display-only exceptions: `.pi` paths in
     `test/interactive-mode-status.test.ts` and

@@ -635,6 +635,11 @@ function resolveConfigFolder(path: string): string {
 	}
 }
 
+function getConfigFolderCollisionMessage(cwd: string, agentDir: string): string | undefined {
+	if (!pathsEqual(resolveConfigFolder(join(cwd, CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) return undefined;
+	return `The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`;
+}
+
 export async function main(args: string[], options?: MainOptions) {
 	let cwd: string;
 	try {
@@ -649,12 +654,9 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(1);
 	}
 	const agentDir = getAgentDir();
-	if (pathsEqual(resolveConfigFolder(join(cwd, CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) {
-		console.error(
-			chalk.red(
-				`Error: The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`,
-			),
-		);
+	const startupFolderMessage = getConfigFolderCollisionMessage(cwd, agentDir);
+	if (startupFolderMessage) {
+		console.error(chalk.red(`Error: ${startupFolderMessage}`));
 		process.exit(1);
 	}
 	resetTimings();
@@ -777,12 +779,9 @@ export async function main(args: string[], options?: MainOptions) {
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
-	if (pathsEqual(resolveConfigFolder(join(sessionManager.getCwd(), CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) {
-		console.error(
-			chalk.red(
-				`Error: The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`,
-			),
-		);
+	const selectedFolderMessage = getConfigFolderCollisionMessage(sessionManager.getCwd(), agentDir);
+	if (selectedFolderMessage) {
+		console.error(chalk.red(`Error: ${selectedFolderMessage}`));
 		process.exit(1);
 	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
@@ -840,11 +839,8 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
-		if (pathsEqual(resolveConfigFolder(join(cwd, CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) {
-			throw new Error(
-				`The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`,
-			);
-		}
+		const folderCollisionMessage = getConfigFolderCollisionMessage(cwd, agentDir);
+		if (folderCollisionMessage) throw new Error(folderCollisionMessage);
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);

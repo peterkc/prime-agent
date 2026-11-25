@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { CONFIG_DIR_NAME, ENV_AGENT_DIR, getPackageDir } from "../src/config.ts";
 import { restoreStdout } from "../src/core/output-guard.ts";
@@ -169,6 +170,88 @@ describe("startup with the project and user configuration in the same folder", (
 			}
 		},
 	);
+
+	test("refuses a print command switching into the user agent folder at the real runtime factory", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-config-runtime-"));
+		const faux = registerFauxProvider();
+		const previousExitCode = process.exitCode;
+		const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+		try {
+			const home = join(root, "home");
+			const project = join(home, "project");
+			const agentDir = join(home, CONFIG_DIR_NAME);
+			mkdirSync(project, { recursive: true });
+			mkdirSync(agentDir, { recursive: true });
+			const settingsFile = join(agentDir, "settings.json");
+			writeFileSync(settingsFile, "{}");
+			const session = SessionManager.create(home, join(root, "sessions"));
+			session.appendMessage({ role: "user", content: "existing message", timestamp: Date.now() });
+			const sessionFile = session.getSessionFile()!;
+			const sourceSession = readFileSync(sessionFile, "utf8");
+			vi.stubEnv("HOME", home);
+			vi.stubEnv(ENV_AGENT_DIR, agentDir);
+			vi.stubEnv("PI_OFFLINE", "1");
+			vi.stubEnv("PI_SKIP_VERSION_CHECK", "1");
+			vi.spyOn(process, "cwd").mockReturnValue(project);
+			Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+			process.exitCode = 0;
+			const settings = vi.spyOn(SettingsManager, "create").mockImplementation((cwd) => {
+				if (cwd === home) throw new Error("HOME settings created before factory refusal");
+				return SettingsManager.inMemory();
+			});
+			const migrate = vi.spyOn(migrations, "runMigrations");
+			const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+			let commandRan = false;
+			await main(
+				[
+					"--no-extensions",
+					"--provider",
+					faux.getModel().provider,
+					"--model",
+					faux.getModel().id,
+					"--print",
+					"/collision-switch",
+				],
+				{
+					extensionFactories: [
+						(pi) => {
+							pi.registerProvider(faux.getModel().provider, {
+								baseUrl: faux.getModel().baseUrl,
+								apiKey: "faux-key",
+								api: faux.api,
+								models: faux.models,
+							});
+							pi.registerCommand("collision-switch", {
+								handler: async (_args, ctx) => {
+									commandRan = true;
+									await ctx.switchSession(sessionFile);
+								},
+							});
+						},
+					],
+				},
+			);
+			expect(commandRan).toBe(true);
+			const errors = stderr.mock.calls.map(([message]) => String(message)).join("\n");
+			expect(errors).toContain("Extension error (command:collision-switch)");
+			expect(errors).toContain(agentDir);
+			expect(errors).toContain("Start in a project folder");
+			expect(process.exitCode).toBe(0);
+			expect(settings.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
+			expect(migrate.mock.calls.filter(([cwd]) => cwd === home)).toEqual([]);
+			expect(readFileSync(settingsFile, "utf8")).toBe("{}");
+			expect(readFileSync(sessionFile, "utf8")).toBe(sourceSession);
+		} finally {
+			restoreStdout();
+			process.exitCode = previousExitCode;
+			if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
+			else Reflect.deleteProperty(process.stdin, "isTTY");
+			vi.restoreAllMocks();
+			vi.unstubAllEnvs();
+			faux.unregister();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	test("refuses --session HOME --name before changing the session file and without a stack trace", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-config-named-resume-"));
