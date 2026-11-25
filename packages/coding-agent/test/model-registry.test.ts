@@ -1024,6 +1024,31 @@ describe("ModelRegistry", () => {
 					headers: { "x-proxy": "enabled" },
 				});
 			});
+
+			test("extension header values are sent as written, without a command or environment lookup", async () => {
+				vi.stubEnv("PI_TEST_EXTENSION_HEADER_SECRET", "secret-value");
+				const marker = join(tempDir, "command-ran");
+				const values = { "x-command": `!touch "${marker}"`, "x-env": "PI_TEST_EXTENSION_HEADER_SECRET" };
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				registry.registerProvider("custom-provider", {
+					...providerConfig("https://custom.test/v1", [{ id: "custom-a" }], "openai-completions"),
+					headers: values,
+				});
+				const modelConfig = providerConfig("https://custom.test/v1", [{ id: "model-a" }], "openai-completions");
+				registry.registerProvider("model-headers", {
+					...modelConfig,
+					models: [{ ...modelConfig.models![0], headers: values }],
+				});
+
+				for (const model of [
+					registry.find("custom-provider", "custom-a")!,
+					registry.find("model-headers", "model-a")!,
+				]) {
+					expect(await registry.getApiKeyAndHeaders(model)).toMatchObject({ ok: true, headers: values });
+				}
+				expect(existsSync(marker)).toBe(false);
+			});
 		});
 	});
 
