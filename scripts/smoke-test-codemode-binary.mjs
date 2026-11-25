@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { agentDirEnvName } from "./agent-dir-env.mjs";
 
 const WORKER_MARKER = "PI_CODEMODE_WORKER_OK";
@@ -48,6 +48,7 @@ function findManifest(binary) {
 		if (dir === dirname(dir)) throw new Error(`No package.json found above ${binary}`);
 		dir = dirname(dir);
 	}
+	if (basename(dir) === "dist" && existsSync(join(dirname(dir), "package.json"))) dir = dirname(dir);
 	return join(dir, "package.json");
 }
 

@@ -1,2 +1,1 @@
 - Changed eval isolation to follow the configured coding-agent identity and remove only the container bootstrap credential copy, never a host source selected by sandbox IDs alone.
-- Kept image validation ahead of coding-agent module loading and host credential bind paths absolute.

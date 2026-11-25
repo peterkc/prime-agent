@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { CONFIG_DIR_NAME, ENV_AGENT_DIR, getPackageDir } from "../src/config.ts";
@@ -20,6 +21,8 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { main } from "../src/main.ts";
 import * as migrations from "../src/migrations.ts";
+
+const sourceResolverUrl = pathToFileURL(join(getPackageDir(), "src", "experimental", "source-resolver.ts")).href;
 
 // Regression test for https://github.com/earendil-works/pi/issues/11509
 describe("startup in a deleted working directory", () => {
@@ -267,6 +270,8 @@ describe("startup with the project and user configuration in the same folder", (
 			const result = spawnSync(
 				process.execPath,
 				[
+					"--import",
+					sourceResolverUrl,
 					join(getPackageDir(), "src", "cli.ts"),
 					"--offline",
 					"--no-extensions",

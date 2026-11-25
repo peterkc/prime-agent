@@ -65,7 +65,8 @@ New fork-only files are not changes to pi-owned files.
   official setup, OAuth and managed-update branch coverage; separate rows assert
   Prime's existing setup and OAuth safeguards. The managed npm fixture creates the
   executable from the real package bin manifest (`pi`), not from `APP_NAME`.
-  Production safeguards stay unchanged. The subagent fixture publishes its PID
+  These test mocks change no production setup, OAuth or managed-update code. The
+  subagent fixture publishes its PID
   only after installing its SIGTERM handler and emitting its partial message, so
   the lifecycle test's readiness signal means both are ready. Identity regression
   rows use exact variable names to check the public contract, including the old
@@ -81,7 +82,8 @@ New fork-only files are not changes to pi-owned files.
   Remove this fix when pi adopts the same marker-bound removal condition.
 - **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
   project configuration folder resolves to the user agent folder, including case-only
-  aliases and existing symlink ancestors of not-yet-created folders. Startup session
+  aliases and symlinks of existing folders, and existing symlink ancestors of
+  not-yet-created folders. Startup session
   selection also applies the check before `--name` or runtime setup. The runtime
   factory repeats the check before loading the selected cwd as a project. The
   comparison uses the configured agent folder, including an agent-dir override.
@@ -96,29 +98,36 @@ New fork-only files are not changes to pi-owned files.
   the user agent folder as project configuration. A check before teardown in
   `packages/coding-agent/src/core/agent-session-runtime.ts` would remove this limit.
   It is not carried, to keep the guard in `packages/coding-agent/src/main.ts`.
-- **Recorded exceptions and stage-2 limits:**
-  - FR-8 display-only exceptions: `.pi` paths in
+- **Recorded exceptions and stage-2 limits:** Stage 2 is the follow-up change that
+  finishes the identity rename on `next`.
+  - The startup check misses a case-only alias of a not-yet-created folder on a
+    case-insensitive volume, and a dangling symlink at the project folder. Auth,
+    package, config and MCP commands, migrations and settings can run before the
+    later session-selection check. Once the session manager creates the folder,
+    session selection refuses before loading it as project configuration. Stage 2
+    must harden comparisons for these missing paths.
+  - Display-only exceptions to the no-`.pi`-paths rule: `.pi` paths in
     `test/interactive-mode-status.test.ts` and
     `test/tool-execution-component.test.ts` are supplied display text, not config
     discovery paths. These fixtures do not access those paths.
-  - FR-8 caller-supplied tilde-expansion exception:
+  - Caller-supplied tilde-expansion exception to the no-`.pi`-paths rule:
     `test/skills.test.ts:375-389` passes explicit `~/.pi/agent/skills` paths to
     compare tilde expansion with the absolute path. It accesses that caller-supplied
     path, not config-folder resolution; checks use a disposable `HOME`.
   - Test-only official-distribution mocks deliberately supply `pi` and `.pi` to
     exercise pi's guarded branches. Prime behavior has separate assertions.
-  - Under risk R5, managed self-update is not reachable for Prime on `next` with
+  - Managed self-update is not reachable for Prime on `next` with
     the current package manifest: verification looks for `prime-agent`, the real
     bin is `pi`, and the managed marker/release service still names pi.dev. The
     managed-update rows exercise pi's official identity, not a fictional Prime
     install. Stage 2 must resolve this before use.
-  - Under R5, help/UI still shows the extra `agent` segment, producing
+  - Help/UI still shows the extra `agent` segment, producing
     `~/.prime/agent/agent`: `src/cli/args.ts:415,462`,
     `src/package-manager-cli.ts:313`, `src/extensions/mcp/cli.ts:43` and
     `src/modes/interactive/components/config-selector.ts:206`.
   - MCP empty-state hints and auth credential help now use the configured folders.
     Docs that name `PI_` variables still describe pi; stage 2 owns those corrections.
-  - Known unconverted identity consumers remain follow-ups for stage 2 under R5:
+  - Known unconverted identity consumers remain follow-ups for stage 2:
     `.github/workflows/issue-analysis.yml`, `apps/p2`,
     `scripts/cost.ts`, `scripts/stats.ts`, `scripts/tool-stats.ts`,
     `scripts/session-transcripts.ts`, `scripts/edit-tool-stats.mjs`,
@@ -128,7 +137,7 @@ New fork-only files are not changes to pi-owned files.
     read-only, as pi's Docker design does. Stage 1 runs no Docker or paid eval.
   - Without `piConfig`, the folder fallback is `~/.pi` on this branch, not
     fork/main's `~/.prime/agent`. `next` always ships `piConfig`; changing that
-    fallback was not carried under D7.
+    fallback was not carried in this change.
 - **Kind:** intentional difference
 - **Removal condition:** Remove when pi offers separate product-identity and folder
   settings that preserve both Prime configuration folders and normalized names.
