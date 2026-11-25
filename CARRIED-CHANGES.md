@@ -74,12 +74,13 @@ New fork-only files are not changes to pi-owned files.
   scripts follow the configured identity too. Plain-Node scripts derive the same
   variable name from the tested manifest through the fork-only
   `scripts/agent-dir-env.mjs`; the profiler keeps its non-isolated default.
-- **Credential removal fix (upstreamable fix):** The harness captures the container
+- **Credential removal fix:** The harness captures the container
   marker and host path before environment isolation. It removes a credential only
   for a marked container whose path is the entrypoint's bootstrap copy destination
   and whose sandbox IDs are configured. A host run with sandbox IDs alone never
   removes its source file. Source, bootstrap copy and session folder stay distinct.
-  Remove this fix when pi adopts the same marker-bound removal condition.
+  This part could go to pi as a separate fix. Remove it when pi adopts the same
+  marker-bound removal condition.
 - **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
   project configuration folder resolves to the user agent folder, including case-only
   aliases and symlinks of existing folders, and existing symlink ancestors of
@@ -106,11 +107,12 @@ New fork-only files are not changes to pi-owned files.
     later session-selection check. Once the session manager creates the folder,
     session selection refuses before loading it as project configuration. Stage 2
     must harden comparisons for these missing paths.
-  - Display-only exceptions to the no-`.pi`-paths rule: `.pi` paths in
+  - These tests use no `.pi` configuration paths, with two exceptions. Display-only
+    exception: `.pi` paths in
     `test/interactive-mode-status.test.ts` and
     `test/tool-execution-component.test.ts` are supplied display text, not config
     discovery paths. These fixtures do not access those paths.
-  - Caller-supplied tilde-expansion exception to the no-`.pi`-paths rule:
+  - Caller-supplied tilde-expansion exception to that rule:
     `test/skills.test.ts:375-389` passes explicit `~/.pi/agent/skills` paths to
     compare tilde expansion with the absolute path. It accesses that caller-supplied
     path, not config-folder resolution; checks use a disposable `HOME`.
