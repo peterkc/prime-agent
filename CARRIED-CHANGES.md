@@ -17,6 +17,7 @@ New fork-only files are not changes to pi-owned files.
   - `packages/coding-agent/src/config.ts`
   - `packages/coding-agent/src/index.ts`
   - `packages/coding-agent/src/cli/auth-command.ts`
+  - `packages/coding-agent/src/extensions/mcp/cli.ts`
   - `packages/coding-agent/src/extensions/mcp/index.ts`
   - `packages/coding-agent/test/auth-login.test.ts`
   - `packages/coding-agent/test/auth-logout.test.ts`
