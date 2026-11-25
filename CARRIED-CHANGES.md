@@ -164,3 +164,35 @@ remove the forced-end fork behavior:
 - **Kind:** upstream backport
 - **Removal condition:** Remove when next moves to a pi release that contains
   `efbcd5adb4bc89f66a9694093be5785511e3eef6`.
+
+## Replace retired Mistral models
+
+- **Files:** `packages/ai/test/abort.test.ts`,
+  `packages/ai/test/context-overflow.test.ts`,
+  `packages/ai/test/cross-provider-handoff.test.ts`, `packages/ai/test/empty.test.ts`,
+  `packages/ai/test/image-tool-result.test.ts`, `packages/ai/test/mistral-raw-stop-reason.test.ts`,
+  `packages/ai/test/mistral-tool-schema.test.ts`, `packages/ai/test/responseid.test.ts`,
+  `packages/ai/test/stream.test.ts`, `packages/ai/test/tokens.test.ts`,
+  `packages/ai/test/tool-call-without-result.test.ts`, `packages/ai/test/total-tokens.test.ts`,
+  `packages/ai/test/unicode-surrogate.test.ts`,
+  `packages/coding-agent/src/core/model-resolver.ts`
+- **Reason:** Backport pi commit `4d6a37d080a3b44c80f6dcb399f853dc7d8ea18f` (#12449).
+  Replace the retired Mistral models `devstral-medium-latest` and `pixtral-12b`
+  in tests and use `mistral-medium-latest` as the default Mistral model.
+  The upstream changelog bullet uses a fork `.changes` fragment.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `4d6a37d080a3b44c80f6dcb399f853dc7d8ea18f`.
+
+## Replace removed OpenCode and Copilot models in tests
+
+- **Files:** `packages/ai/catalog/providers/github-copilot.ts`,
+  `packages/ai/catalog/providers/opencode.ts`, `packages/ai/test/cache-retention.test.ts`,
+  `packages/ai/test/github-copilot-anthropic.test.ts`,
+  `packages/ai/test/openai-completions-tool-choice.test.ts`, `packages/ai/test/providers.test.ts`
+- **Reason:** Backport pi commit `45a3cb606776f40f4aa071cf7ed1684b8bc66bd6` (#12492).
+  Replace removed Copilot and OpenCode model IDs with current equivalents in
+  tests, and remove catalog rules and test cases that apply only to retired models.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `45a3cb606776f40f4aa071cf7ed1684b8bc66bd6`.
