@@ -68,13 +68,24 @@ function* textTurn(stop: string) {
 }
 type Args = { options: Options; prompt: AsyncIterable<SDKUserMessage> };
 type Fake = (args: Args) => AsyncIterable<unknown>;
-function fixture(query: Fake) {
+function fixture(
+	query: Fake,
+	initializationResult: () => Promise<{ claude_code_version?: string }> = async () => ({
+		claude_code_version: "2.1.248",
+	}),
+) {
 	const dir = mkdtempSync(join(getAgentDir(), "instance-"));
 	const path = join(dir, "claude");
 	writeFileSync(path, "fixture", { mode: 0o700 });
 	chmodSync(path, 0o700);
 	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ claudePath: path }));
-	return { dir, path, provider: new ClaudeSdkProvider(dir, query as (args: Args) => AsyncIterable<SDKMessage>) };
+	return {
+		dir,
+		path,
+		provider: new ClaudeSdkProvider(dir, (args) =>
+			Object.assign(query(args) as AsyncIterable<SDKMessage>, { initializationResult }),
+		),
+	};
 }
 afterEach(() => {
 	vi.unstubAllEnvs();
@@ -225,6 +236,22 @@ it.each(["missing binary", "missing login", "superseded output"])("fails visibly
 	expect(calls).toBe(scenario === "missing binary" ? 0 : 1);
 	expect(msg.content).toEqual([]);
 });
+it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a prompt", async (version) => {
+	let input: Promise<SDKUserMessage[]> | undefined;
+	const f = fixture(
+		({ prompt }) => {
+			input = collectPrompt(prompt);
+			return (async function* () {
+				yield result();
+			})();
+		},
+		async () => ({ claude_code_version: version }),
+	);
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(await input).toEqual([]);
+	expect(msg.stopReason).toBe("error");
+	expect(msg.errorMessage).toContain("2.1.248");
+});
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
 	for (const key of [
 		"ANTHROPIC_API_KEY",
@@ -361,12 +388,12 @@ it.each(["sessions"])("isolates %s under the last handler, including compaction"
 	const release = createDeferred();
 	const paths: string[] = [];
 	let hold = false;
-	const generate: Fake = async function* ({ options }) {
+	const generate: Fake = ({ options }) => {
 		paths.push(String(options.pathToClaudeCodeExecutable));
-		if (hold) {
-			await release.promise;
-		}
-		yield* textTurn("end_turn");
+		return (async function* () {
+			if (hold) await release.promise;
+			yield* textTurn("end_turn");
+		})();
 	};
 	const a = fixture(generate),
 		b = fixture(generate);

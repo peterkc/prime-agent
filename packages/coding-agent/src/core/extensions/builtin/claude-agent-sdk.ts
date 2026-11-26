@@ -41,13 +41,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { comparePackageVersions } from "../../../utils/version-check.js";
 import type { ExtensionFactory } from "../types.js";
 import { readClaudeSettings } from "./claude-agent-sdk-config.js";
 
 type Query = (args: {
 	options: Options;
 	prompt: AsyncIterable<SDKUserMessage>;
-}) => AsyncIterable<SDKMessage> & { close?(): void };
+}) => AsyncIterable<SDKMessage> & { initializationResult(): Promise<{ claude_code_version?: string }>; close?(): void };
 const defaultQuery: Query = (args) => {
 	// FR-1: load only on the first turn; Bun's bundler needs a literal require.
 	const sdk: { query: typeof sdkQuery } =
@@ -155,7 +156,12 @@ function imageBlock(part: { mimeType: string; data: string }) {
 		throw Error(`Unsupported image type ${media}`);
 	return { type: "image", source: { type: "base64", media_type: media, data: part.data } } as const;
 }
-async function* promptFor(messages: Context["messages"], resumed: boolean): AsyncGenerator<SDKUserMessage> {
+async function* promptFor(
+	messages: Context["messages"],
+	resumed: boolean,
+	versionAccepted: Promise<boolean>,
+): AsyncGenerator<SDKUserMessage> {
+	if (!(await versionAccepted)) return;
 	const content: Block[] = [];
 	for (const msg of messages) {
 		if (resumed && msg.role === "toolResult") {
@@ -331,12 +337,27 @@ export class ClaudeSdkProvider {
 				let limitAfterTools = false,
 					completed = false;
 				let query: ReturnType<Query> | undefined;
+				let allowPrompt!: (allowed: boolean) => void;
+				const versionAccepted = new Promise<boolean>((resolve) => {
+					allowPrompt = resolve;
+				});
 				ctrl.signal.addEventListener("abort", abortAttempt, { once: true });
 				try {
 					query = this.query({
-						prompt: promptFor(point ? context.messages.slice(point.index + 1) : context.messages, !!point),
+						prompt: promptFor(
+							point ? context.messages.slice(point.index + 1) : context.messages,
+							!!point,
+							versionAccepted,
+						),
 						options: sdkOptions,
 					});
+					const { claude_code_version: version } = await query.initializationResult();
+					if ((comparePackageVersions(version ?? "", "2.1.248") ?? -1) < 0)
+						throw Error(
+							`Claude Code 2.1.248 or later is required for verbatim prompts (reported: ${version ?? "unknown"})`,
+						);
+					ctrl.signal.throwIfAborted();
+					allowPrompt(true);
 					for await (const m of query) {
 						ctrl.signal.throwIfAborted();
 						if (m.type === "assistant" && m.supersedes?.length) {
@@ -437,6 +458,8 @@ export class ClaudeSdkProvider {
 						}
 					}
 				} catch (error) {
+					allowPrompt(false);
+					query?.close?.();
 					if (
 						point &&
 						!ctrl.signal.aborted &&
@@ -447,7 +470,6 @@ export class ClaudeSdkProvider {
 						)
 					) {
 						release();
-						query?.close?.();
 						await server.close();
 						point = undefined;
 						toolOrder.clear();
