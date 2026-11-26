@@ -199,6 +199,41 @@ function connectAcpClient(connection: any, options: ClientHarnessOptions = {}): 
 }
 
 describe("ACP mode end to end", () => {
+	it.each(["in-process", "ACP", "ACP current"])(
+		"returns the provider's cause for an unavailable %s selection",
+		async (path) => {
+			const h = await createHarness();
+			const registry = h.session.modelRegistry;
+			registry.registerProvider("claude-sdk", {
+				modelsFrom: "anthropic",
+				missingAuthMessage: "Cannot find the claude executable",
+			});
+			const model = registry.getAll().find((m) => m.provider === "claude-sdk")!;
+			const connection = new InProcessAgentConnection(runtimeHostFor(h.session));
+			const { client, close } = connectAcpClient(connection);
+			try {
+				if (path === "in-process")
+					await expect(connection.setModel(model.provider, model.id)).rejects.toThrow(
+						"Cannot find the claude executable",
+					);
+				else {
+					await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+					const { sessionId } = await client.request("session/new", { cwd: h.tempDir, mcpServers: [] });
+					if (path === "ACP current") h.session.agent.state.model = model;
+					await expect(
+						client.request("session/set_config_option", {
+							sessionId,
+							configId: "model",
+							value: JSON.stringify([model.provider, model.id]),
+						}),
+					).rejects.toMatchObject({ code: -32602, data: { reason: "Cannot find the claude executable" } });
+				}
+			} finally {
+				close();
+				h.cleanup();
+			}
+		},
+	);
 	it("advertises model and effort pickers and applies unambiguous ACP selections (#2455)", async () => {
 		const harness = await createHarness({
 			models: [

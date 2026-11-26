@@ -66,6 +66,7 @@ function createHost(authStorage: AuthStorage): {
 		authStorage,
 		refresh: vi.fn(),
 		getAll: () => [],
+		hasExternalAuth: () => false,
 		getProviderDisplayName: (providerId: string) => providerId,
 		getProviderAuthStatus: (providerId: string) => authStorage.getAuthStatus(providerId),
 	} as unknown as ModelRegistry;
@@ -464,6 +465,18 @@ describe("ProviderAuthFlows", () => {
 		},
 	);
 
+	it.each(["local-claude", ""])("omits an external provider from API-key login with registration key %s", (apiKey) => {
+		const { host } = createHost(AuthStorage.inMemory());
+		const modelRegistry = ModelRegistry.inMemory(host.modelRegistry.authStorage);
+		modelRegistry.registerProvider("external-fixture", {
+			modelsFrom: "anthropic",
+			apiKey,
+			missingAuthMessage: apiKey ? "" : "unavailable",
+		});
+		expect(
+			new ProviderAuthFlows({ ...host, modelRegistry }).getLoginProviderOptions().map((p) => p.id),
+		).not.toContain("external-fixture");
+	});
 	it("includes xAI subscription and API-key entries from the provider registry", () => {
 		const { host } = createHost(AuthStorage.inMemory());
 		const flows = new ProviderAuthFlows({

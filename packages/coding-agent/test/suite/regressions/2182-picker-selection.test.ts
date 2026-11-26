@@ -83,6 +83,43 @@ async function fixture(scoped = false) {
 	};
 }
 
+it.each(["Cannot find the claude executable", "Cannot read claude-sdk.json"])(
+	"explains %s before offering login",
+	async (cause) => {
+		const f = await fixture();
+		const registry = f.harness.session.modelRegistry;
+		registry.registerProvider("claude-sdk", { modelsFrom: "anthropic", missingAuthMessage: cause });
+		const model = registry.getAll().find((m) => m.provider === "claude-sdk")!;
+		const loginProvider = vi.fn();
+		const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+		const mode = Object.assign(f.mode, { ensureModelProviderConfigured: prototype.ensureModelProviderConfigured });
+		expect(
+			await mode.ensureModelProviderConfigured(model, { loginProvider }, [
+				{ id: "claude-sdk", authType: "api_key" },
+			]),
+		).toBe(false);
+		expect(f.mode.showError).toHaveBeenCalledWith(cause);
+		expect(loginProvider).not.toHaveBeenCalled();
+	},
+);
+it.each([true, false])("does not label external models as requiring sign in (inline=%s)", async (inline) => {
+	const f = await fixture();
+	const model = { ...f.model, provider: "external-fixture" };
+	f.harness.session.modelRegistry.registerProvider(model.provider, { missingAuthMessage: "unavailable" });
+	const selector = new ModelSelectorComponent(
+		{ requestRender: () => {} } as TUI,
+		f.model,
+		f.harness.session.modelRegistry,
+		[],
+		vi.fn(),
+		vi.fn(),
+		undefined,
+		{ availableModels: [model], inline },
+	);
+	const row = stripAnsi(selector.render(120).join("\n"));
+	expect(row).toContain("unavailable");
+	expect(row).not.toContain("require sign in");
+});
 it("retains picker focus and draft until model and explicit effort both complete", async () => {
 	const f = await fixture();
 	const modelApplied = deferred();

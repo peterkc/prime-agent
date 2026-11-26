@@ -8931,6 +8931,13 @@ export class InteractiveMode {
 		providerOptions: ReadonlyArray<AuthSelectorProvider>,
 	): Promise<boolean> {
 		if (this.isModelProviderConfigured(model)) return true;
+		const cause = this.modelRegistry.getProviderMissingAuthMessage(model.provider);
+		if (cause) {
+			this.showError(cause);
+			return false;
+		}
+		// The daemon can have a registration the local registry has not loaded.
+		if (this.modelRegistry.hasExternalAuth(model.provider) || model.api === "claude-agent-sdk") return true;
 
 		const provider = providerOptions.find(
 			(option) => option.id === model.provider && (option.category ?? "provider") === "provider",

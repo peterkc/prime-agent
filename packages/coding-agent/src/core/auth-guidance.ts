@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { getDocsPath } from "../config.js";
+import type { ModelRegistry } from "./model-registry.js";
 
 const UNKNOWN_PROVIDER = "unknown";
 export const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
@@ -12,7 +13,15 @@ export function getProviderLoginHelp(): string {
 	].join("\n");
 }
 
-export function formatNoModelsAvailableMessage(): string {
+export function formatNoModelsAvailableMessage(saved?: {
+	provider: string | undefined;
+	registry: ModelRegistry;
+}): string {
+	if (saved?.provider) {
+		const cause = saved.registry.getProviderMissingAuthMessage(saved.provider);
+		if (cause) return cause;
+		if (!saved.registry.hasProvider(saved.provider)) return `Provider ${saved.provider} is not registered.`;
+	}
 	return `No models available. ${getProviderLoginHelp()}`;
 }
 

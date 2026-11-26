@@ -222,7 +222,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		model = result.model;
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
+			modelFallbackMessage = formatNoModelsAvailableMessage({
+				provider: existingSession.model?.provider ?? settingsManager.getDefaultProvider(),
+				registry: modelRegistry,
+			});
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}

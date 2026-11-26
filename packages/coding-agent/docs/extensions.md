@@ -1777,7 +1777,7 @@ pi.registerProvider("corporate-ai", {
 - `authHeader` - If true, adds `Authorization: Bearer` header automatically.
 - `models` - Array of model definitions. If provided, replaces all existing models for this provider. Model definitions can set `baseUrl` to override the provider endpoint for that model.
 - `modelsFrom` - Copy another provider's models instead of defining `models`. The source must be built in, loaded from `models.json`, or registered first. A missing source gives zero models. You cannot chain `modelsFrom` providers.
-- `missingAuthMessage` - When the provider has no configured auth, Prime shows this message instead of API-key guidance. `claude-sdk` uses the error it found while checking its settings or executable.
+- `missingAuthMessage` - Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable.
 - `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu.
 - `streamSimple` - Custom streaming implementation for non-standard APIs.
 

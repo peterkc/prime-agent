@@ -477,6 +477,8 @@ export class InProcessAgentConnection implements AgentConnection {
 			// never mutates stale state (session.setModel owns the clear).
 			(registry.getProviderAuthStatus(provider).source === "stale" ? registry.find(provider, modelId) : undefined);
 		if (!model) {
+			const cause = registry.getProviderMissingAuthMessage(provider);
+			if (cause && registry.find(provider, modelId)) throw new Error(cause);
 			throw new Error(`Model not found: ${provider}/${modelId}`);
 		}
 		await this.session.setModel(model);

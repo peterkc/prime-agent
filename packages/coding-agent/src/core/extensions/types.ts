@@ -1258,7 +1258,7 @@ export interface ExtensionAPI {
 export interface ProviderConfig {
 	/** Copy the named provider's current models, including after catalog reloads. The source must be built in, from models.json, or registered before this provider. */
 	modelsFrom?: string;
-	/** Shown instead of API-key guidance when this provider is not configured. */
+	/** Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable. */
 	missingAuthMessage?: string;
 	/** Display name for the provider in UI. */
 	name?: string;

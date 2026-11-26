@@ -1924,6 +1924,14 @@ export class ModelRegistry {
 		};
 	}
 
+	hasExternalAuth(provider: string): boolean {
+		return typeof this.registeredProviders.get(provider)?.missingAuthMessage === "string";
+	}
+
+	hasProvider(provider: string): boolean {
+		return this.registeredProviders.has(provider) || this.models.some((model) => model.provider === provider);
+	}
+
 	getProviderMissingAuthMessage(provider: string): string | undefined {
 		return this.registeredProviders.get(provider)?.missingAuthMessage || undefined;
 	}
@@ -2151,6 +2159,7 @@ export class ModelRegistry {
  * Input type for registerProvider API.
  */
 export interface ProviderConfigInput {
+	/** Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable. */
 	missingAuthMessage?: string;
 	modelsFrom?: string;
 	name?: string;

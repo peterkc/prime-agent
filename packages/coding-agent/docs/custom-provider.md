@@ -575,7 +575,7 @@ interface ProviderConfig {
   /** Copy a built-in provider, a models.json provider, or one registered first.
    * Exclusive with models. A missing source gives zero rows. Chains are not allowed. */
   modelsFrom?: string;
-  missingAuthMessage?: string; // When the provider has no configured auth, Prime shows this message instead of API-key guidance. claude-sdk uses its registration error.
+  missingAuthMessage?: string; // Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable.
 
   /** OAuth provider for /login support. */
   oauth?: {

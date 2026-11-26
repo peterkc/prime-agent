@@ -421,6 +421,52 @@ it.each([undefined, false])(
 		}
 	},
 );
+it.each(["restored", "default"])("does not prescribe login for a %s unavailable claude-sdk model", async (source) => {
+	const dir = mkdtempSync(join(getAgentDir(), "no-model-"));
+	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled: true, claudePath: join(dir, "missing") }));
+	const services = await createAgentSessionServices({
+		cwd: dir,
+		agentDir: dir,
+		authStorage: AuthStorage.inMemory(),
+		settingsManager: SettingsManager.inMemory(
+			source === "default" ? { defaultModel: "claude", defaultProvider: "claude-sdk" } : {},
+		),
+		telemetryDisabled: true,
+	});
+	const sessionManager = SessionManager.inMemory(dir);
+	if (source === "restored") sessionManager.appendModelChange("claude-sdk", "claude");
+	const { session, modelFallbackMessage } = await createAgentSessionFromServices({
+		services,
+		sessionManager,
+		telemetryDisabled: true,
+	});
+	try {
+		expect(modelFallbackMessage).toContain("Cannot find the claude executable");
+		expect(modelFallbackMessage).not.toMatch(/API key|\/login/i);
+	} finally {
+		session.dispose();
+	}
+});
+it("names an unregistered saved provider instead of suggesting login", async () => {
+	const dir = mkdtempSync(join(getAgentDir(), "absent-"));
+	const services = await createAgentSessionServices({
+		cwd: dir,
+		agentDir: dir,
+		authStorage: AuthStorage.inMemory(),
+		telemetryDisabled: true,
+		settingsManager: SettingsManager.inMemory({ defaultModel: "gone", defaultProvider: "removed-provider" }),
+	});
+	const { session, modelFallbackMessage } = await createAgentSessionFromServices({
+		services,
+		sessionManager: SessionManager.inMemory(dir),
+		telemetryDisabled: true,
+	});
+	try {
+		expect(modelFallbackMessage).toBe("Provider removed-provider is not registered.");
+	} finally {
+		session.dispose();
+	}
+});
 it("removes the provider on /reload after opt-out", async () => {
 	const dir = mkdtempSync(join(getAgentDir(), "reload-"));
 	const file = join(dir, "claude-sdk.json");

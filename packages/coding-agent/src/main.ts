@@ -902,7 +902,10 @@ async function resolvePreparedStartupModel(options: {
 		});
 		model = result.model;
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
+			modelFallbackMessage = formatNoModelsAvailableMessage({
+				provider: existingSession.model?.provider ?? settingsManager.getDefaultProvider(),
+				registry: modelRegistry,
+			});
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
@@ -1696,7 +1699,7 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSession");
 
 	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
+		console.error(chalk.red(modelFallbackMessage ?? formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 

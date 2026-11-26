@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
 import { deleteSessionFile } from "../src/core/session-file-actions.js";
 import {
 	acquireSessionLease,
@@ -446,6 +448,25 @@ describe("worker roster reporter", () => {
 		});
 	});
 
+	it("returns the registration failure for a known unavailable set_model target", async () => {
+		const { daemon } = makeWorkerReporter();
+		const state = makeState({ activeSessionId: "unavailable" });
+		const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
+		registry.registerProvider("claude-sdk", {
+			modelsFrom: "anthropic",
+			missingAuthMessage: "Cannot find the claude executable",
+		});
+		Object.assign(state.runtime.session, { modelRegistry: registry });
+		daemon.sessions.set(state.activeSessionId, state);
+		const model = registry.getAll().find((m) => m.provider === "claude-sdk")!;
+		const dispatch = daemon as unknown as { handleCommand(client: object, command: object): Promise<unknown> };
+		await expect(
+			dispatch.handleCommand(
+				{},
+				{ type: "set_model", activeSessionId: state.activeSessionId, provider: model.provider, modelId: model.id },
+			),
+		).rejects.toThrow("Cannot find the claude executable");
+	});
 	it("flushes cron and model changes that have no session-event carrier", async () => {
 		vi.useFakeTimers();
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-cron-flush-"));
