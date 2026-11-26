@@ -146,7 +146,11 @@ Prime Agent ships these built-in extensions, enabled by default:
   SDK on that turn, not when it lists models. By default Prime looks for `claude`
   on `PATH`. To select another executable, set `claudePath` in the global agent
   folder's `claude-sdk.json`, for example `{"claudePath":"/opt/bin/claude"}`.
-  Project settings do not override this file. Displayed cost uses catalog rates.
+  The path must be absolute. Prime lists the models as available only if it finds
+  the executable at registration. Project settings do not override this file.
+  Displayed cost uses catalog rates. Claude Code writes transcripts under
+  `~/.claude/projects`, even if you start Prime with `--no-session`. Each resumed
+  turn forks the Claude session (`forkSession`) and writes a full transcript copy.
 - **Observation-pack** archives text-only, successful tool results larger than
   10,240 UTF-8 bytes when compaction keeps them for a new context cycle. With
   `ipython` active, the model sees a stable placeholder with complete-line
@@ -1771,6 +1775,7 @@ pi.registerProvider("corporate-ai", {
 - `headers` - Custom headers to include in requests. Values are sent as written, never resolved as environment variable names or `!` commands, so a header can safely carry session data.
 - `authHeader` - If true, adds `Authorization: Bearer` header automatically.
 - `models` - Array of model definitions. If provided, replaces all existing models for this provider. Model definitions can set `baseUrl` to override the provider endpoint for that model.
+- `modelsFrom` - Copy another provider's models instead of defining `models`. The source must be built in, loaded from `models.json`, or registered first. A missing source gives zero models. You cannot chain `modelsFrom` providers.
 - `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu.
 - `streamSimple` - Custom streaming implementation for non-standard APIs.
 

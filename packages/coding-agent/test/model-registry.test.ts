@@ -121,10 +121,17 @@ describe("ModelRegistry", () => {
 		expect(getModelsForProvider(registry, "copy")).toEqual(before);
 	});
 
-	it("rejects modelsFrom that names the provider itself", () => {
+	it.each(["self", "chain", "reverse chain", "cycle"])("rejects modelsFrom %s", (mode) => {
 		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		if (mode === "chain") registry.registerProvider("source", { modelsFrom: "anthropic" });
+		if (mode === "reverse chain") registry.registerProvider("other", { modelsFrom: "copy" });
+		if (mode === "cycle") registry.registerProvider("source", { modelsFrom: "copy" });
 		expect(() =>
-			registry.registerProvider("copy", { modelsFrom: "copy", api: "copy-api", streamSimple: vi.fn() }),
+			registry.registerProvider("copy", {
+				modelsFrom: mode === "self" ? "copy" : "source",
+				api: "copy-api",
+				streamSimple: vi.fn(),
+			}),
 		).toThrow(/modelsFrom/);
 		expect(getModelsForProvider(registry, "copy")).toEqual([]);
 	});

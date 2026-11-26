@@ -2039,6 +2039,13 @@ export class ModelRegistry {
 		if (config.modelsFrom === providerName) {
 			throw new Error(`Provider ${providerName}: modelsFrom cannot name the provider itself.`);
 		}
+		if (
+			config.modelsFrom !== undefined &&
+			(this.registeredProviders.get(config.modelsFrom)?.modelsFrom !== undefined ||
+				[...this.registeredProviders.values()].some((other) => other.modelsFrom === providerName))
+		) {
+			throw new Error(`Provider ${providerName}: modelsFrom cannot be chained.`);
+		}
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}

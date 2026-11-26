@@ -572,6 +572,10 @@ interface ProviderConfig {
   /** Models to register. If provided, replaces all existing models for this provider. */
   models?: ProviderModelConfig[];
 
+  /** Copy a built-in provider, a models.json provider, or one registered first.
+   * Exclusive with models. A missing source gives zero rows. Chains are not allowed. */
+  modelsFrom?: string;
+
   /** OAuth provider for /login support. */
   oauth?: {
     name: string;

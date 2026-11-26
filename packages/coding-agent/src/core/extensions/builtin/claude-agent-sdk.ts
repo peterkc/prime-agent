@@ -1,4 +1,27 @@
 // Adapted from rynfar/meridian src/proxy/server.ts at commit 510da1d9 (MIT, per its README)
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Trevor Walker
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 import { createHash } from "node:crypto";
 import { accessSync, constants, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -26,7 +49,7 @@ type Query = (args: {
 	prompt: AsyncIterable<SDKUserMessage>;
 }) => AsyncIterable<SDKMessage> & { close?(): void };
 const defaultQuery: Query = (args) => {
-	// Keep the literal require visible to Bun's bundler. Source ESM uses Node's loader.
+	// FR-1: load only on the first turn; Bun's bundler needs a literal require.
 	const sdk: { query: typeof sdkQuery } =
 		typeof require === "function"
 			? require("@anthropic-ai/claude-agent-sdk")
@@ -36,7 +59,7 @@ const defaultQuery: Query = (args) => {
 const sessions = new Map<string, { provider: ClaudeSdkProvider; running: Set<AbortController> }>();
 
 function childEnv() {
-	const env: Record<string, string | undefined> = {};
+	const env: Record<string, string | undefined> = { DISABLE_AUTO_COMPACT: "1" };
 	for (const key of Object.keys(process.env))
 		if (
 			/^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TERM|LANG|LC_.*|TZ|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|CLAUDE_CONFIG_DIR)$/.test(
@@ -48,11 +71,11 @@ function childEnv() {
 }
 function executable(configured?: string) {
 	const candidates = configured
-		? [resolve(configured)]
+		? [configured]
 		: (process.env.PATH ?? "")
 				.split(delimiter)
 				.filter(Boolean)
-				.map((p) => resolve(p, process.platform === "win32" ? "claude.exe" : "claude"));
+				.map((p) => resolve(p, "claude"));
 	for (const path of candidates) {
 		try {
 			accessSync(path, constants.X_OK);
@@ -109,6 +132,13 @@ function resumePoint(model: Model<string>, context: Context) {
 	)
 		return;
 	if (typeof m.responseId !== "string") return;
+	const calls = m.content.filter((block) => block.type === "toolCall");
+	let matched = 0;
+	for (const tail of context.messages.slice(index + 1)) {
+		if (tail.role === "user") continue;
+		if (tail.role !== "toolResult" || tail.toolCallId !== calls[matched++]?.id) return;
+	}
+	if (matched !== calls.length) return;
 	const parts = m.responseId.split(".");
 	if (
 		parts.length === 3 &&
@@ -159,11 +189,18 @@ export class ClaudeSdkProvider {
 		private readonly query: Query = defaultQuery,
 	) {}
 	extension: ExtensionFactory = (pi) => {
+		let apiKey: string | undefined;
+		try {
+			executable(readClaudeSettings(this.agentDir).claudePath);
+			apiKey = "local-claude";
+		} catch {
+			// Keep the catalog registered but unavailable. An explicit turn reports the path or settings error.
+		}
 		pi.registerProvider("claude-sdk", {
 			api: "claude-agent-sdk",
 			modelsFrom: "anthropic",
 			baseUrl: "https://claude-sdk.invalid",
-			apiKey: "local-claude",
+			apiKey,
 			streamSimple: this.streamSimple,
 		});
 		pi.on("session_start", (_event, ctx) => {
@@ -302,6 +339,11 @@ export class ClaudeSdkProvider {
 					});
 					for await (const m of query) {
 						ctrl.signal.throwIfAborted();
+						if (m.type === "assistant" && m.supersedes?.length) {
+							// Stream deltas and hooks do not identify their owning assistant UUID.
+							msg.content = [];
+							throw Error("Claude superseded earlier output; discarding this turn");
+						}
 						if (m.type === "assistant" && m.error)
 							throw Error(
 								m.error === "authentication_failed"
@@ -400,7 +442,7 @@ export class ClaudeSdkProvider {
 						!ctrl.signal.aborted &&
 						!captured.size &&
 						!msg.content.length &&
-						/^(?:No conversation found with session ID|No message found with message\.uuid of|Resume rejected)\b/.test(
+						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(
 							error instanceof Error ? error.message : String(error),
 						)
 					) {

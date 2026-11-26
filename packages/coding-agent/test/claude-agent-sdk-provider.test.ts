@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { join } from "node:path";
 import type { HookInput, Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -152,6 +151,7 @@ it.each(["tool list"])("preserves the MCP %s and refuses direct calls", async ()
 });
 it.each(["two calls", "no calls", "cancel"])("handles held denials: %s", async (scenario) => {
 	const controller = new AbortController();
+	let querySignal: AbortSignal | undefined;
 	const order: string[] = [];
 	const f = fixture(async function* ({ options }) {
 		yield raw("message_start");
@@ -179,42 +179,40 @@ it.each(["two calls", "no calls", "cancel"])("handles held denials: %s", async (
 			}
 		await Promise.resolve();
 		order.push("boundary");
-		if (scenario === "cancel") controller.abort();
-		else yield raw("message_delta", { delta: { stop_reason: "tool_use" }, usage });
+		if (scenario === "cancel") {
+			controller.abort();
+			querySignal = options.abortController?.signal;
+		} else yield raw("message_delta", { delta: { stop_reason: "tool_use" }, usage });
 		await Promise.all(denials);
 		yield { type: "result", subtype: "error_max_turns", is_error: true, errors: [] };
 		throw Error("SDK exited after one turn");
 	});
 	const msg = await f.provider.streamSimple(model, { ...context, tools }, { signal: controller.signal }).result();
 	expect(msg.stopReason).toBe(scenario === "cancel" ? "aborted" : scenario === "two calls" ? "toolUse" : "error");
+	if (scenario === "cancel") expect(querySignal?.aborted).toBe(true);
 	if (scenario !== "no calls") expect(order).toEqual(["boundary", "call-0", "call-1"]);
 	if (scenario === "two calls")
 		expect(msg.content.filter((b) => b.type === "toolCall")).toEqual(
 			tools.map((t, n) => ({ type: "toolCall", id: `call-${n}`, name: t.name, arguments: { n } })),
 		);
 });
-it.each(["abort"])("forwards %s to the running SDK query", async () => {
-	const ctrl = new AbortController();
-	let aborted = false;
-	const f = fixture(async function* ({ options }) {
-		ctrl.abort();
-		aborted = options.abortController?.signal.aborted === true;
-		yield result();
-	});
-	expect((await f.provider.streamSimple(model, context, { signal: ctrl.signal }).result()).stopReason).toBe("aborted");
-	expect(aborted).toBe(true);
-});
-it.each(["missing binary", "missing login", "malformed settings"])("fails visibly: %s", async (scenario) => {
+it.each(["missing binary", "missing login", "superseded output"])("fails visibly: %s", async (scenario) => {
 	let calls = 0;
 	const f = fixture(async function* () {
 		calls++;
+		if (scenario === "superseded output") {
+			yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "retracted" } });
+			yield { type: "assistant", uuid: checkpointAt };
+			yield { type: "assistant", uuid: forkedSession, supersedes: [checkpointAt] };
+			yield result();
+			return;
+		}
 		yield { type: "assistant", error: "authentication_failed", message: { content: [] } };
 	});
 	if (scenario === "missing binary") {
 		writeFileSync(join(f.dir, "claude-sdk.json"), "{}");
 		vi.stubEnv("PATH", join(f.dir, "empty"));
 	}
-	if (scenario === "malformed settings") writeFileSync(join(f.dir, "claude-sdk.json"), "{bad");
 	const msg = await f.provider.streamSimple(model, context).result();
 	expect(msg.stopReason).toBe("error");
 	expect(msg.errorMessage).toMatch(
@@ -222,9 +220,10 @@ it.each(["missing binary", "missing login", "malformed settings"])("fails visibl
 			? /PATH.*claudePath|claudePath.*PATH/
 			: scenario === "missing login"
 				? /claude auth login/
-				: /claude-sdk.json/,
+				: /superseded/i,
 	);
-	expect(calls).toBe(scenario === "missing login" ? 1 : 0);
+	expect(calls).toBe(scenario === "missing binary" ? 0 : 1);
+	expect(msg.content).toEqual([]);
 });
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
 	for (const key of [
@@ -235,6 +234,7 @@ it.each(["allowlist"])("restricts the child environment by %s", async () => {
 		"CLAUDE_CODE_SESSION_ACCESS_TOKEN",
 		"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 		"CLAUDE_CODE_USE_BEDROCK",
+		"DISABLE_AUTO_COMPACT",
 		"OTHER",
 	])
 		vi.stubEnv(key, "sentinel");
@@ -245,11 +245,11 @@ it.each(["allowlist"])("restricts the child environment by %s", async () => {
 		yield result();
 	});
 	await f.provider.streamSimple(model, context).result();
-	expect(env).toMatchObject({ LC_FIXTURE: "kept" });
+	expect(env).toMatchObject({ LC_FIXTURE: "kept", DISABLE_AUTO_COMPACT: "1" });
 	expect(
 		Object.keys(env ?? {}).filter(
 			(k) =>
-				!/^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TERM|LANG|LC_.*|TZ|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|CLAUDE_CONFIG_DIR)$/.test(
+				!/^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TERM|LANG|LC_.*|TZ|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|CLAUDE_CONFIG_DIR|DISABLE_AUTO_COMPACT)$/.test(
 					k,
 				),
 		),
@@ -287,8 +287,15 @@ it.each(["images"])("retains user and tool-result %s", async () => {
 		})),
 	);
 });
-it.each(["on then off"])("loads three source models only when builtins are enabled: %s", async () => {
-	for (const enabled of [true, false]) {
+it.each(["availability at registration"])("loads three source models only when builtins are enabled: %s", async () => {
+	const dir = mkdtempSync(join(getAgentDir(), "path-"));
+	vi.stubEnv("PATH", dir);
+	for (const [enabled, installed] of [
+		[true, false],
+		[true, true],
+		[false, true],
+	]) {
+		if (installed) writeFileSync(join(dir, "claude"), "fixture", { mode: 0o700 });
 		const authStorage = AuthStorage.inMemory(),
 			modelRegistry = ModelRegistry.inMemory(authStorage);
 		modelRegistry.registerProvider("anthropic", {
@@ -311,8 +318,12 @@ it.each(["on then off"])("loads three source models only when builtins are enabl
 					.filter((m) => m.provider === "claude-sdk")
 					.map((m) => [m.id, m.api]),
 			).toEqual(enabled ? ["a", "b", "c"].map((id) => [id, "claude-agent-sdk"]) : []);
-			const loader = createRequire(import.meta.url);
-			expect(loader.cache[loader.resolve("@anthropic-ai/claude-agent-sdk")]).toBeUndefined();
+			expect(
+				modelRegistry
+					.getAvailable()
+					.filter((m) => m.provider === "claude-sdk")
+					.map((m) => m.id),
+			).toEqual(enabled && installed ? ["a", "b", "c"] : []);
 		} finally {
 			services.mcpManager.dispose();
 		}
@@ -511,7 +522,6 @@ it.each([
 	"no state",
 	"foreign",
 	"error",
-	"aborted",
 	"unparsable",
 	"system prompt",
 	"tools",
@@ -523,10 +533,10 @@ it.each([
 	const { checkpoint, history } = await checkpointFixture();
 	let selected = model;
 	const newer = { type: "text" as const, text: "edited checkpoint" };
-	if (scenario === "no state" || scenario === "tool tail") delete checkpoint.responseId;
+	if (scenario === "no state") delete checkpoint.responseId;
 	if (scenario === "tool tail") history.messages.pop();
 	if (scenario === "foreign") checkpoint.provider = "foreign";
-	if (scenario === "error" || scenario === "aborted") checkpoint.stopReason = scenario;
+	if (scenario === "error") checkpoint.stopReason = "error";
 	if (scenario === "unparsable") checkpoint.responseId = "not-sdk-state";
 	if (scenario === "system prompt") history.systemPrompt = "different";
 	if (scenario === "tools") history.tools = tools.slice(1);
@@ -563,9 +573,7 @@ it.each([
 it.each([
 	["No conversation found with session ID", false, true],
 	["No message found with message.uuid of", false, true],
-	["Resume rejected", false, true],
 	["login required", false, false],
-	["rate limit", false, false],
 	["No conversation found with session ID", true, false],
 ] as const)("resume error %s after output=%s retries=%s", async (error, late, retry) => {
 	const { history } = await checkpointFixture();

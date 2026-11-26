@@ -1087,6 +1087,7 @@ describe("AgentSessionRuntime characterization", () => {
 					services,
 					sessionManager,
 					sessionStartEvent,
+					model: faux.getModel(),
 				})),
 				services,
 				diagnostics: services.diagnostics,
