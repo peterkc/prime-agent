@@ -335,7 +335,7 @@ export class ClaudeSdkProvider {
 					pathToClaudeCodeExecutable: path,
 					model: model.id,
 					effort: level === "minimal" ? "low" : level === "off" ? undefined : level,
-					thinking: level === "off" ? { type: "disabled" } : undefined,
+					thinking: !level || level === "off" ? { type: "disabled" } : undefined,
 					systemPrompt: context.systemPrompt ?? "",
 					tools: [],
 					settingSources: [],
@@ -562,7 +562,6 @@ export class ClaudeSdkProvider {
 						completed = true;
 					} else if (
 						point &&
-						!ctrl.signal.aborted &&
 						!captured.size &&
 						!msg.content.length &&
 						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(message)
@@ -579,9 +578,9 @@ export class ClaudeSdkProvider {
 				}
 				ctrl.signal.throwIfAborted();
 				if (!completed) throw Error("Claude query ended without a result");
+				const allToolsCaptured = [...toolOrder.keys()].every((id) => captured.has(id));
 				if (msg.stopReason !== "length") {
-					if ([...toolOrder.keys()].some((id) => !captured.has(id)))
-						throw Error("Claude rejected a tool call before Prime could capture it");
+					if (!allToolsCaptured) throw Error("Claude rejected a tool call before Prime could capture it");
 					if (!hasTurnOutput(msg.content, captured.size)) throw Error("Claude returned nothing.");
 				}
 				msg.stopReason = msg.stopReason === "length" ? "length" : captured.size ? "toolUse" : "stop";
@@ -593,7 +592,7 @@ export class ClaudeSdkProvider {
 					stream.push({ type: "toolcall_start", contentIndex, partial: msg });
 					stream.push({ type: "toolcall_end", toolCall: call, contentIndex, partial: msg });
 				}
-				if (sessionId && assistantUuid && uuid.test(sessionId) && uuid.test(assistantUuid))
+				if (allToolsCaptured && sessionId && assistantUuid && uuid.test(sessionId) && uuid.test(assistantUuid))
 					msg.responseId = `${sessionId}.${assistantUuid}.${historyHash(model, context, [...context.messages, msg])}`;
 				stream.push({
 					type: "done",
