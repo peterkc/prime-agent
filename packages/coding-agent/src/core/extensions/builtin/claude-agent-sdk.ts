@@ -196,7 +196,9 @@ export class ClaudeSdkProvider {
 	extension: ExtensionFactory = (pi) => {
 		let missingAuthMessage = "";
 		try {
-			executable(readClaudeSettings(this.agentDir).claudePath);
+			const settings = readClaudeSettings(this.agentDir);
+			if (!settings.enabled) return;
+			executable(settings.claudePath);
 		} catch (error) {
 			missingAuthMessage = error instanceof Error ? error.message : String(error);
 		}
@@ -212,7 +214,8 @@ export class ClaudeSdkProvider {
 		pi.on("session_start", (_event, ctx) => {
 			sessions.set(ctx.sessionManager.getSessionId(), { provider: this, running: new Set() });
 		});
-		pi.on("session_shutdown", (_event, ctx) => {
+		pi.on("session_shutdown", (event, ctx) => {
+			if (event.reason === "reload") pi.unregisterProvider("claude-sdk");
 			const id = ctx.sessionManager.getSessionId(),
 				entry = sessions.get(id);
 			if (entry?.provider !== this) return;

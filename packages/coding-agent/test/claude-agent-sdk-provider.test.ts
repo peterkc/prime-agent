@@ -14,10 +14,11 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Type } from "typebox";
 import { afterEach, expect, it, vi } from "vitest";
 import { getAgentDir } from "../src/config.js";
-import { createAgentSessionServices } from "../src/core/agent-session-services.js";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ClaudeSdkProvider } from "../src/core/extensions/builtin/claude-agent-sdk.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { resolveCliModel } from "../src/core/model-resolver.js";
 import { providerStreamFailureDetails } from "../src/core/provider-retry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -79,7 +80,7 @@ function fixture(
 	const path = join(dir, "claude");
 	writeFileSync(path, "fixture", { mode: 0o700 });
 	chmodSync(path, 0o700);
-	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ claudePath: path }));
+	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled: true, claudePath: path }));
 	return {
 		dir,
 		path,
@@ -359,6 +360,7 @@ it.each(["availability at registration"])("loads three source models only when b
 		[true, true],
 		[false, true],
 	]) {
+		writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled: true }));
 		if (installed) writeFileSync(join(dir, "claude"), "fixture", { mode: 0o700 });
 		const authStorage = AuthStorage.inMemory(),
 			modelRegistry = ModelRegistry.inMemory(authStorage);
@@ -368,8 +370,8 @@ it.each(["availability at registration"])("loads three source models only when b
 			models: ["a", "b", "c"].map((id) => ({ ...model, id })),
 		});
 		const services = await createAgentSessionServices({
-			cwd: getAgentDir(),
-			agentDir: getAgentDir(),
+			cwd: dir,
+			agentDir: dir,
 			authStorage,
 			modelRegistry,
 			settingsManager: SettingsManager.inMemory({ enableBuiltinExtensions: enabled }),
@@ -393,6 +395,57 @@ it.each(["availability at registration"])("loads three source models only when b
 		}
 	}
 });
+it.each([undefined, false])(
+	"does not register a provider with enabled=%s even with claude on PATH",
+	async (enabled) => {
+		const dir = mkdtempSync(join(getAgentDir(), "opt-in-"));
+		vi.stubEnv("PATH", dir);
+		writeFileSync(join(dir, "claude"), "fixture", { mode: 0o700 });
+		if (enabled !== undefined) writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled }));
+		const authStorage = AuthStorage.inMemory(),
+			modelRegistry = ModelRegistry.inMemory(authStorage);
+		const cliModel = modelRegistry.getAll().find((m) => m.provider === "anthropic")!.id;
+		const baseline = resolveCliModel({ cliModel, modelRegistry });
+		const services = await createAgentSessionServices({
+			cwd: dir,
+			agentDir: dir,
+			authStorage,
+			modelRegistry,
+			telemetryDisabled: true,
+		});
+		try {
+			expect(modelRegistry.getAll().some((m) => m.provider === "claude-sdk")).toBe(false);
+			expect(resolveCliModel({ cliModel, modelRegistry })).toEqual(baseline);
+		} finally {
+			services.mcpManager.dispose();
+		}
+	},
+);
+it("removes the provider on /reload after opt-out", async () => {
+	const dir = mkdtempSync(join(getAgentDir(), "reload-"));
+	const file = join(dir, "claude-sdk.json");
+	writeFileSync(file, JSON.stringify({ enabled: true }));
+	const services = await createAgentSessionServices({
+		cwd: dir,
+		agentDir: dir,
+		authStorage: AuthStorage.inMemory(),
+		telemetryDisabled: true,
+	});
+	const { session } = await createAgentSessionFromServices({
+		services,
+		sessionManager: SessionManager.inMemory(dir),
+		telemetryDisabled: true,
+	});
+	try {
+		const hasRows = () => session.modelRegistry.getAll().some((m) => m.provider === "claude-sdk");
+		expect(hasRows()).toBe(true);
+		writeFileSync(file, JSON.stringify({ enabled: false }));
+		await session.reload();
+		expect(hasRows()).toBe(false);
+	} finally {
+		session.dispose();
+	}
+});
 it.each([true, false])("R2-2 re-registers when claude was initially available=%s", async (initiallyAvailable) => {
 	const dir = mkdtempSync(join(getAgentDir(), "reregister-"));
 	const authStorage = AuthStorage.inMemory(),
@@ -402,7 +455,7 @@ it.each([true, false])("R2-2 re-registers when claude was initially available=%s
 	for (const available of [initiallyAvailable, !initiallyAvailable]) {
 		writeFileSync(
 			join(dir, "claude-sdk.json"),
-			JSON.stringify({ claudePath: available ? path : join(dir, "missing") }),
+			JSON.stringify({ enabled: true, claudePath: available ? path : join(dir, "missing") }),
 		);
 		const services = await createAgentSessionServices({
 			cwd: dir,
@@ -422,7 +475,8 @@ it.each([true, false])("R2-2 re-registers when claude was initially available=%s
 	}
 });
 it.each([
-	["{}", /PATH.*claudePath/],
+	['{"enabled":true}', /PATH.*claudePath/],
+	['{"enabled":"false"}', /claude-sdk\.json: expected a boolean enabled/],
 	["{", /Cannot read .*claude-sdk\.json/],
 	['{"claudePath":"relative"}', /claude-sdk\.json: expected an absolute claudePath/],
 ] as const)("R2-2 reports the registration failure for settings %s", async (settings, cause) => {

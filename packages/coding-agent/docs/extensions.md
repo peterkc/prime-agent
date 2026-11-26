@@ -138,14 +138,15 @@ To share extensions via npm or git as Prime Agent packages, see [packages.md](pa
 
 ## Built-in Extensions
 
-Prime Agent ships these built-in extensions, enabled by default:
+Prime Agent ships these built-in extensions:
 
-- **Claude Agent SDK** lists the Anthropic catalog under `claude-sdk`. Select
+- **Claude Agent SDK** is off by default. To list Anthropic models under `claude-sdk`,
+  set `"enabled": true` in the global agent folder's `claude-sdk.json` and run `/reload`. Select
   `claude-sdk/<model ID>` to use Claude Code 2.1.248 or later with Prime tools.
   Run `claude auth login` in your terminal before your first turn. Prime loads the
   SDK on that turn, not when it lists models. By default Prime looks for `claude`
   on `PATH`. To select another executable, set `claudePath` in the global agent
-  folder's `claude-sdk.json`, for example `{"claudePath":"/opt/bin/claude"}`.
+  folder's `claude-sdk.json`, for example `{"enabled":true,"claudePath":"/opt/bin/claude"}`.
   The path must be absolute. Prime lists the models as available only if it finds
   the executable at registration. Project settings do not override this file.
   Displayed cost uses catalog rates. Claude Code writes transcripts under

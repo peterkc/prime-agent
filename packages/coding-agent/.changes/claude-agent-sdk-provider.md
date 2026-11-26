@@ -1,2 +1,2 @@
-- Added the `claude-sdk` provider to use Prime tools and Anthropic catalog models through an installed Claude Code CLI.
+- Added the opt-in `claude-sdk` provider to use Prime tools and Anthropic catalog models through an installed Claude Code CLI.
 - Added `missingAuthMessage` so providers can explain why they are unavailable instead of directing users to configure an API key.
