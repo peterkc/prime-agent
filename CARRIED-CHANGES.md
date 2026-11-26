@@ -411,13 +411,10 @@ remove the forced-end fork behavior:
 
 ## Prime Python thin slice
 
-- **Files:** `package.json`, `package-lock.json`, `.github/workflows/fork-ci.yml`,
-  `CARRIED-CHANGES.md`
+- **Files:** `package.json`, `package-lock.json`, `CARRIED-CHANGES.md`
 - **Reason:** Build the private `packages/prime` workspace after pi's packages in
-  both build chains. Record its workspace in the npm lockfile. Sync its copied
-  runtime with `uv sync --frozen` before the existing other-workspaces test step
-  runs its extension-boundary tests. No pi package changes are carried.
+  both build chains. Record its workspace in the npm lockfile. No pi package
+  changes are carried.
 - **Kind:** required integration
 - **Removal condition:** Remove when Prime no longer uses a separate workspace
-  package, or pi's native workspace build and CI discover its build and runtime
-  requirements without these root changes.
+  package, or pi's native workspace build discovers it without these root changes.

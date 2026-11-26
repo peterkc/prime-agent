@@ -15,6 +15,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
+	ENV_AGENT_DIR,
 	ENV_PREFIX,
 	getAgentDir,
 	ModelRuntime,
@@ -26,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { run } from "../src/cli.ts";
 import ipython from "../src/ipython.ts";
 import { ReplKernelManager } from "../src/kernel/repl-manager.ts";
+import { processGroupHasLiveMember } from "../src/utils/child-process.ts";
 
 const python = fileURLToPath(new URL("../runtime/.venv/bin/python", import.meta.url));
 const pythonVariable = `${ENV_PREFIX}_KERNEL_PYTHON`;
@@ -51,6 +53,8 @@ async function host(persisted = true) {
 	vi.stubEnv(pythonVariable, python);
 	const dir = mkdtempSync(join(tmpdir(), "prime-ipython-"));
 	cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+	// ExtensionContext exposes no agentDir; getAgentDir reads this exported override.
+	vi.stubEnv(ENV_AGENT_DIR, join(dir, "agent"));
 	const faux = fauxProvider();
 	const modelRuntime = await ModelRuntime.create({
 		authPath: join(dir, "auth.json"),
@@ -128,22 +132,30 @@ function snapshot(runtime: AgentSessionRuntime): string {
 }
 
 interface KernelWire {
+	readonly flushingSnapshotForDispose: boolean;
 	writeLine(request: Record<string, unknown>): Promise<void>;
 }
 
-// The gate intercepts the real wire write, not serialization or the filesystem operation.
+// Gate the final capture, not an earlier or concurrent debounced snapshot.
 function holdFinalSnapshot(path: string) {
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
-	const original = ReplKernelManager.prototype as unknown as KernelWire;
-	const write = original.writeLine;
+	const snapshotter = ReplKernelManager.prototype as unknown as {
+		captureSnapshot(options?: { final?: boolean }): ReturnType<ReplKernelManager["snapshotState"]>;
+	};
+	const capture = snapshotter.captureSnapshot;
 	const observations: string[] = [];
-	vi.spyOn(original, "writeLine").mockImplementation(async function (this: KernelWire, request) {
-		if (request.type === "snapshot") {
+	vi.spyOn(snapshotter, "captureSnapshot").mockImplementation(async function (this: typeof snapshotter, options) {
+		if (options?.final) {
 			entered.resolve();
 			await release.promise;
 			observations.push("snapshot");
 		}
+		return capture.call(this, options);
+	});
+	const wire = ReplKernelManager.prototype as unknown as KernelWire;
+	const write = wire.writeLine;
+	vi.spyOn(wire, "writeLine").mockImplementation(function (this: KernelWire, request) {
 		if (request.type === "shutdown") {
 			expect(existsSync(path)).toBe(true);
 			observations.push("shutdown");
@@ -155,6 +167,186 @@ function holdFinalSnapshot(path: string) {
 }
 
 describe("ipython extension boundary", () => {
+	it("F5: test services and snapshots use only the test agent directory", async () => {
+		const { runtime, cell, dir } = await host();
+		expect(getAgentDir()).toBe(join(dir, "agent"));
+		await cell("42");
+		await runtime.dispose();
+		expect(existsSync(join(dir, "agent", "session-artifacts", runtime.session.sessionId, "kernel-state.dill"))).toBe(
+			true,
+		);
+	});
+
+	it.each(["snapshot", "queue"] as const)("F2: reports kernel exit during final %s wait", async (mode) => {
+		const { runtime, cell } = await host();
+		const spawns = vi.spyOn(childProcess, "spawn");
+		syncBuiltinESMExports();
+		await cell("x = 41");
+		const child = spawns.mock.results[spawns.mock.calls.findIndex(([, args]) => args?.includes("rlm.repl"))].value;
+		const errors: string[] = [];
+		runtime.session.extensionRunner.onError((error) => errors.push(`${error.event}: ${error.error}`));
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		cleanups.push(() => release.resolve());
+		if (mode === "snapshot") {
+			const wire = ReplKernelManager.prototype as unknown as KernelWire;
+			const write = wire.writeLine;
+			vi.spyOn(wire, "writeLine").mockImplementation(async function (this: KernelWire, request) {
+				if (request.type === "snapshot" && this.flushingSnapshotForDispose) {
+					entered.resolve();
+					await release.promise;
+				}
+				return write.call(this, request);
+			});
+		} else {
+			const prototype = ReplKernelManager.prototype as unknown as {
+				executionQueue: Promise<unknown>;
+				runSnapshotFlushForDispose(): Promise<void>;
+			};
+			const flush = prototype.runSnapshotFlushForDispose;
+			vi.spyOn(prototype, "runSnapshotFlushForDispose").mockImplementation(function (this: typeof prototype) {
+				this.executionQueue = release.promise;
+				const pending = flush.call(this);
+				entered.resolve();
+				return pending;
+			});
+		}
+		const disposal = runtime.dispose();
+		await entered.promise;
+		const exited = once(child, "exit");
+		child.kill("SIGKILL");
+		await exited;
+		release.resolve();
+		await disposal;
+		expect(errors.join("\n")).toMatch(/session_shutdown: .*snapshot/i);
+	});
+
+	it("F7: hard kernel kill reaps its bash process group", async () => {
+		const { cell } = await host(false);
+		const server = net.createServer();
+		const accepted = once(server, "connection");
+		server.listen(0, "127.0.0.1");
+		await once(server, "listening");
+		cleanups.push(
+			() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+		);
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Expected a TCP address");
+		const code = `import socket; s=socket.create_connection(('127.0.0.1', ${address.port})); s.recv(1)`;
+		const command = `exec ${JSON.stringify(python)} -c ${JSON.stringify(code)}`;
+		const spawned = await cell(`h = bash(${JSON.stringify(command)})\nh.pid`);
+		const pid = Number(text(spawned).trim());
+		cleanups.push(() => {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {}
+		});
+		const [socket] = await accepted;
+		cleanups.push(() => socket.destroy());
+		const closed = once(socket, "close");
+		expect((await cell("import os\nos._exit(9)")).isError).toBe(true);
+		await closed;
+		expect(processGroupHasLiveMember(pid)).toBe(false);
+	});
+
+	it("F1: replaces a crashed kernel before the next cell", async () => {
+		const { cell } = await host(false);
+		expect((await cell("import os\nos._exit(7)")).isError).toBe(true);
+		const next = await cell("21 * 2");
+		expect(next.isError).toBe(false);
+		expect(text(next).trim()).toBe("42");
+	});
+
+	it.each(["corrupt", "legacy-code"] as const)("F3: reports a whole %s restore failure once", async (mode) => {
+		const { runtime, cell, open } = await host();
+		await cell("x = 41");
+		const file = runtime.session.sessionFile;
+		if (!file) throw new Error("Expected a saved session file");
+		await runtime.dispose();
+		const path = snapshot(runtime);
+		if (mode === "corrupt") writeFileSync(path, "broken-payload");
+		else {
+			const legacy = childProcess.spawnSync(
+				python,
+				["-c", "import dill, sys; open(sys.argv[1], 'wb').write(dill.dumps({'x': lambda: 41}))", path],
+				{ encoding: "utf8" },
+			);
+			expect(legacy.status, legacy.stderr).toBe(0);
+		}
+		const reopened = await open(SessionManager.open(file));
+		const result = await cell("'x' in globals()", reopened);
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain("could not be restored; all saved names were lost");
+		expect(text(result)).toContain("False");
+		expect(text(await cell("42", reopened)).trim()).toBe("42");
+	});
+
+	it.each(["json", "shape", "no-payload"] as const)(
+		"F8: malformed manifest %s is a first-result warning",
+		async (mode) => {
+			const { runtime, cell, open } = await host();
+			await cell("x = 41");
+			const file = runtime.session.sessionFile;
+			if (!file) throw new Error("Expected a saved session file");
+			await runtime.dispose();
+			writeFileSync(snapshot(runtime).replace(/\.dill$/, ".json"), mode === "shape" ? '{"skipped":[{}]}' : "{");
+			if (mode === "no-payload") rmSync(snapshot(runtime));
+			const reopened = await open(SessionManager.open(file));
+			const result = await cell("42", reopened);
+			expect(result.isError).toBe(false);
+			expect(text(result)).toContain("snapshot manifest could not be read");
+			expect(text(result)).toContain("42");
+			expect(text(await cell("42", reopened)).trim()).toBe("42");
+		},
+	);
+
+	it.each(["..", "../outside", "nested/id", "nested\\id", ""])(
+		"F13: session ID %j gets no snapshot target",
+		async (id) => {
+			const { runtime, cell } = await host();
+			vi.spyOn(SessionManager.prototype, "getSessionId").mockReturnValue(id);
+			const restores = vi.spyOn(ReplKernelManager.prototype, "restoreState");
+			const writes = vi.spyOn(ReplKernelManager.prototype as unknown as KernelWire, "writeLine");
+			expect(text(await cell("42")).trim()).toBe("42");
+			await runtime.dispose();
+			expect(restores).not.toHaveBeenCalled();
+			expect(
+				writes.mock.calls.filter(([request]) => request.type === "snapshot" || request.type === "restore"),
+			).toEqual([]);
+		},
+	);
+
+	it("F15: shutdown aborts startup while restore is held", async () => {
+		const { runtime, cell } = await host();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const restore = ReplKernelManager.prototype.restoreState;
+		vi.spyOn(ReplKernelManager.prototype, "restoreState").mockImplementation(async function (
+			this: ReplKernelManager,
+		) {
+			entered.resolve();
+			await release.promise;
+			return restore.call(this);
+		});
+		cleanups.push(() => release.resolve());
+		const pending = cell("42");
+		await entered.promise;
+		try {
+			await runtime.dispose();
+			expect((await pending).isError).toBe(true);
+		} finally {
+			release.resolve();
+		}
+	});
+
+	it("F6: pi owns signals and exit-time kernel cleanup stays synchronous", () => {
+		const shared = readFileSync(new URL("../src/kernel/shared.ts", import.meta.url), "utf8");
+		expect(shared).not.toMatch(/process\.on\("(?:SIGINT|SIGTERM|beforeExit)"/);
+		expect(shared).not.toContain("process.exit(");
+		expect(shared).toContain('process.on("exit",');
+		expect(shared).toContain("k.disposeSync()");
+	});
+
 	it("AC-12: runs sequentially, streams output, supports await and keeps one lazy kernel", async () => {
 		const { runtime, cell } = await host(false);
 		const spawns = vi.spyOn(childProcess, "spawn");
@@ -168,6 +360,8 @@ describe("ipython extension boundary", () => {
 		const first = await cell(
 			"import os, sys\nx = 41\nprint('stream-out')\nprint('stream-err', file=sys.stderr)\nos.getpid()",
 		);
+		expect(updates.at(-1)).toContain("stream-out");
+		expect(updates.at(-1)).toContain("stream-err");
 		const second = await cell("await asyncio.sleep(0)\nprint(os.getpid())\nx + 1");
 		expect(first.isError).toBe(false);
 		expect(text(first)).toContain("stream-err");
@@ -240,7 +434,7 @@ describe("ipython extension boundary", () => {
 		const spawns = vi.spyOn(childProcess, "spawn");
 		syncBuiltinESMExports();
 		expect((await cell("x = 41")).isError).toBe(false);
-		const child = spawns.mock.results[0].value;
+		const child = spawns.mock.results[spawns.mock.calls.findIndex(([, args]) => args?.includes("rlm.repl"))].value;
 		const errors: string[] = [];
 		runtime.session.extensionRunner.onError((error) => errors.push(`${error.event}: ${error.error}`));
 		const path = snapshot(runtime);
@@ -259,12 +453,13 @@ describe("ipython extension boundary", () => {
 		const spawns = vi.spyOn(childProcess, "spawn");
 		syncBuiltinESMExports();
 		expect((await cell("x = 41")).isError).toBe(false);
-		const child = spawns.mock.results[0].value;
+		const child = spawns.mock.results[spawns.mock.calls.findIndex(([, args]) => args?.includes("rlm.repl"))].value;
 		const exited = once(child, "exit");
+		const writes = vi.spyOn(ReplKernelManager.prototype as unknown as KernelWire, "writeLine");
 		runtime.session.dispose();
 		await exited;
 		expect(child.exitCode).toBe(0);
-		expect(existsSync(snapshot(runtime))).toBe(false);
+		expect(writes.mock.calls.filter(([request]) => request.type === "snapshot")).toEqual([]);
 	});
 
 	it("AC-15: unsupported host requests fail without hanging", async () => {
@@ -310,7 +505,7 @@ describe("ipython extension boundary", () => {
 			}
 			const spawns = vi.spyOn(childProcess, "spawn");
 			syncBuiltinESMExports();
-			const imports = vi.spyOn(childProcess, "spawnSync");
+			const syncImports = vi.spyOn(childProcess, "spawnSync");
 			syncBuiltinESMExports();
 			const network = vi.fn(() => {
 				throw new Error("No network is allowed");
@@ -327,8 +522,9 @@ describe("ipython extension boundary", () => {
 			expect(tcp).not.toHaveBeenCalled();
 			expect(secure).not.toHaveBeenCalled();
 			if (mode === "without-runtime") {
-				expect(imports.mock.calls).toHaveLength(1);
-				expect(imports.mock.calls[0][1]).toEqual(["-c", "import rlm.repl, dill"]);
+				expect(syncImports).not.toHaveBeenCalled();
+				expect(spawns.mock.calls).toHaveLength(1);
+				expect(spawns.mock.calls[0][1]).toEqual(["-c", "import rlm.repl, dill"]);
 				expect(text(result)).toContain("import");
 			}
 			vi.stubEnv(pythonVariable, python);

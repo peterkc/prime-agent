@@ -22,8 +22,11 @@ export interface ActiveOrphanProcess {
 	processStartId?: string;
 }
 
-export function recordOrphanProcessState(pid: number, active: boolean): void {
-	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+export function recordOrphanProcessState(
+	pid: number,
+	active: boolean,
+	path = process.env[ORPHAN_PROCESS_JOURNAL_ENV],
+): void {
 	if (!path || !Number.isInteger(pid) || pid <= 0) {
 		return;
 	}
@@ -118,8 +121,7 @@ export function clearOrphanProcessJournal(path: string): void {
 }
 
 // Kills still-active bash() children journaled by the given kernel pid; sibling kernels' records are untouched.
-export function reapKernelOrphanProcesses(kernelPid: number): void {
-	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+export function reapKernelOrphanProcesses(kernelPid: number, path = process.env[ORPHAN_PROCESS_JOURNAL_ENV]): void {
 	if (!path || !Number.isInteger(kernelPid) || kernelPid <= 0) {
 		return;
 	}
@@ -138,7 +140,7 @@ export function reapKernelOrphanProcesses(kernelPid: number): void {
 		}
 		// Inactive only after a delivered signal; a stale record is neutralized by the startId check.
 		if (killOrphanProcess(orphan.pid)) {
-			recordOrphanProcessState(orphan.pid, false);
+			recordOrphanProcessState(orphan.pid, false, path);
 		}
 	}
 }

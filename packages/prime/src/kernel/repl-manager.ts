@@ -9,15 +9,21 @@ import {
 	existsSync,
 	fchmodSync,
 	mkdirSync,
+	mkdtempSync,
 	openSync,
 	renameSync,
 	rmSync,
 	statSync,
 	writeSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.ts";
+import {
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	reapKernelOrphanProcesses,
+	recordOrphanProcessState,
+} from "../orphan-process-journal.ts";
 import { spawnHidden } from "../utils/child-process.ts";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
@@ -203,6 +209,7 @@ export class ReplKernelManager {
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
+	private orphanJournalDir?: string;
 	private readyDeferred?: ReturnType<typeof createDeferred<number>>;
 	private kernelStderr = "";
 	/** Serializes execute() calls — the runtime runs one request at a time. */
@@ -366,6 +373,8 @@ export class ReplKernelManager {
 			throw new Error("Kernel was disposed during startup");
 		}
 
+		this.orphanJournalDir = mkdtempSync(join(tmpdir(), "prime-kernel-"));
+		const journalPath = join(this.orphanJournalDir, "processes.jsonl");
 		const child = spawnHidden(python, ["-m", "rlm.repl"], {
 			cwd: this.options.cwd,
 			// bash.py journals its process groups under this pid so the host can
@@ -375,11 +384,12 @@ export class ReplKernelManager {
 				...this.options.env,
 				...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}),
 				PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
+				[ORPHAN_PROCESS_JOURNAL_ENV]: journalPath,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.child = child;
-		if (child.pid !== undefined) recordOrphanProcessState(child.pid, true);
+		if (child.pid !== undefined) recordOrphanProcessState(child.pid, true, journalPath);
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
 		this.wireChild(child);
@@ -1440,10 +1450,15 @@ export class ReplKernelManager {
 				// The kernel has already exited.
 			}
 			// Inactive only when the signal proved the pid still named our un-reaped child.
-			if (pid !== undefined && signaled) recordOrphanProcessState(pid, false);
+			const journalPath = this.orphanJournalDir ? join(this.orphanJournalDir, "processes.jsonl") : undefined;
+			if (pid !== undefined && signaled) recordOrphanProcessState(pid, false, journalPath);
 			// A killed/crashed kernel cannot run its own shutdown hook, so the host
 			// reaps the bash() process groups it journaled under this kernel pid.
-			if (pid !== undefined) reapKernelOrphanProcesses(pid);
+			if (pid !== undefined) reapKernelOrphanProcesses(pid, journalPath);
+		}
+		if (this.orphanJournalDir) {
+			rmSync(this.orphanJournalDir, { recursive: true, force: true });
+			this.orphanJournalDir = undefined;
 		}
 		this.startPromise = undefined;
 	}
@@ -1511,7 +1526,10 @@ export class ReplKernelManager {
 			} catch (error) {
 				snapshotError = error;
 			}
-			if (this.startStale(generation)) return false;
+			if (this.startStale(generation)) {
+				if (snapshotError) throw snapshotError;
+				return false;
+			}
 		}
 		// Protocol shutdown first: the runtime closes MCP servers and kills live bash() process groups a bare hard-kill would leak.
 		const protocolShutdownAvailable = this.state === "running";
@@ -1622,7 +1640,11 @@ export class ReplKernelManager {
 		options: { executionTimeoutMs?: number; pruneOversized?: boolean; final?: boolean } = {},
 	): Promise<SnapshotResult | null> {
 		const cfg = this.options.snapshot;
-		if (!cfg || !this.isRunning) return null;
+		if (!cfg) return null;
+		if (!this.isRunning) {
+			if (options.final) throw new Error("Final kernel snapshot failed: kernel is not running");
+			return null;
+		}
 		try {
 			const r = await this.enqueueRequest(
 				{

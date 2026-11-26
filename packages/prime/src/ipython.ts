@@ -20,7 +20,7 @@ import {
 	raceStartupWithAbort,
 } from "./kernel/shared.ts";
 import { manifestPathIn, snapshotPathIn } from "./kernel/state-snapshot.ts";
-import { spawnSyncHidden } from "./utils/child-process.ts";
+import { spawnHidden, waitForChildProcess } from "./utils/child-process.ts";
 
 const schema = Type.Object({
 	code: Type.String({ description: "Python code to execute in the persistent Python REPL." }),
@@ -48,9 +48,11 @@ class IpythonKernelProvisioner {
 	constructor(ctx: ExtensionContext) {
 		this.cwd = ctx.cwd;
 		this.sessionId = ctx.sessionManager.getSessionId();
-		this.snapshotDir = ctx.sessionManager.getSessionFile()
-			? join(getAgentDir(), "session-artifacts", this.sessionId)
-			: undefined;
+		// Session headers are loaded from disk; reject path-like IDs before joining.
+		this.snapshotDir =
+			ctx.sessionManager.getSessionFile() && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(this.sessionId)
+				? join(getAgentDir(), "session-artifacts", this.sessionId)
+				: undefined;
 		this.unregisterCleanup = registerSessionResourceCleanup((sessionId) => {
 			if ((!sessionId || sessionId === this.sessionId) && !this.stopping) void this.shutdown({ snapshot: false });
 		});
@@ -62,7 +64,12 @@ class IpythonKernelProvisioner {
 		this.managerPromise ??= this.startKernel();
 		const startup = this.managerPromise;
 		try {
-			return await raceStartupWithAbort(startup, signal);
+			const manager = await raceStartupWithAbort(startup, signal);
+			if (manager.isDefunct && !this.stopping) {
+				if (this.managerPromise === startup) this.managerPromise = undefined;
+				return this.ensure(signal);
+			}
+			return manager;
 		} catch (error) {
 			if (!signal?.aborted && this.managerPromise === startup) this.managerPromise = undefined;
 			throw error;
@@ -74,13 +81,20 @@ class IpythonKernelProvisioner {
 		const python = process.env[variable];
 		const runtimeDir = fileURLToPath(new URL("../runtime/", import.meta.url));
 		if (!python) throw new Error(`Set ${variable} to a Python interpreter with the runtime from ${runtimeDir}.`);
-		const check = spawnSyncHidden(python, ["-c", "import rlm.repl, dill"], {
+		const check = spawnHidden(python, ["-c", "import rlm.repl, dill"], {
 			cwd: this.cwd,
-			encoding: "utf8",
+			stdio: ["ignore", "ignore", "pipe"],
 			timeout: 5000,
 		});
-		if (check.status !== 0)
-			throw new Error(`${variable} cannot import rlm.repl and dill: ${check.error?.message ?? check.stderr.trim()}`);
+		let stderr = "";
+		check.stderr?.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+		try {
+			if ((await waitForChildProcess(check)) !== 0) throw new Error(stderr.trim());
+		} catch (error) {
+			throw new Error(`${variable} cannot import rlm.repl and dill: ${errorMessage(error)}`, { cause: error });
+		}
 		const signal = this.startupAbort.signal;
 		if (signal.aborted) throw new Error("Python kernel is shutting down");
 		const shellPath = resolveKernelBashShell();
@@ -101,17 +115,23 @@ class IpythonKernelProvisioner {
 			await withKernelBootPermit(() => manager.start({ signal }), signal);
 			const snapshotExisted = this.snapshotDir && existsSync(snapshotPathIn(this.snapshotDir));
 			if (this.snapshotDir) {
-				const notSaved = readNotSavedNames(manifestPathIn(this.snapshotDir));
-				const restored = await manager.restoreState();
+				let notSaved: string[] = [];
+				const notices: string[] = [];
+				try {
+					notSaved = readNotSavedNames(manifestPathIn(this.snapshotDir));
+				} catch (error) {
+					notices.push(`Kernel snapshot manifest could not be read: ${errorMessage(error)}`);
+				}
+				const restored = await raceStartupWithAbort(manager.restoreState(), signal);
 				if (snapshotExisted) {
 					const failed = restored?.failed.map((entry) => entry.name) ?? [];
-					this.restoreNotice = [
+					notices.push(
 						notSaved.length ? `Not saved: ${notSaved.join(", ")}` : "",
+						restored === null ? "Kernel snapshot could not be restored; all saved names were lost." : "",
 						failed.length ? `Failed to revive: ${failed.join(", ")}` : "",
-					]
-						.filter(Boolean)
-						.join("\n");
+					);
 				}
+				this.restoreNotice = notices.filter(Boolean).join("\n");
 			}
 			const result = await manager.execute(bootstrapCode, { signal });
 			if (result.status !== "ok")
@@ -193,10 +213,13 @@ function createIpythonToolDefinition(
 		execute: async (_id, params, signal, onUpdate, ctx) => {
 			const provisioner = getProvisioner(ctx);
 			const manager = await provisioner.ensure(signal);
+			let streamed = "";
 			const result = await manager.execute(params.code, {
 				signal,
-				onStream: (chunk) =>
-					onUpdate?.({ content: [{ type: "text", text: chunk }], details: { status: "ok", durationMs: 0 } }),
+				onStream: (chunk) => {
+					streamed += chunk;
+					onUpdate?.({ content: [{ type: "text", text: streamed }], details: { status: "ok", durationMs: 0 } });
+				},
 			});
 			const output = [
 				provisioner.takeRestoreNotice(),
