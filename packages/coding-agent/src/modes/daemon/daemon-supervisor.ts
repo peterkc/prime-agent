@@ -300,7 +300,10 @@ const SCHEDULED_WAKE_MAX_TIMEOUT_MS = 2_147_483_647;
 const SCHEDULED_WAKE_CLIENT_ID = "scheduled-wake";
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
-/** Minimum time between roster-triggered retries after another daemon refused a session's mesh claim. */
+/**
+ * Minimum time between roster-triggered retries after another daemon refused a session's mesh claim. Roster rows
+ * can change several times a second, and each retry takes a file lease; a send retries at once instead.
+ */
 const MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS = 30_000;
 
 // Commands proving the client tracks the catalog; only such clients receive heartbeats_changed pushes.
@@ -5380,15 +5383,6 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/** Roster rows can change several times a second; a send retries at once instead. */
-	private async retryClaimedMeshEnrollment(sessionId: string, sessionFile: string): Promise<void> {
-		try {
-			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS);
-		} catch (error) {
-			this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`);
-		}
-	}
-
 	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
 		const entry = workerRosterEntryFromSummary(summary);
 		const previous = this.roster().get(entry.agentId);
@@ -5421,8 +5415,14 @@ export class DaemonSupervisor {
 				previous.summary.sessionFile !== entry.summary.sessionFile)
 		)
 			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile, true);
-		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile)
-			void this.retryClaimedMeshEnrollment(entry.summary.sessionId, entry.summary.sessionFile);
+		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile) {
+			const sessionId = entry.summary.sessionId;
+			void this.mesh
+				?.retryClaimedEnrollment(sessionId, entry.summary.sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS)
+				.catch((error: unknown) =>
+					this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`),
+				);
+		}
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {

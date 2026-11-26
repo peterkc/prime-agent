@@ -442,7 +442,10 @@ describe("supervisor session move", () => {
 		} finally {
 			claim.release();
 		}
-		expect(await send()).toMatchObject({ success: true, data: { deliveryStatus: "stored", cotalId: "published" } });
+		const stored = await send();
+		expect(stored).toMatchObject({ success: true, data: { deliveryStatus: "stored", cotalId: "published" } });
+		// The retry needs the file; the receipt goes back to the worker and must not carry a local path.
+		expect((stored as { data: { from: object } }).data.from).not.toHaveProperty("sessionFile");
 		expect(Endpoint.instances.at(-1)!.unicastAttributed).toHaveBeenCalledExactlyOnceWith(
 			enrollment.readDirectory(f.meshRoot, "target")!.principal,
 			"hi",

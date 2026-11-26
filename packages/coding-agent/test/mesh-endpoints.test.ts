@@ -9,7 +9,7 @@ import { type AgentFamilyMember, createAgentMessageHostHandlers } from "../src/c
 import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
 import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
-import { meshMessagePayload } from "../src/modes/daemon/cotal/mesh-shared.js";
+import { MeshNotStoredError, meshMessagePayload } from "../src/modes/daemon/cotal/mesh-shared.js";
 import { DAEMON_PROTOCOL_INFO } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
@@ -378,24 +378,37 @@ describe("mesh endpoints", () => {
 		expect(enroll).not.toHaveBeenCalled();
 	});
 
-	it("pi-dkwcu a sender's enrollment retry counts against the send deadline and stores nothing when it runs out", async () => {
-		const { mesh, root } = await fixture();
-		const file = join(root, "c.json");
-		writeFileSync(file, "{}");
-		directories.set("c", { sessionId: "c", name: "c", principal: "local.c", homeSocket: "home" });
-		vi.mocked(enrollment.claimEnrollment).mockImplementationOnce(() => {
-			throw new SessionAlreadyActiveError(file, "other-daemon");
-		});
-		await mesh.enroll("c", file);
-		vi.spyOn(mesh, "enroll").mockReturnValue(new Promise(() => undefined));
-		vi.useFakeTimers();
-		const sending = expect(mesh.send({ sessionId: "c", sessionFile: file }, "b", "hello")).rejects.toThrow(
-			"Message was not stored: sender c: enrollment retry did not finish before the send deadline",
-		);
-		await vi.advanceTimersByTimeAsync(30_000);
-		await sending;
-		for (const endpoint of Endpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
-	});
+	it.each([
+		["runs out of time", "enrollment retry did not finish before the send deadline"],
+		["is rejected", "move is pending"],
+	] as const)(
+		"pi-dkwcu a sender's enrollment retry that %s stores nothing and reports not stored",
+		async (kind, reason) => {
+			const { mesh, root } = await fixture();
+			const file = join(root, "c.json");
+			writeFileSync(file, "{}");
+			directories.set("c", { sessionId: "c", name: "c", principal: "local.c", homeSocket: "home" });
+			vi.mocked(enrollment.claimEnrollment).mockImplementationOnce(() => {
+				throw new SessionAlreadyActiveError(file, "other-daemon");
+			});
+			await mesh.enroll("c", file);
+			vi.spyOn(mesh, "enroll").mockImplementation(() =>
+				kind === "is rejected" ? Promise.reject(new Error(reason)) : new Promise(() => undefined),
+			);
+			vi.useFakeTimers();
+			const sending = mesh.send({ sessionId: "c", sessionFile: file }, "b", "hello");
+			const outcome = sending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await vi.advanceTimersByTimeAsync(30_000);
+			const error = await outcome;
+			expect(error).toBeInstanceOf(MeshNotStoredError);
+			expect((error as Error).message).toMatch(/^Message was not stored: sender c: /);
+			expect((error as Error).message).toContain(reason);
+			for (const endpoint of Endpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+		},
+	);
 
 	it("pi-dkwcu does not enroll again after other failures or without a failure", async () => {
 		const { mesh, root } = await fixture();

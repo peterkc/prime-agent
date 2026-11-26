@@ -237,7 +237,8 @@ export class MeshEndpoints {
 	 */
 	retryClaimedEnrollment(sessionId: string, sessionFile: string, minIntervalMs = 0): Promise<void> {
 		if (this.enrollmentFailures.get(sessionId) !== CLAIMED_BY_ANOTHER_DAEMON) return Promise.resolve();
-		if (Date.now() - (this.claimRefusedAt.get(sessionId) ?? 0) < minIntervalMs) return Promise.resolve();
+		if (minIntervalMs > 0 && Date.now() - (this.claimRefusedAt.get(sessionId) ?? 0) < minIntervalMs)
+			return Promise.resolve();
 		return this.enroll(sessionId, sessionFile);
 	}
 
@@ -1036,7 +1037,8 @@ export class MeshEndpoints {
 		normalizeAgentSessionMessage(policy.canWait === true ? `${AGENT_MESSAGE_CAN_WAIT_HEADER}\n${message}` : message);
 		if (this.closing) throw new MeshNotStoredError("Message was not stored: mesh is shutting down");
 		if (this.refusal) throw new MeshNotStoredError(`Message was not stored: mesh unavailable: ${this.refusal}`);
-		if (sessionFile) await this.retrySenderEnrollment(senderSessionId, sessionFile, deadline);
+		if (sessionFile && this.enrollmentFailures.get(senderSessionId) === CLAIMED_BY_ANOTHER_DAEMON)
+			await this.retrySenderEnrollment(senderSessionId, sessionFile, deadline);
 		const source = this.sessions.get(senderSessionId);
 		if (!source)
 			throw new MeshNotStoredError(

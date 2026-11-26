@@ -112,7 +112,7 @@ export type MoveRefusal = "claimed" | "open";
 export function formatMoveHint(hosts: readonly SessionHost[], targetFolder: string, refusal: MoveRefusal): string {
 	if (hosts.length === 0)
 		return refusal === "claimed"
-			? `Another daemon holds this session's mesh claim, often the daemon that ran it before. Stop or restart that daemon (\`${APP_NAME} status\` lists the daemons), then run this move again.`
+			? `Another daemon holds this session's mesh claim, often the daemon that ran it before. Stop that daemon (\`${APP_NAME} status\` lists the daemons), then run this move again.`
 			: "Another process has the session file or one of its child transcripts open. Close it, then run this move again.";
 	return hosts
 		.map(
