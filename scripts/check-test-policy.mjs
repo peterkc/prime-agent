@@ -285,6 +285,19 @@ function changedTestFiles(base) {
 	);
 }
 
+const knownRules = new Set([
+	"conditional-or-disabled-test",
+	"environment-gated-path",
+	"explicit-test-timeout",
+	"fixed-resource",
+	"optional-assertion",
+	"test-retry",
+	"vacuous-assertion",
+	"wall-clock-poll",
+	"wall-clock-sleep",
+	"wall-clock-timer",
+]);
+
 function scan(content, path = "") {
 	const lines = content.split("\n");
 	const maskedContent = path.endsWith(".py") ? maskPythonSyntax(content) : maskJsSyntax(content);
@@ -294,8 +307,11 @@ function scan(content, path = "") {
 	let title = "<module>";
 	const add = (category, line, detail, explicitTitle = title) => {
 		const previous = lines[line - 2]?.trim() ?? "";
-		const suppression = previous.match(/^(?:\/\/|#) test-policy: allow ([a-z-]+) -- (.+)$/);
-		if (suppression?.[1] === category && suppression[2].trim().length >= 12) return;
+		const suppression = previous.match(/^(?:\/\/|#) test-policy: allow ([a-z-]+(?:,\s*[a-z-]+)*) -- (.+)$/);
+		if (suppression && suppression[2].trim().length >= 12) {
+			const rules = suppression[1].split(/,\s*/);
+			if (rules.every((rule) => knownRules.has(rule)) && rules.includes(category)) return;
+		}
 		violations.push({ category, detail, identity: `${category}\0${explicitTitle}\0${detail}`, line, title: explicitTitle });
 	};
 

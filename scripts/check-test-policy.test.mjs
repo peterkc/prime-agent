@@ -102,3 +102,23 @@ for (const [name, env] of [
 		assert.match(result.stdout, /Test policy check passed against/);
 	});
 }
+
+for (const [rules, reason, expected] of [
+	["test-retry, explicit-test-timeout", "Upstream test options are unchanged", []],
+	["test-retry", "Upstream test options are unchanged", ["explicit-test-timeout"]],
+	["test-retry, explicit-test-timout", "Upstream test options are unchanged", ["test-retry", "explicit-test-timeout"]],
+	["test-retry, fixed-resource", "Upstream test options are unchanged", ["explicit-test-timeout"]],
+	["test-retry, explicit-test-timeout", "Too short", ["test-retry", "explicit-test-timeout"]],
+]) {
+	test(`allows only the named known test-policy rules (${rules}; ${reason})`, async (t) => {
+		const { root, base } = await fixture(t);
+		git(root, "update-ref", "refs/remotes/fork/next", base);
+		await writeFile(
+			join(root, "packages/example/test/policy.test.ts"),
+			`// test-policy: allow ${rules} -- ${reason}\nit("upstream options", { retry: 3, timeout: 60000 }, () => {});\n`,
+		);
+		const result = check(root);
+		assert.equal(result.status, expected.length === 0 ? 0 : 1, result.stderr);
+		assert.deepEqual([...result.stderr.matchAll(/policy\.test\.ts:2 \[([a-z-]+)\]/g)].map((match) => match[1]), expected);
+	});
+}
