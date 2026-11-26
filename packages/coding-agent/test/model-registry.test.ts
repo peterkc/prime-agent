@@ -1067,6 +1067,22 @@ describe("ModelRegistry", () => {
 				expect(models.every((m) => m.baseUrl === expectedBaseUrl)).toBe(true);
 			});
 
+			test("an empty extension key preserves the models.json request key and headers", async () => {
+				writeModelsJson({
+					fixture: {
+						...providerConfig("https://fixture.invalid", [{ id: "test" }]),
+						apiKey: "fixture-key",
+						headers: { "x-source": "file" },
+					},
+				});
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				registry.registerProvider("fixture", { apiKey: "" });
+				expect(await registry.getApiKeyAndHeaders(registry.find("fixture", "test")!)).toMatchObject({
+					ok: true,
+					apiKey: "fixture-key",
+					headers: { "x-source": "file" },
+				});
+			});
 			test("headers-only override keeps custom provider models after refresh", async () => {
 				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 

@@ -1775,7 +1775,9 @@ export class ModelRegistry {
 		},
 		fromExtension = false,
 	): void {
-		if (config.apiKey === undefined && !config.headers && !config.authHeader) {
+		const clearsExtensionKey =
+			fromExtension && config.apiKey === "" && this.providerRequestConfigs.get(providerName)?.fromExtension;
+		if (!config.apiKey && !config.headers && !config.authHeader && !clearsExtensionKey) {
 			return;
 		}
 
