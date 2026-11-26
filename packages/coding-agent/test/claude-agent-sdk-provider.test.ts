@@ -168,88 +168,114 @@ it.each(["tool list"])("preserves the MCP %s and refuses direct calls", async ()
 	});
 	expect((await f.provider.streamSimple(model, { ...context, tools }).result()).stopReason).toBe("stop");
 });
-it.each(["two calls", "no calls", "cancel"])("handles held denials: %s", async (scenario) => {
-	const controller = new AbortController();
-	let querySignal: AbortSignal | undefined;
-	const order: string[] = [];
-	const f = fixture(async function* ({ options }) {
-		yield raw("message_start");
-		const hook = options.hooks?.PreToolUse?.[0].hooks[0];
-		if (!hook) throw Error("missing hook");
-		const denials: Promise<unknown>[] = [];
-		if (scenario !== "no calls")
-			for (const [index, t] of tools.entries()) {
-				const id = `call-${index}`,
-					name = `mcp__prime__${t.name}`,
-					input = { n: index };
-				yield raw("content_block_start", { index, content_block: { type: "tool_use", id, name, input: {} } });
-				yield raw("content_block_stop", { index });
-				const promise = hook(
-					{ hook_event_name: "PreToolUse", tool_name: name, tool_input: input, tool_use_id: id } as HookInput,
-					id,
-					{ signal: controller.signal },
-				);
-				denials.push(
-					promise.then((response) => {
-						expect(response).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
-						order.push(id);
-					}),
-				);
-			}
-		await Promise.resolve();
-		order.push("boundary");
-		if (scenario === "cancel") {
-			controller.abort();
-			querySignal = options.abortController?.signal;
-		} else yield raw("message_delta", { delta: { stop_reason: "tool_use" }, usage });
-		await Promise.all(denials);
-		yield { type: "result", subtype: "error_max_turns", is_error: true, errors: [] };
-		throw Error("SDK exited after one turn");
-	});
-	const msg = await f.provider.streamSimple(model, { ...context, tools }, { signal: controller.signal }).result();
-	expect(msg.stopReason).toBe(scenario === "cancel" ? "aborted" : scenario === "two calls" ? "toolUse" : "error");
-	if (scenario === "cancel") expect(querySignal?.aborted).toBe(true);
-	if (scenario !== "no calls") expect(order).toEqual(["boundary", "call-0", "call-1"]);
-	if (scenario === "two calls")
-		expect(msg.content.filter((b) => b.type === "toolCall")).toEqual(
-			tools.map((t, n) => ({ type: "toolCall", id: `call-${n}`, name: t.name, arguments: { n } })),
-		);
-});
-it.each(["missing binary", "missing login", "superseded output"])("fails visibly: %s", async (scenario) => {
-	let calls = 0;
-	const f = fixture(async function* () {
-		calls++;
-		if (scenario === "superseded output") {
-			yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "retracted" } });
-			yield { type: "assistant", uuid: checkpointAt };
-			yield { type: "assistant", uuid: forkedSession, supersedes: [checkpointAt] };
-			yield result();
-			return;
-		}
-		yield { type: "assistant", error: "authentication_failed", message: { content: [] } };
-	});
-	if (scenario === "missing binary") {
-		writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ enabled: true }));
-		vi.stubEnv("PATH", join(f.dir, "empty"));
-	}
-	const msg = await f.provider.streamSimple(model, context).result();
-	expect(msg.stopReason).toBe("error");
-	expect(msg.errorMessage).toMatch(
-		scenario === "missing binary"
-			? /PATH.*claudePath|claudePath.*PATH/
-			: scenario === "missing login"
-				? /claude auth login/
-				: /superseded/i,
-	);
-	if (scenario === "missing binary") expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
-	if (scenario === "missing login")
-		expect(providerStreamFailureDetails(msg)).toMatchObject({
-			kind: "permission",
-			providerErrorType: "authentication_failed",
+it.each(["two calls", "two calls with max_tokens", "no calls", "cancel"])(
+	"handles held denials: %s",
+	async (scenario) => {
+		const controller = new AbortController();
+		let querySignal: AbortSignal | undefined;
+		const order: string[] = [];
+		const f = fixture(async function* ({ options }) {
+			yield raw("message_start");
+			const hook = options.hooks?.PreToolUse?.[0].hooks[0];
+			if (!hook) throw Error("missing hook");
+			const denials: Promise<unknown>[] = [];
+			if (scenario !== "no calls")
+				for (const [index, t] of tools.entries()) {
+					const id = `call-${index}`,
+						name = `mcp__prime__${t.name}`,
+						input = { n: index };
+					yield raw("content_block_start", { index, content_block: { type: "tool_use", id, name, input: {} } });
+					yield raw("content_block_stop", { index });
+					const promise = hook(
+						{ hook_event_name: "PreToolUse", tool_name: name, tool_input: input, tool_use_id: id } as HookInput,
+						id,
+						{ signal: controller.signal },
+					);
+					denials.push(
+						promise.then((response) => {
+							expect(response).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+							order.push(id);
+						}),
+					);
+				}
+			await Promise.resolve();
+			order.push("boundary");
+			if (scenario === "cancel") {
+				controller.abort();
+				querySignal = options.abortController?.signal;
+			} else yield raw("message_delta", { delta: { stop_reason: "tool_use" }, usage });
+			await Promise.all(denials);
+			yield {
+				type: "result",
+				subtype: "error_max_turns",
+				is_error: true,
+				errors: [],
+				stop_reason: scenario === "two calls with max_tokens" ? "max_tokens" : null,
+			};
+			throw Error("SDK exited after one turn");
 		});
-	expect(calls).toBe(scenario === "missing binary" ? 0 : 1);
-	expect(msg.content).toEqual([]);
-});
+		const msg = await f.provider.streamSimple(model, { ...context, tools }, { signal: controller.signal }).result();
+		expect(msg.stopReason).toBe(
+			scenario === "cancel" ? "aborted" : scenario.startsWith("two calls") ? "toolUse" : "error",
+		);
+		if (scenario === "cancel") expect(querySignal?.aborted).toBe(true);
+		if (scenario !== "no calls") expect(order).toEqual(["boundary", "call-0", "call-1"]);
+		if (scenario.startsWith("two calls"))
+			expect(msg.content.filter((b) => b.type === "toolCall")).toEqual(
+				tools.map((t, n) => ({ type: "toolCall", id: `call-${n}`, name: t.name, arguments: { n } })),
+			);
+	},
+);
+it.each(["missing binary", "missing login", "superseded output", "execution error with max_tokens"])(
+	"fails visibly: %s",
+	async (scenario) => {
+		let calls = 0;
+		const f = fixture(async function* () {
+			calls++;
+			if (scenario === "superseded output") {
+				yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "retracted" } });
+				yield { type: "assistant", uuid: checkpointAt };
+				yield { type: "assistant", uuid: forkedSession, supersedes: [checkpointAt] };
+				yield result();
+				return;
+			}
+			if (scenario === "execution error with max_tokens") {
+				yield {
+					type: "result",
+					subtype: "error_during_execution",
+					is_error: true,
+					errors: ["execution failed"],
+					stop_reason: "max_tokens",
+				};
+				return;
+			}
+			yield { type: "assistant", error: "authentication_failed", message: { content: [] } };
+		});
+		if (scenario === "missing binary") {
+			writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ enabled: true }));
+			vi.stubEnv("PATH", join(f.dir, "empty"));
+		}
+		const msg = await f.provider.streamSimple(model, context).result();
+		expect(msg.stopReason).toBe("error");
+		expect(msg.errorMessage).toMatch(
+			scenario === "missing binary"
+				? /PATH.*claudePath|claudePath.*PATH/
+				: scenario === "missing login"
+					? /claude auth login/
+					: scenario === "superseded output"
+						? /superseded/i
+						: /execution failed/,
+		);
+		if (scenario === "missing binary") expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
+		if (scenario === "missing login")
+			expect(providerStreamFailureDetails(msg)).toMatchObject({
+				kind: "permission",
+				providerErrorType: "authentication_failed",
+			});
+		expect(calls).toBe(scenario === "missing binary" ? 0 : 1);
+		expect(msg.content).toEqual([]);
+	},
+);
 it.each([
 	["oauth_org_not_allowed", "permission"],
 	["account_on_hold", "permission"],
@@ -324,6 +350,18 @@ it.each([
 	expect(msg.errorMessage).toContain(detail);
 	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
+const quietEnvironment = {
+	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+	DISABLE_TELEMETRY: "1",
+	DISABLE_ERROR_REPORTING: "1",
+	DISABLE_FEEDBACK_COMMAND: "1",
+	CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
+	DISABLE_AUTOUPDATER: "1",
+	CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+	CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+	ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+	CLAUDE_CODE_MAX_RETRIES: "0",
+};
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
 	for (const key of [
 		"ANTHROPIC_API_KEY",
@@ -333,6 +371,10 @@ it.each(["allowlist"])("restricts the child environment by %s", async () => {
 		"CLAUDE_CODE_SESSION_ACCESS_TOKEN",
 		"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_UNRELATED",
+		"ANTHROPIC_UNRELATED",
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+		...Object.keys(quietEnvironment),
 		"DISABLE_AUTO_COMPACT",
 		"OTHER",
 	])
@@ -343,8 +385,13 @@ it.each(["allowlist"])("restricts the child environment by %s", async () => {
 		env = options.env;
 		yield* textTurn("end_turn");
 	});
-	await f.provider.streamSimple(model, context).result();
-	expect(env).toMatchObject({ LC_FIXTURE: "kept", DISABLE_AUTO_COMPACT: "1" });
+	await f.provider.streamSimple(model, context, { maxTokens: 64 }).result();
+	expect(env).toMatchObject({
+		...quietEnvironment,
+		CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64",
+		LC_FIXTURE: "kept",
+		DISABLE_AUTO_COMPACT: "1",
+	});
 	expect(
 		Object.keys(env ?? {}).filter(
 			(k) =>
@@ -989,15 +1036,9 @@ it.each(["arguments and pre-hook rejection"])("AC-20 repairs hook %s without sal
 	const tool = {
 		name: "repair",
 		description: "repair fixture",
-		parameters: Type.Object({
-			file_path: Type.String(),
-			object: Type.Object({}),
-			array: Type.Array(Type.Number()),
-			literal: Type.String(),
-			count: Type.Number(),
-		}),
+		parameters: Type.Object({ file_path: Type.String() }),
 	};
-	const input = { filePath: "project", object: '{"enabled":true}', array: "[1,2]", literal: "[1,2]", count: "7" };
+	const input = { filePath: "project" };
 	let calls = 0;
 	const f = fixture(async function* ({ options }) {
 		const id = `call-${++calls}`;
@@ -1028,50 +1069,9 @@ it.each(["arguments and pre-hook rejection"])("AC-20 repairs hook %s without sal
 			type: "toolCall",
 			id: "call-1",
 			name: "repair",
-			arguments: { file_path: "project", object: { enabled: true }, array: [1, 2], literal: "[1,2]", count: "7" },
+			arguments: { file_path: "project" },
 		},
 	]);
-});
-
-const quietEnvironment = {
-	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-	DISABLE_TELEMETRY: "1",
-	DISABLE_ERROR_REPORTING: "1",
-	DISABLE_FEEDBACK_COMMAND: "1",
-	CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
-	DISABLE_AUTOUPDATER: "1",
-	CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
-	CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
-	ENABLE_CLAUDEAI_MCP_SERVERS: "false",
-	CLAUDE_CODE_MAX_RETRIES: "0",
-};
-it.each(["quiet switches"])("AC-21 fixes the %s and drops other Claude and Anthropic variables", async () => {
-	for (const key of Object.keys(quietEnvironment)) vi.stubEnv(key, "altered");
-	vi.stubEnv("CLAUDE_UNRELATED", "sentinel");
-	vi.stubEnv("ANTHROPIC_UNRELATED", "sentinel");
-	vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
-	let options: Options | undefined;
-	const f = fixture(async function* (args) {
-		options = args.options;
-		yield* textTurn("end_turn");
-	});
-	await f.provider.streamSimple(model, context, { maxTokens: 64 }).result();
-	expect(options).toMatchObject({
-		env: { ...quietEnvironment, CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64" },
-		strictMcpConfig: true,
-		settingSources: [],
-		settings: { disableClaudeAiConnectors: true },
-	});
-	expect(
-		Object.keys(options?.env ?? {})
-			.filter((key) => /^(CLAUDE|ANTHROPIC)_/.test(key))
-			.sort(),
-	).toEqual(
-		[
-			...Object.keys(quietEnvironment).filter((key) => key.startsWith("CLAUDE_")),
-			"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-		].sort(),
-	);
 });
 
 it.each(["no output", "thinking with empty text"])("AC-22 rejects an empty turn with %s", async (kind) => {
@@ -1147,7 +1147,7 @@ it.each(["keepalives"])("AC-22 aborts and closes a query stalled on %s", async (
 	}
 });
 
-it.each(["max_tokens result", "CLI cap error result", "CLI cap exception"])(
+it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 	"AC-22 discards the partial tool call on %s",
 	async (terminal) => {
 		let calls = 0;
@@ -1160,10 +1160,18 @@ it.each(["max_tokens result", "CLI cap error result", "CLI cap exception"])(
 				content_block: { type: "tool_use", id: "cut", name: "mcp__prime__one", input: {} },
 			});
 			yield raw("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"nest' } });
-			const capExceeded = "API Error: Claude's response exceeded the 64 output token maximum.";
+			const capExceeded =
+				"Claude's response exceeded the 32 output token maximum. To configure this limit, set CLAUDE_CODE_MAX_OUTPUT_TOKENS.";
 			if (terminal === "CLI cap exception") throw Error(`Claude Code returned an error result: ${capExceeded}`);
-			if (terminal === "CLI cap error result") {
+			if (terminal === "CLI cap assistant error") {
+				yield {
+					type: "assistant",
+					error: "max_output_tokens",
+					message: { content: [{ type: "text", text: capExceeded }] },
+					parent_tool_use_id: null,
+				};
 				yield { type: "result", subtype: "error_during_execution", is_error: true, errors: [capExceeded] };
+				throw Error("Claude Code exited with code 1");
 			} else yield result("max_tokens");
 		});
 		const msg = await f.provider.streamSimple(model, { ...context, tools }, { maxTokens: 64 }).result();

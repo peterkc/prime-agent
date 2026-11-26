@@ -1,0 +1,2 @@
+- Added tool-input repair and unique tool aliases for `claude-sdk`, with quieter Claude Code startup and visible errors for empty or idle turns.
+- Fixed capped `claude-sdk` turns to report the token limit without returning incomplete tool calls.

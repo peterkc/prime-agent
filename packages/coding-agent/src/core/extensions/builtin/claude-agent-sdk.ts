@@ -321,8 +321,7 @@ export class ClaudeSdkProvider {
 			const path = executable(settings.claudePath);
 			const tools = aliasPrimeTools(context.tools ?? []);
 			const maxTokens = options?.maxTokens ?? model.maxTokens;
-			const capped = (message: string) =>
-				message.includes(`Claude's response exceeded the ${maxTokens} output token maximum.`);
+			const capped = (message: string) => /Claude's response exceeded the \d+ output token maximum\./.test(message);
 			let point = resumePoint(model, context);
 			stream.push({ type: "start", partial: msg });
 			for (;;) {
@@ -429,6 +428,12 @@ export class ClaudeSdkProvider {
 							msg.content = [];
 							throw Error("Claude superseded earlier output; discarding this turn");
 						}
+						if (m.type === "assistant" && m.error === "max_output_tokens") {
+							release();
+							msg.stopReason = "length";
+							completed = true;
+							break;
+						}
 						if (m.type === "assistant" && m.error) {
 							const error = m.error;
 							// Claude owns login. Prime's one auth retry cannot refresh it.
@@ -459,12 +464,12 @@ export class ClaudeSdkProvider {
 						}
 						if (m.type === "result") {
 							release();
-							if (m.stop_reason === "max_tokens") {
-								msg.stopReason = "length";
-							} else if (m.subtype === "error_max_turns" && captured.size) {
+							if (m.subtype === "error_max_turns" && captured.size) {
 								limitAfterTools = true;
 							} else if (m.subtype !== "success" || m.is_error) {
 								throw Error(m.subtype === "success" ? m.result : m.errors.join("; ") || m.subtype);
+							} else if (m.stop_reason === "max_tokens") {
+								msg.stopReason = "length";
 							}
 							completed = true;
 							continue;
@@ -553,9 +558,7 @@ export class ClaudeSdkProvider {
 						!ctrl.signal.aborted &&
 						!captured.size &&
 						!msg.content.length &&
-						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(
-							message,
-						)
+						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(message)
 					) {
 						release();
 						await server.close();

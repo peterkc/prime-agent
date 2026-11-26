@@ -4,6 +4,17 @@ import { repairToolInput } from "../src/core/extensions/builtin/claude-agent-sdk
 
 it.each([
 	{
+		kind: "JSON containers and unchanged string and number",
+		schema: Type.Object({
+			object: Type.Object({}),
+			array: Type.Array(Type.Number()),
+			literal: Type.String(),
+			count: Type.Number(),
+		}),
+		input: { object: '{"enabled":true}', array: "[1,2]", literal: "[1,2]", count: "7" },
+		output: { object: { enabled: true }, array: [1, 2], literal: "[1,2]", count: "7" },
+	},
+	{
 		kind: "nested snake case and boolean string",
 		schema: Type.Object({ groups: Type.Array(Type.Object({ filePath: Type.String(), enabled: Type.Boolean() })) }),
 		input: { groups: [{ file_path: "foo", enabled: "true", extra: "[]" }] },
