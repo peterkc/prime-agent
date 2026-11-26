@@ -241,6 +241,8 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+/** The refusal text when a process outside this daemon holds a lease in the move's transcript set. `prime-agent move` matches it. */
+export const OPEN_OR_BEING_WRITTEN_ELSEWHERE = "open or being written elsewhere";
 // The daemon client's default request budget is 30s and each ready-worker heartbeat
 // forward gets 5s, so waiting longer than this on in-flight launches would only
 // surface as a client transport timeout instead of a bounded per-worker state error.
@@ -3336,9 +3338,12 @@ export class DaemonSupervisor {
 					leases = acquireSessionMoveLeases(paths, paths.agentDir);
 				} catch (error) {
 					if (error instanceof SessionAlreadyActiveError)
-						throw new Error(`Cannot move session ${error.sessionPath}: it is open or being written elsewhere`, {
-							cause: error,
-						});
+						throw new Error(
+							`Cannot move session ${error.sessionPath}: it is ${OPEN_OR_BEING_WRITTEN_ELSEWHERE}`,
+							{
+								cause: error,
+							},
+						);
 					throw error;
 				}
 				const { info } = await this.checkSessionMove(command);

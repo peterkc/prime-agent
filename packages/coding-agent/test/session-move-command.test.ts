@@ -42,7 +42,7 @@ vi.mock("node:net", async (original) => ({
 vi.mock("../src/utils/child-process.js", () => ({ spawnHidden: vi.fn() }));
 vi.mock("../src/cli/session-hosts.js", async (original) => {
 	const actual = await original<typeof SessionHosts>();
-	return { ...actual, findSessionHosts: vi.fn(async () => []), formatMoveHint: vi.fn(actual.formatMoveHint) };
+	return { ...actual, findSessionHosts: vi.fn(async () => []) };
 });
 vi.mock("../src/cli/daemon-stop-confirm.js", async (original) => ({
 	...(await original<typeof StopConfirm>()),
@@ -450,11 +450,11 @@ describe("session move command", () => {
 		expect(errors()).toContain(error);
 		if (kind === "other") {
 			expect(findSessionHosts).not.toHaveBeenCalled();
-			expect(formatMoveHint).not.toHaveBeenCalled();
+			expect(errors()).not.toMatch(/run this move again/);
 			return;
 		}
 		expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("session-1", f.sourceSocket);
-		expect(formatMoveHint).toHaveBeenCalledExactlyOnceWith(kind === "claimed" ? hosts : [], f.target, kind);
+		expect(errors()).toContain(formatMoveHint(kind === "claimed" ? hosts : [], kind));
 		if (kind === "claimed") expect(errors()).toContain("stop 0fe15d9b54cc --daemon-socket /run/default.sock");
 	});
 	it.each(["delayed", "disconnect", "timeout", "before-send"])(

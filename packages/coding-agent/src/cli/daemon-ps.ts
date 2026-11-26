@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, VERSION } from "../config.js";
@@ -27,6 +27,7 @@ import {
 	signalProcessGroupIfHeld,
 	spawnSyncHidden,
 } from "../utils/child-process.js";
+import { canonicalizePath } from "../utils/paths.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 
@@ -463,20 +464,12 @@ export function findSharedSessionFolders(
 		if (daemon.status !== "current" && daemon.status !== "stale") continue;
 		const folder = sessionDirOf(daemon.socketPath);
 		if (!folder) continue;
-		const sessionDir = canonicalFolder(folder);
+		const sessionDir = resolve(canonicalizePath(folder));
 		socketsByFolder.set(sessionDir, [...(socketsByFolder.get(sessionDir) ?? []), daemon.socketPath]);
 	}
 	return [...socketsByFolder]
 		.filter(([, socketPaths]) => socketPaths.length > 1)
 		.map(([sessionDir, socketPaths]) => ({ sessionDir, socketPaths }));
-}
-
-function canonicalFolder(folder: string): string {
-	try {
-		return realpathSync(folder);
-	} catch {
-		return resolve(folder);
-	}
 }
 
 /**

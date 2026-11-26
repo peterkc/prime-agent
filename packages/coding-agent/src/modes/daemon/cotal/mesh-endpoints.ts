@@ -45,6 +45,7 @@ import {
 	withDirectoryLock,
 } from "./enrollment.js";
 import {
+	CLAIMED_BY_ANOTHER_DAEMON,
 	type GateWatcherRecord,
 	InvalidMeshPayloadError,
 	MeshNotStoredError,
@@ -58,7 +59,6 @@ import {
 export { MeshTransferRecordError } from "./mesh-shared.js";
 
 const MESH_SEND_TIMEOUT_MS = 30_000;
-const CLAIMED_BY_ANOTHER_DAEMON = "claimed by another daemon";
 
 export type MeshHandoffResult = { status: "deferred"; reason: "run_active" };
 
@@ -458,7 +458,7 @@ export class MeshEndpoints {
 		} catch (error) {
 			if (!this.transfers.has(sessionId)) this.moving.delete(sessionId);
 			if (error instanceof SessionAlreadyActiveError)
-				throw new Error(`Session ${sessionId}: claimed by another daemon`, { cause: error });
+				throw new Error(`Session ${sessionId}: ${CLAIMED_BY_ANOTHER_DAEMON}`, { cause: error });
 			throw error;
 		}
 	}
@@ -579,7 +579,7 @@ export class MeshEndpoints {
 			beginning.state = "failed";
 			if (replacement && this.replacements.get(sessionId) === replacement) this.replacements.delete(sessionId);
 			if (error instanceof SessionAlreadyActiveError)
-				throw new Error(`Session ${sessionId}: claimed by another daemon`, { cause: error });
+				throw new Error(`Session ${sessionId}: ${CLAIMED_BY_ANOTHER_DAEMON}`, { cause: error });
 			throw error;
 		} finally {
 			this.replacementBegins.delete(sessionId);

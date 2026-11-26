@@ -109,15 +109,23 @@ export function formatStopHint(hosts: readonly SessionHost[]): string {
 /** Why the source daemon refused the move: another daemon holds the mesh claim, or a process has the file open. */
 export type MoveRefusal = "claimed" | "open";
 
-export function formatMoveHint(hosts: readonly SessionHost[], targetFolder: string, refusal: MoveRefusal): string {
+const STOP_CLAIM_HOLDER = `Stop that daemon (\`${APP_NAME} status\` lists the daemons), then run this move again.`;
+
+/**
+ * The host lookup knows where the session runs, not which daemon holds its mesh claim or file lease. So a host only
+ * gets a stop command, and the move runs again from the same daemon; a claim still held after that needs its holder
+ * stopped.
+ */
+export function formatMoveHint(hosts: readonly SessionHost[], refusal: MoveRefusal): string {
 	if (hosts.length === 0)
 		return refusal === "claimed"
-			? `Another daemon holds this session's mesh claim, often the daemon that ran it before. Stop that daemon (\`${APP_NAME} status\` lists the daemons), then run this move again.`
+			? `Another daemon holds this session's mesh claim, often the daemon that ran it before. ${STOP_CLAIM_HOLDER}`
 			: "Another process has the session file or one of its child transcripts open. Close it, then run this move again.";
-	return hosts
-		.map(
-			(host) =>
-				`${hostLabel(host)}. Stop it there, then move it from that daemon:\n  ${stopCommand(host)}\n  ${APP_NAME} move ${quoteArgument(host.sessionId)} ${quoteArgument(targetFolder)} --daemon-socket ${quoteArgument(host.socketPath)}`,
-		)
-		.join("\n");
+	const steps = hosts.map(
+		(host) => `${hostLabel(host)}. Stop it there, then run this move again:\n  ${stopCommand(host)}`,
+	);
+	return [
+		...steps,
+		`If the move is then refused because another daemon holds this session's mesh claim: ${STOP_CLAIM_HOLDER}`,
+	].join("\n");
 }

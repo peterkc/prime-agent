@@ -90,15 +90,24 @@ describe("pi-dkwcu session hosts", () => {
 		expect(await findSessionHosts(ARC, "/run/prime.sock", failing)).toEqual([]);
 	});
 
-	it("gives the stop and move commands for the host, or advice for the refusal without one", () => {
-		const host = { socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: ARC };
-		const hint = formatMoveHint([host], "/Volumes/arc hiq", "claimed");
-		for (const text of [
-			`${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`,
-			`${APP_NAME} move ${ARC} '/Volumes/arc hiq' --daemon-socket /run/default.sock`,
-		])
-			expect(hint).toContain(text);
-		expect(formatMoveHint([], "/Volumes/archiq", "claimed")).toContain(`${APP_NAME} status`);
-		expect(formatMoveHint([], "/Volumes/archiq", "open")).not.toMatch(/status|--daemon-socket/);
+	it.each(["claimed", "open"] as const)(
+		"F27 a %s refusal with a host gives its stop command, no move from it, and the claim-holder step",
+		(refusal) => {
+			const hosts = [
+				{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: ARC },
+				{ socketPath: "/run/arc hiq.sock", activeSessionId: "c39ad04fac8b", sessionId: ARC },
+			];
+			const hint = formatMoveHint(hosts, refusal);
+			expect(hint).toContain(`${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`);
+			expect(hint).toContain(`${APP_NAME} stop c39ad04fac8b --daemon-socket '/run/arc hiq.sock'`);
+			expect(hint).not.toContain(`${APP_NAME} move`);
+			// The follow-up when the claim holder is not the host: the no-host claim advice.
+			expect(hint).toContain(`${APP_NAME} status`);
+		},
+	);
+
+	it("gives advice for a refusal without a host", () => {
+		expect(formatMoveHint([], "claimed")).toContain(`${APP_NAME} status`);
+		expect(formatMoveHint([], "open")).not.toMatch(/status|--daemon-socket/);
 	});
 });

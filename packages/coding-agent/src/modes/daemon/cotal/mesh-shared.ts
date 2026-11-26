@@ -6,6 +6,9 @@ import {
 	parseAgentMessageScheduling,
 } from "../../../core/agent-messages.js";
 
+/** The refusal text when another process holds a session's mesh claim. `prime-agent move` matches it. */
+export const CLAIMED_BY_ANOTHER_DAEMON = "claimed by another daemon";
+
 function sessionKey(sessionId: string): string {
 	if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid mesh session ID");
 	return sessionId;
