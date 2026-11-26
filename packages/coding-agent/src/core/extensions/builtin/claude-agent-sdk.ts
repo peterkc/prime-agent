@@ -581,7 +581,8 @@ export class ClaudeSdkProvider {
 				const allToolsCaptured = [...toolOrder.keys()].every((id) => captured.has(id));
 				if (msg.stopReason !== "length") {
 					if (!allToolsCaptured) throw Error("Claude rejected a tool call before Prime could capture it");
-					if (!hasTurnOutput(msg.content, captured.size)) throw Error("Claude returned nothing.");
+					if (!hasTurnOutput(msg.content, captured.size))
+						throw new StreamFailureError("Claude returned nothing.", { kind: "invalid_request" });
 				}
 				msg.stopReason = msg.stopReason === "length" ? "length" : captured.size ? "toolUse" : "stop";
 				for (const call of [...captured.values()].sort(

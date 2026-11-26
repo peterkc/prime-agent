@@ -1098,6 +1098,7 @@ it.each(["no output", "thinking with empty text"])("AC-22 rejects an empty turn 
 	const msg = await f.provider.streamSimple(model, context).result();
 	expect(msg.stopReason).toBe("error");
 	expect(msg.errorMessage).toMatch(/Claude returned nothing/i);
+	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 	expect(calls).toBe(1);
 });
 
