@@ -19,11 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import {
-	ORPHAN_PROCESS_JOURNAL_ENV,
-	reapKernelOrphanProcesses,
-	recordOrphanProcessState,
-} from "../orphan-process-journal.ts";
+import { ORPHAN_PROCESS_JOURNAL_ENV, reapKernelOrphanProcesses } from "../orphan-process-journal.ts";
 import { spawnHidden } from "../utils/child-process.ts";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
@@ -357,10 +353,6 @@ export class ReplKernelManager {
 		// handlers can dispose a kernel that is still booting.
 		liveKernels.add(this);
 
-		if ((this.state as string) === "shutdown") {
-			throw new Error("Kernel was disposed during startup");
-		}
-
 		// Per-kernel journals have no later scavenger: host death without 'exit' leaves this dir.
 		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
 		// Print/RPC SIGINT skips awaited shutdown, so Ctrl-C takes no final snapshot.
@@ -380,7 +372,6 @@ export class ReplKernelManager {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.child = child;
-		if (child.pid !== undefined) recordOrphanProcessState(child.pid, true, journalPath);
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
 		this.wireChild(child);
@@ -1434,18 +1425,15 @@ export class ReplKernelManager {
 				child.stderr?.destroy();
 			}
 			const pid = child.pid;
-			let signaled = false;
 			try {
-				signaled = child.kill(killSignal);
+				child.kill(killSignal);
 			} catch {
 				// The kernel has already exited.
 			}
-			// Inactive only when the signal proved the pid still named our un-reaped child.
-			const journalPath = this.orphanJournalDir ? join(this.orphanJournalDir, "processes.jsonl") : undefined;
-			if (pid !== undefined && signaled) recordOrphanProcessState(pid, false, journalPath);
 			// A killed/crashed kernel cannot run its own shutdown hook, so the host
 			// reaps the bash() process groups it journaled under this kernel pid.
-			if (pid !== undefined) reapKernelOrphanProcesses(pid, journalPath);
+			if (pid !== undefined && this.orphanJournalDir)
+				reapKernelOrphanProcesses(pid, join(this.orphanJournalDir, "processes.jsonl"));
 		}
 		if (this.orphanJournalDir) {
 			rmSync(this.orphanJournalDir, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
 import { win32 } from "node:path";
 import { execFileSyncHidden, spawnSyncHidden } from "./utils/child-process.ts";
 
@@ -22,11 +22,7 @@ export interface ActiveOrphanProcess {
 	processStartId?: string;
 }
 
-export function recordOrphanProcessState(
-	pid: number,
-	active: boolean,
-	path = process.env[ORPHAN_PROCESS_JOURNAL_ENV],
-): void {
+export function recordOrphanProcessState(pid: number, active: boolean, path: string): void {
 	if (!path || !Number.isInteger(pid) || pid <= 0) {
 		return;
 	}
@@ -116,12 +112,8 @@ export function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
 	return isOrphanProcessIdentityCurrent(orphan);
 }
 
-export function clearOrphanProcessJournal(path: string): void {
-	rmSync(path, { force: true });
-}
-
 // Kills still-active bash() children journaled by the given kernel pid; sibling kernels' records are untouched.
-export function reapKernelOrphanProcesses(kernelPid: number, path = process.env[ORPHAN_PROCESS_JOURNAL_ENV]): void {
+export function reapKernelOrphanProcesses(kernelPid: number, path: string): void {
 	if (!path || !Number.isInteger(kernelPid) || kernelPid <= 0) {
 		return;
 	}
