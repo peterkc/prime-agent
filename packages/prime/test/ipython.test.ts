@@ -315,6 +315,22 @@ describe("ipython extension boundary", () => {
 		expect(secure).not.toHaveBeenCalled();
 	});
 
+	it("R3-1: an interpreter probe killed by a signal reports its stderr, not a timeout", async () => {
+		const { cell, dir } = await host(false);
+		const crashing = join(dir, "crashing-python");
+		writeFileSync(
+			crashing,
+			`#!${python}\nimport os, signal, sys\nsys.stderr.write("native extension crashed\\n")\nsys.stderr.flush()\nos.kill(os.getpid(), signal.SIGTERM)\n`,
+			{ mode: 0o700 },
+		);
+		vi.stubEnv(pythonVariable, crashing);
+		const result = await cell("42");
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain(pythonVariable);
+		expect(text(result)).toContain("native extension crashed");
+		expect(text(result)).not.toMatch(/timed out/i);
+	});
+
 	it("F5: test services and snapshots use only the test agent directory", async () => {
 		const { runtime, cell, dir } = await host();
 		expect(getAgentDir()).toBe(join(dir, "agent"));

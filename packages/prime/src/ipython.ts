@@ -94,7 +94,11 @@ class IpythonKernelProvisioner {
 		});
 		try {
 			if ((await waitForChildProcess(check)) !== 0)
-				throw new Error(check.signalCode || check.killed ? "Interpreter import check timed out" : stderr.trim());
+				throw new Error(
+					check.killed
+						? "Interpreter import check timed out"
+						: stderr.trim() || `Interpreter import check ended by ${check.signalCode}`,
+				);
 		} catch (error) {
 			throw new Error(`${variable} cannot import rlm.repl and dill: ${errorMessage(error)}`, { cause: error });
 		}
