@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { run } from "../src/cli.ts";
 import ipython from "../src/ipython.ts";
 import { ReplKernelManager } from "../src/kernel/repl-manager.ts";
+import { DEFAULT_MAX_OUTPUT_CHARS, type ExecuteOptions, type ExecuteResult } from "../src/kernel/shared.ts";
 import { processGroupHasLiveMember } from "../src/utils/child-process.ts";
 
 const python = fileURLToPath(new URL("../runtime/.venv/bin/python", import.meta.url));
@@ -167,6 +168,153 @@ function holdFinalSnapshot(path: string) {
 }
 
 describe("ipython extension boundary", () => {
+	it("R2-1: large streamed output keeps bounded partial-result tails", async () => {
+		const { runtime, cell } = await host(false);
+		const updates: string[] = [];
+		runtime.session.subscribe((event) => {
+			if (event.type === "tool_execution_update") {
+				for (const block of event.partialResult.content) {
+					if (block.type === "text") updates.push(block.text);
+				}
+			}
+		});
+		const result = await cell("print('x' * 200000, end='stream-tail', flush=True)");
+		expect(result.isError).toBe(false);
+		expect(updates.length).toBeGreaterThan(0);
+		expect(updates.every((update) => update.length <= DEFAULT_MAX_OUTPUT_CHARS)).toBe(true);
+		expect(updates.at(-1)).toBe(`${"x".repeat(DEFAULT_MAX_OUTPUT_CHARS - 11)}stream-tail`);
+	});
+
+	it.each(["ok", "reject"] as const)("R2-1: throttles updates and flushes on %s", async (mode) => {
+		const { runtime, cell } = await host(false);
+		await cell("0");
+		const tool = runtime.session.agent.state.tools.find((tool) => tool.name === "ipython");
+		if (!tool) throw new Error("ipython was not registered");
+		const entered = Promise.withResolvers<ExecuteOptions>();
+		const release = Promise.withResolvers<ExecuteResult>();
+		vi.spyOn(ReplKernelManager.prototype, "execute").mockImplementationOnce((_code, options) => {
+			entered.resolve(options ?? {});
+			return release.promise;
+		});
+		const updates: string[] = [];
+		const pending = tool.execute("stream", { code: "controlled stream" }, undefined, (update) => {
+			for (const block of update.content) {
+				if (block.type === "text") updates.push(block.text);
+			}
+		});
+		const options = await entered.promise;
+		vi.useFakeTimers({ now: 1000 });
+		try {
+			options.onStream?.("first", "stdout");
+			options.onStream?.("-second", "stderr");
+			expect(updates).toEqual(["first"]);
+			await vi.advanceTimersByTimeAsync(99);
+			expect(updates).toEqual(["first"]);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(updates).toEqual(["first", "first-second"]);
+			options.onStream?.("-last", "stdout");
+			if (mode === "ok") {
+				release.resolve({ stdout: "first-last", stderr: "-second", status: "ok", durationMs: 0 });
+				await pending;
+			} else {
+				const rejected = expect(pending).rejects.toThrow("stream failure");
+				release.reject(new Error("stream failure"));
+				await rejected;
+			}
+			expect(updates).toEqual(["first", "first-second", "first-second-last"]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			release.resolve({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+			await pending.catch(() => undefined);
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["success", "partial"] as const)("R2-4: reports the final %s restore retry outcome", async (mode) => {
+		const { runtime, cell, dir, open } = await host();
+		writeFileSync(join(dir, "retry_module.py"), "class Value:\n    pass\n");
+		await cell(
+			"import sys\nsys.path.insert(0, '.')\nimport retry_module as _retry\nx = 41\nfailed_to_revive = _retry.Value()",
+		);
+		const file = runtime.session.sessionFile;
+		if (!file) throw new Error("Expected a saved session file");
+		await runtime.dispose();
+		const path = snapshot(runtime);
+		const saved = readFileSync(path);
+		writeFileSync(path, "broken-payload");
+		if (mode === "partial") rmSync(join(dir, "retry_module.py"));
+		const restore = ReplKernelManager.prototype.restoreState;
+		vi.spyOn(ReplKernelManager.prototype, "restoreState").mockImplementation(async function (
+			this: ReplKernelManager,
+		) {
+			const restored = await restore.call(this);
+			expect(restored).toBeNull();
+			writeFileSync(path, saved);
+			return restored;
+		});
+		const writes = vi.spyOn(ReplKernelManager.prototype as unknown as KernelWire, "writeLine");
+		const reopened = await open(SessionManager.open(file));
+		const result = await cell("x", reopened);
+		expect(result.isError).toBe(false);
+		expect(writes.mock.calls.filter(([request]) => request.type === "restore")).toHaveLength(2);
+		expect(text(result)).toContain("41");
+		expect(text(result)).not.toContain("all saved names were lost");
+		if (mode === "partial") expect(text(result)).toContain("Failed to revive: failed_to_revive");
+		else {
+			expect(text(result).trim()).toBe("41");
+			expect(text(await cell("type(failed_to_revive).__name__", reopened)).trim()).toBe("'Value'");
+		}
+		expect(text(await cell("42", reopened)).trim()).toBe("42");
+	});
+
+	it("R2-4: failed restore without retry preserves saved bytes during disposal", async () => {
+		const { dir } = await host(false);
+		const path = join(dir, "kernel-state.dill");
+		const saved = Buffer.from("broken-payload-that-must-not-be-overwritten");
+		writeFileSync(path, saved);
+		const manager = new ReplKernelManager({
+			python,
+			cwd: dir,
+			snapshot: { path, manifestPath: join(dir, "kernel-state.json") },
+		});
+		cleanups.push(async () => {
+			await manager.shutdown({ snapshot: false });
+		});
+		await manager.start();
+		expect(await manager.restoreState()).toBeNull();
+		await manager.shutdown({ snapshot: true });
+		expect(readFileSync(path)).toEqual(saved);
+	});
+
+	it("R2-5: a hanging interpreter probe reports its timeout", async () => {
+		const { cell, dir } = await host(false);
+		const hanging = join(dir, "hanging-python");
+		writeFileSync(hanging, `#!${python}\nimport signal\nsignal.pause()\n`, { mode: 0o700 });
+		vi.stubEnv(pythonVariable, hanging);
+		const spawn = childProcess.spawn;
+		const spawns = vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+			expect(options?.timeout).toBe(5000);
+			return spawn(command, args, { ...options, timeout: 25 });
+		});
+		syncBuiltinESMExports();
+		const network = vi.fn(() => {
+			throw new Error("No network is allowed");
+		});
+		vi.stubGlobal("fetch", network);
+		const tcp = vi.spyOn(net, "connect");
+		const secure = vi.spyOn(tls, "connect");
+		syncBuiltinESMExports();
+		const result = await cell("42");
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain(pythonVariable);
+		expect(text(result)).toMatch(/timed out/i);
+		expect(spawns.mock.calls).toHaveLength(1);
+		expect(spawns.mock.calls[0][1]).toEqual(["-c", "import rlm.repl, dill"]);
+		expect(network).not.toHaveBeenCalled();
+		expect(tcp).not.toHaveBeenCalled();
+		expect(secure).not.toHaveBeenCalled();
+	});
+
 	it("F5: test services and snapshots use only the test agent directory", async () => {
 		const { runtime, cell, dir } = await host();
 		expect(getAgentDir()).toBe(join(dir, "agent"));

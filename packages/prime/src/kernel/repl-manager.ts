@@ -250,6 +250,7 @@ export class ReplKernelManager {
 	private pendingRebootstrap = false;
 	/** Restore the saved namespace on that fresh start too (false when the snapshot itself is the declared culprit). */
 	private pendingRestore = false;
+	private restoreResult: RestoreResult | null = null;
 	private completedExecutions = 0;
 	/** Tri-state: undefined = no non-repair restore attempted yet, null = manifest was missing at that attempt. */
 	private restoredManifestStat?: { mtimeMs: number; size: number } | null;
@@ -360,6 +361,9 @@ export class ReplKernelManager {
 			throw new Error("Kernel was disposed during startup");
 		}
 
+		// Per-kernel journals have no later scavenger: host death without 'exit' leaves this dir.
+		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
+		// Print/RPC SIGINT skips awaited shutdown, so Ctrl-C takes no final snapshot.
 		this.orphanJournalDir = mkdtempSync(join(tmpdir(), "prime-kernel-"));
 		const journalPath = join(this.orphanJournalDir, "processes.jsonl");
 		const child = spawnHidden(python, ["-m", "rlm.repl"], {
@@ -1675,10 +1679,16 @@ export class ReplKernelManager {
 		return this.performRestore(false);
 	}
 
+	/** Outcome of the latest restore attempt, including the lazy startup retry. */
+	get lastRestoreResult(): RestoreResult | null {
+		return this.restoreResult;
+	}
+
 	/** Repair restores bypass the repair gate and are bounded so a stalled kernel cannot wedge it. */
 	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
+		this.restoreResult = null;
 		// Before the attempt, so a failed or timed-out restore still arms the skip;
 		// repair retries (reprovision after a failed first restore) keep the non-repair stat.
 		if (!protocolRepair) this.restoredManifestStat = manifestStatOf(cfg.manifestPath);
@@ -1698,11 +1708,12 @@ export class ReplKernelManager {
 				return null;
 			}
 			this.pendingRestore = false;
-			return {
+			this.restoreResult = {
 				restored: asStringArray(r.doneFields.restored),
 				failed: asReasonArray(r.doneFields.failed),
 				path: cfg.path,
 			};
+			return this.restoreResult;
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
 			if (!protocolRepair) this.pendingRestore = true;

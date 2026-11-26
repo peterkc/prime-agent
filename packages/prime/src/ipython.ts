@@ -13,6 +13,7 @@ import { Type } from "typebox";
 import { withKernelBootPermit } from "./kernel/boot-gate.ts";
 import { ReplKernelManager } from "./kernel/repl-manager.ts";
 import {
+	DEFAULT_MAX_OUTPUT_CHARS,
 	type ExecuteResult,
 	errorMessage,
 	isRecord,
@@ -26,6 +27,7 @@ const schema = Type.Object({
 	code: Type.String({ description: "Python code to execute in the persistent Python REPL." }),
 });
 const bootstrapCode = "import asyncio\nfrom rlm import bash\nimport rlm";
+const OUTPUT_UPDATE_THROTTLE_MS = 100;
 const imageMimeTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
 interface IpythonDetails {
@@ -91,7 +93,8 @@ class IpythonKernelProvisioner {
 			stderr += chunk.toString();
 		});
 		try {
-			if ((await waitForChildProcess(check)) !== 0) throw new Error(stderr.trim());
+			if ((await waitForChildProcess(check)) !== 0)
+				throw new Error(check.signalCode || check.killed ? "Interpreter import check timed out" : stderr.trim());
 		} catch (error) {
 			throw new Error(`${variable} cannot import rlm.repl and dill: ${errorMessage(error)}`, { cause: error });
 		}
@@ -114,29 +117,30 @@ class IpythonKernelProvisioner {
 		try {
 			await withKernelBootPermit(() => manager.start({ signal }), signal);
 			const snapshotExisted = this.snapshotDir && existsSync(snapshotPathIn(this.snapshotDir));
+			let notSaved: string[] = [];
+			const notices: string[] = [];
 			if (this.snapshotDir) {
-				let notSaved: string[] = [];
-				const notices: string[] = [];
 				try {
 					notSaved = readNotSavedNames(manifestPathIn(this.snapshotDir));
 				} catch (error) {
 					notices.push(`Kernel snapshot manifest could not be read: ${errorMessage(error)}`);
 				}
-				const restored = await raceStartupWithAbort(manager.restoreState(), signal);
-				if (snapshotExisted) {
-					const failed = restored?.failed.map((entry) => entry.name) ?? [];
-					notices.push(
-						notSaved.length ? `Not saved: ${notSaved.join(", ")}` : "",
-						restored === null ? "Kernel snapshot could not be restored; all saved names were lost." : "",
-						failed.length ? `Failed to revive: ${failed.join(", ")}` : "",
-					);
-				}
-				this.restoreNotice = notices.filter(Boolean).join("\n");
+				await raceStartupWithAbort(manager.restoreState(), signal);
 			}
 			const result = await manager.execute(bootstrapCode, { signal });
 			if (result.status !== "ok")
 				throw new Error(`Failed to prepare the Python runtime: ${result.error?.evalue ?? result.stderr}`);
-			if (snapshotExisted) manager.markRestoredNamespaceFresh();
+			if (snapshotExisted) {
+				const restored = manager.lastRestoreResult;
+				const failed = restored?.failed.map((entry) => entry.name) ?? [];
+				notices.push(
+					notSaved.length ? `Not saved: ${notSaved.join(", ")}` : "",
+					restored === null ? "Kernel snapshot could not be restored; all saved names were lost." : "",
+					failed.length ? `Failed to revive: ${failed.join(", ")}` : "",
+				);
+				manager.markRestoredNamespaceFresh();
+			}
+			this.restoreNotice = notices.filter(Boolean).join("\n");
 			return manager;
 		} catch (error) {
 			await manager.shutdown({ snapshot: false });
@@ -214,13 +218,38 @@ function createIpythonToolDefinition(
 			const provisioner = getProvisioner(ctx);
 			const manager = await provisioner.ensure(signal);
 			let streamed = "";
-			const result = await manager.execute(params.code, {
-				signal,
-				onStream: (chunk) => {
-					streamed += chunk;
-					onUpdate?.({ content: [{ type: "text", text: streamed }], details: { status: "ok", durationMs: 0 } });
-				},
-			});
+			let updateTimer: ReturnType<typeof setTimeout> | undefined;
+			let updateDirty = false;
+			let lastUpdateAt = 0;
+			function emitOutputUpdate(): void {
+				if (!onUpdate || !updateDirty) return;
+				updateDirty = false;
+				lastUpdateAt = Date.now();
+				onUpdate({ content: [{ type: "text", text: streamed }], details: { status: "ok", durationMs: 0 } });
+			}
+			function onStream(chunk: string): void {
+				if (!onUpdate) return;
+				streamed = (streamed + chunk).slice(-DEFAULT_MAX_OUTPUT_CHARS);
+				updateDirty = true;
+				const delay = OUTPUT_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+				if (delay <= 0) {
+					clearTimeout(updateTimer);
+					updateTimer = undefined;
+					emitOutputUpdate();
+				} else {
+					updateTimer ??= setTimeout(() => {
+						updateTimer = undefined;
+						emitOutputUpdate();
+					}, delay);
+				}
+			}
+			let result: ExecuteResult;
+			try {
+				result = await manager.execute(params.code, { signal, onStream });
+			} finally {
+				clearTimeout(updateTimer);
+				emitOutputUpdate();
+			}
 			const output = [
 				provisioner.takeRestoreNotice(),
 				result.stdout,
