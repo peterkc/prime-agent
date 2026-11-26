@@ -331,3 +331,80 @@ remove the forced-end fork behavior:
 - **Kind:** upstream backport
 - **Removal condition:** Remove when next moves to a pi release that contains
   `45a3cb606776f40f4aa071cf7ed1684b8bc66bd6`.
+
+## Refresh Qwen Token Plan gateways and model lists
+
+- **Files:**
+  - `packages/ai/README.md`
+  - `packages/ai/catalog/providers/qwen-token-plan-individual.ts`
+  - `packages/ai/catalog/providers/qwen-token-plan.ts`
+  - `packages/ai/src/env-api-keys.ts`
+  - `packages/ai/src/providers/qwen-token-plan-cn.ts`
+  - `packages/ai/src/providers/qwen-token-plan-individual-cn.ts`
+  - `packages/ai/src/providers/qwen-token-plan-individual.ts`
+  - `packages/ai/src/providers/qwen-token-plan.ts`
+  - `packages/ai/test/generate-models-strict.test.ts`
+  - `packages/ai/test/qwen-token-plan-models.test.ts`
+  - `packages/coding-agent/docs/providers.md`
+  - `packages/coding-agent/src/cli/args.ts`
+- **Reason:** Backport pi commit `1397070024775090032162f7f06d674041f0f068` (#12112).
+  Use current Qwen gateways and per-plan key variables, add current Individual models, and remove retired Team models.
+  The upstream changelog bullets use fork `.changes` fragments.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `1397070024775090032162f7f06d674041f0f068`.
+
+## Add the Qwen Individual preview and drop strict allowlist enforcement
+
+- **Files:**
+  - `packages/ai/catalog/providers/qwen-token-plan-individual-cn.ts`
+  - `packages/ai/catalog/providers/qwen-token-plan-individual.ts`
+  - `packages/ai/scripts/model-data.ts`
+  - `packages/ai/test/generate-models-strict.test.ts`
+  - `packages/ai/test/model-data-validation.test.ts`
+  - `packages/ai/test/qwen-token-plan-models.test.ts`
+- **Reason:** Backport pi commit `1e34c3b4c7df78e716a8f53ad0bcf3a00feceedc` (#12313).
+  Take the upstream Individual allowlist and remove its strict generation assertion and dependent tests. The next Qwen backport replaces the preview ID with the GA ID.
+  The upstream changelog bullets use fork `.changes` fragments.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `1e34c3b4c7df78e716a8f53ad0bcf3a00feceedc`.
+
+## Replace retired Cloudflare and Qwen models
+
+- **Files:**
+  - `packages/ai/README.md`
+  - `packages/ai/catalog/providers/qwen-token-plan-individual.ts`
+  - `packages/ai/test/cross-provider-handoff.test.ts`
+  - `packages/ai/test/empty.test.ts`
+  - `packages/ai/test/openai-completions-empty-tools.test.ts`
+  - `packages/ai/test/qwen-token-plan-models.test.ts`
+  - `packages/ai/test/stream.test.ts`
+  - `packages/ai/test/tokens.test.ts`
+  - `packages/ai/test/tool-call-without-result.test.ts`
+  - `packages/ai/test/total-tokens.test.ts`
+  - `packages/ai/test/unicode-surrogate.test.ts`
+  - `packages/coding-agent/src/core/model-resolver.ts`
+  - `packages/coding-agent/test/model-runtime-cloudflare-compat.test.ts`
+- **Reason:** Backport pi commit `22f5f29950e45667fc21c6f978699b335043a3aa` (#12552).
+  Use the GA Qwen model and GLM-5.3 for Cloudflare Workers AI and AI Gateway. Replace retired Cloudflare model IDs in tests and the README.
+  The upstream changelog bullets use fork `.changes` fragments. Two fork-only
+  `test-policy: allow` comments in `packages/ai/test/total-tokens.test.ts`
+  preserve upstream retry and timeout options on renamed credential-gated
+  e2e tests. No test behavior or assertion changes.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `22f5f29950e45667fc21c6f978699b335043a3aa`. Keep the two fork-only
+  policy comments until pi's file or the fork's test policy makes them unnecessary.
+
+## Remove retired Together reasoning-model overrides
+
+- **Files:**
+  - `packages/ai/catalog/providers/together.ts`
+  - `packages/ai/test/together-models.test.ts`
+- **Reason:** Backport pi commit `e459be65a3563d4e58d74f379a55f890475aef81`.
+  Remove reasoning-effort overrides for retired Together models and test the thinking toggle on current reasoning models.
+  The upstream changelog bullets use fork `.changes` fragments.
+- **Kind:** upstream backport
+- **Removal condition:** Remove when next moves to a pi release that contains
+  `e459be65a3563d4e58d74f379a55f890475aef81`.

@@ -58,7 +58,7 @@ Binding for Chord v2 (`packages/chord/src/`) and its tests, when writing and whe
 
 ## Testing Policy
 
-- `node scripts/check-test-policy.mjs` is required and runs in `npm run check`. Never weaken it or add a broad exclusion. A platform exception must use `// test-policy: allow <rule> -- <specific reason>` immediately above one expression, and CI must run that test on a supported platform.
+- `node scripts/check-test-policy.mjs` is required and runs in `npm run check`. Never weaken it or add a broad exclusion. A platform exception must use `// test-policy: allow <rule>[, <rule>...] -- <specific reason>` immediately above one expression. Name only known rules; CI must run that test on a supported platform.
 - A test must fail when the behavior it covers is broken. Temporarily revert or stub the production behavior to prove the failure. If the test still passes, delete it.
 - Test observable behavior at process boundaries, durable formats, concurrency/ordering, crash recovery, and load. Do not assert a mock's own return value, private implementation steps, or exact rendered copy unless that text is a protocol contract.
 - CI tests must be unconditional and self-contained. Do not use live provider APIs, real credentials, paid tokens, `.skip`, `.skipIf`, `.runIf`, `.todo`, `.only`, environment-gated early returns, or optional assertions. Put manual live-provider probes outside the CI test suite.
