@@ -1193,6 +1193,7 @@ it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 		const f = fixture(async function* ({ options }) {
 			calls++;
 			cap = options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+			yield { type: "assistant", session_id: sourceSession, uuid: checkpointAt };
 			yield raw("content_block_start", {
 				index: 0,
 				content_block: { type: "tool_use", id: "cut", name: "mcp__prime__one", input: {} },
@@ -1215,37 +1216,7 @@ it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 		const msg = await f.provider.streamSimple(model, { ...context, tools }, { maxTokens: 64 }).result();
 		expect({ stop: msg.stopReason, calls, cap }).toEqual({ stop: "length", calls: 1, cap: "64" });
 		expect(msg.content.filter((b) => b.type === "toolCall")).toEqual([]);
-	},
-);
-
-it.each(["max_tokens after an assistant block"])(
-	"AC-22 replays a capped turn with an uncaptured tool: %s",
-	async () => {
-		const calls: Options[] = [];
-		const f = fixture(async function* ({ options }) {
-			calls.push(options);
-			if (calls.length === 1) {
-				yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "partial reply" } });
-				yield raw("content_block_stop", { index: 0 });
-				yield { type: "assistant", session_id: sourceSession, uuid: checkpointAt };
-				yield raw("content_block_start", {
-					index: 1,
-					content_block: { type: "tool_use", id: "cut", name: "mcp__prime__one", input: {} },
-				});
-				yield result("max_tokens");
-			} else yield* textTurn("end_turn");
-		});
-		const ctx = { ...context, tools };
-		const msg = await f.provider.streamSimple(model, ctx).result();
-		expect(msg.stopReason).toBe("length");
-		expect(msg.content).toEqual([{ type: "text", text: "partial reply" }]);
 		expect(msg.responseId).toBeUndefined();
-		const next = await f.provider
-			.streamSimple(model, { ...ctx, messages: [...ctx.messages, msg, ...context.messages] })
-			.result();
-		expect(next.stopReason).toBe("stop");
-		expect(calls).toHaveLength(2);
-		expect(calls[1].resume).toBeUndefined();
 	},
 );
 

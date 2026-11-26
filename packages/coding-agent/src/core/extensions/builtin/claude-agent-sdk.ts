@@ -329,7 +329,11 @@ export class ClaudeSdkProvider {
 				server = primeServer(tools);
 				const level = options?.reasoning;
 				const attempt = new AbortController(),
-					abortAttempt = () => attempt.abort();
+					abortAttempt = () => attempt.abort(),
+					abortIdleAttempt = () => {
+						release();
+						abortAttempt();
+					};
 				const sdkOptions: Options = {
 					...(point ? { resume: point.resume, resumeSessionAt: point.resumeSessionAt, forkSession: true } : {}),
 					pathToClaudeCodeExecutable: path,
@@ -401,10 +405,7 @@ export class ClaudeSdkProvider {
 					let version: string | undefined;
 					try {
 						version = (
-							await guardClaudeInit(query.initializationResult(), settings.idleTimeoutSeconds, () => {
-								release();
-								attempt.abort();
-							})
+							await guardClaudeInit(query.initializationResult(), settings.idleTimeoutSeconds, abortIdleAttempt)
 						).claude_code_version;
 					} catch (error) {
 						allowPrompt(false);
@@ -425,10 +426,7 @@ export class ClaudeSdkProvider {
 						);
 					ctrl.signal.throwIfAborted();
 					allowPrompt(true);
-					for await (const m of guardClaudeStream(query, settings.idleTimeoutSeconds, () => {
-						release();
-						attempt.abort();
-					})) {
+					for await (const m of guardClaudeStream(query, settings.idleTimeoutSeconds, abortIdleAttempt)) {
 						ctrl.signal.throwIfAborted();
 						if (m.type === "assistant" && m.supersedes?.length) {
 							// Stream deltas and hooks do not identify their owning assistant UUID.
