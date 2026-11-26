@@ -41,6 +41,27 @@ function isKeepalive(message: unknown): boolean {
 	);
 }
 
+function idleError(seconds: number) {
+	return Error(`Claude query timed out after ${seconds} seconds without an SDK message.`);
+}
+
+export async function guardClaudeInit<T>(init: Promise<T>, seconds: number, abort: () => void): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const result = await Promise.race([
+			init,
+			new Promise<typeof idle>((resolve) => {
+				timer = setTimeout(() => resolve(idle), seconds * 1000);
+			}),
+		]);
+		if (result !== idle) return result;
+	} finally {
+		clearTimeout(timer);
+	}
+	abort();
+	throw idleError(seconds);
+}
+
 export async function* guardClaudeStream<T>(
 	query: AsyncIterable<T> & { close?(): void },
 	seconds: number,
@@ -73,7 +94,7 @@ export async function* guardClaudeStream<T>(
 		}
 		abort();
 		query.close?.();
-		throw Error(`Claude query timed out after ${seconds} seconds without an SDK message.`);
+		throw idleError(seconds);
 	} finally {
 		// Await the iterator's teardown before publishing a terminal event to Prime.
 		await iterator.return?.();

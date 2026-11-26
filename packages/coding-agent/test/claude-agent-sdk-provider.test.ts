@@ -975,7 +975,7 @@ it.each([
 		async function* ({ options, prompt }) {
 			inputs.push(await collectPrompt(prompt));
 			if (options.resume) yield { type: "result", subtype: "error_during_execution", errors: [error] };
-			else yield result();
+			else yield* textTurn("end_turn");
 		},
 		vi
 			.fn()
@@ -1143,6 +1143,34 @@ it.each(["keepalives"])("AC-22 aborts and closes a query stalled on %s", async (
 		waitForClose.resolve();
 		releaseClose.resolve();
 		await response;
+		vi.useRealTimers();
+	}
+});
+
+it.each(["initialization"])("AC-22 aborts a query whose %s stalls", async () => {
+	vi.useFakeTimers();
+	let input: Promise<SDKUserMessage[]> | undefined;
+	let signal: AbortSignal | undefined;
+	const f = fixture(
+		({ prompt, options }) => {
+			signal = options.abortController?.signal;
+			input = collectPrompt(prompt);
+			return (async function* () {
+				yield result();
+			})();
+		},
+		() => new Promise(() => {}),
+	);
+	writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ claudePath: f.path, idleTimeoutSeconds: 2 }));
+	try {
+		const response = f.provider.streamSimple(model, context).result();
+		await vi.advanceTimersByTimeAsync(2_000);
+		const message = await response;
+		expect(signal?.aborted).toBe(true);
+		expect(await input).toEqual([]);
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toMatch(/timed out after 2 seconds/);
+	} finally {
 		vi.useRealTimers();
 	}
 });

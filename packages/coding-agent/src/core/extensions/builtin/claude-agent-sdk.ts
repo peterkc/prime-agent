@@ -50,7 +50,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { comparePackageVersions } from "../../../utils/version-check.js";
 import type { ExtensionFactory } from "../types.js";
 import { readClaudeSettings } from "./claude-agent-sdk-config.js";
-import { guardClaudeStream, hasTurnOutput } from "./claude-agent-sdk-stream-guard.js";
+import { guardClaudeInit, guardClaudeStream, hasTurnOutput } from "./claude-agent-sdk-stream-guard.js";
 import { aliasPrimeTools, primeMcpPrefix, repairToolInput } from "./claude-agent-sdk-tool-input.js";
 
 type Query = (args: {
@@ -400,10 +400,17 @@ export class ClaudeSdkProvider {
 					});
 					let version: string | undefined;
 					try {
-						version = (await query.initializationResult()).claude_code_version;
+						version = (
+							await guardClaudeInit(query.initializationResult(), settings.idleTimeoutSeconds, () => {
+								release();
+								attempt.abort();
+							})
+						).claude_code_version;
 					} catch (error) {
 						allowPrompt(false);
 						ctrl.signal.throwIfAborted();
+						// An idle timeout aborted the attempt; there is no startup result to read.
+						if (attempt.signal.aborted) throw error;
 						// The CLI can emit a startup failure result before the SDK rejects its control response.
 						for await (const m of query) {
 							if (m.type === "result" && m.subtype !== "success" && m.errors.length)
