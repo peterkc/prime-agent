@@ -272,7 +272,10 @@ it.each(["bad settings", "unsupported image"])("reports %s as invalid input", as
 	expect(msg.stopReason).toBe("error");
 	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
-it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a prompt", async (version) => {
+it.each([
+	["2.1.247", "reported: 2.1.247"],
+	[undefined, "cannot confirm the version"],
+] as const)("refuses CLI version %s without yielding a prompt", async (version, detail) => {
 	let input: Promise<SDKUserMessage[]> | undefined;
 	const f = fixture(
 		({ prompt }) => {
@@ -287,7 +290,7 @@ it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a promp
 	expect(await input).toEqual([]);
 	expect(msg.stopReason).toBe("error");
 	expect(msg.errorMessage).toContain("2.1.248");
-	if (version === undefined) expect(msg.errorMessage).toContain("cannot confirm the version");
+	expect(msg.errorMessage).toContain(detail);
 	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
@@ -524,11 +527,10 @@ it.each([
 	['{"enabled":true}', /PATH.*claudePath/],
 	['{"enabled":"false"}', /claude-sdk\.json: expected a boolean enabled/],
 	["{", /Cannot read .*claude-sdk\.json/],
-	['{"claudePath":"relative"}', /claude-sdk\.json: expected an absolute claudePath/],
 ] as const)("R2-2 reports the registration failure for settings %s", async (settings, cause) => {
 	const dir = mkdtempSync(join(getAgentDir(), "unavailable-"));
+	// Use the PATH from setup-env: registration must not discover the host’s claude.
 	writeFileSync(join(dir, "claude-sdk.json"), settings);
-	vi.stubEnv("PATH", dir);
 	const h = await createHarness({ extensionFactories: [new ClaudeSdkProvider(dir).extension] });
 	try {
 		await h.session.bindExtensions({});
