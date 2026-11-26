@@ -1,0 +1,34 @@
+{
+	"name": "@peterkc/prime-agent",
+	"version": "1.5.2",
+	"private": true,
+	"description": "Prime entry point and persistent Python extension for pi",
+	"type": "module",
+	"bin": {
+		"prime-agent": "dist/cli.js"
+	},
+	"main": "./dist/ipython.js",
+	"types": "./dist/ipython.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/ipython.d.ts",
+			"import": "./dist/ipython.js"
+		}
+	},
+	"scripts": {
+		"clean": "node ../../scripts/package-files.mjs clean dist",
+		"build": "tsc -p tsconfig.build.json && node ../../scripts/package-files.mjs executable dist/cli.js",
+		"test": "vitest --run"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "1.5.2",
+		"@earendil-works/pi-ai": "1.5.2",
+		"typebox": "1.3.27"
+	},
+	"devDependencies": {
+		"vitest": "4.1.12"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

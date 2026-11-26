@@ -1,0 +1,1 @@
+- Added a private `prime-agent` command with persistent Python execution, saved state and awaited kernel shutdown through pi extensions.
