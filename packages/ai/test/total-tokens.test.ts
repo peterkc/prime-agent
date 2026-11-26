@@ -309,11 +309,12 @@ describe("totalTokens field", () => {
 	// =========================================================================
 
 	describe.skipIf(!hasCloudflareWorkersAICredentials())("Cloudflare Workers AI", () => {
+		// test-policy: allow test-retry, explicit-test-timeout -- upstream pi 22f5f29950 renamed this credential-gated e2e title; retry and timeout are unchanged.
 		it(
-			"@cf/moonshotai/kimi-k2.6 - should return totalTokens equal to sum of components",
+			"@cf/zai-org/glm-5.3 - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+				const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 				console.log(`\nCloudflare Workers AI / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, {
@@ -334,11 +335,12 @@ describe("totalTokens field", () => {
 	// =========================================================================
 
 	describe.skipIf(!hasCloudflareAiGatewayCredentials())("Cloudflare AI Gateway", () => {
+		// test-policy: allow test-retry, explicit-test-timeout -- upstream pi 22f5f29950 renamed this credential-gated e2e title; retry and timeout are unchanged.
 		it(
-			"workers-ai/@cf/moonshotai/kimi-k2.6 - should return totalTokens equal to sum of components",
+			"workers-ai/@cf/zai-org/glm-5.3 - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+				const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3");
 
 				console.log(`\nCloudflare AI Gateway / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, {
