@@ -366,10 +366,14 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 		}
 		recovered = parseRecovered(isRecord(response.data) ? response.data.recovered : undefined);
 		if (!response.success) {
-			if (!/claimed by another daemon|open or being written elsewhere/.test(response.error))
-				throw new Error(response.error);
+			const refusal = response.error.includes("claimed by another daemon")
+				? "claimed"
+				: response.error.includes("open or being written elsewhere")
+					? "open"
+					: undefined;
+			if (!refusal) throw new Error(response.error);
 			const hosts = await findSessionHosts(info.id, sourceSocket);
-			throw new Error(`${response.error}\n${formatMoveHint(hosts, targetCwd)}`);
+			throw new Error(`${response.error}\n${formatMoveHint(hosts, targetCwd, refusal)}`);
 		}
 		const reply = parseReply(response.data);
 		const note =

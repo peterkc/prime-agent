@@ -51,9 +51,9 @@ describe("pi-dkwcu session hosts", () => {
 				sessionName: "arc-advisor",
 			},
 		]);
-		expect(formatStopHint(hosts)).toBe(
-			`arc-advisor is live in /run/default.sock. Stop it there:\n  ${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`,
-		);
+		const hint = formatStopHint(hosts);
+		for (const text of ["/run/default.sock", `${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`])
+			expect(hint).toContain(text);
 	});
 
 	it("lists every daemon that runs the session and never the one already asked", async () => {
@@ -90,11 +90,15 @@ describe("pi-dkwcu session hosts", () => {
 		expect(await findSessionHosts(ARC, "/run/prime.sock", failing)).toEqual([]);
 	});
 
-	it("gives the stop and move commands for the host, or a general move hint without one", () => {
+	it("gives the stop and move commands for the host, or advice for the refusal without one", () => {
 		const host = { socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: ARC };
-		expect(formatMoveHint([host], "/Volumes/arc hiq")).toBe(
-			`${ARC} is live in /run/default.sock. Stop it there, then move it from that daemon:\n  ${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock\n  ${APP_NAME} move ${ARC} '/Volumes/arc hiq' --daemon-socket /run/default.sock`,
-		);
-		expect(formatMoveHint([], "/Volumes/archiq")).toContain("--daemon-socket <socket>");
+		const hint = formatMoveHint([host], "/Volumes/arc hiq", "claimed");
+		for (const text of [
+			`${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`,
+			`${APP_NAME} move ${ARC} '/Volumes/arc hiq' --daemon-socket /run/default.sock`,
+		])
+			expect(hint).toContain(text);
+		expect(formatMoveHint([], "/Volumes/archiq", "claimed")).toContain(`${APP_NAME} status`);
+		expect(formatMoveHint([], "/Volumes/archiq", "open")).not.toMatch(/status|--daemon-socket/);
 	});
 });

@@ -300,6 +300,8 @@ const SCHEDULED_WAKE_MAX_TIMEOUT_MS = 2_147_483_647;
 const SCHEDULED_WAKE_CLIENT_ID = "scheduled-wake";
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+/** Minimum time between roster-triggered retries after another daemon refused a session's mesh claim. */
+const MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS = 30_000;
 
 // Commands proving the client tracks the catalog; only such clients receive heartbeats_changed pushes.
 const HEARTBEAT_TRACKING_COMMANDS: ReadonlySet<string> = new Set([
@@ -669,7 +671,7 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 export function readPersistedDaemonFolders(
 	agentDir: string,
 	socketPath: string,
-): { cwd?: string; sessionDir?: string } | undefined {
+): { cwd?: string; sessionDir?: string; agentDir: string } | undefined {
 	try {
 		const configPath = join(defaultWorkerDescriptorDir(agentDir, socketPath), SUPERVISOR_CONFIG_FILE_NAME);
 		const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Partial<PersistedSupervisorConfig>;
@@ -684,7 +686,7 @@ export function readPersistedDaemonFolders(
 			return undefined;
 		}
 		const { cwd, sessionDir } = durableAgentSessionRuntimeConfig(parsed.defaultSessionConfig);
-		const folders = { sessionDir };
+		const folders = { sessionDir, agentDir: parsed.defaultSessionConfig.agentDir };
 		try {
 			if (cwd && statSync(cwd).isDirectory()) return { ...folders, cwd };
 		} catch {
@@ -3077,7 +3079,6 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
-			await this.retryClaimedMeshEnrollment(source.summary.sessionId, source.summary.sessionFile);
 			const targetSessionId = await this.mesh.resolveAddress(command.targetSessionId);
 			if (targetSessionId === source.summary.sessionId)
 				throw new Error("Message was not stored: agent messaging cannot target the sending session");
@@ -3087,6 +3088,7 @@ export class DaemonSupervisor {
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
 					sessionId: source.summary.sessionId,
+					sessionFile: source.summary.sessionFile,
 					sessionName: source.summary.sessionName,
 					runtimeKind: source.summary.runtimeKind ?? "top-level",
 				},
@@ -5378,9 +5380,10 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** Roster rows can change several times a second; a send retries at once instead. */
 	private async retryClaimedMeshEnrollment(sessionId: string, sessionFile: string): Promise<void> {
 		try {
-			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile);
+			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS);
 		} catch (error) {
 			this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`);
 		}

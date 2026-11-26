@@ -64,7 +64,7 @@ describe("daemon restart", () => {
 		process.exitCode = undefined;
 		discover.mockResolvedValue([daemon(defaultPath), daemon(workPath)]);
 		launch.mockResolvedValue(complete);
-		vi.mocked(readPersistedDaemonFolders).mockReturnValue({ cwd: process.cwd() });
+		vi.mocked(readPersistedDaemonFolders).mockReturnValue({ cwd: process.cwd(), agentDir: process.cwd() });
 		prompt.mockResolvedValue(true);
 	});
 	afterEach(() => {

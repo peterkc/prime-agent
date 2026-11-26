@@ -102,9 +102,14 @@ export function formatStopHint(hosts: readonly SessionHost[]): string {
 	return hosts.map((host) => `${hostLabel(host)}. Stop it there:\n  ${stopCommand(host)}`).join("\n");
 }
 
-export function formatMoveHint(hosts: readonly SessionHost[], targetFolder: string): string {
+/** Why the source daemon refused the move: another daemon holds the mesh claim, or a process has the file open. */
+export type MoveRefusal = "claimed" | "open";
+
+export function formatMoveHint(hosts: readonly SessionHost[], targetFolder: string, refusal: MoveRefusal): string {
 	if (hosts.length === 0)
-		return `Another daemon still holds this session, often the daemon that ran it before. Run the move against that daemon with --daemon-socket <socket>; \`${APP_NAME} status\` lists the daemons.`;
+		return refusal === "claimed"
+			? `Another daemon holds this session's mesh claim, often the daemon that ran it before. Stop or restart that daemon (\`${APP_NAME} status\` lists the daemons), then run this move again.`
+			: "Another process has the session file or one of its child transcripts open. Close it, then run this move again.";
 	return hosts
 		.map(
 			(host) =>

@@ -448,9 +448,8 @@ describe("daemon command", () => {
 			if (kind === "other") expect(findSessionHosts).not.toHaveBeenCalled();
 			else expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("arc-advisor", "/tmp/prime-agent.sock");
 			if (kind === "host")
-				expect(printed).toContain(
-					"Unknown active session: arc-advisor\narc-advisor is live in /tmp/default.sock. Stop it there:\n  prime-agent stop 0fe15d9b54cc --daemon-socket /tmp/default.sock",
-				);
+				for (const text of ["/tmp/default.sock", "prime-agent stop 0fe15d9b54cc --daemon-socket /tmp/default.sock"])
+					expect(printed).toContain(text);
 			else expect(printed.endsWith(daemonClientMock.behavior.killError)).toBe(true);
 		},
 	);

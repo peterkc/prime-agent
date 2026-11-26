@@ -23,7 +23,7 @@ import { promptYesNo } from "../src/cli/daemon-stop-confirm.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 import { repositorySocketPath } from "../src/cli/repository-daemon.js";
 import type * as SessionHosts from "../src/cli/session-hosts.js";
-import { findSessionHosts } from "../src/cli/session-hosts.js";
+import { findSessionHosts, formatMoveHint } from "../src/cli/session-hosts.js";
 import { ENV_AGENT_DIR, ENV_SESSION_DIR } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../src/core/session-manager.js";
@@ -40,10 +40,10 @@ vi.mock("node:net", async (original) => ({
 	createConnection: (path: string) => connect(path),
 }));
 vi.mock("../src/utils/child-process.js", () => ({ spawnHidden: vi.fn() }));
-vi.mock("../src/cli/session-hosts.js", async (original) => ({
-	...(await original<typeof SessionHosts>()),
-	findSessionHosts: vi.fn(async () => []),
-}));
+vi.mock("../src/cli/session-hosts.js", async (original) => {
+	const actual = await original<typeof SessionHosts>();
+	return { ...actual, findSessionHosts: vi.fn(async () => []), formatMoveHint: vi.fn(actual.formatMoveHint) };
+});
 vi.mock("../src/cli/daemon-stop-confirm.js", async (original) => ({
 	...(await original<typeof StopConfirm>()),
 	promptYesNo: vi.fn(),
@@ -435,29 +435,27 @@ describe("session move command", () => {
 					expect(output()).toContain(text);
 		},
 	);
-	it.each(["claimed", "claimed-no-host", "other"] as const)(
-		"pi-dkwcu a %s refusal names the daemon that runs the session only for a claim or open-file refusal",
-		async (kind) => {
-			moveFailure = true;
-			moveError = kind === "other" ? "move refused" : "Session session-1: claimed by another daemon; Nothing moved";
-			if (kind === "claimed")
-				vi.mocked(findSessionHosts).mockResolvedValueOnce([
-					{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" },
-				]);
-			await run(["--yes"]);
-			expect(process.exitCode).toBe(1);
-			expect(errors()).toContain(moveError);
-			if (kind === "other") expect(findSessionHosts).not.toHaveBeenCalled();
-			else expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("session-1", f.sourceSocket);
-			if (kind === "claimed")
-				for (const text of [
-					"stop 0fe15d9b54cc --daemon-socket /run/default.sock",
-					`move session-1 '${f.target.replaceAll("'", `'"'"'`)}' --daemon-socket /run/default.sock`,
-				])
-					expect(errors()).toContain(text);
-			if (kind === "claimed-no-host") expect(errors()).toContain("--daemon-socket <socket>");
-		},
-	);
+	it.each([
+		["claimed", "Session session-1: claimed by another daemon; Nothing moved"],
+		["open", "Cannot move session /x/session-1.jsonl: it is open or being written elsewhere"],
+		["other", "move refused"],
+	] as const)("pi-dkwcu a %s refusal adds the matching host hint", async (kind, error) => {
+		moveFailure = true;
+		moveError = error;
+		const hosts = [{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" }];
+		vi.mocked(findSessionHosts).mockResolvedValueOnce(kind === "claimed" ? hosts : []);
+		await run(["--yes"]);
+		expect(process.exitCode).toBe(1);
+		expect(errors()).toContain(error);
+		if (kind === "other") {
+			expect(findSessionHosts).not.toHaveBeenCalled();
+			expect(formatMoveHint).not.toHaveBeenCalled();
+			return;
+		}
+		expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("session-1", f.sourceSocket);
+		expect(formatMoveHint).toHaveBeenCalledExactlyOnceWith(kind === "claimed" ? hosts : [], f.target, kind);
+		if (kind === "claimed") expect(errors()).toContain("stop 0fe15d9b54cc --daemon-socket /run/default.sock");
+	});
 	it.each(["delayed", "disconnect", "timeout", "before-send"])(
 		"F2 move reply %s distinguishes sent and unsent requests",
 		async (mode) => {

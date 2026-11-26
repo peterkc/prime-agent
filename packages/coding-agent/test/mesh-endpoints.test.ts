@@ -378,6 +378,25 @@ describe("mesh endpoints", () => {
 		expect(enroll).not.toHaveBeenCalled();
 	});
 
+	it("pi-dkwcu a sender's enrollment retry counts against the send deadline and stores nothing when it runs out", async () => {
+		const { mesh, root } = await fixture();
+		const file = join(root, "c.json");
+		writeFileSync(file, "{}");
+		directories.set("c", { sessionId: "c", name: "c", principal: "local.c", homeSocket: "home" });
+		vi.mocked(enrollment.claimEnrollment).mockImplementationOnce(() => {
+			throw new SessionAlreadyActiveError(file, "other-daemon");
+		});
+		await mesh.enroll("c", file);
+		vi.spyOn(mesh, "enroll").mockReturnValue(new Promise(() => undefined));
+		vi.useFakeTimers();
+		const sending = expect(mesh.send({ sessionId: "c", sessionFile: file }, "b", "hello")).rejects.toThrow(
+			"Message was not stored: sender c: enrollment retry did not finish before the send deadline",
+		);
+		await vi.advanceTimersByTimeAsync(30_000);
+		await sending;
+		for (const endpoint of Endpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+	});
+
 	it("pi-dkwcu does not enroll again after other failures or without a failure", async () => {
 		const { mesh, root } = await fixture();
 		await expect(mesh.enroll("missing", join(root, "missing.json"))).rejects.toThrow("session file is missing");

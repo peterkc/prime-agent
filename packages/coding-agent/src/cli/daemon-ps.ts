@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import chalk from "chalk";
-import { APP_NAME, getAgentDir, getSessionsDir, VERSION } from "../config.js";
+import { APP_NAME, getAgentDir, VERSION } from "../config.js";
 import {
 	isOrphanProcessIdentityCurrent,
 	killOrphanProcess,
@@ -443,7 +443,7 @@ export async function runPs(json: boolean): Promise<void> {
 	for (const shared of findSharedSessionFolders(daemons, (socketPath) => persistedSessionDir(agentDir, socketPath)))
 		console.log(
 			chalk.yellow(
-				`Warning: ${shared.socketPaths.join(" and ")} share the session folder ${shared.sessionDir}. Each daemon sees the other's saved sessions, so stop, move and scheduled wakes from one can reach a session the other runs. Give one of them its own session folder.`,
+				`Warning: ${shared.socketPaths.join(" and ")} share the session folder ${shared.sessionDir}. Each daemon lists the other's saved sessions, so a stop or move sent to one can name a session the other runs and fail, and a scheduled wake can try to start a session the other already runs. Give one of them its own session folder.`,
 			),
 		);
 }
@@ -479,10 +479,13 @@ function canonicalFolder(folder: string): string {
 	}
 }
 
-/** The folder a daemon saved at start; without a saved folder it uses the default sessions folder. */
-function persistedSessionDir(agentDir: string, socketPath: string): string | undefined {
+/**
+ * The folder a daemon saved at start. Without one it used `sessions` in its own saved agent folder; the caller's
+ * session-folder variable says nothing about that daemon.
+ */
+export function persistedSessionDir(agentDir: string, socketPath: string): string | undefined {
 	const folders = readPersistedDaemonFolders(agentDir, socketPath);
-	return folders ? (folders.sessionDir ?? getSessionsDir(agentDir)) : undefined;
+	return folders ? (folders.sessionDir ?? join(folders.agentDir, "sessions")) : undefined;
 }
 
 export type ReapAction =

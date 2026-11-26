@@ -1,5 +1,6 @@
 import * as cp from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -11,6 +12,7 @@ import {
 	evaluateShutdownQuietPeriod,
 	findSharedSessionFolders,
 	isWorkerSocketPath,
+	persistedSessionDir,
 	planReap,
 	planShutdownAll,
 	planShutdownConfirmation,
@@ -18,7 +20,7 @@ import {
 	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
 import { formatDaemonListTable } from "../src/cli/daemon-ps-format.js";
-import { APP_NAME, ENV_AGENT_DIR, VERSION } from "../src/config.js";
+import { APP_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR, VERSION } from "../src/config.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_INFO, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
@@ -26,6 +28,33 @@ import { DAEMON_PROTOCOL_INFO, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daem
 vi.mock("node:child_process", { spy: true });
 
 describe("pi-dkwcu shared session folders", () => {
+	it("reads a daemon's folder from its saved config, defaulting to its own agent folder, never the caller's variable", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-saved-folder-")));
+		try {
+			vi.stubEnv(ENV_SESSION_DIR, join(root, "repo", "sessions"));
+			function save(socketPath: string, config: object): void {
+				const folder = join(
+					root,
+					"daemon-workers",
+					createHash("sha256").update(socketPath).digest("hex").slice(0, 12),
+				);
+				mkdirSync(folder, { recursive: true });
+				writeFileSync(
+					join(folder, "supervisor-config"),
+					JSON.stringify({ version: 1, socketPath, defaultSessionConfig: config }),
+				);
+			}
+			save("/run/default.sock", { agentDir: join(root, "agent") });
+			save("/run/repo.sock", { agentDir: join(root, "agent"), sessionDir: join(root, "repo", "sessions") });
+			expect(persistedSessionDir(root, "/run/default.sock")).toBe(join(root, "agent", "sessions"));
+			expect(persistedSessionDir(root, "/run/repo.sock")).toBe(join(root, "repo", "sessions"));
+			expect(persistedSessionDir(root, "/run/unknown.sock")).toBeUndefined();
+		} finally {
+			vi.unstubAllEnvs();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("reports reachable daemons that resolve to one folder, through a symlink too, and skips the rest", () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-shared-folder-")));
 		try {

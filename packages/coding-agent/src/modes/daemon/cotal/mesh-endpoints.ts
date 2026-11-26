@@ -164,6 +164,8 @@ export class MeshEndpoints {
 	private readonly config?: MeshConfiguration;
 	private readonly refusal?: string;
 	private readonly enrollmentFailures = new Map<string, string>();
+	/** When enrollment last found the claim held by another daemon, for rate-limited retries. */
+	private readonly claimRefusedAt = new Map<string, number>();
 	private readonly invalidDirectoryEntries = new Set<string>();
 	private readonly sessions = new Map<string, SessionEndpoint>();
 	private readonly enrolling = new Map<string, Promise<void>>();
@@ -230,10 +232,12 @@ export class MeshEndpoints {
 
 	/**
 	 * Enrolls again only after a refusal because another daemon held the claim. That daemon can release the
-	 * claim later, for example when it stops, and nothing else would enroll the session again.
+	 * claim later, for example when it stops, and nothing else would enroll the session again. Each attempt
+	 * takes a file lease, so frequent callers pass a minimum interval since the last refusal.
 	 */
-	retryClaimedEnrollment(sessionId: string, sessionFile: string): Promise<void> {
+	retryClaimedEnrollment(sessionId: string, sessionFile: string, minIntervalMs = 0): Promise<void> {
 		if (this.enrollmentFailures.get(sessionId) !== CLAIMED_BY_ANOTHER_DAEMON) return Promise.resolve();
+		if (Date.now() - (this.claimRefusedAt.get(sessionId) ?? 0) < minIntervalMs) return Promise.resolve();
 		return this.enroll(sessionId, sessionFile);
 	}
 
@@ -304,6 +308,7 @@ export class MeshEndpoints {
 				if (this.enrollmentFailures.get(sessionId) !== CLAIMED_BY_ANOTHER_DAEMON)
 					this.options.log(`Mesh session ${sessionId}: ${CLAIMED_BY_ANOTHER_DAEMON}`);
 				this.enrollmentFailures.set(sessionId, CLAIMED_BY_ANOTHER_DAEMON);
+				this.claimRefusedAt.set(sessionId, Date.now());
 				return;
 			}
 			throw error;
@@ -395,6 +400,7 @@ export class MeshEndpoints {
 			if (session.state === "closed") throw new Error(`Session ${sessionId}: mesh endpoint is closed`);
 			session.state = "connected";
 			this.enrollmentFailures.delete(sessionId);
+			this.claimRefusedAt.delete(sessionId);
 			this.drain(session);
 		} catch (error) {
 			if (session) {
@@ -1018,7 +1024,8 @@ export class MeshEndpoints {
 	}
 
 	async send(
-		sender: AgentSessionMessageSender & { sessionId: string },
+		// The file only locates a retry; the receipt's sender must not carry a local path.
+		{ sessionFile, ...sender }: AgentSessionMessageSender & { sessionId: string; sessionFile?: string },
 		targetSessionId: string,
 		message: string,
 		scheduling: AgentMessageSchedulingOptions = {},
@@ -1029,6 +1036,7 @@ export class MeshEndpoints {
 		normalizeAgentSessionMessage(policy.canWait === true ? `${AGENT_MESSAGE_CAN_WAIT_HEADER}\n${message}` : message);
 		if (this.closing) throw new MeshNotStoredError("Message was not stored: mesh is shutting down");
 		if (this.refusal) throw new MeshNotStoredError(`Message was not stored: mesh unavailable: ${this.refusal}`);
+		if (sessionFile) await this.retrySenderEnrollment(senderSessionId, sessionFile, deadline);
 		const source = this.sessions.get(senderSessionId);
 		if (!source)
 			throw new MeshNotStoredError(
@@ -1061,6 +1069,26 @@ export class MeshEndpoints {
 			},
 			policy,
 		);
+	}
+
+	/** The retry counts against the send deadline, so the caller's request timeout still covers the publish. */
+	private async retrySenderEnrollment(sessionId: string, sessionFile: string, deadline: number): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<"expired">((resolve) => {
+			timer = setTimeout(() => resolve("expired"), Math.max(0, deadline - Date.now()));
+		});
+		try {
+			const outcome = await Promise.race([this.retryClaimedEnrollment(sessionId, sessionFile), expired]);
+			if (outcome === "expired")
+				throw new MeshNotStoredError(
+					`Message was not stored: sender ${sessionId}: enrollment retry did not finish before the send deadline`,
+				);
+		} catch (error) {
+			if (error instanceof MeshNotStoredError) throw error;
+			throw new MeshNotStoredError(`Message was not stored: sender ${sessionId}: ${redactMeshError(error)}`);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	private async sendFrom(
