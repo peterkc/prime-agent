@@ -21,9 +21,13 @@ export interface SessionHostLookup {
 	readonly list?: (socketPath: string) => Promise<readonly SessionSummary[]>;
 }
 
+export type LiveSessionSummary = SessionSummary & { activeSessionId: string };
+
 /** The selector rule of `stop`: exact ids or names first, unambiguous id suffixes second. */
-export function matchLiveSessions(sessions: readonly SessionSummary[], selector: string): SessionSummary[] {
-	const live = sessions.filter((session) => typeof session.activeSessionId === "string");
+export function matchLiveSessions(sessions: readonly SessionSummary[], selector: string): LiveSessionSummary[] {
+	const live = sessions.filter(
+		(session): session is LiveSessionSummary => typeof session.activeSessionId === "string",
+	);
 	const exact = live.filter(
 		(session) =>
 			session.activeSessionId === selector || session.sessionId === selector || session.sessionName === selector,
@@ -31,7 +35,7 @@ export function matchLiveSessions(sessions: readonly SessionSummary[], selector:
 	if (exact.length > 0) return exact;
 	return live.filter(
 		(session) =>
-			matchesSessionIdSuffix(session.activeSessionId!, selector) ||
+			matchesSessionIdSuffix(session.activeSessionId, selector) ||
 			matchesSessionIdSuffix(session.sessionId, selector),
 	);
 }
@@ -76,7 +80,7 @@ export async function findSessionHosts(
 			return matchLiveSessions(sessions, selector).map(
 				(session): SessionHost => ({
 					socketPath: daemon.socketPath,
-					activeSessionId: session.activeSessionId!,
+					activeSessionId: session.activeSessionId,
 					sessionId: session.sessionId,
 					...(session.sessionName ? { sessionName: session.sessionName } : {}),
 				}),
