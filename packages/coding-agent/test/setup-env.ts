@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import { afterAll, vi } from "vitest";
 
 // A run started from a daemon session inherits that session's daemon wiring and its real agent folder.
@@ -12,6 +12,11 @@ for (const name of Object.keys(process.env)) {
 delete process.env.PRIME_AGENT_SESSION_DIR;
 delete process.env.PRIME_AGENT_CODING_AGENT_SESSION_DIR; // legacy name, still read by getSessionDir()
 delete process.env.PRIME_AGENT_KERNEL_OWNER_PID;
+// Some tests supply their own agentDir. Keep host claude executables out of discovery in every directory.
+process.env.PATH = (process.env.PATH ?? "")
+	.split(delimiter)
+	.filter((dir) => isAbsolute(dir) && !existsSync(join(dir, "claude")))
+	.join(delimiter);
 const agentDir = mkdtempSync(join(tmpdir(), "prime-agent-test-home-"));
 process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
 afterAll(() => vi.dynamicImportSettled().then(() => rmSync(agentDir, { recursive: true, force: true })));
