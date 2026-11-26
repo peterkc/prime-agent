@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { agentDirEnvName } from "./agent-dir-env.mjs";
 
 const WORKER_MARKER = "PI_CODEMODE_WORKER_OK";
 const SUCCESS_MARKER = "PI_CODEMODE_BINARY_SMOKE_OK";
@@ -38,6 +40,18 @@ async function readRequest(request) {
 	return body;
 }
 
+/** A compiled binary has package.json beside it; a Node entry point finds the nearest one above it. */
+function findManifest(binary) {
+	if (extname(binary) !== ".js") return join(dirname(binary), "package.json");
+	let dir = dirname(binary);
+	while (!existsSync(join(dir, "package.json"))) {
+		if (dir === dirname(dir)) throw new Error(`No package.json found above ${binary}`);
+		dir = dirname(dir);
+	}
+	if (basename(dir) === "dist" && existsSync(join(dirname(dir), "package.json"))) dir = dirname(dir);
+	return join(dir, "package.json");
+}
+
 function toolResultContainsMarker(body) {
 	const payload = JSON.parse(body);
 	return (
@@ -54,6 +68,7 @@ async function main() {
 		throw new Error("Usage: node scripts/smoke-test-codemode-binary.mjs <pi-binary>");
 	}
 	const binary = resolve(binaryArg);
+	const agentDirVariable = agentDirEnvName(findManifest(binary));
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-codemode-binary-smoke-"));
 	let requestCount = 0;
 	const server = createServer(async (request, response) => {
@@ -133,7 +148,7 @@ async function main() {
 			cwd: tempDir,
 			env: {
 				...process.env,
-				PI_CODING_AGENT_DIR: tempDir,
+				[agentDirVariable]: tempDir,
 				PI_OFFLINE: "1",
 			},
 			stdio: ["ignore", "pipe", "pipe"],

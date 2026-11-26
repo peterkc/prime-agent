@@ -5,6 +5,8 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -36,7 +38,15 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
+import {
+	APP_NAME,
+	CONFIG_DIR_NAME,
+	ENV_SESSION_DIR,
+	expandTildePath,
+	getAgentDir,
+	getPackageDir,
+	VERSION,
+} from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -71,7 +81,7 @@ import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-schema.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
-import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
+import { isLocalPath, normalizePath, pathsEqual, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
@@ -608,7 +618,47 @@ export interface MainOptions {
 	extensionFactories?: InlineExtension[];
 }
 
+/** Resolve symlinks in the existing prefix of a configuration folder that may not exist yet. */
+function resolveConfigFolder(path: string): string {
+	let ancestor = resolve(path);
+	const missing: string[] = [];
+	while (!existsSync(ancestor)) {
+		const parent = dirname(ancestor);
+		if (parent === ancestor) break;
+		missing.unshift(basename(ancestor));
+		ancestor = parent;
+	}
+	try {
+		return join(realpathSync.native(ancestor), ...missing);
+	} catch {
+		return join(ancestor, ...missing);
+	}
+}
+
+function getConfigFolderCollisionMessage(cwd: string, agentDir: string): string | undefined {
+	if (!pathsEqual(resolveConfigFolder(join(cwd, CONFIG_DIR_NAME)), resolveConfigFolder(agentDir))) return undefined;
+	return `The project configuration folder is also your user agent folder: ${agentDir}. Start in a project folder instead.`;
+}
+
 export async function main(args: string[], options?: MainOptions) {
+	let cwd: string;
+	try {
+		cwd = process.cwd();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		console.error(
+			chalk.red(
+				"Error: The current working directory no longer exists. Change to an existing directory and try again.",
+			),
+		);
+		process.exit(1);
+	}
+	const agentDir = getAgentDir();
+	const startupFolderMessage = getConfigFolderCollisionMessage(cwd, agentDir);
+	if (startupFolderMessage) {
+		console.error(chalk.red(`Error: ${startupFolderMessage}`));
+		process.exit(1);
+	}
 	resetTimings();
 	// Commands and startup selectors can load user-authored themes before runtime creation.
 	setThemeJsonValidator(validateThemeJson);
@@ -628,19 +678,6 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	cleanupManagedInstall();
 
-	let cwd: string;
-	try {
-		cwd = process.cwd();
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		console.error(
-			chalk.red(
-				"Error: The current working directory no longer exists. Change to an existing directory and try again.",
-			),
-		);
-		process.exit(1);
-	}
-	const agentDir = getAgentDir();
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
@@ -742,6 +779,11 @@ export async function main(args: string[], options?: MainOptions) {
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	const selectedFolderMessage = getConfigFolderCollisionMessage(sessionManager.getCwd(), agentDir);
+	if (selectedFolderMessage) {
+		console.error(chalk.red(`Error: ${selectedFolderMessage}`));
+		process.exit(1);
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -797,6 +839,8 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
+		const folderCollisionMessage = getConfigFolderCollisionMessage(cwd, agentDir);
+		if (folderCollisionMessage) throw new Error(folderCollisionMessage);
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);

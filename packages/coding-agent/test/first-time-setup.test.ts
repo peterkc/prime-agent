@@ -1,10 +1,25 @@
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { shouldRunFirstTimeSetup } from "../src/cli/startup-ui.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+
+const identity = vi.hoisted(() => ({ official: true }));
+
+vi.mock("../src/config.ts", async (importOriginal) => {
+	const actual = await importOriginal<{ APP_NAME: string; CONFIG_DIR_NAME: string }>();
+	return {
+		...actual,
+		get APP_NAME() {
+			return identity.official ? "pi" : actual.APP_NAME;
+		},
+		get CONFIG_DIR_NAME() {
+			return identity.official ? ".pi" : actual.CONFIG_DIR_NAME;
+		},
+	};
+});
 
 describe("shouldRunFirstTimeSetup", () => {
 	const originalPiExperimental = process.env.PI_EXPERIMENTAL;
@@ -13,6 +28,7 @@ describe("shouldRunFirstTimeSetup", () => {
 	let settingsPath: string;
 
 	beforeEach(() => {
+		identity.official = true;
 		tempDir = mkdtempSync(join(tmpdir(), "pi-first-time-setup-"));
 		settingsPath = join(tempDir, "settings.json");
 		process.env.PI_EXPERIMENTAL = "1";
@@ -33,8 +49,13 @@ describe("shouldRunFirstTimeSetup", () => {
 		}
 	});
 
-	it("returns true when experimental, default agent dir, and no settings.json", () => {
+	it("returns true for pi when experimental, default agent dir, and no settings.json", () => {
 		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(true);
+	});
+
+	it("returns false for Prime when experimental, default agent dir, and no settings.json", () => {
+		identity.official = false;
+		expect(shouldRunFirstTimeSetup(settingsPath)).toBe(false);
 	});
 
 	it("returns false when experimental features are disabled", () => {

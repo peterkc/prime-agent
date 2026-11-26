@@ -9,9 +9,11 @@ import { contentText, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import {
 	type AgentSession,
+	CONFIG_DIR_NAME,
 	type CreateAgentSessionOptions,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	ENV_AGENT_DIR,
 	getAgentDir,
 	type InlineExtension,
 	ModelRuntime,
@@ -80,7 +82,7 @@ export function resolveModelSelection(
 }
 
 export function applyIsolatedEnvironment(home: string, agentDir: string): () => void {
-	const overrides = { HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: agentDir };
+	const overrides = { HOME: home, USERPROFILE: home, [ENV_AGENT_DIR]: agentDir };
 	const previous = new Map<string, string | undefined>();
 	for (const name of Object.keys(process.env)) {
 		if (!name.startsWith("PI_EVAL_")) continue;
@@ -117,6 +119,24 @@ function resolveSandboxIdentity(): SandboxIdentity | undefined {
 		throw new Error("Set both PI_EVAL_SANDBOX_UID and PI_EVAL_SANDBOX_GID, or neither.");
 	}
 	return { uid, gid };
+}
+
+/** Capture the host credential path; only the entrypoint's bootstrap copy may be removed. */
+export function resolveHostCredentialFile(): { authPath: string; removeBootstrapCopy: () => Promise<void> } {
+	const authPath = join(getAgentDir(), "auth.json");
+	const container = process.env.PI_EVAL_CONTAINER === "1";
+	if (
+		container &&
+		(!resolveSandboxIdentity() || resolve(authPath) !== join(tmpdir(), "pi-eval-host-agent", "auth.json"))
+	) {
+		throw new Error("Eval container credentials must use the entrypoint bootstrap copy and sandbox IDs.");
+	}
+	return {
+		authPath,
+		removeBootstrapCopy: async () => {
+			if (container) await rm(authPath, { force: true });
+		},
+	};
 }
 
 async function chownTree(path: string, identity: SandboxIdentity): Promise<void> {
@@ -278,12 +298,12 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 	const startedAt = performance.now();
 	signal?.throwIfAborted();
 	const selection = resolveModelSelection(options.model);
-	const hostAgentDir = getAgentDir();
+	const hostCredentials = resolveHostCredentialFile();
 	const sandboxIdentity = resolveSandboxIdentity();
 	const root = await mkdtemp(join(tmpdir(), "pi-eval-"));
 	const workspace = join(root, "workspace");
 	const isolatedHome = join(root, "home");
-	const agentDir = join(isolatedHome, ".pi", "agent");
+	const agentDir = join(isolatedHome, CONFIG_DIR_NAME);
 	const extensionFactories: InlineExtension[] = [];
 	let forcedSystemPrompt: string | undefined;
 	if (options.transformSystemPrompt) {
@@ -309,9 +329,8 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 	let hiddenCredentialEnvironment: { name: string; value: string } | undefined;
 	const restoreEnvironment = applyIsolatedEnvironment(isolatedHome, agentDir);
 	try {
-		const authPath = join(hostAgentDir, "auth.json");
 		const credentials = new InMemoryCredentialStore();
-		const storedCredential = readStoredCredential(selection.provider, authPath);
+		const storedCredential = readStoredCredential(selection.provider, hostCredentials.authPath);
 		if (storedCredential) await credentials.modify(selection.provider, async () => storedCredential);
 		const modelRuntime = await ModelRuntime.create({ credentials });
 		await Promise.all([mkdir(workspace), mkdir(agentDir, { recursive: true })]);
@@ -325,8 +344,8 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 		if (!storedCredential && auth.auth.apiKey) {
 			await modelRuntime.setRuntimeApiKey(selection.provider, auth.auth.apiKey);
 		}
+		await hostCredentials.removeBootstrapCopy();
 		if (sandboxIdentity) {
-			await rm(authPath, { force: true });
 			const credentialEnvironmentValue = auth.source ? process.env[auth.source] : undefined;
 			if (auth.source && /^[A-Z][A-Z0-9_]*$/.test(auth.source) && credentialEnvironmentValue) {
 				hiddenCredentialEnvironment = { name: auth.source, value: credentialEnvironmentValue };

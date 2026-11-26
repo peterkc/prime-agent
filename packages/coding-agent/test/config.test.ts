@@ -1,7 +1,10 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
-import { delimiter, join } from "path";
-import { afterEach, describe, expect, test } from "vitest";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { delimiter, join, resolve } from "path";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import * as config from "../src/config.ts";
 import {
 	detectInstallChange,
 	detectInstallMethod,
@@ -12,6 +15,7 @@ import {
 	getUpdateInstruction,
 	makeConfiguredSelfUpdateCommand,
 } from "../src/config.ts";
+import * as publicApi from "../src/index.ts";
 
 const execPathDescriptor = Object.getOwnPropertyDescriptor(process, "execPath");
 const originalPath = process.env.PATH;
@@ -540,5 +544,117 @@ describe("configured self-update command", () => {
 			display:
 				"wrapper install @earendil-works/pi-coding-agent@1.2.3 --name=@earendil-works/pi-coding-agent --version 1.2.3 {unknown}",
 		});
+	});
+});
+
+describe("Prime identity", () => {
+	let identityDir: string;
+
+	beforeEach(() => {
+		identityDir = mkdtempSync(join(tmpdir(), "prime-identity-"));
+		tempDir = identityDir;
+	});
+
+	test("exports the Prime identity and exact environment names", () => {
+		expect({
+			APP_NAME: publicApi.APP_NAME,
+			ENV_PREFIX: publicApi.ENV_PREFIX,
+			ENV_AGENT_DIR: publicApi.ENV_AGENT_DIR,
+		}).toEqual({
+			APP_NAME: "prime-agent",
+			ENV_PREFIX: "PRIME_AGENT",
+			ENV_AGENT_DIR: "PRIME_AGENT_CODING_AGENT_DIR",
+		});
+		expect(config.CONFIG_DIR_NAME).toBe(".prime/agent");
+		expect(config.ENV_SESSION_DIR).toBe("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
+	});
+
+	test.each([
+		["unset overrides", undefined, undefined, ".prime/agent"],
+		["Prime override", "~/custom-agent", undefined, "custom-agent"],
+		["legacy override ignored", undefined, "~/legacy-agent", ".prime/agent"],
+		["Prime override wins", "~/custom-agent", "~/legacy-agent", "custom-agent"],
+		["empty Prime override", "", "~/legacy-agent", ".prime/agent"],
+	] as const)("resolves the agent folder with %s", (_name, prime, legacy, expected) => {
+		vi.stubEnv("HOME", identityDir);
+		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", prime);
+		vi.stubEnv("PI_CODING_AGENT_DIR", legacy);
+		expect(config.getAgentDir()).toBe(join(homedir(), expected));
+		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", undefined);
+		vi.stubEnv("PI_CODING_AGENT_DIR", undefined);
+		expect(config.getAgentDir()).toBe(join(homedir(), ".prime", "agent"));
+	});
+
+	test.each([
+		["prime---agent", "PRIME_AGENT"],
+		["__prime..agent__", "PRIME_AGENT"],
+		["--", "PI"],
+	])("normalizes the environment prefix for %s", (name, expected) => {
+		const packageDir = identityDir;
+		writeFileSync(join(packageDir, "package.json"), JSON.stringify({ piConfig: { name } }));
+		const script = join(packageDir, "prefix.mts");
+		const configUrl = pathToFileURL(resolve(__dirname, "../src/config.ts")).href;
+		writeFileSync(
+			script,
+			`import * as config from ${JSON.stringify(configUrl)};
+console.log(JSON.stringify([config.ENV_PREFIX, config.ENV_AGENT_DIR, config.ENV_SESSION_DIR]));
+`,
+		);
+		const result = spawnSync(process.execPath, [script], {
+			env: { ...process.env, PI_PACKAGE_DIR: packageDir },
+			encoding: "utf8",
+			timeout: 10000,
+		});
+		expect(result.status, result.stderr).toBe(0);
+		expect(JSON.parse(result.stdout)).toEqual([
+			expected,
+			`${expected}_CODING_AGENT_DIR`,
+			`${expected}_CODING_AGENT_SESSION_DIR`,
+		]);
+	});
+
+	test("reads project settings from .prime/agent", () => {
+		const projectDir = identityDir;
+		const settingsDir = join(projectDir, ".prime", "agent");
+		mkdirSync(settingsDir, { recursive: true });
+		writeFileSync(join(settingsDir, "settings.json"), JSON.stringify({ theme: "light" }));
+		const settings = publicApi.SettingsManager.create(projectDir, join(projectDir, "user-agent"));
+		expect(settings.getTheme()).toBe("light");
+		expect(settings.getProjectSettings()).toMatchObject({ theme: "light" });
+	});
+
+	test("creates a session file under PRIME_AGENT_CODING_AGENT_SESSION_DIR", () => {
+		const projectDir = identityDir;
+		const sourceDir = join(projectDir, "source-sessions");
+		const sessionDir = join(projectDir, "override-sessions");
+		const agentDir = join(projectDir, "agent");
+		const source = publicApi.SessionManager.create(projectDir, sourceDir);
+		source.appendMessage({ role: "user", content: "saved input", timestamp: 0 });
+		const cliPath = resolve(__dirname, "../src/cli.ts");
+		const resolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
+		const result = spawnSync(
+			process.execPath,
+			["--import", resolverUrl, cliPath, "--fork", source.getSessionFile()!, "--model", "missing-model", "-p", "hi"],
+			{
+				cwd: projectDir,
+				env: {
+					...process.env,
+					PRIME_AGENT_CODING_AGENT_DIR: agentDir,
+					PI_CODING_AGENT_DIR: agentDir,
+					PRIME_AGENT_CODING_AGENT_SESSION_DIR: sessionDir,
+					PI_OFFLINE: "1",
+				},
+				encoding: "utf8",
+				timeout: 10000,
+			},
+		);
+		expect(result.status, result.stderr).toBe(1);
+		expect(result.stderr).toContain("missing-model");
+		const files = readdirSync(sessionDir);
+		expect(files).toHaveLength(1);
+		const [sessionFile] = files;
+		expect(sessionFile).toMatch(/\.jsonl$/);
+		expect(readFileSync(join(sessionDir, sessionFile), "utf8")).toContain("saved input");
+		expect(readdirSync(sourceDir)).toHaveLength(1);
 	});
 });

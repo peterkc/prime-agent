@@ -5,6 +5,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
+import { agentDirEnvName } from "./agent-dir-env.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const packageDir = join(repoRoot, "packages", "coding-agent");
@@ -13,7 +15,7 @@ const bundledDistCliPath = join(packageDir, "dist", "bundle", "cli.js");
 const srcCliPath = join(packageDir, "src", "cli.ts");
 const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
-const agentDirEnvName = "PI_CODING_AGENT_DIR";
+const agentDirVariable = agentDirEnvName(join(packageDir, "package.json"));
 const startupBenchmarkEnvName = "PI_STARTUP_BENCHMARK";
 
 function printHelp() {
@@ -34,7 +36,7 @@ Options:
                          Default: profiles-node for Node, profiles-bun for Bun
   --label <name>         Profile name prefix (default: <mode>-startup)
   --runtime <name>       node, bun, or auto (default: auto)
-  --agent-dir <dir>      Use a specific PI_CODING_AGENT_DIR for the benchmark run
+  --agent-dir <dir>      Use a specific ${agentDirVariable} for the benchmark run
   --isolated-agent-dir   Use a fresh temporary agent dir instead of the normal one
   --bundle               Build and profile the bundled Node entrypoint instead of dist/cli.js
   --no-offline           Do not force PI_OFFLINE=1 / PI_SKIP_VERSION_CHECK=1
@@ -379,9 +381,9 @@ function getRuntimeCommand(runtime, mode, profileDir, profileName, cpuProfile, n
 function createBenchmarkEnv(options, isolatedAgentDir) {
 	const env = { ...process.env, PI_TIMING: "1" };
 	if (options.agentDir) {
-		env[agentDirEnvName] = options.agentDir;
+		env[agentDirVariable] = options.agentDir;
 	} else if (isolatedAgentDir) {
-		env[agentDirEnvName] = isolatedAgentDir;
+		env[agentDirVariable] = isolatedAgentDir;
 	}
 	if (options.mode === "tui") {
 		env[startupBenchmarkEnvName] = "1";

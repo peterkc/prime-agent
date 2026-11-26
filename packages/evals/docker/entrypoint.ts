@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chownSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -103,8 +104,13 @@ const codingAgentEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-c
 if (codingAgentEntry !== "/repo/node_modules/@earendil-works/pi-coding-agent/dist/index.js") {
 	throw new Error(`Eval does not resolve pi-coding-agent from dist: ${codingAgentEntry}`);
 }
+const piConfig: { name?: string } | undefined = JSON.parse(
+	readFileSync(resolve(dirname(codingAgentEntry), "../package.json"), "utf8"),
+).piConfig;
+const envPrefix = (piConfig?.name || "pi").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "PI";
+const ENV_AGENT_DIR = `${envPrefix}_CODING_AGENT_DIR`;
 
-const agentDir = "/tmp/pi-eval-host-agent";
+const agentDir = join(tmpdir(), "pi-eval-host-agent");
 mkdirSync(agentDir, { recursive: true });
 const authSource = "/run/pi-eval-secrets/auth.json";
 if (existsSync(authSource)) copyFileSync(authSource, join(agentDir, "auth.json"));
@@ -112,7 +118,7 @@ chownTree(agentDir, sandboxUid, sandboxGid);
 chownTree("/artifacts", sandboxUid, sandboxGid);
 process.env.HOME = "/tmp/pi-eval-bootstrap";
 process.env.USERPROFILE = process.env.HOME;
-process.env.PI_CODING_AGENT_DIR = agentDir;
+process.env[ENV_AGENT_DIR] = agentDir;
 process.env.PI_EVAL_CONTAINER = "1";
 process.umask(0o022);
 

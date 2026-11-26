@@ -9,7 +9,7 @@ import {
 	type OAuthChallenge,
 	OAuthIssuerMismatchError,
 } from "@earendil-works/pi-mcp/oauth";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAuthStorageBackend } from "../src/core/auth-storage.ts";
 import {
 	createMcpAuthProvider,
@@ -18,6 +18,25 @@ import {
 	signInMcpServer,
 } from "../src/extensions/mcp/oauth.ts";
 import { startOAuthMcpServer } from "./suite/mcp-oauth-server.ts";
+
+const identity = vi.hoisted(() => ({ official: true }));
+
+vi.mock("../src/config.ts", async (importOriginal) => {
+	const actual = await importOriginal<{ APP_NAME: string; CONFIG_DIR_NAME: string }>();
+	return {
+		...actual,
+		get APP_NAME() {
+			return identity.official ? "pi" : actual.APP_NAME;
+		},
+		get CONFIG_DIR_NAME() {
+			return identity.official ? ".pi" : actual.CONFIG_DIR_NAME;
+		},
+	};
+});
+
+beforeEach(() => {
+	identity.official = true;
+});
 
 describe("MCP OAuth refresh", () => {
 	const cleanups: (() => Promise<void> | void)[] = [];
@@ -253,6 +272,15 @@ describe("MCP OAuth client ID metadata documents", () => {
 		expect(server.authorizations).toHaveLength(1);
 		expect(server.tokenRequests[1].get("grant_type")).toBe("refresh_token");
 		expect(server.tokenRequests[1].get("client_id")).toBe("https://pi.dev/oauth/client.json");
+	});
+
+	it("registers dynamically by default for Prime when the server supports documents", async () => {
+		identity.official = false;
+		const { server, signIn } = await startServer({ cimd: true, issParameter: true });
+		await signIn({});
+		expect(server.registrations).toHaveLength(1);
+		expect(server.authorizations[0].get("client_id")).toBe("client-1");
+		expect(server.tokenRequests[0].get("client_id")).toBe("client-1");
 	});
 
 	// #11426

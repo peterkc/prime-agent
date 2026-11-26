@@ -9,6 +9,141 @@ Each entry gives its **files**, **reason**, **kind** (`upstreamable hook`,
 **removal condition**.
 New fork-only files are not changes to pi-owned files.
 
+## Change #0: Prime identity
+
+- **Files:**
+  - `CARRIED-CHANGES.md`
+  - `packages/coding-agent/package.json`
+  - `packages/coding-agent/src/config.ts`
+  - `packages/coding-agent/src/index.ts`
+  - `packages/coding-agent/src/cli/auth-command.ts`
+  - `packages/coding-agent/src/extensions/mcp/cli.ts`
+  - `packages/coding-agent/src/extensions/mcp/index.ts`
+  - `packages/coding-agent/test/auth-login.test.ts`
+  - `packages/coding-agent/test/auth-logout.test.ts`
+  - `packages/coding-agent/test/config.test.ts`
+  - `packages/coding-agent/test/credential-print.test.ts`
+  - `packages/coding-agent/test/first-time-setup.test.ts`
+  - `packages/coding-agent/test/interactive-mode-bug-report-hint.test.ts`
+  - `packages/coding-agent/test/mcp-command.test.ts`
+  - `packages/coding-agent/test/mcp-extension.test.ts`
+  - `packages/coding-agent/test/mcp-oauth-refresh.test.ts`
+  - `packages/coding-agent/test/package-command-paths.test.ts`
+  - `packages/coding-agent/test/package-manager.test.ts`
+  - `packages/coding-agent/test/program-status-reporter.test.ts`
+  - `packages/coding-agent/test/resource-loader.test.ts`
+  - `packages/coding-agent/test/rpc.test.ts`
+  - `packages/coding-agent/test/session-file-invalid.test.ts`
+  - `packages/coding-agent/test/session-manager/file-operations.test.ts`
+  - `packages/coding-agent/test/settings-manager-bug.test.ts`
+  - `packages/coding-agent/test/settings-manager.test.ts`
+  - `packages/coding-agent/test/stdout-cleanliness.test.ts`
+  - `packages/coding-agent/test/suite/agent-session-mcp-oauth.test.ts`
+  - `packages/coding-agent/test/suite/regressions/2781-skill-collision-precedence.test.ts`
+  - `packages/coding-agent/test/suite/regressions/2791-fswatch-error-crash.test.ts`
+  - `packages/coding-agent/test/suite/regressions/8337-utf8-bom-parsing.test.ts`
+  - `packages/coding-agent/test/fixtures/subagent-child.mjs`
+  - `packages/coding-agent/test/suite/regressions/8261-subagent-project-trust.test.ts`
+  - `packages/coding-agent/test/utilities.ts`
+  - `packages/coding-agent/test/theme-export.test.ts`
+  - `packages/coding-agent/test/theme-picker.test.ts`
+  - `packages/coding-agent/test/trust-manager.test.ts`
+  - `packages/coding-agent/src/main.ts`
+  - `packages/coding-agent/test/deleted-cwd.test.ts`
+  - `packages/evals/src/harness.ts`
+  - `packages/evals/src/docker.ts`
+  - `packages/evals/docker/entrypoint.ts`
+  - `packages/evals/test/harness.test.ts`
+  - `scripts/smoke-test-codemode-binary.mjs`
+  - `scripts/profile-coding-agent-node.mjs`
+  - `scripts/coding-agent-smoke.mjs`
+- **Reason:** Give the coding agent the Prime name and keep both user and project
+  configuration in `.prime/agent`. Normalize the product name for environment
+  variables and export the identity names for integrations. Tests follow the
+  configured folders, variable names and product-name text. Credential test helpers
+  resolve their folder through `getAgentDir()`. Test-only config mocks retain pi's
+  official setup, OAuth and managed-update branch coverage; separate rows assert
+  Prime's existing setup and OAuth safeguards. The managed npm fixture creates the
+  executable from the real package bin manifest (`pi`), not from `APP_NAME`.
+  These test mocks change no production setup, OAuth or managed-update code. The
+  subagent fixture publishes its PID
+  only after installing its SIGTERM handler and emitting its partial message, so
+  the lifecycle test's readiness signal means both are ready. Identity regression
+  rows use exact variable names to check the public contract, including the old
+  name's absence of effect. The eval harness, container bootstrap and smoke/profile
+  scripts follow the configured identity too. Plain-Node scripts derive the same
+  variable name from the tested manifest through the fork-only
+  `scripts/agent-dir-env.mjs`; the profiler keeps its non-isolated default.
+- **Credential removal fix:** The harness captures the container
+  marker and host path before environment isolation. It removes a credential only
+  for a marked container whose path is the entrypoint's bootstrap copy destination
+  and whose sandbox IDs are configured. A host run with sandbox IDs alone never
+  removes its source file. Source, bootstrap copy and session folder stay distinct.
+  This part could go to pi as a separate fix. Remove it when pi adopts the same
+  marker-bound removal condition.
+- **CLI folder check:** Refuse before auth dispatch, settings or migrations when the
+  project configuration folder resolves to the user agent folder, including case-only
+  aliases and symlinks of existing folders, and existing symlink ancestors of
+  not-yet-created folders. Startup session
+  selection also applies the check before `--name` or runtime setup. The runtime
+  factory repeats the check before loading the selected cwd as a project. The
+  comparison uses the configured agent folder, including an agent-dir override.
+  SDK callers passing their own cwd and agent folder are not covered.
+- **Recorded in-session limit:** Switching to a session whose project configuration
+  folder resolves to the user agent folder refuses after the current session is
+  torn down. Interactive `/resume` and `/import` report a fatal runtime error,
+  record it as a crash report and exit. RPC `switch_session` is left with a disposed
+  session. A print-mode extension command calling `ctx.switchSession` reports an
+  extension error but still finishes with exit code 0 after teardown. `/import`
+  also leaves its copied session file behind. None of these paths reads or writes
+  the user agent folder as project configuration. A check before teardown in
+  `packages/coding-agent/src/core/agent-session-runtime.ts` would remove this limit.
+  It is not carried, to keep the guard in `packages/coding-agent/src/main.ts`.
+- **Recorded exceptions and stage-2 limits:** Stage 2 is the follow-up change that
+  finishes the identity rename on `next`.
+  - The startup check misses a case-only alias of a not-yet-created folder on a
+    case-insensitive volume, and a dangling symlink at the project folder. Auth,
+    package, config and MCP commands, migrations and settings can run before the
+    later session-selection check. Once the session manager creates the folder,
+    session selection refuses before loading it as project configuration. Stage 2
+    must harden comparisons for these missing paths.
+  - These tests use no `.pi` configuration paths, with two exceptions. Display-only
+    exception: `.pi` paths in
+    `test/interactive-mode-status.test.ts` and
+    `test/tool-execution-component.test.ts` are supplied display text, not config
+    discovery paths. These fixtures do not access those paths.
+  - Caller-supplied tilde-expansion exception to that rule:
+    `test/skills.test.ts:375-389` passes explicit `~/.pi/agent/skills` paths to
+    compare tilde expansion with the absolute path. It accesses that caller-supplied
+    path, not config-folder resolution; checks use a disposable `HOME`.
+  - Test-only official-distribution mocks deliberately supply `pi` and `.pi` to
+    exercise pi's guarded branches. Prime behavior has separate assertions.
+  - Managed self-update is not reachable for Prime on `next` with
+    the current package manifest: verification looks for `prime-agent`, the real
+    bin is `pi`, and the managed marker/release service still names pi.dev. The
+    managed-update rows exercise pi's official identity, not a fictional Prime
+    install. Stage 2 must resolve this before use.
+  - Help/UI still shows the extra `agent` segment, producing
+    `~/.prime/agent/agent`: `src/cli/args.ts:415,462`,
+    `src/package-manager-cli.ts:313`, `src/extensions/mcp/cli.ts:43` and
+    `src/modes/interactive/components/config-selector.ts:206`.
+  - MCP empty-state hints and auth credential help now use the configured folders.
+    Docs that name `PI_` variables still describe pi; stage 2 owns those corrections.
+  - Known unconverted identity consumers remain follow-ups for stage 2:
+    `.github/workflows/issue-analysis.yml`, `apps/p2`,
+    `scripts/cost.ts`, `scripts/stats.ts`, `scripts/tool-stats.ts`,
+    `scripts/session-transcripts.ts`, `scripts/edit-tool-stats.mjs`,
+    `scripts/read-tool-stats.mjs`, `scripts/session-context-stats.mjs` and
+    `packages/evals/evals/prompt-templates.docs.eval.ts`.
+  - Docker evals now select `~/.prime/agent/auth.json` by default and bind-mount it
+    read-only, as pi's Docker design does. Stage 1 runs no Docker or paid eval.
+  - Without `piConfig`, the folder fallback is `~/.pi` on this branch, not
+    fork/main's `~/.prime/agent`. `next` always ships `piConfig`; changing that
+    fallback was not carried in this change.
+- **Kind:** intentional difference
+- **Removal condition:** Remove when pi offers separate product-identity and folder
+  settings that preserve both Prime configuration folders and normalized names.
+
 ## Fork development rules
 
 - **Files:** `AGENTS.md`
