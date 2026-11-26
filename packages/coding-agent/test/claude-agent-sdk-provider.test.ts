@@ -286,6 +286,7 @@ it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a promp
 	expect(await input).toEqual([]);
 	expect(msg.stopReason).toBe("error");
 	expect(msg.errorMessage).toContain("2.1.248");
+	if (version === undefined) expect(msg.errorMessage).toContain("cannot confirm the version");
 	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
@@ -679,6 +680,33 @@ it.each([
 			...(scenario === "tool tail" ? [] : [text("Tool result two (call-1):"), text("answer 1")]),
 		],
 	]);
+});
+it.each([
+	["CLI configuration is invalid", false],
+	["No conversation found with session ID", true],
+] as const)("R2-1 handles startup result %s", async (error, replay) => {
+	const { history } = await checkpointFixture();
+	const inputs: SDKUserMessage[][] = [];
+	const f = fixture(
+		async function* ({ options, prompt }) {
+			inputs.push(await collectPrompt(prompt));
+			if (options.resume) yield { type: "result", subtype: "error_during_execution", errors: [error] };
+			else yield result();
+		},
+		vi
+			.fn()
+			.mockRejectedValueOnce(Error("control response closed"))
+			.mockResolvedValue({ claude_code_version: "2.1.248" }),
+	);
+	const reply = await f.provider.streamSimple(model, history).result();
+	if (replay) {
+		expect(reply.stopReason).toBe("stop");
+		expect(inputs[1]).toHaveLength(1);
+	} else {
+		expect(reply.errorMessage).toContain(error);
+		expect(inputs).toHaveLength(1);
+	}
+	expect(inputs[0]).toEqual([]);
 });
 it.each([
 	["No conversation found with session ID", false, true],

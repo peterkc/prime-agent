@@ -350,10 +350,22 @@ export class ClaudeSdkProvider {
 						})(),
 						options: sdkOptions,
 					});
-					const { claude_code_version: version } = await query.initializationResult();
+					let version: string | undefined;
+					try {
+						version = (await query.initializationResult()).claude_code_version;
+					} catch (error) {
+						allowPrompt(false);
+						ctrl.signal.throwIfAborted();
+						// The CLI can emit a startup failure result before the SDK rejects its control response.
+						for await (const m of query) {
+							if (m.type === "result" && m.subtype !== "success" && m.errors.length)
+								throw Error(m.errors.join("; "));
+						}
+						throw error;
+					}
 					if ((comparePackageVersions(version ?? "", "2.1.248") ?? -1) < 0)
 						throw new StreamFailureError(
-							`Claude Code 2.1.248 or later is required for verbatim prompts (reported: ${version ?? "unknown"})`,
+							`Claude Code 2.1.248 or later is required for verbatim prompts (${version ? `reported: ${version}` : "Prime cannot confirm the version"})`,
 							{ kind: "invalid_request" },
 						);
 					ctrl.signal.throwIfAborted();
