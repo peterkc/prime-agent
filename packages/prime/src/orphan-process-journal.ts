@@ -18,21 +18,19 @@ interface OrphanProcessRecord {
 export interface ActiveOrphanProcess {
 	pid: number;
 	kernelPid?: number;
-	/** Missing on identity-free records: old journals or host writes whose start-id query failed (kernels no longer write pid-only records). */
+	/** Missing on identity-free records from old journals (kernels no longer write pid-only records). */
 	processStartId?: string;
 }
 
-export function recordOrphanProcessState(pid: number, active: boolean, path: string): void {
+export function recordOrphanProcessState(pid: number, path: string): void {
 	if (!path || !Number.isInteger(pid) || pid <= 0) {
 		return;
 	}
-	const processStartId = active ? getProcessStartId(pid) : undefined;
 	const record: OrphanProcessRecord = {
 		version: 1,
 		pid,
 		ownerPid: process.pid,
-		...(processStartId ? { processStartId } : {}),
-		active,
+		active: false,
 		recordedAt: new Date().toISOString(),
 	};
 	try {
@@ -79,8 +77,8 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 			// A crash can truncate only the final append.
 		}
 	}
-	// Pid-only actives (no processStartId) still surface from old journals or
-	// host writes whose start-id query failed; reapers decide per-platform.
+	// Pid-only actives (no processStartId) still surface from old journals;
+	// reapers decide per-platform.
 	return [...latest.values()]
 		.filter(
 			(record) =>
@@ -102,8 +100,7 @@ export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boo
  * Identity-free records cannot prove the pid still names the journaled process.
  * On win32 the kernel's kill-on-close job already reaped its tree when it died,
  * so a bare-pid taskkill only risks killing a reused pid. POSIX keeps the
- * best-effort kill (group-scoped, and the spawn gate makes pid-only actives
- * host-written rarities there).
+ * best-effort kill (group-scoped; only older runtimes write pid-only actives).
  */
 export function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
 	if (orphan.processStartId === undefined) {
@@ -132,7 +129,7 @@ export function reapKernelOrphanProcesses(kernelPid: number, path: string): void
 		}
 		// Inactive only after a delivered signal; a stale record is neutralized by the startId check.
 		if (killOrphanProcess(orphan.pid)) {
-			recordOrphanProcessState(orphan.pid, false, path);
+			recordOrphanProcessState(orphan.pid, path);
 		}
 	}
 }
