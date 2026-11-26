@@ -41,6 +41,7 @@ import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
 import { sessionPendingForDelete } from "./mesh-cotal.js";
 import { repositoryDaemon } from "./repository-daemon.js";
+import { findSessionHosts, formatStopHint } from "./session-hosts.js";
 import { formatSessionsTable } from "./sessions-table-format.js";
 
 interface ParsedDaemonClientCommand {
@@ -386,11 +387,7 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				);
 				return;
 			case "kill":
-				await printResponseData(
-					client,
-					{ type: "kill", activeSessionId: requireActiveSessionId(parsed.positionals) },
-					parsed.json,
-				);
+				await runKill(client, parsed);
 				return;
 			case "delete":
 				await runDelete(client, parsed);
@@ -1386,6 +1383,18 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 	}
 
 	throw new Error(`Unknown schedule command: ${subcommand}`);
+}
+
+async function runKill(client: DaemonClient, parsed: ParsedDaemonClientCommand): Promise<void> {
+	const selector = requireActiveSessionId(parsed.positionals);
+	try {
+		await printResponseData(client, { type: "kill", activeSessionId: selector }, parsed.json);
+	} catch (error) {
+		if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
+		const hosts = await findSessionHosts(selector, parsed.socketPath);
+		if (hosts.length === 0) throw error;
+		throw new Error(`${error.message}\n${formatStopHint(hosts)}`, { cause: error });
+	}
 }
 
 async function resolveLiveSessionSelector(client: DaemonClient, selector: string): Promise<string> {

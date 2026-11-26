@@ -3077,6 +3077,7 @@ export class DaemonSupervisor {
 				throw new Error("Message was not stored: restart that session to use mesh messaging");
 			if (!source.summary.sessionFile || !source.summary.sessionId)
 				throw new Error("Message was not stored: sender has no session file");
+			await this.retryClaimedMeshEnrollment(source.summary.sessionId, source.summary.sessionFile);
 			const targetSessionId = await this.mesh.resolveAddress(command.targetSessionId);
 			if (targetSessionId === source.summary.sessionId)
 				throw new Error("Message was not stored: agent messaging cannot target the sending session");
@@ -5377,6 +5378,14 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private async retryClaimedMeshEnrollment(sessionId: string, sessionFile: string): Promise<void> {
+		try {
+			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile);
+		} catch (error) {
+			this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`);
+		}
+	}
+
 	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
 		const entry = workerRosterEntryFromSummary(summary);
 		const previous = this.roster().get(entry.agentId);
@@ -5409,6 +5418,8 @@ export class DaemonSupervisor {
 				previous.summary.sessionFile !== entry.summary.sessionFile)
 		)
 			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile, true);
+		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile)
+			void this.retryClaimedMeshEnrollment(entry.summary.sessionId, entry.summary.sessionFile);
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {

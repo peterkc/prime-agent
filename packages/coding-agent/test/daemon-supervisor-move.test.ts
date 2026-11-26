@@ -376,6 +376,41 @@ describe("supervisor session move", () => {
 		freeClaim(f);
 		freeLeases(f.paths);
 	});
+	it("pi-dkwcu enrolls a roster session again once another daemon releases its claim", async () => {
+		const f = await fixture(false);
+		const claim = enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile);
+		const supervisor = harness(await start(f.root, f.sourceDir, f.socket)) as unknown as Harness & {
+			writeRosterEntry(entry: object): void;
+		};
+		const sessions = (supervisor.mesh as unknown as { sessions: Map<string, unknown> }).sessions;
+		const first = vi.spyOn(supervisor.mesh, "enqueueEnrollment");
+		const retry = vi.spyOn(supervisor.mesh, "retryClaimedEnrollment");
+		const entry = {
+			agentId: f.id,
+			summary: {
+				id: "active",
+				activeSessionId: "active",
+				sessionId: f.id,
+				sessionFile: f.paths.sourceFile,
+				cwd: f.root,
+			},
+		};
+		try {
+			supervisor.writeRosterEntry(entry);
+			await first.mock.results[0]!.value;
+			await expect(supervisor.mesh.send({ sessionId: f.id }, "other", "hello")).rejects.toThrow(
+				"claimed by another daemon",
+			);
+			supervisor.writeRosterEntry(entry);
+			await retry.mock.results[0]!.value;
+			expect(sessions.has(f.id)).toBe(false);
+		} finally {
+			claim.release();
+		}
+		supervisor.writeRosterEntry(entry);
+		await retry.mock.results[1]!.value;
+		expect(sessions.has(f.id)).toBe(true);
+	});
 	it("AC-13/#55 dispatch moves an enrolled ID and releases custody", async () => {
 		const f = await fixture();
 		const response = await dispatch(f);

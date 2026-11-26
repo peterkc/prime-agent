@@ -1,5 +1,5 @@
 import * as cp from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -9,6 +9,7 @@ import {
 	type DaemonInfo,
 	discoverDaemons,
 	evaluateShutdownQuietPeriod,
+	findSharedSessionFolders,
 	isWorkerSocketPath,
 	planReap,
 	planShutdownAll,
@@ -23,6 +24,38 @@ import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_INFO, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 
 vi.mock("node:child_process", { spy: true });
+
+describe("pi-dkwcu shared session folders", () => {
+	it("reports reachable daemons that resolve to one folder, through a symlink too, and skips the rest", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "prime-shared-folder-")));
+		try {
+			const shared = join(root, "sessions");
+			mkdirSync(shared);
+			mkdirSync(join(root, "own"));
+			symlinkSync(shared, join(root, "link"));
+			const folders: Record<string, string | undefined> = {
+				"default.sock": shared,
+				"prime.sock": join(root, "link"),
+				"repo.sock": join(root, "own"),
+				"hung.sock": shared,
+				"unknown.sock": undefined,
+			};
+			const daemons = [
+				makeDaemon({ socketPath: "default.sock", status: "current", isDefault: true }),
+				makeDaemon({ socketPath: "prime.sock", status: "stale" }),
+				makeDaemon({ socketPath: "repo.sock", status: "current" }),
+				makeDaemon({ socketPath: "hung.sock", status: "unreachable" }),
+				makeDaemon({ socketPath: "unknown.sock", status: "current" }),
+			];
+			expect(findSharedSessionFolders(daemons, (socket) => folders[socket])).toEqual([
+				{ sessionDir: shared, socketPaths: ["default.sock", "prime.sock"] },
+			]);
+			expect(findSharedSessionFolders(daemons.slice(2), (socket) => folders[socket])).toEqual([]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
 
 it("shows repository roots and keeps the default marker with an empty root cell", () => {
 	const table = formatDaemonListTable([

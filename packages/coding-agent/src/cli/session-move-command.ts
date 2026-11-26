@@ -20,6 +20,7 @@ import { getCommandSpec } from "./command-registry.js";
 import { runStart } from "./daemon-command.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 import { prepareRepositoryDaemon, resolveRepositoryDaemon } from "./repository-daemon.js";
+import { findSessionHosts, formatMoveHint } from "./session-hosts.js";
 
 const SESSION_MOVE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
@@ -364,7 +365,12 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			);
 		}
 		recovered = parseRecovered(isRecord(response.data) ? response.data.recovered : undefined);
-		if (!response.success) throw new Error(response.error);
+		if (!response.success) {
+			if (!/claimed by another daemon|open or being written elsewhere/.test(response.error))
+				throw new Error(response.error);
+			const hosts = await findSessionHosts(info.id, sourceSocket);
+			throw new Error(`${response.error}\n${formatMoveHint(hosts, targetCwd)}`);
+		}
 		const reply = parseReply(response.data);
 		const note =
 			reply.mesh.status === "failed"

@@ -1,0 +1,3 @@
+- Fixed a session that stayed unable to send agent messages after another daemon held its mesh claim. The daemon now tries to enroll the session again when it sends a message or its roster entry updates, and logs the refusal only once while the claim stays held.
+- `prime-agent stop` and `prime-agent move` now name the daemon that runs the session when the daemon they reached cannot stop or move it, and print the `--daemon-socket` commands to run instead.
+- `prime-agent status` and `prime-agent doctor` now warn when two running daemons use the same session folder. Each such daemon sees the other's saved sessions, so commands from one can reach a session the other runs.

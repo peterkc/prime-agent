@@ -58,6 +58,7 @@ import {
 export { MeshTransferRecordError } from "./mesh-shared.js";
 
 const MESH_SEND_TIMEOUT_MS = 30_000;
+const CLAIMED_BY_ANOTHER_DAEMON = "claimed by another daemon";
 
 export type MeshHandoffResult = { status: "deferred"; reason: "run_active" };
 
@@ -227,6 +228,15 @@ export class MeshEndpoints {
 		return reason;
 	}
 
+	/**
+	 * Enrolls again only after a refusal because another daemon held the claim. That daemon can release the
+	 * claim later, for example when it stops, and nothing else would enroll the session again.
+	 */
+	retryClaimedEnrollment(sessionId: string, sessionFile: string): Promise<void> {
+		if (this.enrollmentFailures.get(sessionId) !== CLAIMED_BY_ANOTHER_DAEMON) return Promise.resolve();
+		return this.enroll(sessionId, sessionFile);
+	}
+
 	enqueueEnrollment(sessionId: string, sessionFile?: string): Promise<void> {
 		const work = this.enrollmentQueue.then(() => {
 			if (!this.closing) return this.enroll(sessionId, sessionFile);
@@ -290,8 +300,10 @@ export class MeshEndpoints {
 			claim = retainedClaim ?? claimEnrollment(this.options.meshRoot, sessionId, sessionFile);
 		} catch (error) {
 			if (error instanceof SessionAlreadyActiveError) {
-				this.enrollmentFailures.set(sessionId, "claimed by another daemon");
-				this.options.log(`Mesh session ${sessionId}: claimed by another daemon`);
+				// Retries repeat while the other daemon holds the claim; log only the first refusal.
+				if (this.enrollmentFailures.get(sessionId) !== CLAIMED_BY_ANOTHER_DAEMON)
+					this.options.log(`Mesh session ${sessionId}: ${CLAIMED_BY_ANOTHER_DAEMON}`);
+				this.enrollmentFailures.set(sessionId, CLAIMED_BY_ANOTHER_DAEMON);
 				return;
 			}
 			throw error;
