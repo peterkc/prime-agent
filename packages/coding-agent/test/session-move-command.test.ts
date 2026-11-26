@@ -443,7 +443,8 @@ describe("session move command", () => {
 		moveFailure = true;
 		moveError = error;
 		const hosts = [{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" }];
-		vi.mocked(findSessionHosts).mockResolvedValueOnce(kind === "claimed" ? hosts : []);
+		// Queue a result only when the lookup runs; an unused one would leak into the next test.
+		if (kind !== "other") vi.mocked(findSessionHosts).mockResolvedValueOnce(kind === "claimed" ? hosts : []);
 		await run(["--yes"]);
 		expect(process.exitCode).toBe(1);
 		expect(errors()).toContain(error);
