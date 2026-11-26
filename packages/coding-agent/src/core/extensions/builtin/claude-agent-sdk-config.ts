@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { StreamFailureError } from "@earendil-works/pi-ai";
 
 export function readClaudeSettings(agentDir: string): { claudePath?: string } {
 	const path = join(agentDir, "claude-sdk.json");
@@ -13,6 +14,8 @@ export function readClaudeSettings(agentDir: string): { claudePath?: string } {
 		return { claudePath: value.claudePath };
 	} catch (error) {
 		if (error instanceof Error && "code" in error && error.code === "ENOENT") return {};
-		throw Error(`Cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		const message = `Cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`;
+		if (error instanceof Error && "code" in error) throw Error(message);
+		throw new StreamFailureError(message, { kind: "invalid_request" });
 	}
 }

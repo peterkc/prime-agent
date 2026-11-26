@@ -18,6 +18,7 @@ import { createAgentSessionServices } from "../src/core/agent-session-services.j
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ClaudeSdkProvider } from "../src/core/extensions/builtin/claude-agent-sdk.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { providerStreamFailureDetails } from "../src/core/provider-retry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createHarness } from "./suite/harness.js";
@@ -233,8 +234,42 @@ it.each(["missing binary", "missing login", "superseded output"])("fails visibly
 				? /claude auth login/
 				: /superseded/i,
 	);
+	if (scenario === "missing binary") expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
+	if (scenario === "missing login")
+		expect(providerStreamFailureDetails(msg)).toMatchObject({
+			kind: "permission",
+			providerErrorType: "authentication_failed",
+		});
 	expect(calls).toBe(scenario === "missing binary" ? 0 : 1);
 	expect(msg.content).toEqual([]);
+});
+it.each([
+	["oauth_org_not_allowed", "permission"],
+	["account_on_hold", "permission"],
+	["verification_required", "permission"],
+	["billing_error", "permission"],
+	["invalid_request", "invalid_request"],
+	["model_not_found", "invalid_request"],
+	["rate_limit", "rate_limit"],
+])("reports the SDK error %s as %s", async (error, kind) => {
+	const f = fixture(async function* () {
+		yield { type: "assistant", error };
+	});
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(providerStreamFailureDetails(msg)).toMatchObject({ kind, providerErrorType: error });
+});
+it.each(["bad settings", "unsupported image"])("reports %s as invalid input", async (scenario) => {
+	const f = fixture(async function* () {
+		yield result();
+	});
+	const messages: Context["messages"] =
+		scenario === "unsupported image"
+			? [{ role: "user", content: [{ type: "image", mimeType: "image/svg+xml", data: "" }], timestamp: 0 }]
+			: context.messages;
+	if (scenario === "bad settings") writeFileSync(join(f.dir, "claude-sdk.json"), "{bad");
+	const msg = await f.provider.streamSimple(model, { messages }).result();
+	expect(msg.stopReason).toBe("error");
+	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
 it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a prompt", async (version) => {
 	let input: Promise<SDKUserMessage[]> | undefined;
@@ -251,6 +286,7 @@ it.each(["2.1.247", undefined])("refuses CLI version %s without yielding a promp
 	expect(await input).toEqual([]);
 	expect(msg.stopReason).toBe("error");
 	expect(msg.errorMessage).toContain("2.1.248");
+	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
 it.each(["allowlist"])("restricts the child environment by %s", async () => {
 	for (const key of [

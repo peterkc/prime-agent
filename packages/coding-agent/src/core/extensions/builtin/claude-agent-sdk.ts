@@ -32,11 +32,13 @@ import {
 	type AssistantMessageEventStream,
 	type Context,
 	calculateCost,
+	classifyStreamFailure,
 	createAssistantMessageEventStream,
 	formatStreamFailureMessage,
 	type Model,
 	recordStreamFailure,
 	type SimpleStreamOptions,
+	StreamFailureError,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -85,7 +87,9 @@ function executable(configured?: string) {
 			/* Try the next PATH entry. */
 		}
 	}
-	throw Error("Cannot find the claude executable. Check PATH or the claudePath setting.");
+	throw new StreamFailureError("Cannot find the claude executable. Check PATH or the claudePath setting.", {
+		kind: "invalid_request",
+	});
 }
 function primeServer(tools: Context["tools"]) {
 	const server = new McpServer({ name: "prime", version: "1" }, { capabilities: { tools: {} } });
@@ -153,15 +157,10 @@ type Block = Exclude<SDKUserMessage["message"]["content"], string>[number];
 function imageBlock(part: { mimeType: string; data: string }) {
 	const media = part.mimeType;
 	if (media !== "image/png" && media !== "image/jpeg" && media !== "image/gif" && media !== "image/webp")
-		throw Error(`Unsupported image type ${media}`);
+		throw new StreamFailureError(`Unsupported image type ${media}`, { kind: "invalid_request" });
 	return { type: "image", source: { type: "base64", media_type: media, data: part.data } } as const;
 }
-async function* promptFor(
-	messages: Context["messages"],
-	resumed: boolean,
-	versionAccepted: Promise<boolean>,
-): AsyncGenerator<SDKUserMessage> {
-	if (!(await versionAccepted)) return;
+function promptFor(messages: Context["messages"], resumed: boolean): SDKUserMessage {
 	const content: Block[] = [];
 	for (const msg of messages) {
 		if (resumed && msg.role === "toolResult") {
@@ -186,7 +185,7 @@ async function* promptFor(
 				else if (part.type === "toolCall") content.push({ type: "text", text: JSON.stringify(part) });
 			}
 	}
-	yield { type: "user", parent_tool_use_id: null, message: { role: "user", content } };
+	return { type: "user", parent_tool_use_id: null, message: { role: "user", content } };
 }
 
 export class ClaudeSdkProvider {
@@ -343,18 +342,18 @@ export class ClaudeSdkProvider {
 				});
 				ctrl.signal.addEventListener("abort", abortAttempt, { once: true });
 				try {
+					const prompt = promptFor(point ? context.messages.slice(point.index + 1) : context.messages, !!point);
 					query = this.query({
-						prompt: promptFor(
-							point ? context.messages.slice(point.index + 1) : context.messages,
-							!!point,
-							versionAccepted,
-						),
+						prompt: (async function* () {
+							if (await versionAccepted) yield prompt;
+						})(),
 						options: sdkOptions,
 					});
 					const { claude_code_version: version } = await query.initializationResult();
 					if ((comparePackageVersions(version ?? "", "2.1.248") ?? -1) < 0)
-						throw Error(
+						throw new StreamFailureError(
 							`Claude Code 2.1.248 or later is required for verbatim prompts (reported: ${version ?? "unknown"})`,
+							{ kind: "invalid_request" },
 						);
 					ctrl.signal.throwIfAborted();
 					allowPrompt(true);
@@ -365,12 +364,27 @@ export class ClaudeSdkProvider {
 							msg.content = [];
 							throw Error("Claude superseded earlier output; discarding this turn");
 						}
-						if (m.type === "assistant" && m.error)
-							throw Error(
-								m.error === "authentication_failed"
+						if (m.type === "assistant" && m.error) {
+							const error = m.error;
+							// Claude owns login. Prime's one auth retry cannot refresh it.
+							const kind = [
+								"authentication_failed",
+								"oauth_org_not_allowed",
+								"account_on_hold",
+								"verification_required",
+								"billing_error",
+							].includes(error)
+								? "permission"
+								: error === "model_not_found"
+									? "invalid_request"
+									: classifyStreamFailure(error);
+							throw new StreamFailureError(
+								error === "authentication_failed"
 									? "Claude is not logged in. Run claude auth login."
-									: m.error,
+									: formatStreamFailureMessage(Error(error)),
+								{ kind, providerErrorType: error },
 							);
+						}
 						if (m.type === "assistant" && !m.parent_tool_use_id) {
 							sessionId = m.session_id;
 							assistantUuid = m.uuid;
