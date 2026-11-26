@@ -241,6 +241,8 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+/** The refusal text when a process outside this daemon holds a lease in the move's transcript set. `prime-agent move` matches it. */
+export const OPEN_OR_BEING_WRITTEN_ELSEWHERE = "open or being written elsewhere";
 // The daemon client's default request budget is 30s and each ready-worker heartbeat
 // forward gets 5s, so waiting longer than this on in-flight launches would only
 // surface as a client transport timeout instead of a bounded per-worker state error.
@@ -300,6 +302,11 @@ const SCHEDULED_WAKE_MAX_TIMEOUT_MS = 2_147_483_647;
 const SCHEDULED_WAKE_CLIENT_ID = "scheduled-wake";
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+/**
+ * Minimum time between roster-triggered retries after another daemon refused a session's mesh claim. Roster rows
+ * can change several times a second, and each retry takes a file lease; a send retries at once instead.
+ */
+const MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS = 30_000;
 
 // Commands proving the client tracks the catalog; only such clients receive heartbeats_changed pushes.
 const HEARTBEAT_TRACKING_COMMANDS: ReadonlySet<string> = new Set([
@@ -669,7 +676,7 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 export function readPersistedDaemonFolders(
 	agentDir: string,
 	socketPath: string,
-): { cwd?: string; sessionDir?: string } | undefined {
+): { cwd?: string; sessionDir?: string; agentDir: string } | undefined {
 	try {
 		const configPath = join(defaultWorkerDescriptorDir(agentDir, socketPath), SUPERVISOR_CONFIG_FILE_NAME);
 		const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Partial<PersistedSupervisorConfig>;
@@ -684,7 +691,7 @@ export function readPersistedDaemonFolders(
 			return undefined;
 		}
 		const { cwd, sessionDir } = durableAgentSessionRuntimeConfig(parsed.defaultSessionConfig);
-		const folders = { sessionDir };
+		const folders = { sessionDir, agentDir: parsed.defaultSessionConfig.agentDir };
 		try {
 			if (cwd && statSync(cwd).isDirectory()) return { ...folders, cwd };
 		} catch {
@@ -3086,6 +3093,7 @@ export class DaemonSupervisor {
 				{
 					activeSessionId: source.summary.activeSessionId ?? source.summary.id,
 					sessionId: source.summary.sessionId,
+					sessionFile: source.summary.sessionFile,
 					sessionName: source.summary.sessionName,
 					runtimeKind: source.summary.runtimeKind ?? "top-level",
 				},
@@ -3330,9 +3338,12 @@ export class DaemonSupervisor {
 					leases = acquireSessionMoveLeases(paths, paths.agentDir);
 				} catch (error) {
 					if (error instanceof SessionAlreadyActiveError)
-						throw new Error(`Cannot move session ${error.sessionPath}: it is open or being written elsewhere`, {
-							cause: error,
-						});
+						throw new Error(
+							`Cannot move session ${error.sessionPath}: it is ${OPEN_OR_BEING_WRITTEN_ELSEWHERE}`,
+							{
+								cause: error,
+							},
+						);
 					throw error;
 				}
 				const { info } = await this.checkSessionMove(command);
@@ -5377,6 +5388,15 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** An async wrapper, so a synchronous throw from the mesh is logged instead of failing the roster write. */
+	private async retryClaimedMeshEnrollment(sessionId: string, sessionFile: string): Promise<void> {
+		try {
+			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS);
+		} catch (error) {
+			this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`);
+		}
+	}
+
 	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
 		const entry = workerRosterEntryFromSummary(summary);
 		const previous = this.roster().get(entry.agentId);
@@ -5409,6 +5429,8 @@ export class DaemonSupervisor {
 				previous.summary.sessionFile !== entry.summary.sessionFile)
 		)
 			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile, true);
+		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile)
+			void this.retryClaimedMeshEnrollment(entry.summary.sessionId, entry.summary.sessionFile);
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {

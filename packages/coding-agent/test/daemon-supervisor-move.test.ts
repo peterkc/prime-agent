@@ -46,6 +46,7 @@ class Endpoint extends EventEmitter {
 	readonly provisionDmInbox = vi.fn(async () => undefined);
 	readonly provisionDlvInbox = vi.fn(async () => undefined);
 	readonly reissueAcl = vi.fn(async () => undefined);
+	readonly unicastAttributed = vi.fn(async () => ({ msg: { id: "published" }, ack: { seq: 1, duplicate: false } }));
 	constructor(readonly options: core.EndpointOptions) {
 		super();
 		Endpoint.instances.push(this);
@@ -376,6 +377,81 @@ describe("supervisor session move", () => {
 		freeClaim(f);
 		freeLeases(f.paths);
 	});
+	/** A daemon other than the session's home, with the session's claim held elsewhere until `release`. */
+	async function claimedElsewhere() {
+		const f = await fixture(false);
+		const claim = enrollment.claimEnrollment(f.meshRoot, f.id, f.paths.sourceFile);
+		const socket = join(f.root, "archiq.sock");
+		const supervisor = harness(await start(f.root, f.sourceDir, socket)) as unknown as Harness & {
+			writeRosterEntry(entry: object): void;
+		};
+		const sessions = (supervisor.mesh as unknown as { sessions: Map<string, unknown> }).sessions;
+		const summary = {
+			id: "active",
+			activeSessionId: "active",
+			sessionId: f.id,
+			sessionFile: f.paths.sourceFile,
+			cwd: f.root,
+		};
+		return { f, claim, socket, supervisor, sessions, summary };
+	}
+
+	it("pi-dkwcu a roster change enrolls a session again after another daemon releases its claim, at most every 30 seconds", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		const { f, claim, supervisor, sessions, summary } = await claimedElsewhere();
+		const first = vi.spyOn(supervisor.mesh, "enqueueEnrollment");
+		const retry = vi.spyOn(supervisor.mesh, "retryClaimedEnrollment");
+		const entry = { agentId: f.id, summary };
+		try {
+			supervisor.writeRosterEntry(entry);
+			await first.mock.results[0]!.value;
+		} finally {
+			claim.release();
+		}
+		supervisor.writeRosterEntry(entry);
+		await retry.mock.results[0]!.value;
+		expect(sessions.has(f.id)).toBe(false);
+		vi.setSystemTime(Date.now() + 30_000);
+		supervisor.writeRosterEntry(entry);
+		await retry.mock.results[1]!.value;
+		expect(sessions.has(f.id)).toBe(true);
+	});
+
+	it("pi-dkwcu mesh_send enrolls the sender again at once after another daemon releases its claim", async () => {
+		const { f, claim, socket, supervisor, summary } = await claimedElsewhere();
+		const targetFile = join(f.sourceDir, "target.jsonl");
+		fs.writeFileSync(targetFile, fs.readFileSync(f.paths.sourceFile, "utf8").replace(f.id, "target"));
+		await supervisor.mesh.openSession("target", targetFile);
+		await supervisor.mesh.openSession(f.id, f.paths.sourceFile);
+		Object.assign(supervisor, {
+			findWorkerForClient: async () => ({
+				worker: { meshDeliveryCapable: true, meshReplacementCapable: true },
+				summary,
+			}),
+		});
+		const client = new DaemonClient(socket);
+		clients.push(client);
+		await client.connect();
+		const send = () =>
+			client.request({ type: "mesh_send", fromActiveSessionId: "active", targetSessionId: "target", message: "hi" });
+		try {
+			expect(await send()).toMatchObject({
+				success: false,
+				error: expect.stringContaining("claimed by another daemon"),
+			});
+		} finally {
+			claim.release();
+		}
+		const stored = await send();
+		expect(stored).toMatchObject({ success: true, data: { deliveryStatus: "stored", cotalId: "published" } });
+		// The retry needs the file; the receipt goes back to the worker and must not carry a local path.
+		expect((stored as { data: { from: object } }).data.from).not.toHaveProperty("sessionFile");
+		expect(Endpoint.instances.at(-1)!.unicastAttributed).toHaveBeenCalledExactlyOnceWith(
+			enrollment.readDirectory(f.meshRoot, "target")!.principal,
+			"hi",
+		);
+	});
+
 	it("AC-13/#55 dispatch moves an enrolled ID and releases custody", async () => {
 		const f = await fixture();
 		const response = await dispatch(f);

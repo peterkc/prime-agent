@@ -6,9 +6,10 @@ import * as core from "@cotal-ai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { type AgentFamilyMember, createAgentMessageHostHandlers } from "../src/core/agent-messages.js";
+import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
 import * as enrollment from "../src/modes/daemon/cotal/enrollment.js";
 import { type MeshEndpointOptions, MeshEndpoints } from "../src/modes/daemon/cotal/mesh-endpoints.js";
-import { meshMessagePayload } from "../src/modes/daemon/cotal/mesh-shared.js";
+import { MeshNotStoredError, meshMessagePayload } from "../src/modes/daemon/cotal/mesh-shared.js";
 import { DAEMON_PROTOCOL_INFO } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
@@ -350,6 +351,73 @@ describe("mesh endpoints", () => {
 		expect(enrollment.provisionEnrollment).not.toHaveBeenCalled();
 		expect(Endpoint.instances).toHaveLength(2);
 		expect(enrollment.deprovisionEnrollment).not.toHaveBeenCalled();
+	});
+
+	it("pi-dkwcu enrolls again once another daemon releases the claim, logging the refusal once", async () => {
+		const { mesh, root, log } = await fixture();
+		const file = join(root, "c.json");
+		writeFileSync(file, "{}");
+		directories.set("c", { sessionId: "c", name: "c", principal: "local.c", homeSocket: "home" });
+		const held = () => {
+			throw new SessionAlreadyActiveError(file, "other-daemon");
+		};
+		vi.mocked(enrollment.claimEnrollment).mockImplementationOnce(held).mockImplementationOnce(held);
+		await mesh.enroll("c", file);
+		await mesh.retryClaimedEnrollment("c", file);
+		await expect(mesh.send({ sessionId: "c" }, "b", "hello")).rejects.toThrow(
+			"Message was not stored: sender c claimed by another daemon",
+		);
+		expect(log.mock.calls.filter(([line]) => line === "Mesh session c: claimed by another daemon")).toHaveLength(1);
+		expect(Endpoint.instances).toHaveLength(2);
+
+		await mesh.retryClaimedEnrollment("c", file);
+		expect(Endpoint.instances).toHaveLength(3);
+		expect(await mesh.send({ sessionId: "c" }, "b", "hello")).toMatchObject({ deliveryStatus: "stored" });
+		const enroll = vi.spyOn(mesh, "enroll");
+		await mesh.retryClaimedEnrollment("c", file);
+		expect(enroll).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["runs out of time", "enrollment retry did not finish before the send deadline"],
+		["is rejected", "move is pending"],
+	] as const)(
+		"pi-dkwcu a sender's enrollment retry that %s stores nothing and reports not stored",
+		async (kind, reason) => {
+			const { mesh, root } = await fixture();
+			const file = join(root, "c.json");
+			writeFileSync(file, "{}");
+			directories.set("c", { sessionId: "c", name: "c", principal: "local.c", homeSocket: "home" });
+			vi.mocked(enrollment.claimEnrollment).mockImplementationOnce(() => {
+				throw new SessionAlreadyActiveError(file, "other-daemon");
+			});
+			await mesh.enroll("c", file);
+			vi.spyOn(mesh, "enroll").mockImplementation(() =>
+				kind === "is rejected" ? Promise.reject(new Error(reason)) : new Promise(() => undefined),
+			);
+			vi.useFakeTimers();
+			const sending = mesh.send({ sessionId: "c", sessionFile: file }, "b", "hello");
+			const outcome = sending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await vi.advanceTimersByTimeAsync(30_000);
+			const error = await outcome;
+			expect(error).toBeInstanceOf(MeshNotStoredError);
+			expect((error as Error).message).toMatch(/^Message was not stored: sender c: /);
+			expect((error as Error).message).toContain(reason);
+			for (const endpoint of Endpoint.instances) expect(endpoint.unicastAttributed).not.toHaveBeenCalled();
+		},
+	);
+
+	it("pi-dkwcu does not enroll again after other failures or without a failure", async () => {
+		const { mesh, root } = await fixture();
+		await expect(mesh.enroll("missing", join(root, "missing.json"))).rejects.toThrow("session file is missing");
+		const enroll = vi.spyOn(mesh, "enroll");
+		await mesh.retryClaimedEnrollment("missing", join(root, "missing.json"));
+		await mesh.retryClaimedEnrollment("never-enrolled", join(root, "never.json"));
+		await mesh.retryClaimedEnrollment("a", join(root, "a.json"));
+		expect(enroll).not.toHaveBeenCalled();
 	});
 
 	it.each(["provision", "start", "read", "deleted"])("AC-18 failed %s removes only after delete", async (stage) => {

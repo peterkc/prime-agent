@@ -232,7 +232,9 @@ worker when needed. Opening elsewhere does not transfer a live claim. A session 
 in a daemon that does not hold its claim cannot send agent messages, including to its
 family. Closing a worker or its session does not release the session's mesh claim.
 Open the session in the daemon that holds its claim.
-Stopping that daemon releases its claims. Workers from
+Stopping that daemon releases its claims. The daemon that has the session open then takes
+the claim on the session's next agent message send, or on its next roster change, at most
+once every 30 seconds. Until then, messages sent to an idle session wait in its inbox. Workers from
 before mesh support must be restarted; restarting only the supervisor can leave them
 running. Mesh sends and handoffs refuse old workers with a restart message.
 `prime-agent send` and RPC `send_message` still refuse non-session clients in Cotal mode.

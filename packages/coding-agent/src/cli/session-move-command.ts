@@ -5,7 +5,7 @@ import { canonicalSessionPath } from "../core/session-lease.js";
 import { SessionManager } from "../core/session-manager.js";
 import { preflightSessionMove, sessionMoveChildFiles, sessionMoveSize } from "../core/session-move.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
-import { enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
+import { CLAIMED_BY_ANOTHER_DAEMON, enrollmentPath } from "../modes/daemon/cotal/mesh-shared.js";
 import { resolveCatalogSessionMatch } from "../modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import {
@@ -15,11 +15,12 @@ import {
 } from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
-import { readPersistedDaemonFolders } from "../modes/daemon/daemon-supervisor.js";
+import { OPEN_OR_BEING_WRITTEN_ELSEWHERE, readPersistedDaemonFolders } from "../modes/daemon/daemon-supervisor.js";
 import { getCommandSpec } from "./command-registry.js";
 import { runStart } from "./daemon-command.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 import { prepareRepositoryDaemon, resolveRepositoryDaemon } from "./repository-daemon.js";
+import { findSessionHosts, formatMoveHint, type MoveRefusal } from "./session-hosts.js";
 
 const SESSION_MOVE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
@@ -364,7 +365,14 @@ export async function runSessionMove(args: readonly string[]): Promise<void> {
 			);
 		}
 		recovered = parseRecovered(isRecord(response.data) ? response.data.recovered : undefined);
-		if (!response.success) throw new Error(response.error);
+		if (!response.success) {
+			let refusal: MoveRefusal | undefined;
+			if (response.error.includes(CLAIMED_BY_ANOTHER_DAEMON)) refusal = "claimed";
+			else if (response.error.includes(OPEN_OR_BEING_WRITTEN_ELSEWHERE)) refusal = "open";
+			if (!refusal) throw new Error(response.error);
+			const hosts = await findSessionHosts(info.id, sourceSocket);
+			throw new Error(`${response.error}\n${formatMoveHint(hosts, refusal)}`);
+		}
 		const reply = parseReply(response.data);
 		const note =
 			reply.mesh.status === "failed"

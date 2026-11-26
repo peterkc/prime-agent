@@ -30,7 +30,6 @@ import {
 	type MeshNotifyResult,
 	meetsDaemonCommandCompatibility,
 } from "../modes/daemon/daemon-protocol.js";
-import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { deleteDaemonSavedSession, listDaemonSavedSessions } from "../modes/daemon/saved-session-catalog.js";
@@ -41,6 +40,7 @@ import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
 import { sessionPendingForDelete } from "./mesh-cotal.js";
 import { repositoryDaemon } from "./repository-daemon.js";
+import { findSessionHosts, formatStopHint, matchLiveSessions } from "./session-hosts.js";
 import { formatSessionsTable } from "./sessions-table-format.js";
 
 interface ParsedDaemonClientCommand {
@@ -386,11 +386,7 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				);
 				return;
 			case "kill":
-				await printResponseData(
-					client,
-					{ type: "kill", activeSessionId: requireActiveSessionId(parsed.positionals) },
-					parsed.json,
-				);
+				await runKill(client, parsed);
 				return;
 			case "delete":
 				await runDelete(client, parsed);
@@ -1388,20 +1384,20 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 	throw new Error(`Unknown schedule command: ${subcommand}`);
 }
 
+async function runKill(client: DaemonClient, parsed: ParsedDaemonClientCommand): Promise<void> {
+	const selector = requireActiveSessionId(parsed.positionals);
+	try {
+		await printResponseData(client, { type: "kill", activeSessionId: selector }, parsed.json);
+	} catch (error) {
+		if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
+		const hosts = await findSessionHosts(selector, parsed.socketPath);
+		if (hosts.length === 0) throw error;
+		throw new Error(`${error.message}\n${formatStopHint(hosts)}`, { cause: error });
+	}
+}
+
 async function resolveLiveSessionSelector(client: DaemonClient, selector: string): Promise<string> {
-	const sessions = (await getLiveSessions(client)).filter(
-		(session): session is SessionSummary & { activeSessionId: string } => typeof session.activeSessionId === "string",
-	);
-	const exact = sessions.filter(
-		(session) =>
-			session.activeSessionId === selector || session.sessionId === selector || session.sessionName === selector,
-	);
-	const suffix = sessions.filter(
-		(session) =>
-			matchesSessionIdSuffix(session.activeSessionId, selector) ||
-			matchesSessionIdSuffix(session.sessionId, selector),
-	);
-	const matches = exact.length > 0 ? exact : suffix;
+	const matches = matchLiveSessions(await getLiveSessions(client), selector);
 	if (matches.length === 1) {
 		return matches[0]!.activeSessionId;
 	}

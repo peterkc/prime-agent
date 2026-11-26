@@ -1,0 +1,113 @@
+import { describe, expect, it, vi } from "vitest";
+import type { DaemonInfo } from "../src/cli/daemon-ps.js";
+import { findSessionHosts, formatMoveHint, formatStopHint, matchLiveSessions } from "../src/cli/session-hosts.js";
+import { APP_NAME } from "../src/config.js";
+import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+
+const ARC = "01a200dc-7ad5-77ed-9fbd-d53f2a08b67d";
+
+function session(activeSessionId: string | undefined, sessionId: string, sessionName?: string): SessionSummary {
+	return { id: activeSessionId ?? sessionId, activeSessionId, sessionId, sessionName } as SessionSummary;
+}
+
+function daemon(socketPath: string, status: DaemonInfo["status"] = "current"): DaemonInfo {
+	return { socketPath, status, isDefault: false };
+}
+
+const rosters: Record<string, readonly SessionSummary[]> = {
+	"/run/prime.sock": [session("e1a528117870", "01a13ede-a1d8-7236-aab2-9f9c683d5791", "pi-prime")],
+	"/run/default.sock": [session("0fe15d9b54cc", ARC, "arc-advisor"), session(undefined, "saved-only", "saved")],
+	"/run/archiq.sock": [session("c39ad04fac8b", ARC, "arc-advisor")],
+};
+
+function lookup(daemons: readonly DaemonInfo[], list = async (socket: string) => rosters[socket] ?? []) {
+	return { discover: async () => daemons, list };
+}
+
+describe("pi-dkwcu session hosts", () => {
+	it("matches live sessions by exact id or name first, then by id suffix", () => {
+		const sessions = [
+			session("abc123", ARC, "arc-advisor"),
+			session("def456", "other", "abc123x"),
+			session(undefined, "x", "saved"),
+		];
+		expect(matchLiveSessions(sessions, "arc-advisor").map((s) => s.activeSessionId)).toEqual(["abc123"]);
+		expect(matchLiveSessions(sessions, ARC).map((s) => s.activeSessionId)).toEqual(["abc123"]);
+		expect(matchLiveSessions(sessions, "d53f2a08b67d").map((s) => s.activeSessionId)).toEqual(["abc123"]);
+		expect(matchLiveSessions(sessions, "saved")).toEqual([]);
+	});
+
+	it("finds the session in other reachable daemons and names the stop command", async () => {
+		const hosts = await findSessionHosts(
+			"arc-advisor",
+			"/run/prime.sock",
+			lookup([daemon("/run/prime.sock"), daemon("/run/default.sock", "stale")]),
+		);
+		expect(hosts).toEqual([
+			{
+				socketPath: "/run/default.sock",
+				activeSessionId: "0fe15d9b54cc",
+				sessionId: ARC,
+				sessionName: "arc-advisor",
+			},
+		]);
+		const hint = formatStopHint(hosts);
+		for (const text of ["/run/default.sock", `${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`])
+			expect(hint).toContain(text);
+	});
+
+	it("lists every daemon that runs the session and never the one already asked", async () => {
+		const hosts = await findSessionHosts(
+			ARC,
+			"/run/prime.sock",
+			lookup([daemon("/run/prime.sock"), daemon("/run/default.sock"), daemon("/run/archiq.sock")]),
+		);
+		expect(hosts.map((host) => host.socketPath)).toEqual(["/run/default.sock", "/run/archiq.sock"]);
+		const self = await findSessionHosts(ARC, "/run/default.sock", lookup([daemon("/run/default.sock")]));
+		expect(self).toEqual([]);
+	});
+
+	it("skips unreachable daemons and daemons that fail to answer, and returns nothing when discovery fails", async () => {
+		const list = vi.fn(async (socket: string) => {
+			if (socket === "/run/archiq.sock") throw new Error("connect timeout");
+			return rosters[socket] ?? [];
+		});
+		const hosts = await findSessionHosts(
+			ARC,
+			"/run/prime.sock",
+			lookup(
+				[
+					daemon("/run/default.sock", "unreachable"),
+					daemon("/run/archiq.sock"),
+					daemon("/run/gone.sock", "orphan-file"),
+				],
+				list,
+			),
+		);
+		expect(hosts).toEqual([]);
+		expect(list).toHaveBeenCalledExactlyOnceWith("/run/archiq.sock");
+		const failing = { discover: async () => Promise.reject(new Error("ps failed")) };
+		expect(await findSessionHosts(ARC, "/run/prime.sock", failing)).toEqual([]);
+	});
+
+	it.each(["claimed", "open"] as const)(
+		"F27 a %s refusal with a host gives its stop command, no move from it, and the claim-holder step",
+		(refusal) => {
+			const hosts = [
+				{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: ARC },
+				{ socketPath: "/run/arc hiq.sock", activeSessionId: "c39ad04fac8b", sessionId: ARC },
+			];
+			const hint = formatMoveHint(hosts, refusal);
+			expect(hint).toContain(`${APP_NAME} stop 0fe15d9b54cc --daemon-socket /run/default.sock`);
+			expect(hint).toContain(`${APP_NAME} stop c39ad04fac8b --daemon-socket '/run/arc hiq.sock'`);
+			expect(hint).not.toContain(`${APP_NAME} move`);
+			// The follow-up when the claim holder is not the host: the no-host claim advice.
+			expect(hint).toContain(`${APP_NAME} status`);
+		},
+	);
+
+	it("gives advice for a refusal without a host", () => {
+		expect(formatMoveHint([], "claimed")).toContain(`${APP_NAME} status`);
+		expect(formatMoveHint([], "open")).not.toMatch(/status|--daemon-socket/);
+	});
+});

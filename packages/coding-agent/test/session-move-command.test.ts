@@ -22,6 +22,8 @@ import type * as StopConfirm from "../src/cli/daemon-stop-confirm.js";
 import { promptYesNo } from "../src/cli/daemon-stop-confirm.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 import { repositorySocketPath } from "../src/cli/repository-daemon.js";
+import type * as SessionHosts from "../src/cli/session-hosts.js";
+import { findSessionHosts, formatMoveHint } from "../src/cli/session-hosts.js";
 import { ENV_AGENT_DIR, ENV_SESSION_DIR } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../src/core/session-manager.js";
@@ -38,6 +40,10 @@ vi.mock("node:net", async (original) => ({
 	createConnection: (path: string) => connect(path),
 }));
 vi.mock("../src/utils/child-process.js", () => ({ spawnHidden: vi.fn() }));
+vi.mock("../src/cli/session-hosts.js", async (original) => {
+	const actual = await original<typeof SessionHosts>();
+	return { ...actual, findSessionHosts: vi.fn(async () => []) };
+});
 vi.mock("../src/cli/daemon-stop-confirm.js", async (original) => ({
 	...(await original<typeof StopConfirm>()),
 	promptYesNo: vi.fn(),
@@ -52,6 +58,7 @@ let method: "trash" | "unlink";
 let meshReason: string;
 let recovered: object[];
 let moveFailure: boolean | "before-send";
+let moveError: string;
 let blockingJobId: string | undefined;
 let targetRunning: boolean;
 let holdMove: boolean;
@@ -175,7 +182,7 @@ function connect(path: string): Duplex {
 	return socket;
 }
 function moved(command: Extract<DaemonCommand, { type: "move_saved_session" }>) {
-	if (moveFailure) return { success: false, error: "move refused", data: { recovered } };
+	if (moveFailure) return { success: false, error: moveError, data: { recovered } };
 	const entries = readFileSync(command.sessionPath, "utf8")
 		.trim()
 		.split("\n")
@@ -251,6 +258,7 @@ beforeEach(() => {
 	meshReason = "record refused";
 	recovered = [];
 	moveFailure = false;
+	moveError = "move refused";
 	blockingJobId = undefined;
 	holdMove = false;
 	connected.length = 0;
@@ -427,6 +435,33 @@ describe("session move command", () => {
 					expect(output()).toContain(text);
 		},
 	);
+	const CLAIMED = "Session session-1: claimed by another daemon; Nothing moved";
+	it.each([
+		["claimed", CLAIMED, true],
+		// Without a host the two refusals get different advice, so a claim refusal read as "open" fails here.
+		["claimed", CLAIMED, false],
+		["open", "Cannot move session /x/session-1.jsonl: it is open or being written elsewhere", false],
+		["other", "move refused", false],
+	] as const)("pi-dkwcu a %s refusal (%s, live host %s) adds the matching host hint", async (kind, error, live) => {
+		moveFailure = true;
+		moveError = error;
+		const hosts = live
+			? [{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" }]
+			: [];
+		// Queue a result only when the lookup runs; an unused one would leak into the next test.
+		if (kind !== "other") vi.mocked(findSessionHosts).mockResolvedValueOnce(hosts);
+		await run(["--yes"]);
+		expect(process.exitCode).toBe(1);
+		expect(errors()).toContain(error);
+		if (kind === "other") {
+			expect(findSessionHosts).not.toHaveBeenCalled();
+			expect(errors()).not.toMatch(/run this move again/);
+			return;
+		}
+		expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("session-1", f.sourceSocket);
+		expect(errors()).toContain(formatMoveHint(hosts, kind));
+		if (live) expect(errors()).toContain("stop 0fe15d9b54cc --daemon-socket /run/default.sock");
+	});
 	it.each(["delayed", "disconnect", "timeout", "before-send"])(
 		"F2 move reply %s distinguishes sent and unsent requests",
 		async (mode) => {

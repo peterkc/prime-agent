@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { repositoryDaemon } from "../src/cli/repository-daemon.js";
+import type * as SessionHosts from "../src/cli/session-hosts.js";
 import { ENV_AGENT_DIR, getDefaultAgentDir } from "../src/config.js";
 import { SemanticEdgeRecorder } from "../src/core/semantic-edges.js";
 import { getSessionArtifactPathForFile, readSessionInfo } from "../src/core/session-manager.js";
@@ -51,6 +52,7 @@ const daemonClientMock = vi.hoisted(() => {
 		notifyData: undefined as unknown,
 		notifyError: undefined as Error | undefined,
 		notifyEnvelopeFailure: undefined as Extract<Response, { success: false }> | undefined,
+		killError: undefined as string | undefined,
 	};
 
 	class MockDaemonClient {
@@ -85,6 +87,8 @@ const daemonClientMock = vi.hoisted(() => {
 				if (behavior.notifyEnvelopeFailure) return behavior.notifyEnvelopeFailure;
 				return { type: "response", command: command.type, success: true, data: behavior.notifyData };
 			}
+			if (command.type === "kill" && behavior.killError)
+				return { type: "response", command: command.type, success: false, error: behavior.killError };
 			if (command.type === "list") {
 				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
 			}
@@ -183,8 +187,14 @@ vi.mock("node:child_process", async (importOriginal) => {
 	return { ...original, spawn: spawnMock.mockSpawn as never };
 });
 
+vi.mock("../src/cli/session-hosts.js", async (original) => ({
+	...(await original<typeof SessionHosts>()),
+	findSessionHosts: vi.fn(async () => []),
+}));
+
 import { getCommandSpec } from "../src/cli/command-registry.js";
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
+import { findSessionHosts } from "../src/cli/session-hosts.js";
 
 describe("daemon command", () => {
 	const notifyArgs = ["daemon", "notify", "--daemon-socket", "/tmp/notify.sock"];
@@ -401,6 +411,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.notifyData = undefined;
 		daemonClientMock.behavior.notifyError = undefined;
 		daemonClientMock.behavior.notifyEnvelopeFailure = undefined;
+		daemonClientMock.behavior.killError = undefined;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -415,6 +426,33 @@ describe("daemon command", () => {
 		process.exitCode = undefined;
 		vi.restoreAllMocks();
 	});
+
+	it.each(["host", "no-host", "other"] as const)(
+		"pi-dkwcu a failed stop names the daemon that runs the session (%s)",
+		async (kind) => {
+			vi.mocked(findSessionHosts).mockClear();
+			daemonClientMock.behavior.killError =
+				kind === "other" ? 'Ambiguous active session "arc"' : "Unknown active session: arc-advisor";
+			if (kind === "host")
+				vi.mocked(findSessionHosts).mockResolvedValueOnce([
+					{
+						socketPath: "/tmp/default.sock",
+						activeSessionId: "0fe15d9b54cc",
+						sessionId: "01a200dc",
+						sessionName: "arc-advisor",
+					},
+				]);
+			await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "kill", "arc-advisor"]);
+			expect(process.exitCode).toBe(1);
+			const printed = consoleErrorMessages.join("\n");
+			if (kind === "other") expect(findSessionHosts).not.toHaveBeenCalled();
+			else expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("arc-advisor", "/tmp/prime-agent.sock");
+			if (kind === "host")
+				for (const text of ["/tmp/default.sock", "prime-agent stop 0fe15d9b54cc --daemon-socket /tmp/default.sock"])
+					expect(printed).toContain(text);
+			else expect(printed.endsWith(daemonClientMock.behavior.killError)).toBe(true);
+		},
+	);
 
 	it.each([
 		["list", ["--json"], true],

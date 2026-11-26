@@ -944,7 +944,9 @@ describe("self-update daemon restart", () => {
 		useFixedOwnerHello();
 		const saved = vi
 			.spyOn(supervisor, "readPersistedDaemonFolders")
-			.mockImplementation(() => (mockState.calls.includes("shutdown-daemon") ? undefined : { cwd: tempDir }));
+			.mockImplementation(() =>
+				mockState.calls.includes("shutdown-daemon") ? undefined : { cwd: tempDir, agentDir: tempDir },
+			);
 		const sessionDir = process.env.PRIME_AGENT_SESSION_DIR;
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});

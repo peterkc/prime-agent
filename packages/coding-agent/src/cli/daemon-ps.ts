@@ -17,6 +17,7 @@ import {
 } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { createDaemonStateRootMatcher } from "../modes/daemon/daemon-state-root.js";
+import { readPersistedDaemonFolders } from "../modes/daemon/daemon-supervisor.js";
 import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
 import {
@@ -26,6 +27,7 @@ import {
 	signalProcessGroupIfHeld,
 	spawnSyncHidden,
 } from "../utils/child-process.js";
+import { canonicalizePath } from "../utils/paths.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 
@@ -438,6 +440,45 @@ export async function runPs(json: boolean): Promise<void> {
 		return;
 	}
 	console.log(formatDaemonListTable(daemons));
+	const agentDir = getAgentDir();
+	for (const shared of findSharedSessionFolders(daemons, (socketPath) => persistedSessionDir(agentDir, socketPath)))
+		console.log(
+			chalk.yellow(
+				`Warning: ${shared.socketPaths.join(" and ")} share the session folder ${shared.sessionDir}. Each daemon lists the other's saved sessions, so a stop or move sent to one can name a session the other runs and fail, and a scheduled wake can try to start a session the other already runs. Give one of them its own session folder.`,
+			),
+		);
+}
+
+export interface SharedSessionFolder {
+	readonly sessionDir: string;
+	readonly socketPaths: readonly string[];
+}
+
+/** Reachable daemons whose session folders resolve to one canonical folder. */
+export function findSharedSessionFolders(
+	daemons: readonly DaemonInfo[],
+	sessionDirOf: (socketPath: string) => string | undefined,
+): SharedSessionFolder[] {
+	const socketsByFolder = new Map<string, string[]>();
+	for (const daemon of daemons) {
+		if (daemon.status !== "current" && daemon.status !== "stale") continue;
+		const folder = sessionDirOf(daemon.socketPath);
+		if (!folder) continue;
+		const sessionDir = resolve(canonicalizePath(folder));
+		socketsByFolder.set(sessionDir, [...(socketsByFolder.get(sessionDir) ?? []), daemon.socketPath]);
+	}
+	return [...socketsByFolder]
+		.filter(([, socketPaths]) => socketPaths.length > 1)
+		.map(([sessionDir, socketPaths]) => ({ sessionDir, socketPaths }));
+}
+
+/**
+ * The folder a daemon saved at start. Without one it used `sessions` in its own saved agent folder; the caller's
+ * session-folder variable says nothing about that daemon.
+ */
+export function persistedSessionDir(agentDir: string, socketPath: string): string | undefined {
+	const folders = readPersistedDaemonFolders(agentDir, socketPath);
+	return folders ? (folders.sessionDir ?? join(folders.agentDir, "sessions")) : undefined;
 }
 
 export type ReapAction =
