@@ -392,6 +392,25 @@ it.each(["availability at registration"])("loads three source models only when b
 		}
 	}
 });
+it.each([
+	["{}", /PATH.*claudePath/],
+	["{", /Cannot read .*claude-sdk\.json/],
+	['{"claudePath":"relative"}', /claude-sdk\.json: expected an absolute claudePath/],
+] as const)("R2-2 reports the registration failure for settings %s", async (settings, cause) => {
+	const dir = mkdtempSync(join(getAgentDir(), "unavailable-"));
+	writeFileSync(join(dir, "claude-sdk.json"), settings);
+	vi.stubEnv("PATH", dir);
+	const h = await createHarness({ extensionFactories: [new ClaudeSdkProvider(dir).extension] });
+	try {
+		await h.session.bindExtensions({});
+		const selected = h.session.modelRegistry.getAll().find((m) => m.provider === "claude-sdk")!;
+		await expect(h.session.setModel(selected)).rejects.toThrow(cause);
+		h.session.agent.state.model = selected;
+		await expect(h.session.prompt("test")).rejects.toThrow(cause);
+	} finally {
+		h.cleanup();
+	}
+});
 it.each(["transient"])("AgentSession retries a late %s failure", async () => {
 	let calls = 0;
 	const f = fixture(async function* () {

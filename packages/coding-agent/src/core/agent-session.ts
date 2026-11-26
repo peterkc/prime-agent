@@ -2091,6 +2091,14 @@ export class AgentSession {
 		this._subagentRuntimeHost = host;
 	}
 
+	private _missingAuthError(model: Model<Api>, fallback?: string): Error {
+		return new Error(
+			this._modelRegistry.getProviderMissingAuthMessage(model.provider) ??
+				fallback ??
+				formatNoApiKeyFoundMessage(model.provider),
+		);
+	}
+
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
@@ -2099,7 +2107,7 @@ export class AgentSession {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
-				throw new Error(formatNoApiKeyFoundMessage(model.provider));
+				throw this._missingAuthError(model);
 			}
 			throw new Error(result.error);
 		}
@@ -2111,7 +2119,7 @@ export class AgentSession {
 		if (isOAuth) {
 			throw new Error(formatAuthenticationFailedMessage(model.provider));
 		}
-		throw new Error(formatNoApiKeyFoundMessage(model.provider));
+		throw this._missingAuthError(model);
 	}
 
 	/**
@@ -2808,7 +2816,7 @@ export class AgentSession {
 			if (isOAuth) {
 				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
 			}
-			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+			throw this._missingAuthError(this.model);
 		}
 	}
 
@@ -8765,7 +8773,7 @@ export class AgentSession {
 			!this._modelRegistry.hasConfiguredAuth(model) &&
 			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
 		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
+			throw this._missingAuthError(model, `No API key for ${model.provider}/${model.id}`);
 		}
 		if (!(await this._modelRegistry.canUseModel(model, { assumeAuthConfigured: staleOnly }))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
@@ -8773,7 +8781,7 @@ export class AgentSession {
 		if (staleOnly) {
 			this._modelRegistry.clearProviderAuthStale(model.provider);
 			if (!this._modelRegistry.hasConfiguredAuth(model)) {
-				throw new Error(`No API key for ${model.provider}/${model.id}`);
+				throw this._missingAuthError(model, `No API key for ${model.provider}/${model.id}`);
 			}
 		}
 

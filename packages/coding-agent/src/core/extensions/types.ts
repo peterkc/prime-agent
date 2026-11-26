@@ -1258,6 +1258,8 @@ export interface ExtensionAPI {
 export interface ProviderConfig {
 	/** Copy the named provider's current models, including after catalog reloads. The source must be built in, from models.json, or registered before this provider. */
 	modelsFrom?: string;
+	/** Shown instead of API-key guidance when this provider is not configured. */
+	missingAuthMessage?: string;
 	/** Display name for the provider in UI. */
 	name?: string;
 	/** Base URL for the API endpoint. Required when defining models. */

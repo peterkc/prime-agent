@@ -1924,6 +1924,10 @@ export class ModelRegistry {
 		};
 	}
 
+	getProviderMissingAuthMessage(provider: string): string | undefined {
+		return this.registeredProviders.get(provider)?.missingAuthMessage;
+	}
+
 	/**
 	 * Get display name for a provider.
 	 */
@@ -2147,6 +2151,7 @@ export class ModelRegistry {
  * Input type for registerProvider API.
  */
 export interface ProviderConfigInput {
+	missingAuthMessage?: string;
 	modelsFrom?: string;
 	name?: string;
 	baseUrl?: string;

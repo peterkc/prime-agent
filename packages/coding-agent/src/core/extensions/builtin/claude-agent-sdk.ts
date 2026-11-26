@@ -194,18 +194,18 @@ export class ClaudeSdkProvider {
 		private readonly query: Query = defaultQuery,
 	) {}
 	extension: ExtensionFactory = (pi) => {
-		let apiKey: string | undefined;
+		let missingAuthMessage: string | undefined;
 		try {
 			executable(readClaudeSettings(this.agentDir).claudePath);
-			apiKey = "local-claude";
-		} catch {
-			// Keep the catalog registered but unavailable. An explicit turn reports the path or settings error.
+		} catch (error) {
+			missingAuthMessage = error instanceof Error ? error.message : String(error);
 		}
 		pi.registerProvider("claude-sdk", {
 			api: "claude-agent-sdk",
 			modelsFrom: "anthropic",
 			baseUrl: "https://claude-sdk.invalid",
-			apiKey,
+			apiKey: missingAuthMessage === undefined ? "local-claude" : undefined,
+			missingAuthMessage,
 			streamSimple: this.streamSimple,
 		});
 		pi.on("session_start", (_event, ctx) => {
