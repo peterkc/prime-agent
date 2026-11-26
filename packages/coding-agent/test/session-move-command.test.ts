@@ -435,16 +435,21 @@ describe("session move command", () => {
 					expect(output()).toContain(text);
 		},
 	);
+	const CLAIMED = "Session session-1: claimed by another daemon; Nothing moved";
 	it.each([
-		["claimed", "Session session-1: claimed by another daemon; Nothing moved"],
-		["open", "Cannot move session /x/session-1.jsonl: it is open or being written elsewhere"],
-		["other", "move refused"],
-	] as const)("pi-dkwcu a %s refusal adds the matching host hint", async (kind, error) => {
+		["claimed", CLAIMED, true],
+		// Without a host the two refusals get different advice, so a claim refusal read as "open" fails here.
+		["claimed", CLAIMED, false],
+		["open", "Cannot move session /x/session-1.jsonl: it is open or being written elsewhere", false],
+		["other", "move refused", false],
+	] as const)("pi-dkwcu a %s refusal (%s, live host %s) adds the matching host hint", async (kind, error, live) => {
 		moveFailure = true;
 		moveError = error;
-		const hosts = [{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" }];
+		const hosts = live
+			? [{ socketPath: "/run/default.sock", activeSessionId: "0fe15d9b54cc", sessionId: "session-1" }]
+			: [];
 		// Queue a result only when the lookup runs; an unused one would leak into the next test.
-		if (kind !== "other") vi.mocked(findSessionHosts).mockResolvedValueOnce(kind === "claimed" ? hosts : []);
+		if (kind !== "other") vi.mocked(findSessionHosts).mockResolvedValueOnce(hosts);
 		await run(["--yes"]);
 		expect(process.exitCode).toBe(1);
 		expect(errors()).toContain(error);
@@ -454,8 +459,8 @@ describe("session move command", () => {
 			return;
 		}
 		expect(findSessionHosts).toHaveBeenCalledExactlyOnceWith("session-1", f.sourceSocket);
-		expect(errors()).toContain(formatMoveHint(kind === "claimed" ? hosts : [], kind));
-		if (kind === "claimed") expect(errors()).toContain("stop 0fe15d9b54cc --daemon-socket /run/default.sock");
+		expect(errors()).toContain(formatMoveHint(hosts, kind));
+		if (live) expect(errors()).toContain("stop 0fe15d9b54cc --daemon-socket /run/default.sock");
 	});
 	it.each(["delayed", "disconnect", "timeout", "before-send"])(
 		"F2 move reply %s distinguishes sent and unsent requests",
