@@ -5383,6 +5383,15 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** An async wrapper, so a synchronous throw from the mesh is logged instead of failing the roster write. */
+	private async retryClaimedMeshEnrollment(sessionId: string, sessionFile: string): Promise<void> {
+		try {
+			await this.mesh?.retryClaimedEnrollment(sessionId, sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS);
+		} catch (error) {
+			this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`);
+		}
+	}
+
 	private rosterEntryForWorkerSummary(worker: ResidentWorker, summary: SessionSummary): WorkerRosterEntry {
 		const entry = workerRosterEntryFromSummary(summary);
 		const previous = this.roster().get(entry.agentId);
@@ -5415,14 +5424,8 @@ export class DaemonSupervisor {
 				previous.summary.sessionFile !== entry.summary.sessionFile)
 		)
 			void this.enrollMeshSession(entry.summary.sessionId, entry.summary.sessionFile, true);
-		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile) {
-			const sessionId = entry.summary.sessionId;
-			void this.mesh
-				?.retryClaimedEnrollment(sessionId, entry.summary.sessionFile, MESH_CLAIM_ROSTER_RETRY_INTERVAL_MS)
-				.catch((error: unknown) =>
-					this.log(`Mesh session ${sessionId}: enrollment retry failed: ${redactMeshError(error)}`),
-				);
-		}
+		else if (queueMeshEnrollment && entry.summary.sessionId && entry.summary.sessionFile)
+			void this.retryClaimedMeshEnrollment(entry.summary.sessionId, entry.summary.sessionFile);
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {
