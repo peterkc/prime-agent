@@ -7,13 +7,14 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
 import { getProcessStartId } from "../../../src/core/session-lease.js";
@@ -130,11 +131,22 @@ afterEach(async () => {
 	socketTempDirs.clear();
 }, 60_000);
 
+// A shared-library Node build, such as Homebrew's, loads libnode from its own
+// directory or ../lib, so the linked executable needs libnode beside it.
+function linkSharedLibnode(dir: string): void {
+	const libDir = join(dirname(realpathSync(process.execPath)), "..", "lib");
+	if (!existsSync(libDir)) return;
+	for (const name of readdirSync(libDir)) {
+		if (name.startsWith("libnode.")) linkSync(realpathSync(join(libDir, name)), join(dir, name));
+	}
+}
+
 async function createPaths(): Promise<TestPaths> {
 	const harness = await createHarness();
 	harnesses.push(harness);
 	const executablePath = join(harness.tempDir, APP_NAME);
 	linkSync(process.execPath, executablePath);
+	linkSharedLibnode(harness.tempDir);
 	// Unix socket paths are length limited, so the child TMPDIR stays under a short root.
 	const socketTmpRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 	mkdirSync(socketTmpRoot, { recursive: true, mode: 0o700 });
