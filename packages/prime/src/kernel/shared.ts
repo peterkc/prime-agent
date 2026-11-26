@@ -1,10 +1,4 @@
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
-export type KernelBootstrapProgressHandler = (message: string) => void;
-export interface KernelPythonSkill {
-	importName: string;
-	installPath: string;
-}
-
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.ts";
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -52,7 +46,7 @@ export interface KernelSnapshotConfig {
 }
 
 export interface KernelManagerOptions {
-	/** Python interpreter with the kernel runtime available. Defaults to the auto-bootstrapped kernel. */
+	/** Python interpreter with the kernel runtime available. */
 	python?: string;
 	cwd?: string;
 	env?: Record<string, string>;
@@ -60,7 +54,6 @@ export interface KernelManagerOptions {
 	hostHandlers?: HostRequestHandlers;
 	/** Fires when the last live background bash() handle settles (its activity track empties or the kernel tears down). */
 	onBackgroundWorkSettled?: () => void;
-	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
 	/** Runtime bootstrap re-run on a protocol-repaired kernel so live handles (rlm, bash, skills) exist again. */
@@ -70,7 +63,6 @@ export interface KernelManagerOptions {
 }
 
 export interface KernelStartOptions {
-	onBootstrapProgress?: KernelBootstrapProgressHandler;
 	signal?: AbortSignal;
 }
 

@@ -202,7 +202,6 @@ export class ReplKernelManager {
 		| "sessionId"
 		| "hostHandlers"
 		| "onBackgroundWorkSettled"
-		| "pythonSkills"
 		| "snapshot"
 		| "bootstrapCode"
 		| "stderrLogPath"
@@ -269,7 +268,6 @@ export class ReplKernelManager {
 			sessionId: options.sessionId,
 			hostHandlers: options.hostHandlers,
 			onBackgroundWorkSettled: options.onBackgroundWorkSettled,
-			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
@@ -349,25 +347,14 @@ export class ReplKernelManager {
 
 	private async doStart(): Promise<void> {
 		if (this.state !== "idle") return;
+		const python = this.options.python;
+		if (!python) throw new Error("A checked Python interpreter is required");
 		const generation = ++this.startGeneration;
 		this.state = "starting";
 		installSignalHandlersOnce();
 		// Tracked from the moment startup begins so session cleanup and signal
 		// handlers can dispose a kernel that is still booting.
 		liveKernels.add(this);
-
-		let python: string;
-		try {
-			if (!this.options.python) throw new Error("A checked Python interpreter is required");
-			python = this.options.python;
-			if (this.startStale(generation)) throw new Error("Kernel start superseded");
-			this.options.python = python;
-		} catch (error) {
-			if (this.startStale(generation)) throw error; // never touch a newer start's state
-			liveKernels.delete(this);
-			if ((this.state as string) !== "shutdown") this.state = "idle";
-			throw error;
-		}
 
 		if ((this.state as string) === "shutdown") {
 			throw new Error("Kernel was disposed during startup");
