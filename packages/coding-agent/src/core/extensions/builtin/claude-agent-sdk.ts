@@ -194,7 +194,7 @@ export class ClaudeSdkProvider {
 		private readonly query: Query = defaultQuery,
 	) {}
 	extension: ExtensionFactory = (pi) => {
-		let missingAuthMessage: string | undefined;
+		let missingAuthMessage = "";
 		try {
 			executable(readClaudeSettings(this.agentDir).claudePath);
 		} catch (error) {
@@ -204,7 +204,8 @@ export class ClaudeSdkProvider {
 			api: "claude-agent-sdk",
 			modelsFrom: "anthropic",
 			baseUrl: "https://claude-sdk.invalid",
-			apiKey: missingAuthMessage === undefined ? "local-claude" : undefined,
+			// An empty value clears the previous registration; undefined would preserve it.
+			apiKey: missingAuthMessage ? "" : "local-claude",
 			missingAuthMessage,
 			streamSimple: this.streamSimple,
 		});

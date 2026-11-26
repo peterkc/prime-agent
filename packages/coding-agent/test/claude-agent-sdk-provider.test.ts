@@ -392,6 +392,34 @@ it.each(["availability at registration"])("loads three source models only when b
 		}
 	}
 });
+it.each([true, false])("R2-2 re-registers when claude was initially available=%s", async (initiallyAvailable) => {
+	const dir = mkdtempSync(join(getAgentDir(), "reregister-"));
+	const authStorage = AuthStorage.inMemory(),
+		modelRegistry = ModelRegistry.inMemory(authStorage);
+	const path = join(dir, "claude");
+	writeFileSync(path, "fixture", { mode: 0o700 });
+	for (const available of [initiallyAvailable, !initiallyAvailable]) {
+		writeFileSync(
+			join(dir, "claude-sdk.json"),
+			JSON.stringify({ claudePath: available ? path : join(dir, "missing") }),
+		);
+		const services = await createAgentSessionServices({
+			cwd: dir,
+			agentDir: dir,
+			authStorage,
+			modelRegistry,
+			telemetryDisabled: true,
+		});
+		try {
+			expect(modelRegistry.getAvailable().some((m) => m.provider === "claude-sdk")).toBe(available);
+			expect(modelRegistry.getProviderMissingAuthMessage("claude-sdk")).toEqual(
+				available ? undefined : expect.stringContaining("claudePath"),
+			);
+		} finally {
+			services.mcpManager.dispose();
+		}
+	}
+});
 it.each([
 	["{}", /PATH.*claudePath/],
 	["{", /Cannot read .*claude-sdk\.json/],

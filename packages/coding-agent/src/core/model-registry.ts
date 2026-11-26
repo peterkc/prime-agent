@@ -1775,7 +1775,7 @@ export class ModelRegistry {
 		},
 		fromExtension = false,
 	): void {
-		if (!config.apiKey && !config.headers && !config.authHeader) {
+		if (config.apiKey === undefined && !config.headers && !config.authHeader) {
 			return;
 		}
 
@@ -1925,7 +1925,7 @@ export class ModelRegistry {
 	}
 
 	getProviderMissingAuthMessage(provider: string): string | undefined {
-		return this.registeredProviders.get(provider)?.missingAuthMessage;
+		return this.registeredProviders.get(provider)?.missingAuthMessage || undefined;
 	}
 
 	/**
