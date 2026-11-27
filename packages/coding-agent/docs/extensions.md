@@ -1443,7 +1443,7 @@ pi.on("session_start", async (_event, ctx) => {
 
 ### pi.setSessionName(name)
 
-Set the session display name (shown in session selector instead of first message). It returns a promise that rejects when the name is refused, for example because another session already uses it. A refusal you do not await is reported as an extension error.
+Set the session display name (shown in session selector instead of first message). It returns a promise that rejects when the name is refused, for example because another session already uses it. Every refusal is also reported as an extension error, awaited or not, so the extension does not need to show it again.
 
 ```typescript
 await pi.setSessionName("Refactor auth module");

@@ -19,8 +19,8 @@ export default function (pi: ExtensionAPI) {
 				try {
 					await pi.setSessionName(name);
 					ctx.ui.notify(`Session named: ${name}`, "info");
-				} catch (error) {
-					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				} catch {
+					// The refusal is already reported as an extension error.
 				}
 			} else {
 				const current = pi.getSessionName();

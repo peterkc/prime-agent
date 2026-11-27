@@ -3777,14 +3777,12 @@ export class DaemonSupervisor {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
 				// Refuse a name held in another daemon before a worker starts; the worker repeats the check.
-				const agentDir = this.defaultSessionConfig.agentDir;
-				if (agentDir)
-					assertSessionNameAvailable(
-						agentDir,
-						targetSummary.sessionId,
-						createCommand.name!,
-						targetSummary.rlmDepth ?? 0,
-					);
+				assertSessionNameAvailable(
+					this.defaultSessionConfig.agentDir!,
+					targetSummary.sessionId,
+					createCommand.name!,
+					targetSummary.rlmDepth ?? 0,
+				);
 				return this.launchWorker(createCommand, undefined, ownerClientId);
 			});
 		})();

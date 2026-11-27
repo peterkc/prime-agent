@@ -15132,7 +15132,7 @@ export class AgentSession {
 		};
 	}
 
-	/** `adopt` takes a name already on disk, which another writer chose, without the unique-name check. */
+	/** `adopt` (@internal) takes a name already on disk, which another writer chose, without the unique-name check. */
 	setSessionName(name: string, options: { adopt?: boolean } = {}): void {
 		// Only a persisted session can be enrolled in the mesh directory.
 		if (!options.adopt && this.sessionManager.getSessionFile()) {

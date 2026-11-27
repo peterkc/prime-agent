@@ -82,6 +82,14 @@ describe("findSessionNameHolder", () => {
 		rmSync(join(agentDir, "mesh", "no-transcript.jsonl"));
 		expect(findSessionNameHolder(agentDir, "root-b", "gone-a", 0)).toBeUndefined();
 		expect(findSessionNameHolder(agentDir, "root-b", "gone-b", 0)).toBeUndefined();
+		// Only a missing file frees the name; a record that cannot be read keeps it held.
+		enroll(agentDir, "unreadable-record", "held");
+		rmSync(join(agentDir, "mesh", "enrollments", "unreadable-record.json"));
+		mkdirSync(join(agentDir, "mesh", "enrollments", "unreadable-record.json"));
+		enroll(agentDir, "bad-record", "held-too");
+		writeFileSync(join(agentDir, "mesh", "enrollments", "bad-record.json"), "{");
+		expect(findSessionNameHolder(agentDir, "root-b", "held", 0)).toBe("unreadable-record");
+		expect(findSessionNameHolder(agentDir, "root-b", "held-too", 0)).toBe("bad-record");
 	});
 });
 

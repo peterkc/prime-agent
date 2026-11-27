@@ -789,7 +789,7 @@ Decide the target cell first, then dump every action for the turn in one go.
 				gameState = createInitialState();
 			}
 			gameActive = true;
-			// The name is cosmetic: keep playing when another session already uses it.
+			// The name is cosmetic: keep playing when it is refused. The refusal is reported as an extension error.
 			try {
 				await pi.setSessionName("Tic-Tac-Toe");
 			} catch {}

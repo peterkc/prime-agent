@@ -118,7 +118,7 @@ Named sessions are easier to find in `/resume` and `prime-agent --resume`. You c
 
 Agent messages find a session by its name across every daemon on the machine, so a name must be unique there. `/name`, `prime-agent rename`, a new session's name and a subagent's name now refuse a name that another enrolled session already uses, ignoring case. For a session in another daemon, the error names that session's ID. Rename or delete that session first, or choose another name. A closed session keeps its name until it is deleted. A subagent may share its name with subagents of other sessions, but not with a top-level session.
 
-Two limits remain. A fork starts with its source's name. Two sessions named at the same moment can both get the name before either is listed. In both cases a message sent to that name fails with "Ambiguous mesh target"; rename one session, or send to the session ID.
+Three limits remain. A fork starts with its source's name. Two sessions named at the same moment can both get the name before either is listed. A session deleted outside a daemon with the mesh on can leave its directory entry behind; the name check ignores that entry, but message delivery still sees it. In all three cases a message sent to that name can fail with "Ambiguous mesh target"; rename one session, or send to the session ID.
 
 ## Branching with `/tree`
 
