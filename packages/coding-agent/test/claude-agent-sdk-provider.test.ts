@@ -261,7 +261,7 @@ it.each([
 	const msg = await f.provider.streamSimple(model, context).result();
 	expect(providerStreamFailureDetails(msg)).toMatchObject({ kind, providerErrorType: error });
 });
-it("R5 B2 refuses a turn after opt-out before /reload", async () => {
+it("refuses a turn after opt-out before /reload", async () => {
 	const query = vi.fn(async function* () {
 		yield result();
 	});
@@ -643,7 +643,7 @@ it.each(["transient"])("AgentSession retries a late %s failure", async () => {
 	}
 });
 
-it.each(["no session_start", "in-memory fork"])("R5 B1 routes an unbound session after %s", async (scenario) => {
+it.each(["no session_start", "in-memory fork"])("routes a session without its own entry after %s", async (scenario) => {
 	const f = fixture(async function* () {
 		yield* textTurn("end_turn");
 	});
