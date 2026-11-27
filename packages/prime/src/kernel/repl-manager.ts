@@ -350,6 +350,9 @@ export class ReplKernelManager {
 		// No later scavenger: host death without 'exit' leaves this dir under the agent tree.
 		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
 		// No pi mode handles SIGINT shutdown, so a delivered SIGINT takes no final snapshot.
+		// The parent is trusted as the user's own agent tree: an existing one keeps its mode.
+		// Made on every start, so a restart after its removal still gets a journal.
+		mkdirSync(this.options.orphanJournalParent, { recursive: true, mode: 0o700 });
 		this.orphanJournalDir = mkdtempSync(join(this.options.orphanJournalParent, "prime-kernel-"));
 		const generation = ++this.startGeneration;
 		this.state = "starting";

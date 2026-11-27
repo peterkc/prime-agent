@@ -275,6 +275,22 @@ describe("ipython extension boundary", () => {
 		expect(existsSync(join(path, ".."))).toBe(false);
 	});
 
+	it("R7-1: a kernel restart re-creates a removed journal parent", async () => {
+		const { dir } = await host(false);
+		const parent = join(dir, "journal-parent");
+		mkdirSync(parent, { mode: 0o700 });
+		const manager = new ReplKernelManager({ python, cwd: dir, orphanJournalParent: parent });
+		cleanups.push(() => manager.disposeSync());
+		await manager.start();
+		const internal = manager as unknown as { child: childProcess.ChildProcess; protocolRepairPromise: Promise<void> };
+		rmSync(parent, { recursive: true, force: true });
+		internal.child.stdout?.emit("data", Buffer.from("invalid-protocol-frame\n"));
+		await internal.protocolRepairPromise;
+		const result = await manager.execute("21 * 2");
+		expect(result.status).toBe("ok");
+		expect(fs.lstatSync(parent).mode & 0o777).toBe(0o700);
+	});
+
 	it("W4a: journal removal errors do not escape synchronous cleanup", async () => {
 		const { dir } = await host(false);
 		const manager = new ReplKernelManager({ python, cwd: dir, orphanJournalParent: dir });
