@@ -8,12 +8,12 @@ import {
 	calculateCost,
 	getApiProvider,
 	type Model,
-	unregisterApiProviders,
+	resetApiProviders,
 } from "@earendil-works/pi-ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Type } from "typebox";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { getAgentDir } from "../src/config.js";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -90,10 +90,13 @@ function fixture(
 		),
 	};
 }
+beforeEach(() => {
+	resetApiProviders();
+	vi.stubEnv("PI_OFFLINE", "1");
+});
 afterEach(() => {
 	vi.unstubAllEnvs();
 	vi.unstubAllGlobals();
-	unregisterApiProviders("provider:claude-sdk");
 });
 it.each([
 	["end_turn", "stop"],
@@ -491,6 +494,7 @@ it.each(["restored", "default", "none", "compact", "restart after opt-out"])(
 			await expect(request).rejects.toEqual(Error(modelFallbackMessage));
 		} finally {
 			session.dispose();
+			await session.modelRegistry.waitForPendingModelRefreshes(2_000);
 		}
 	},
 );
@@ -532,6 +536,7 @@ it.each(["absent", "discovery down", "config only"])("reports the saved provider
 		}
 	} finally {
 		session.dispose();
+		await session.modelRegistry.waitForPendingModelRefreshes(2_000);
 	}
 });
 it.each(["prompt", "compact"])("removes the provider on /reload after opt-out: %s", async (operation) => {
@@ -566,6 +571,7 @@ it.each(["prompt", "compact"])("removes the provider on /reload after opt-out: %
 		);
 	} finally {
 		session.dispose();
+		await session.modelRegistry.waitForPendingModelRefreshes(2_000);
 	}
 });
 it.each([true, false])("R2-2 re-registers when claude was initially available=%s", async (initiallyAvailable) => {
@@ -643,27 +649,34 @@ it.each(["transient"])("AgentSession retries a late %s failure", async () => {
 	}
 });
 
-it.each(["no session_start", "in-memory fork"])("routes a session without its own entry after %s", async (scenario) => {
-	const f = fixture(async function* () {
-		yield* textTurn("end_turn");
-	});
-	const h = await createHarness({ extensionFactories: [f.provider.extension] });
-	try {
-		const handler = getApiProvider(model.api)!.streamSimple;
-		const sessionId = h.session.sessionId;
-		if (scenario === "in-memory fork") {
-			await h.session.bindExtensions({});
-			h.session.sessionManager.newSession();
-			await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "fork" });
-		} else {
-			expect((await handler(model, context, { sessionId: "inline-child" }).result()).stopReason).toBe("stop");
+it.each(["unbound after inline child disposal", "bound after an in-memory fork"])(
+	"routes a turn with an unknown session ID: %s",
+	async (scenario) => {
+		const f = fixture(async function* () {
+			yield* textTurn("end_turn");
+		});
+		const h = await createHarness({ extensionFactories: [f.provider.extension] });
+		try {
+			const handler = getApiProvider(model.api)!.streamSimple;
+			if (scenario === "unbound after inline child disposal") {
+				const turn = () => handler(model, context, { sessionId: h.session.sessionId }).result();
+				expect((await turn()).stopReason).toBe("stop");
+				// Inline children share their parent's resource loader and extension runtime.
+				const child = await createHarness({ resourceLoader: h.session.resourceLoader });
+				child.cleanup();
+				expect((await turn()).stopReason).toBe("stop");
+			} else {
+				await h.session.bindExtensions({});
+				h.session.sessionManager.newSession();
+				await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "fork" });
+				await h.session.bindExtensions({});
+				expect((await handler(model, context, { sessionId: "inline-child" }).result()).stopReason).toBe("stop");
+			}
+		} finally {
+			h.cleanup();
 		}
-		h.session.dispose();
-		expect(() => handler(model, context, { sessionId })).toThrow(/no live claude-sdk session/i);
-	} finally {
-		h.cleanup();
-	}
-});
+	},
+);
 it.each(["sessions"])("isolates %s under the last handler, including compaction", async () => {
 	const release = createDeferred();
 	const paths: string[] = [];
@@ -704,14 +717,22 @@ it.each(["sessions"])("isolates %s under the last handler, including compaction"
 		const stream = handler(model, context, { sessionId: ha.session.sessionId });
 		const closing = handler(model, context, { sessionId: hb.session.sessionId });
 		expect(paths.slice(-2)).toEqual([a.path, b.path]);
-		await hb.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		const aId = ha.session.sessionId;
+		const bId = hb.session.sessionId;
+		hb.session.sessionManager.newSession();
+		await hb.session.extensionRunner.emit({ type: "session_shutdown", reason: "fork" });
 		release.resolve();
 		expect((await stream.result()).stopReason).toBe("stop");
 		expect((await closing.result()).stopReason).toBe("aborted");
 		await handler(model, context).result();
+		expect(paths.at(-1)).toBe(b.path);
+		ha.session.modelRegistry.refresh();
+		const aHandler = getApiProvider(model.api)!.streamSimple;
+		await aHandler(model, context, { sessionId: bId }).result();
 		expect(paths.at(-1)).toBe(a.path);
 		ha.session.dispose();
-		expect(() => handler(model, context)).toThrow(/no live claude-sdk session/i);
+		await handler(model, context, { sessionId: aId }).result();
+		expect(paths.at(-1)).toBe(b.path);
 	} finally {
 		release.resolve();
 		ha.cleanup();

@@ -216,7 +216,6 @@ export class ClaudeSdkProvider {
 		}
 		const owner = { provider: this, running: new Set<AbortController>() };
 		let ownerId: string | undefined;
-		let shutDown = false;
 		pi.registerProvider("claude-sdk", {
 			api: "claude-agent-sdk",
 			modelsFrom: "anthropic",
@@ -225,28 +224,8 @@ export class ClaudeSdkProvider {
 			apiKey: missingAuthMessage ? "" : "local-claude",
 			missingAuthMessage,
 			streamSimple: (model, context, options) => {
-				let session = options?.sessionId ? sessions.get(options.sessionId) : undefined;
-				if (!options?.sessionId) {
-					// A late registry refresh can reinstall a handler after its session was disposed.
-					for (const live of sessions.values()) {
-						session = live;
-						if (live.provider === this) break;
-					}
-				}
-				if (!session && !shutDown) {
-					if (ownerId !== undefined) {
-						if (sessions.get(ownerId) === owner) session = owner;
-					} else {
-						// Unbound hosts may dispose without session_shutdown; getFlag checks for a stale runtime.
-						try {
-							pi.getFlag("claude-sdk");
-							session = owner;
-						} catch {
-							shutDown = true;
-						}
-					}
-				}
-				if (!session) throw new StreamFailureError("No live claude-sdk session.", { kind: "invalid_request" });
+				const id = options?.sessionId;
+				const session = (id ? sessions.get(id) : undefined) ?? owner;
 				return session.provider.streamSimple(model, context, options, session.running);
 			},
 		});
@@ -255,7 +234,6 @@ export class ClaudeSdkProvider {
 			sessions.set(ownerId, owner);
 		});
 		pi.on("session_shutdown", (event) => {
-			shutDown = true;
 			if (event.reason === "reload") pi.unregisterProvider("claude-sdk");
 			if (ownerId !== undefined && sessions.get(ownerId) === owner) closeSession(ownerId);
 			else for (const controller of owner.running) controller.abort();
