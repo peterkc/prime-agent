@@ -966,7 +966,13 @@ describe("ipython extension boundary", () => {
 			expect(entry).toContain('from "@earendil-works/pi-coding-agent"');
 			expect(entry).toContain("run(process.argv.slice(2), main)");
 			const bin = fileURLToPath(new URL("../../../node_modules/.bin/prime-agent", import.meta.url));
-			const result = childProcess.spawnSync(bin, ["--version"], { encoding: "utf8" });
+			// The bin's main opens SettingsManager, which locks an existing settings.json: keep it off the real agent dir.
+			const isolated = mkdtempSync(join(tmpdir(), "prime-agent-bin-"));
+			cleanups.push(() => rmSync(isolated, { recursive: true, force: true }));
+			const result = childProcess.spawnSync(bin, ["--version"], {
+				encoding: "utf8",
+				env: { ...process.env, HOME: isolated, [ENV_AGENT_DIR]: join(isolated, "agent") },
+			});
 			expect(result.status, result.stderr).toBe(0);
 			expect(result.stdout.trim()).toBe(VERSION);
 		} finally {
