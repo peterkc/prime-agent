@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { win32 } from "node:path";
 import { execFileSyncHidden, spawnSyncHidden } from "./utils/child-process.ts";
 
@@ -20,30 +20,6 @@ export interface ActiveOrphanProcess {
 	kernelPid?: number;
 	/** Missing on identity-free records from old journals (kernels no longer write pid-only records). */
 	processStartId?: string;
-}
-
-export function recordOrphanProcessState(pid: number, path: string): void {
-	if (!path || !Number.isInteger(pid) || pid <= 0) {
-		return;
-	}
-	const record: OrphanProcessRecord = {
-		version: 1,
-		pid,
-		ownerPid: process.pid,
-		active: false,
-		recordedAt: new Date().toISOString(),
-	};
-	try {
-		const descriptor = openSync(path, "a", 0o600);
-		try {
-			writeSync(descriptor, `${JSON.stringify(record)}\n`);
-			fsyncSync(descriptor);
-		} finally {
-			closeSync(descriptor);
-		}
-	} catch {
-		// Process tracking must not make a successfully spawned command fail.
-	}
 }
 
 export function readActiveOrphanProcesses(path: string, ownerPid: number): ActiveOrphanProcess[] {
@@ -127,10 +103,7 @@ export function reapKernelOrphanProcesses(kernelPid: number, path: string): void
 		if (!shouldReapOrphanProcess(orphan)) {
 			continue;
 		}
-		// Inactive only after a delivered signal; a stale record is neutralized by the startId check.
-		if (killOrphanProcess(orphan.pid)) {
-			recordOrphanProcessState(orphan.pid, path);
-		}
+		killOrphanProcess(orphan.pid);
 	}
 }
 
