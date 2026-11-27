@@ -418,10 +418,13 @@ export class ClaudeSdkProvider {
 								: error === "model_not_found"
 									? "invalid_request"
 									: classifyStreamFailure(error);
+							const text = m.message.content
+								.flatMap((block) => (block.type === "text" ? [block.text] : []))
+								.join("\n");
 							throw new StreamFailureError(
 								error === "authentication_failed"
 									? "Claude is not logged in. Run claude auth login."
-									: formatStreamFailureMessage(Error(error)),
+									: text || formatStreamFailureMessage(Error(error)),
 								{ kind, providerErrorType: error },
 							);
 						}

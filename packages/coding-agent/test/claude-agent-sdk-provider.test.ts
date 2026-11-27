@@ -7,6 +7,7 @@ import {
 	type Context,
 	calculateCost,
 	getApiProvider,
+	isContextOverflow,
 	type Model,
 	resetApiProviders,
 } from "@earendil-works/pi-ai";
@@ -259,10 +260,22 @@ it.each([
 	["rate_limit", "rate_limit"],
 ])("reports the SDK error %s as %s", async (error, kind) => {
 	const f = fixture(async function* () {
-		yield { type: "assistant", error };
+		yield { type: "assistant", error, message: { content: [] } };
 	});
 	const msg = await f.provider.streamSimple(model, context).result();
 	expect(providerStreamFailureDetails(msg)).toMatchObject({ kind, providerErrorType: error });
+});
+it.each([
+	["model_not_found", ["This model is unavailable.", "Choose a different model."], false],
+	["invalid_request", ["Prompt is too long"], true],
+] as const)("preserves Claude Code error text for %s", async (error, text, overflow) => {
+	const f = fixture(async function* () {
+		yield { type: "assistant", error, message: { content: text.map((text) => ({ type: "text", text })) } };
+	});
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(isContextOverflow(msg)).toBe(overflow);
+	expect(msg.errorMessage).toBe(text.join("\n"));
+	expect(providerStreamFailureDetails(msg)).toMatchObject({ kind: "invalid_request", providerErrorType: error });
 });
 it("refuses a turn after opt-out before /reload", async () => {
 	const query = vi.fn(async function* () {
