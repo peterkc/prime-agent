@@ -43,7 +43,7 @@ class IpythonKernelProvisioner {
 	private readonly startupAbort = new AbortController();
 	private managerPromise?: Promise<ReplKernelManager>;
 	private shutdownPromise?: Promise<void>;
-	private unregisterCleanup?: () => void;
+	private readonly unregisterCleanup: () => void;
 	private restoreNotice = "";
 	private stopping = false;
 
@@ -92,7 +92,6 @@ class IpythonKernelProvisioner {
 		});
 		const abortCheck = () => check.kill("SIGKILL");
 		signal.addEventListener("abort", abortCheck, { once: true });
-		if (signal.aborted) abortCheck();
 		let stderr = "";
 		check.stderr?.on("data", (chunk: Buffer) => {
 			stderr += chunk.toString();
@@ -193,7 +192,7 @@ class IpythonKernelProvisioner {
 			}
 			await manager.shutdown({ snapshot: options.snapshot, drainHostRequests: true });
 		} finally {
-			this.unregisterCleanup?.();
+			this.unregisterCleanup();
 		}
 	}
 }

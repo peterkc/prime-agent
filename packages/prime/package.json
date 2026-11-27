@@ -7,14 +7,6 @@
 	"bin": {
 		"prime-agent": "dist/cli.js"
 	},
-	"main": "./dist/ipython.js",
-	"types": "./dist/ipython.d.ts",
-	"exports": {
-		".": {
-			"types": "./dist/ipython.d.ts",
-			"import": "./dist/ipython.js"
-		}
-	},
 	"scripts": {
 		"clean": "node ../../scripts/package-files.mjs clean dist",
 		"build": "tsc -p tsconfig.build.json && node ../../scripts/package-files.mjs executable dist/cli.js",

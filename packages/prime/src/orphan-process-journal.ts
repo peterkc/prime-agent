@@ -87,7 +87,7 @@ function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
 
 // Kills still-active bash() children journaled by the given kernel pid; sibling kernels' records are untouched.
 export function reapKernelOrphanProcesses(kernelPid: number, path: string): void {
-	if (!path || !Number.isInteger(kernelPid) || kernelPid <= 0) {
+	if (!Number.isInteger(kernelPid) || kernelPid <= 0) {
 		return;
 	}
 	let orphans: ActiveOrphanProcess[];
