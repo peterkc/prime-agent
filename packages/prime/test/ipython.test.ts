@@ -965,11 +965,18 @@ describe("ipython extension boundary", () => {
 			const entry = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
 			expect(entry).toContain('from "@earendil-works/pi-coding-agent"');
 			expect(entry).toContain("run(process.argv.slice(2), main)");
-			const bin = fileURLToPath(new URL("../../../node_modules/.bin/prime-agent", import.meta.url));
+			// Run the package's declared bin target: npm links workspace bins only when the target exists at install.
+			const packageDir = fileURLToPath(new URL("../", import.meta.url));
+			const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as {
+				bin?: Record<string, string>;
+			};
+			const binTarget = manifest.bin?.["prime-agent"];
+			expect(binTarget).toBeTypeOf("string");
+			const bin = join(packageDir, binTarget!);
 			// The bin's main opens SettingsManager, which locks an existing settings.json: keep it off the real agent dir.
 			const isolated = mkdtempSync(join(tmpdir(), "prime-agent-bin-"));
 			cleanups.push(() => rmSync(isolated, { recursive: true, force: true }));
-			const result = childProcess.spawnSync(bin, ["--version"], {
+			const result = childProcess.spawnSync(process.execPath, [bin, "--version"], {
 				encoding: "utf8",
 				env: { ...process.env, HOME: isolated, [ENV_AGENT_DIR]: join(isolated, "agent") },
 			});
