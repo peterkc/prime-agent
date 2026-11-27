@@ -1,17 +1,25 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { enrollmentPath, parseDirectoryEntry } from "../modes/daemon/cotal/mesh-shared.js";
+import { resolveSessionRlmDepth, type SessionHeader } from "./session-manager.js";
 import { readSessionHeaderLineSync } from "./session-rotation-state.js";
 
-/** The holder's depth, or 0 when its record or header cannot be read, so an unreadable holder keeps its name. */
-function holderRlmDepth(meshRoot: string, sessionId: string): number {
+/**
+ * The holder's RLM depth, by the same rule as the requester's, or undefined for a stale entry whose enrollment or
+ * transcript is gone. A transcript whose header cannot be read counts as top-level, so it keeps its name.
+ */
+function holderRlmDepth(meshRoot: string, sessionId: string): number | undefined {
+	let sessionFile: unknown;
 	try {
-		const record = JSON.parse(readFileSync(enrollmentPath(meshRoot, sessionId), "utf8")) as { sessionFile?: unknown };
-		if (typeof record.sessionFile !== "string") return 0;
-		const header = JSON.parse(readSessionHeaderLineSync(record.sessionFile) ?? "null") as {
-			rlmDepth?: unknown;
-		} | null;
-		return typeof header?.rlmDepth === "number" ? header.rlmDepth : 0;
+		sessionFile = (JSON.parse(readFileSync(enrollmentPath(meshRoot, sessionId), "utf8")) as { sessionFile?: unknown })
+			.sessionFile;
+	} catch {
+		return undefined;
+	}
+	if (typeof sessionFile !== "string" || !existsSync(sessionFile)) return undefined;
+	try {
+		const header = JSON.parse(readSessionHeaderLineSync(sessionFile) ?? "null") as Partial<SessionHeader> | null;
+		return header ? resolveSessionRlmDepth(header, sessionFile) : 0;
 	} catch {
 		return 0;
 	}
@@ -52,7 +60,10 @@ export function findSessionNameHolder(
 			continue;
 		}
 		if (holderName.toLowerCase() !== wanted) continue;
-		if (rlmDepth > 0 && holderRlmDepth(meshRoot, holder) > 0) continue;
+		const holderDepth = holderRlmDepth(meshRoot, holder);
+		// A stale entry, left by a delete or rename outside a mesh-enabled daemon, does not hold the name.
+		if (holderDepth === undefined) continue;
+		if (rlmDepth > 0 && holderDepth > 0) continue;
 		return holder;
 	}
 	return undefined;

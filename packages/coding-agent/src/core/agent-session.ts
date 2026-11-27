@@ -11138,12 +11138,23 @@ export class AgentSession {
 				appendEntry: (customType, data) => {
 					this.sessionManager.appendCustomEntry(customType, data);
 				},
-				setSessionName: async (name) => {
-					if (this._agentMessageController?.setSessionName) {
-						await this._agentMessageController.setSessionName(name);
-						return;
-					}
-					this.setSessionName(name);
+				setSessionName: (name) => {
+					const work = (async () => {
+						if (this._agentMessageController?.setSessionName) {
+							await this._agentMessageController.setSessionName(name);
+							return;
+						}
+						this.setSessionName(name);
+					})();
+					// An extension that does not await the call still gets the refusal reported, not an unhandled rejection.
+					work.catch((err) => {
+						runner.emitError({
+							extensionPath: "<runtime>",
+							event: "set_session_name",
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
+					return work;
 				},
 				getSessionName: () => {
 					return this.sessionManager.getSessionName();
@@ -13113,6 +13124,9 @@ export class AgentSession {
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
+		// Refuse a name held elsewhere in the mesh here, at admission; the child's own setSessionName repeats the check.
+		if (this.sessionManager.getSessionFile())
+			assertSessionNameAvailable(this._agentDir ?? getDefaultAgentDir(), "", name, depth);
 		// A daemon catalog still lists the closing child under its old name while
 		// the detached unwind runs, which is after the delete receipt returned.
 		// Forward every freed session id so both controller paths below admit the
@@ -15118,9 +15132,10 @@ export class AgentSession {
 		};
 	}
 
-	setSessionName(name: string): void {
+	/** `adopt` takes a name already on disk, which another writer chose, without the unique-name check. */
+	setSessionName(name: string, options: { adopt?: boolean } = {}): void {
 		// Only a persisted session can be enrolled in the mesh directory.
-		if (this.sessionManager.getSessionFile()) {
+		if (!options.adopt && this.sessionManager.getSessionFile()) {
 			assertSessionNameAvailable(
 				this._agentDir ?? getDefaultAgentDir(),
 				this.sessionManager.getSessionId(),

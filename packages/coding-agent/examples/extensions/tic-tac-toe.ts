@@ -789,7 +789,10 @@ Decide the target cell first, then dump every action for the turn in one go.
 				gameState = createInitialState();
 			}
 			gameActive = true;
-			pi.setSessionName("Tic-Tac-Toe");
+			// The name is cosmetic: keep playing when another session already uses it.
+			try {
+				await pi.setSessionName("Tic-Tac-Toe");
+			} catch {}
 
 			await ctx.ui.custom<void>((tui, _theme, _kb, done) => {
 				component = new TicTacToeComponent(

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getAgentDir } from "../src/config.js";
+import type { ExtensionAPI } from "../src/core/extensions/types.js";
 import { appendSessionInfoToExistingFile, SessionManager } from "../src/core/session-manager.js";
 import { findSessionNameHolder } from "../src/core/session-name-holder.js";
 import { createHarness, type Harness } from "./suite/harness.js";
@@ -69,11 +70,18 @@ describe("findSessionNameHolder", () => {
 		expect(findSessionNameHolder(agentDir, "root-b", "reviewer", 0)).toBe("child-a");
 	});
 
-	it("keeps the name of a holder whose depth cannot be read", () => {
+	it("keeps the name of a holder whose header cannot be read, and skips a stale entry", () => {
 		const agentDir = tempDir();
-		enroll(agentDir, "unknown", "worker", 1);
-		rmSync(join(agentDir, "mesh", "enrollments", "unknown.json"));
-		expect(findSessionNameHolder(agentDir, "child-b", "worker", 1)).toBe("unknown");
+		enroll(agentDir, "unreadable", "worker", 1);
+		writeFileSync(join(agentDir, "mesh", "unreadable.jsonl"), "not json\n");
+		expect(findSessionNameHolder(agentDir, "child-b", "worker", 1)).toBe("unreadable");
+		// A delete or rename outside a mesh-enabled daemon leaves the entry behind; it no longer holds the name.
+		enroll(agentDir, "no-record", "gone-a");
+		rmSync(join(agentDir, "mesh", "enrollments", "no-record.json"));
+		enroll(agentDir, "no-transcript", "gone-b");
+		rmSync(join(agentDir, "mesh", "no-transcript.jsonl"));
+		expect(findSessionNameHolder(agentDir, "root-b", "gone-a", 0)).toBeUndefined();
+		expect(findSessionNameHolder(agentDir, "root-b", "gone-b", 0)).toBeUndefined();
 	});
 });
 
@@ -123,5 +131,52 @@ describe("naming a session", () => {
 		expect(readFileSync(file, "utf8")).toBe(before);
 		appendSessionInfoToExistingFile(file, "agx-temp", agentDir);
 		expect(SessionManager.open(file).getSessionName()).toBe("agx-temp");
+	});
+	it("refuses a closed child's rename to a top-level name, but not to another child's name", () => {
+		const dir = tempDir();
+		const childFile = join(dir, "child.jsonl");
+		writeFileSync(
+			childFile,
+			`${JSON.stringify({ type: "session", version: 3, id: "child-b", timestamp: new Date().toISOString(), cwd: dir, rlmDepth: 1 })}\n`,
+		);
+		const agentDir = tempDir();
+		enroll(agentDir, "root-a", "pi-review");
+		enroll(agentDir, "child-a", "reviewer", 1);
+		expect(() => appendSessionInfoToExistingFile(childFile, "pi-review", agentDir)).toThrow(
+			/top-level session root-a/,
+		);
+		appendSessionInfoToExistingFile(childFile, "reviewer", agentDir);
+		expect(SessionManager.open(childFile).getSessionName()).toBe("reviewer");
+	});
+
+	it("adopts a name already on disk without the check", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		enroll(getAgentDir(), "root-a", "agx-research");
+		harness.session.setSessionName("agx-research", { adopt: true });
+		expect(harness.session.sessionName).toBe("agx-research");
+	});
+
+	it("rejects an extension's refused rename and reports it, awaited or not", async () => {
+		let api: ExtensionAPI | undefined;
+		const harness = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi: ExtensionAPI) => {
+					api = pi;
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const errors: string[] = [];
+		harness.session.extensionRunner.onError((error) => errors.push(`${error.event}: ${error.error}`));
+		enroll(getAgentDir(), "root-a", "agx-research");
+		// Not awaited: the refusal must not become an unhandled rejection.
+		void api!.setSessionName("agx-research");
+		await expect(api!.setSessionName("AGX-research")).rejects.toThrow(/already used by session root-a/);
+		expect(errors).toHaveLength(2);
+		expect(errors[0]).toMatch(/^set_session_name: .*root-a/);
+		expect(harness.session.sessionName).toBeUndefined();
 	});
 });

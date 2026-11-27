@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getAgentDir } from "../src/config.js";
 import {
 	type AgentSessionMessageController,
 	createAgentSessionMessage,
@@ -519,6 +520,36 @@ describe("AgentSession rlm recursion", () => {
 		const header = JSON.parse(readFileSync(child.sessionFile, "utf8").split("\n")[0] ?? "{}");
 		expect(header).toMatchObject({ parentSession: root.sessionFile, rlmDepth: 3 });
 		expect(child.rlmDepth).toBe(3);
+	});
+
+	it("refuses a subagent name a top-level session holds in the mesh directory, before admission", async () => {
+		const root = createSession();
+		const mesh = join(getAgentDir(), "mesh");
+		mkdirSync(join(mesh, "directory"), { recursive: true });
+		mkdirSync(join(mesh, "enrollments"), { recursive: true });
+		const holderFile = join(mesh, "holder.jsonl");
+		writeFileSync(holderFile, `${JSON.stringify({ type: "session", id: "holder", rlmDepth: 0 })}\n`);
+		writeFileSync(
+			join(mesh, "enrollments", "holder.json"),
+			JSON.stringify({ sessionId: "holder", sessionFile: holderFile }),
+		);
+		writeFileSync(
+			join(mesh, "directory", "holder.json"),
+			JSON.stringify({
+				sessionId: "holder",
+				name: "pi-review",
+				principal: "local.holder",
+				homeSocket: "/run/a.sock",
+			}),
+		);
+		try {
+			await expect(root.runRlmChild("review", { name: "PI-Review" })).rejects.toThrow(
+				/already used by top-level session holder/,
+			);
+			expect((await root.listRlmSubagents()).subagents).toEqual([]);
+		} finally {
+			rmSync(mesh, { recursive: true, force: true });
+		}
 	});
 
 	it("lets the orchestrator choose a unique subagent session name", async () => {
