@@ -16,7 +16,8 @@ export function readClaudeSettings(agentDir: string): {
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("expected an object");
 		const enabled = "enabled" in value ? value.enabled : false;
 		if (typeof enabled !== "boolean") throw Error("expected a boolean enabled");
-		const claudePath = enabled && "claudePath" in value ? value.claudePath : undefined;
+		if (!enabled) return { enabled, idleTimeoutSeconds: defaultIdleTimeoutSeconds };
+		const claudePath = "claudePath" in value ? value.claudePath : undefined;
 		if (claudePath !== undefined && (typeof claudePath !== "string" || !claudePath.trim()))
 			throw Error("expected a nonempty claudePath");
 		if (claudePath !== undefined && !isAbsolute(claudePath)) throw Error("expected an absolute claudePath");

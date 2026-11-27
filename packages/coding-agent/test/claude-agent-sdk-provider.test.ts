@@ -1127,7 +1127,10 @@ it.each(["keepalives"])("AC-22 aborts and closes a query stalled on %s", async (
 			closed = true;
 		}
 	});
-	writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ claudePath: f.path, idleTimeoutSeconds: 2 }));
+	writeFileSync(
+		join(f.dir, "claude-sdk.json"),
+		JSON.stringify({ enabled: true, claudePath: f.path, idleTimeoutSeconds: 2 }),
+	);
 	const response = f.provider
 		.streamSimple(model, context)
 		.result()
@@ -1171,7 +1174,10 @@ it.each(["initialization"])("AC-22 aborts a query whose %s stalls", async () => 
 		},
 		() => new Promise(() => {}),
 	);
-	writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ claudePath: f.path, idleTimeoutSeconds: 2 }));
+	writeFileSync(
+		join(f.dir, "claude-sdk.json"),
+		JSON.stringify({ enabled: true, claudePath: f.path, idleTimeoutSeconds: 2 }),
+	);
 	try {
 		const response = f.provider.streamSimple(model, context).result();
 		await vi.advanceTimersByTimeAsync(2_000);

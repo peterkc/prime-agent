@@ -29,9 +29,10 @@ it.each(["global only", "malformed", "relative", "~/claude"])("reads claudePath:
 });
 
 it.each([
-	[{}, 300],
-	[{ idleTimeoutSeconds: 17 }, 17],
-	[{ idleTimeoutSeconds: 0 }, "invalid"],
+	[{ enabled: true }, 300],
+	[{ enabled: true, idleTimeoutSeconds: 17 }, 17],
+	[{ enabled: true, idleTimeoutSeconds: 0 }, "invalid"],
+	[{ enabled: false, idleTimeoutSeconds: 0 }, 300],
 ] as const)("reads idleTimeoutSeconds from %j", (settings, expected) => {
 	const path = join(getAgentDir(), "claude-sdk.json");
 	writeFileSync(path, JSON.stringify(settings));
