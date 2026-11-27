@@ -314,7 +314,15 @@ export class ClaudeSdkProvider {
 		try {
 			if (options?.signal?.aborted) ctrl.abort();
 			ctrl.signal.throwIfAborted();
-			const path = executable(readClaudeSettings(this.agentDir).claudePath);
+			const settings = readClaudeSettings(this.agentDir);
+			if (!settings.enabled)
+				throw new StreamFailureError(
+					`claude-sdk is switched off in ${resolve(this.agentDir, "claude-sdk.json")}. Run /reload.`,
+					{
+						kind: "invalid_request",
+					},
+				);
+			const path = executable(settings.claudePath);
 			let point = resumePoint(model, context);
 			stream.push({ type: "start", partial: msg });
 			for (;;) {

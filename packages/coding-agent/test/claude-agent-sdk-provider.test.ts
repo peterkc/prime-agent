@@ -225,7 +225,7 @@ it.each(["missing binary", "missing login", "superseded output"])("fails visibly
 		yield { type: "assistant", error: "authentication_failed", message: { content: [] } };
 	});
 	if (scenario === "missing binary") {
-		writeFileSync(join(f.dir, "claude-sdk.json"), "{}");
+		writeFileSync(join(f.dir, "claude-sdk.json"), JSON.stringify({ enabled: true }));
 		vi.stubEnv("PATH", join(f.dir, "empty"));
 	}
 	const msg = await f.provider.streamSimple(model, context).result();
@@ -260,6 +260,19 @@ it.each([
 	});
 	const msg = await f.provider.streamSimple(model, context).result();
 	expect(providerStreamFailureDetails(msg)).toMatchObject({ kind, providerErrorType: error });
+});
+it("R5 B2 refuses a turn after opt-out before /reload", async () => {
+	const query = vi.fn(async function* () {
+		yield result();
+	});
+	const f = fixture(query);
+	vi.stubEnv("PATH", f.dir);
+	const file = join(f.dir, "claude-sdk.json");
+	writeFileSync(file, JSON.stringify({ enabled: false }));
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(msg.errorMessage).toBe(`claude-sdk is switched off in ${file}. Run /reload.`);
+	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
+	expect(query).not.toHaveBeenCalled();
 });
 it.each(["bad settings", "unsupported image"])("reports %s as invalid input", async (scenario) => {
 	const f = fixture(async function* () {
