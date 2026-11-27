@@ -541,6 +541,7 @@ function isOfflineModeEnabled(): boolean {
 export class ModelRegistry {
 	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
+	private readonly modelsJsonProviders = new Set<string>();
 	private discoveryConfigs = new Map<string, Static<typeof ProviderConfigSchema>>();
 	private discoveryCache = new Map<
 		string,
@@ -674,6 +675,7 @@ export class ModelRegistry {
 	}
 
 	private loadModels(): void {
+		this.modelsJsonProviders.clear();
 		this.discoveryConfigs.clear();
 		const {
 			models: customModels,
@@ -827,6 +829,7 @@ export class ModelRegistry {
 					});
 				}
 
+				this.modelsJsonProviders.add(providerName);
 				if (providerConfig.discover !== undefined) this.discoveryConfigs.set(providerName, providerConfig);
 				this.storeProviderRequestConfig(providerName, providerConfig);
 
@@ -1931,7 +1934,11 @@ export class ModelRegistry {
 	}
 
 	hasProvider(provider: string): boolean {
-		return this.registeredProviders.has(provider) || this.models.some((model) => model.provider === provider);
+		return (
+			this.registeredProviders.has(provider) ||
+			this.modelsJsonProviders.has(provider) ||
+			this.models.some((model) => model.provider === provider)
+		);
 	}
 
 	getProviderMissingAuthMessage(provider: string): string | undefined {

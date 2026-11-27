@@ -24,7 +24,7 @@ export function formatNoModelsAvailableMessage(saved?: {
 	if (saved?.provider) {
 		const cause = saved.registry.getProviderMissingAuthMessage(saved.provider);
 		if (cause) return cause;
-		if (!saved.registry.hasProvider(saved.provider)) return `Provider ${saved.provider} is not registered.`;
+		if (!saved.registry.hasProvider(saved.provider)) return formatProviderNotRegisteredMessage(saved.provider);
 	}
 	return `No models available. ${getProviderLoginHelp()}`;
 }

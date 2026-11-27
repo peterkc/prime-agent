@@ -92,6 +92,7 @@ function fixture(
 }
 afterEach(() => {
 	vi.unstubAllEnvs();
+	vi.unstubAllGlobals();
 	unregisterApiProviders("provider:claude-sdk");
 });
 it.each([
@@ -466,14 +467,25 @@ it.each(["restored", "default", "none"])("explains why there is no model (saved 
 		session.dispose();
 	}
 });
-it("names an unregistered saved provider instead of suggesting login", async () => {
+it.each(["absent", "discovery down", "config only"])("reports the saved provider state: %s", async (state) => {
+	clearProviderEnv();
 	const dir = mkdtempSync(join(getAgentDir(), "absent-"));
+	const provider = "custom-provider";
+	if (state !== "absent") {
+		const config = {
+			baseUrl: "https://discovery.invalid",
+			api: "openai-completions",
+			discover: state === "discovery down" ? {} : undefined,
+		};
+		writeFileSync(join(dir, "models.json"), JSON.stringify({ providers: { [provider]: config } }));
+	}
+	vi.stubGlobal("fetch", async () => new Response(null, { status: 503 }));
 	const services = await createAgentSessionServices({
 		cwd: dir,
 		agentDir: dir,
 		authStorage: AuthStorage.inMemory(),
 		telemetryDisabled: true,
-		settingsManager: SettingsManager.inMemory({ defaultModel: "gone", defaultProvider: "removed-provider" }),
+		settingsManager: SettingsManager.inMemory({ defaultModel: "gone", defaultProvider: provider }),
 	});
 	const { session, modelFallbackMessage } = await createAgentSessionFromServices({
 		services,
@@ -481,7 +493,16 @@ it("names an unregistered saved provider instead of suggesting login", async () 
 		telemetryDisabled: true,
 	});
 	try {
-		expect(modelFallbackMessage).toBe("Provider removed-provider is not registered.");
+		expect(session.modelRegistry.getAll().some((m) => m.provider === provider)).toBe(false);
+		if (state === "absent") {
+			expect(modelFallbackMessage).toBe(
+				"Provider custom-provider is not registered. Use /model to pick another model.",
+			);
+		} else {
+			expect.soft(modelFallbackMessage).toMatch(/^No models available\. Use \/login/);
+			session.agent.state.model = { ...model, provider };
+			await expect(session.prompt("test")).rejects.toThrow(/No API key found for custom-provider\./);
+		}
 	} finally {
 		session.dispose();
 	}
