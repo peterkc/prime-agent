@@ -5,6 +5,10 @@ import type { ModelRegistry } from "./model-registry.js";
 const UNKNOWN_PROVIDER = "unknown";
 export const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
 
+export function hasResolvedModel(model: { provider: string } | undefined): boolean {
+	return model !== undefined && model.provider !== UNKNOWN_PROVIDER;
+}
+
 export function getProviderLoginHelp(): string {
 	return [
 		"Use /login to log into a provider via OAuth or API key. See:",

@@ -52,7 +52,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
-import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
+import { formatNoModelsAvailableMessage, hasResolvedModel } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
@@ -1536,7 +1536,7 @@ export async function main(args: string[], options?: MainOptions) {
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
-			startedWithoutModel: !(isFreshDefaultSession ? startupModel.model : summary.model),
+			startedWithoutModel: !hasResolvedModel(isFreshDefaultSession ? startupModel.model : summary.model),
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,
@@ -1732,7 +1732,7 @@ export async function main(args: string[], options?: MainOptions) {
 			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage: runtime.modelFallbackMessage,
-			startedWithoutModel: !session.model,
+			startedWithoutModel: !hasResolvedModel(session.model),
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,

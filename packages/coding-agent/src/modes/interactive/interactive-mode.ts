@@ -86,6 +86,7 @@ import {
 	uploadAgentTraceFile,
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
+import { hasResolvedModel } from "../../core/auth-guidance.js";
 import type { AuthCredential } from "../../core/auth-storage.js";
 import {
 	type AgentCronJob,
@@ -2222,7 +2223,7 @@ export class InteractiveMode {
 		// The no-models warning is a snapshot from whichever process created the
 		// session; trust the live connection over it (e.g. credentials only
 		// visible to the daemon, or added after the snapshot was taken).
-		if (this.options.startedWithoutModel && this.getCurrentModel()) {
+		if (this.options.startedWithoutModel && hasResolvedModel(this.getCurrentModel())) {
 			return "suppress";
 		}
 		return "show";
