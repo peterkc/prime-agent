@@ -696,13 +696,25 @@ describe("ipython extension boundary", () => {
 		},
 	);
 
-	it("AC-17: the entry passes the ipython factory to exported main and sets APP_NAME", async () => {
+	it("AC-17: the entry passes the ipython factory to exported main and does pi's CLI setup", async () => {
 		const title = process.title;
+		const codingAgent = process.env.PI_CODING_AGENT;
+		const aiAgent = process.env.AI_AGENT;
+		const emitWarning = process.emitWarning;
+		const warned = vi.fn();
 		try {
-			const main = vi.fn(async () => {});
+			delete process.env.PI_CODING_AGENT;
+			delete process.env.AI_AGENT;
+			process.emitWarning = warned as typeof process.emitWarning;
+			const main = vi.fn(async () => {
+				expect(process.env.PI_CODING_AGENT).toBe("true");
+				expect(process.env.AI_AGENT).toBe("pi");
+				process.emitWarning("ignored");
+			});
 			await run(["--version"], main);
 			expect(main).toHaveBeenCalledWith(["--version"], { extensionFactories: [ipython] });
 			expect(process.title).toBe(APP_NAME);
+			expect(warned).not.toHaveBeenCalled();
 			const entry = readFileSync(new URL("../src/cli.ts", import.meta.url), "utf8");
 			expect(entry).toContain('from "@earendil-works/pi-coding-agent"');
 			expect(entry).toContain("run(process.argv.slice(2), main)");
@@ -712,6 +724,11 @@ describe("ipython extension boundary", () => {
 			expect(result.stdout.trim()).toBe(VERSION);
 		} finally {
 			process.title = title;
+			process.emitWarning = emitWarning;
+			if (codingAgent === undefined) delete process.env.PI_CODING_AGENT;
+			else process.env.PI_CODING_AGENT = codingAgent;
+			if (aiAgent === undefined) delete process.env.AI_AGENT;
+			else process.env.AI_AGENT = aiAgent;
 		}
 	});
 });

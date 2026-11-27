@@ -6,7 +6,12 @@ export async function run(
 	argv: string[],
 	entry: (args: string[], options: MainOptions) => Promise<void>,
 ): Promise<void> {
+	// The same process setup as pi's setupCli, which pi does not export.
+	// pi's main configures the HTTP dispatcher itself.
 	process.title = APP_NAME;
+	process.env.PI_CODING_AGENT = "true";
+	process.env.AI_AGENT = "pi";
+	process.emitWarning = (() => {}) as typeof process.emitWarning;
 	await entry(argv, { extensionFactories: [ipython] });
 }
 
