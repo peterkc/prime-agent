@@ -1200,11 +1200,14 @@ it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 			calls++;
 			cap = options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
 			yield { type: "assistant", session_id: sourceSession, uuid: checkpointAt };
+			yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+			yield raw("content_block_delta", { index: 0, delta: { type: "text_delta", text: "Before" } });
+			yield raw("content_block_stop", { index: 0 });
 			yield raw("content_block_start", {
-				index: 0,
+				index: 1,
 				content_block: { type: "tool_use", id: "cut", name: "mcp__prime__one", input: {} },
 			});
-			yield raw("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"nest' } });
+			yield raw("content_block_delta", { index: 1, delta: { type: "input_json_delta", partial_json: '{"nest' } });
 			const capExceeded =
 				"Claude's response exceeded the 32 output token maximum. To configure this limit, set CLAUDE_CODE_MAX_OUTPUT_TOKENS.";
 			if (terminal === "CLI cap exception") throw Error(`Claude Code returned an error result: ${capExceeded}`);
@@ -1221,7 +1224,7 @@ it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 		});
 		const msg = await f.provider.streamSimple(model, { ...context, tools }, { maxTokens: 64 }).result();
 		expect({ stop: msg.stopReason, calls, cap }).toEqual({ stop: "length", calls: 1, cap: "64" });
-		expect(msg.content.filter((b) => b.type === "toolCall")).toEqual([]);
+		expect(msg.content.map((b) => (b.type === "text" ? b.text : b.type))).toEqual(["Before"]);
 		expect(msg.responseId).toBeUndefined();
 	},
 );
