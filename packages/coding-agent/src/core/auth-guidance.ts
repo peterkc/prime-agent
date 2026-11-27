@@ -29,6 +29,10 @@ export function formatNoModelsAvailableMessage(saved?: {
 	return `No models available. ${getProviderLoginHelp()}`;
 }
 
+export function formatProviderNotRegisteredMessage(provider: string): string {
+	return `Provider ${provider} is not registered. Use /model to pick another model.`;
+}
+
 export function formatNoModelSelectedMessage(): string {
 	return `No model selected.\n\n${getProviderLoginHelp()}\n\nThen use /model to select a model.`;
 }

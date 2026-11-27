@@ -426,7 +426,13 @@ it.each([undefined, { enabled: false }, { enabled: false, claudePath: "bin/claud
 		}
 	},
 );
-it.each(["restored", "default"])("does not prescribe login for a %s unavailable claude-sdk model", async (source) => {
+function clearProviderEnv() {
+	for (const key of Object.keys(process.env)) {
+		if (/(?:_API_KEY|_TOKEN)$/.test(key) || /^(?:AWS_|GOOGLE_CLOUD_|GCLOUD_)/.test(key)) vi.stubEnv(key, undefined);
+	}
+}
+it.each(["restored", "default", "none"])("explains why there is no model (saved provider: %s)", async (source) => {
+	clearProviderEnv();
 	const dir = mkdtempSync(join(getAgentDir(), "no-model-"));
 	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled: true, claudePath: join(dir, "missing") }));
 	const services = await createAgentSessionServices({
@@ -446,8 +452,16 @@ it.each(["restored", "default"])("does not prescribe login for a %s unavailable 
 		telemetryDisabled: true,
 	});
 	try {
+		if (source === "none") {
+			await expect(session.prompt("test")).rejects.toThrow(
+				/No API key found for the selected model\.[\s\S]*Use \/login/,
+			);
+			return;
+		}
 		expect(modelFallbackMessage).toContain("Cannot find the claude executable");
 		expect(modelFallbackMessage).not.toMatch(/API key|\/login/i);
+		expect(session.model?.provider).toBe("unknown");
+		await expect(session.prompt("test")).rejects.toEqual(Error(modelFallbackMessage));
 	} finally {
 		session.dispose();
 	}
@@ -473,9 +487,12 @@ it("names an unregistered saved provider instead of suggesting login", async () 
 	}
 });
 it("removes the provider on /reload after opt-out", async () => {
+	clearProviderEnv();
 	const dir = mkdtempSync(join(getAgentDir(), "reload-"));
 	const file = join(dir, "claude-sdk.json");
-	writeFileSync(file, JSON.stringify({ enabled: true }));
+	const path = join(dir, "claude");
+	writeFileSync(path, "fixture", { mode: 0o700 });
+	writeFileSync(file, JSON.stringify({ enabled: true, claudePath: path }));
 	const services = await createAgentSessionServices({
 		cwd: dir,
 		agentDir: dir,
@@ -490,9 +507,13 @@ it("removes the provider on /reload after opt-out", async () => {
 	try {
 		const hasRows = () => session.modelRegistry.getAll().some((m) => m.provider === "claude-sdk");
 		expect(hasRows()).toBe(true);
+		await session.setModel(session.modelRegistry.getAvailable().find((m) => m.provider === "claude-sdk")!);
 		writeFileSync(file, JSON.stringify({ enabled: false }));
 		await session.reload();
 		expect(hasRows()).toBe(false);
+		await expect(session.prompt("test")).rejects.toEqual(
+			Error("Provider claude-sdk is not registered. Use /model to pick another model."),
+		);
 	} finally {
 		session.dispose();
 	}

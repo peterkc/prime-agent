@@ -84,6 +84,8 @@ import {
 	formatAuthenticationFailedMessage,
 	formatNoApiKeyFoundMessage,
 	formatNoModelSelectedMessage,
+	formatProviderNotRegisteredMessage,
+	hasResolvedModel,
 	isLikelyAuthenticationError,
 } from "./auth-guidance.js";
 import type { AuthSourceToken } from "./auth-storage.js";
@@ -2808,10 +2810,19 @@ export class AgentSession {
 	}
 
 	private async _validateCanStartAgentRun(): Promise<void> {
+		const resolved = hasResolvedModel(this.model);
+		if (!resolved) {
+			const provider =
+				this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider();
+			const cause = provider && this._modelRegistry.getProviderMissingAuthMessage(provider);
+			if (cause) throw new Error(cause);
+		}
 		if (!this.model) {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+			if (resolved && !this._modelRegistry.hasProvider(this.model.provider))
+				throw new Error(formatProviderNotRegisteredMessage(this.model.provider));
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
 				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
