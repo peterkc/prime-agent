@@ -770,7 +770,6 @@ describe("AgentSessionRuntime characterization", () => {
 				session = child.session;
 			}
 			const prompt = session.prompt("after opt-out");
-			await expect.soft(prompt).rejects.not.toThrow(/API key|\/login/i);
 			await expect(prompt).rejects.toEqual(
 				Error("Provider claude-sdk is not registered. Use /model to pick another model."),
 			);

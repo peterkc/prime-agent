@@ -222,8 +222,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		model = result.model;
 		if (!model) {
+			const savedProvider = existingSession.model?.provider ?? settingsManager.getDefaultProvider();
+			const pending =
+				savedProvider &&
+				!modelRegistry.hasProvider(savedProvider) &&
+				resourceLoader
+					.getExtensions()
+					.runtime.pendingProviderRegistrations.some(({ name }) => name === savedProvider);
 			modelFallbackMessage = formatNoModelsAvailableMessage({
-				provider: existingSession.model?.provider ?? settingsManager.getDefaultProvider(),
+				provider: pending ? undefined : savedProvider,
 				registry: modelRegistry,
 			});
 		} else if (modelFallbackMessage) {

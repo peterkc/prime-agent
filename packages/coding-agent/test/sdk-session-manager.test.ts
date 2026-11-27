@@ -1,14 +1,17 @@
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import { createExtensionRuntime } from "../src/core/extensions/loader.js";
 import type { ResourceLoader } from "../src/core/resource-loader.js";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { getCodingAgentFixtureModel } from "./fixture-models.js";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 describe("createAgentSession session manager defaults", () => {
 	let tempDir: string;
@@ -24,8 +27,36 @@ describe("createAgentSession session manager defaults", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not report a pending extension provider as unregistered at startup", async () => {
+		vi.stubEnv("PI_OFFLINE", "1");
+		const provider = "pending-provider";
+		const extensionsResult = await createTestExtensionsResult(
+			[
+				(pi) =>
+					pi.registerProvider(provider, { modelsFrom: "anthropic", api: "anthropic-messages", apiKey: "fixture" }),
+			],
+			cwd,
+		);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			cwd,
+			agentDir,
+			authStorage: AuthStorage.inMemory(),
+			sessionManager: SessionManager.inMemory(cwd),
+			settingsManager: SettingsManager.inMemory({ defaultProvider: provider, defaultModel: "claude-sonnet-4-5" }),
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
+		});
+		try {
+			await session.bindExtensions({});
+			expect(session.modelRegistry.getAll().some((model) => model.provider === provider)).toBe(true);
+			expect(modelFallbackMessage).toMatch(/^No models available\. Use \/login/);
+		} finally {
+			session.dispose();
 		}
 	});
 

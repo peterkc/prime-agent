@@ -2095,10 +2095,10 @@ export class AgentSession {
 
 	private _missingAuthError(model: Model<Api> | undefined, fallback?: string): Error {
 		const registry = this._modelRegistry;
-		const savedProvider =
-			this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider();
 		const resolved = hasResolvedModel(model);
-		const provider = resolved ? model?.provider : savedProvider;
+		const provider = resolved
+			? model?.provider
+			: (this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider());
 		if (provider) {
 			const cause = registry.getProviderMissingAuthMessage(provider);
 			if (cause) return new Error(cause);
@@ -2120,7 +2120,7 @@ export class AgentSession {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
-				throw this._missingAuthError(model);
+				throw this._missingAuthError(model, formatNoApiKeyFoundMessage(model.provider));
 			}
 			throw new Error(result.error);
 		}
@@ -4736,7 +4736,7 @@ export class AgentSession {
 		if (!message || message.stopReason !== "error" || !message.errorMessage) {
 			return;
 		}
-		if (!isLikelyAuthenticationError(message.errorMessage)) {
+		if (this._modelRegistry.hasExternalAuth(message.provider) || !isLikelyAuthenticationError(message.errorMessage)) {
 			return;
 		}
 		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
