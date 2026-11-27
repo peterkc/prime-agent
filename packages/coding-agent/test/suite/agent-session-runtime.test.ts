@@ -635,6 +635,81 @@ describe("AgentSessionRuntime characterization", () => {
 		},
 	);
 
+	it.each(["empty-branch fork", "runtime-hosted RLM child", "saved selection"])(
+		"keeps the destination model through the production factory: %s",
+		async (operation) => {
+			const h = await createHarness();
+			cleanups.push(h.cleanup);
+			const registered = h.getModel();
+			const custom = { ...registered, id: "custom-model" };
+			const factory = createDefaultRuntimeFactory(
+				{
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					telemetryDisabled: true,
+				},
+				[
+					(pi) =>
+						pi.registerProvider(registered.provider, {
+							baseUrl: registered.baseUrl,
+							apiKey: "faux-key",
+							api: registered.api,
+							models: h.models,
+						}),
+				],
+			);
+			const sessionManager = SessionManager.create(h.tempDir, join(h.tempDir, "sessions"));
+			const saved = operation === "saved selection";
+			if (saved) sessionManager.appendModelChange(registered.provider, registered.id);
+			const runtime = await createAgentSessionRuntime(factory, {
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				sessionManager,
+				sessionOptions: { rlmDepth: 1, model: saved ? { ...custom, provider: "removed-provider" } : registered },
+			});
+			cleanups.push(() => runtime.dispose());
+
+			if (saved) {
+				expect(runtime.session.model?.id).toBe(registered.id);
+				expect(sessionManager.buildSessionContext().model).toEqual({
+					provider: registered.provider,
+					modelId: registered.id,
+				});
+				return;
+			}
+			await runtime.session.setModel(custom, { persist: false });
+			let session: AgentSession;
+			if (operation === "empty-branch fork") {
+				const first = sessionManager.appendMessage(userMsg("first message"));
+				sessionManager.appendMessage(assistantMsg("saved reply"));
+				await runtime.fork(first);
+				session = runtime.session;
+			} else {
+				const child = await runtime.createRlmSubagentRuntime({
+					parentSession: runtime.session,
+					id: "child",
+					prompt: "child prompt",
+					sessionName: "child",
+					sessionDir: join(h.tempDir, "child"),
+					model: custom,
+					thinkingLevel: "off",
+					serviceTier: null,
+					scopedModels: [],
+					activeToolNames: [],
+					customTools: [],
+					includeGoals: false,
+					includeCompactSkill: false,
+					rlmDepth: 2,
+					rlmMaxDepth: 2,
+					rlmParentNodeId: "child",
+				});
+				session = child.session;
+			}
+			expect(session.model?.id).toBe(custom.id);
+		},
+	);
+
 	it.each(["first-message fork", "runtime-hosted RLM child"])(
 		"reports a removed claude-sdk model without login guidance: %s",
 		async (operation) => {

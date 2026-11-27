@@ -754,13 +754,9 @@ export function createDefaultRuntimeFactory(
 		const { services, sessionOptions, diagnostics } = prepared;
 		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);
 		const carriedModel = runtimeSessionOptions?.model;
-		if (carriedModel && !services.modelRegistry.find(carriedModel.provider, carriedModel.id)) {
-			// Restore from the saved selection instead of treating a stale carry as an explicit SDK model.
-			const saved = sessionManager.buildSessionContext().model;
-			if (
-				hasResolvedModel(carriedModel) &&
-				(saved?.provider !== carriedModel.provider || saved.modelId !== carriedModel.id)
-			) {
+		if (carriedModel && !services.modelRegistry.hasProvider(carriedModel.provider)) {
+			// Keep the stale provider for missing-model guidance only if there is no saved selection to restore.
+			if (hasResolvedModel(carriedModel) && !sessionManager.buildSessionContext().model) {
 				sessionManager.appendModelChange(carriedModel.provider, carriedModel.id);
 			}
 			resolvedSessionOptions.model = undefined;
