@@ -1,0 +1,1 @@
+- Fixed two sessions in different daemons getting the same name, which made agent messages sent to that name fail as ambiguous. Naming or renaming a saved session now refuses a name that another enrolled session uses, ignoring case, and a subagent cannot take a top-level session's name.

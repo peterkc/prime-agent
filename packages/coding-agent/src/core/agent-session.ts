@@ -38,6 +38,7 @@ import {
 	resetApiProviders,
 	supportsServiceTier,
 } from "@earendil-works/pi-ai";
+import { getAgentDir as getDefaultAgentDir } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
@@ -342,6 +343,7 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "./session-manager.js";
+import { assertSessionNameAvailable } from "./session-name-holder.js";
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
@@ -15117,6 +15119,15 @@ export class AgentSession {
 	}
 
 	setSessionName(name: string): void {
+		// Only a persisted session can be enrolled in the mesh directory.
+		if (this.sessionManager.getSessionFile()) {
+			assertSessionNameAvailable(
+				this._agentDir ?? getDefaultAgentDir(),
+				this.sessionManager.getSessionId(),
+				name,
+				this._rlmDepth,
+			);
+		}
 		this.sessionManager.appendSessionInfo(name);
 		this._emit({
 			type: "session_info_changed",
