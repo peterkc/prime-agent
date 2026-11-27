@@ -214,6 +214,9 @@ export class ClaudeSdkProvider {
 		} catch (error) {
 			missingAuthMessage = error instanceof Error ? error.message : String(error);
 		}
+		const owner = { provider: this, running: new Set<AbortController>() };
+		let ownerId: string | undefined;
+		let shutDown = false;
 		pi.registerProvider("claude-sdk", {
 			api: "claude-agent-sdk",
 			modelsFrom: "anthropic",
@@ -230,17 +233,32 @@ export class ClaudeSdkProvider {
 						if (live.provider === this) break;
 					}
 				}
+				if (!session && !shutDown) {
+					if (ownerId !== undefined) {
+						if (sessions.get(ownerId) === owner) session = owner;
+					} else {
+						// Unbound hosts may dispose without session_shutdown; getFlag checks for a stale runtime.
+						try {
+							pi.getFlag("claude-sdk");
+							session = owner;
+						} catch {
+							shutDown = true;
+						}
+					}
+				}
 				if (!session) throw new StreamFailureError("No live claude-sdk session.", { kind: "invalid_request" });
 				return session.provider.streamSimple(model, context, options, session.running);
 			},
 		});
 		pi.on("session_start", (_event, ctx) => {
-			sessions.set(ctx.sessionManager.getSessionId(), { provider: this, running: new Set() });
+			ownerId = ctx.sessionManager.getSessionId();
+			sessions.set(ownerId, owner);
 		});
-		pi.on("session_shutdown", (event, ctx) => {
+		pi.on("session_shutdown", (event) => {
+			shutDown = true;
 			if (event.reason === "reload") pi.unregisterProvider("claude-sdk");
-			const id = ctx.sessionManager.getSessionId();
-			if (sessions.get(id)?.provider === this) closeSession(id);
+			if (ownerId !== undefined && sessions.get(ownerId) === owner) closeSession(ownerId);
+			else for (const controller of owner.running) controller.abort();
 		});
 	};
 	streamSimple = (

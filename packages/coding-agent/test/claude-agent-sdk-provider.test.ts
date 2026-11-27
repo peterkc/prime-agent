@@ -614,6 +614,27 @@ it.each(["transient"])("AgentSession retries a late %s failure", async () => {
 	}
 });
 
+it.each(["no session_start", "in-memory fork"])("R5 B1 routes an unbound session after %s", async (scenario) => {
+	const f = fixture(async function* () {
+		yield* textTurn("end_turn");
+	});
+	const h = await createHarness({ extensionFactories: [f.provider.extension] });
+	try {
+		const handler = getApiProvider(model.api)!.streamSimple;
+		const sessionId = h.session.sessionId;
+		if (scenario === "in-memory fork") {
+			await h.session.bindExtensions({});
+			h.session.sessionManager.newSession();
+			await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "fork" });
+		} else {
+			expect((await handler(model, context, { sessionId: "inline-child" }).result()).stopReason).toBe("stop");
+		}
+		h.session.dispose();
+		expect(() => handler(model, context, { sessionId })).toThrow(/no live claude-sdk session/i);
+	} finally {
+		h.cleanup();
+	}
+});
 it.each(["sessions"])("isolates %s under the last handler, including compaction", async () => {
 	const release = createDeferred();
 	const paths: string[] = [];
