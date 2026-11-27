@@ -126,11 +126,9 @@ function killOrphanProcess(pid: number): void {
 	}
 	try {
 		process.kill(-pid, "SIGKILL");
-		return;
 	} catch {
 		try {
 			process.kill(pid, "SIGKILL");
-			return;
 		} catch {
 			// The orphan may already have exited.
 		}
