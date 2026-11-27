@@ -166,7 +166,7 @@ describe("AgentSessionRuntime characterization", () => {
 		return { runtime, faux, tempDir };
 	}
 
-	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void }) {
+	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void; modelFallbackMessage?: string }) {
 		const disposeSession = vi.fn();
 		const session = {
 			sessionManager: { cleanupRotationTemps: () => {} },
@@ -188,9 +188,21 @@ describe("AgentSessionRuntime characterization", () => {
 		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
 			throw new Error("unexpected runtime creation");
 		};
-		const runtime = new AgentSessionRuntime(session, services, createRuntime);
+		const runtime = new AgentSessionRuntime(session, services, createRuntime, [], options?.modelFallbackMessage);
 		return { runtime, disposeSession };
 	}
+
+	it("clears the provider cause when the session gains a model", async () => {
+		const cause = "Cannot find the claude executable";
+		const { runtime } = createRuntimeWithFakeSession({ modelFallbackMessage: cause });
+		try {
+			expect(runtime.modelFallbackMessage).toBe(cause);
+			Object.assign(runtime.session, { model: { provider: "faux", id: "working" } });
+			expect(runtime.modelFallbackMessage).toBeUndefined();
+		} finally {
+			await runtime.dispose();
+		}
+	});
 
 	it("passes session config to replacement runtimes", async () => {
 		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];

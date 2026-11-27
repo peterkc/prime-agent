@@ -7,7 +7,6 @@ import type {
 	AgentSessionRuntimeDiagnostic,
 	AgentSessionServices,
 } from "./agent-session-services.js";
-import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
@@ -127,6 +126,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private startedWithoutModel: boolean;
 
 	constructor(
 		private _session: AgentSession,
@@ -141,6 +141,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		},
 		private _sessionLease?: SessionLease,
 	) {
+		this.startedWithoutModel = !_session.model;
 		this.bindRuntimeHost();
 	}
 
@@ -164,7 +165,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		// The "no models available" warning describes session state, not a
 		// startup event: once the session gains a model (set_model, /login,
 		// onboarding), the stored snapshot is stale and must not reach clients.
-		if (isNoModelsAvailableMessage(this._modelFallbackMessage) && this._session.model) {
+		if (this.startedWithoutModel && this._session.model) {
 			return undefined;
 		}
 		return this._modelFallbackMessage;
@@ -279,6 +280,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this.startedWithoutModel = !result.session.model;
 		this.bindRuntimeHost();
 	}
 

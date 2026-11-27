@@ -1536,6 +1536,7 @@ export async function main(args: string[], options?: MainOptions) {
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
+			startedWithoutModel: !(isFreshDefaultSession ? startupModel.model : summary.model),
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,
@@ -1659,7 +1660,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		throw error;
 	}
-	const { services, session, modelFallbackMessage } = runtime;
+	const { services, session } = runtime;
 	installOwnedSessionRecoveryTracking(runtime);
 	const { settingsManager, modelRegistry } = services;
 
@@ -1699,7 +1700,7 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSession");
 
 	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
-		console.error(chalk.red(modelFallbackMessage ?? formatNoModelsAvailableMessage()));
+		console.error(chalk.red(runtime.modelFallbackMessage ?? formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 
@@ -1730,7 +1731,8 @@ export async function main(args: string[], options?: MainOptions) {
 			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
 			migratedProviders,
-			modelFallbackMessage,
+			modelFallbackMessage: runtime.modelFallbackMessage,
+			startedWithoutModel: !session.model,
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,

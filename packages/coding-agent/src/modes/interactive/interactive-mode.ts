@@ -86,7 +86,6 @@ import {
 	uploadAgentTraceFile,
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
-import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import type { AuthCredential } from "../../core/auth-storage.js";
 import {
 	type AgentCronJob,
@@ -1157,6 +1156,8 @@ export interface InteractiveModeOptions {
 	migratedProviders?: string[];
 	/** Warning message if session model couldn't be restored */
 	modelFallbackMessage?: string;
+	/** The warning describes a missing model, not a successful fallback to another model. */
+	startedWithoutModel?: boolean;
 	/** One-off warning shown on startup. */
 	startupNotice?: string;
 	/** Initial message to send on startup (can include @file content) */
@@ -2221,7 +2222,7 @@ export class InteractiveMode {
 		// The no-models warning is a snapshot from whichever process created the
 		// session; trust the live connection over it (e.g. credentials only
 		// visible to the daemon, or added after the snapshot was taken).
-		if (isNoModelsAvailableMessage(modelFallbackMessage) && this.getCurrentModel()) {
+		if (this.options.startedWithoutModel && this.getCurrentModel()) {
 			return "suppress";
 		}
 		return "show";

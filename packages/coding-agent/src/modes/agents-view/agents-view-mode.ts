@@ -691,6 +691,7 @@ async function runAgentsViewLoop(
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
+				startedWithoutModel: !opened.summary.model,
 				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
