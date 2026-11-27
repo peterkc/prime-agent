@@ -1230,6 +1230,30 @@ it.each(["max_tokens result", "CLI cap assistant error", "CLI cap exception"])(
 	},
 );
 
+it.each(["assistant error", "exception"])("AC-22 does not checkpoint text cut by a CLI cap %s", async (terminal) => {
+	const f = fixture(async function* () {
+		yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "Before" } });
+		yield raw("content_block_stop", { index: 0 });
+		yield { type: "assistant", session_id: sourceSession, uuid: checkpointAt };
+		yield raw("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+		yield raw("content_block_delta", { index: 0, delta: { type: "text_delta", text: "Cut" } });
+		const capExceeded = "Claude's response exceeded the 32 output token maximum.";
+		if (terminal === "exception") throw Error(capExceeded);
+		yield {
+			type: "assistant",
+			error: "max_output_tokens",
+			message: { content: [{ type: "text", text: capExceeded }] },
+		};
+	});
+	const msg = await f.provider.streamSimple(model, context).result();
+	expect(msg.stopReason).toBe("length");
+	expect(msg.content).toEqual([
+		{ type: "text", text: "Before" },
+		{ type: "text", text: "Cut" },
+	]);
+	expect(msg.responseId).toBeUndefined();
+});
+
 it.each(["long and colliding names"])("AC-23 aliases %s and replays the original names", async () => {
 	const originals = ["read", "mcp__prime__read", "long-".repeat(16)];
 	const collidingTools = originals.map((name, i) => ({ name, description: `tool ${i}`, parameters: Type.Object({}) }));

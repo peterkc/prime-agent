@@ -50,7 +50,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { comparePackageVersions } from "../../../utils/version-check.js";
 import type { ExtensionFactory } from "../types.js";
 import { readClaudeSettings } from "./claude-agent-sdk-config.js";
-import { guardClaudeInit, guardClaudeStream, hasTurnOutput } from "./claude-agent-sdk-stream-guard.js";
+import { guardClaudeInit, guardClaudeStream } from "./claude-agent-sdk-stream-guard.js";
 import { aliasPrimeTools, primeMcpPrefix, repairToolInput } from "./claude-agent-sdk-tool-input.js";
 
 type Query = (args: {
@@ -436,6 +436,7 @@ export class ClaudeSdkProvider {
 						}
 						if (m.type === "assistant" && m.error === "max_output_tokens") {
 							release();
+							assistantUuid = undefined;
 							msg.stopReason = "length";
 							completed = true;
 							break;
@@ -557,6 +558,7 @@ export class ClaudeSdkProvider {
 					const message = error instanceof Error ? error.message : String(error);
 					if (attempt.signal.aborted) throw error;
 					if (capped(message)) {
+						assistantUuid = undefined;
 						msg.stopReason = "length";
 						completed = true;
 					} else if (
@@ -580,10 +582,10 @@ export class ClaudeSdkProvider {
 				const allToolsCaptured = [...toolOrder.keys()].every((id) => captured.has(id));
 				if (msg.stopReason !== "length") {
 					if (!allToolsCaptured) throw Error("Claude rejected a tool call before Prime could capture it");
-					if (!hasTurnOutput(msg.content, captured.size))
+					if (!captured.size && !msg.content.some((block) => block.type === "text" && block.text.length > 0))
 						throw new StreamFailureError("Claude returned nothing.", { kind: "invalid_request" });
+					msg.stopReason = captured.size ? "toolUse" : "stop";
 				}
-				msg.stopReason = msg.stopReason === "length" ? "length" : captured.size ? "toolUse" : "stop";
 				for (const call of [...captured.values()].sort(
 					(a, b) => (toolOrder.get(a.id) ?? Infinity) - (toolOrder.get(b.id) ?? Infinity),
 				)) {

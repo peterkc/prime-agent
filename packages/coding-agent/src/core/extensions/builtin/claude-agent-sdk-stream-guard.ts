@@ -23,8 +23,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-
 const idle = Symbol("idle");
 
 function isKeepalive(message: unknown): boolean {
@@ -99,8 +97,4 @@ export async function* guardClaudeStream<T>(
 		// Await the iterator's teardown before publishing a terminal event to Prime.
 		await iterator.return?.();
 	}
-}
-
-export function hasTurnOutput(content: AssistantMessage["content"], capturedTools: number): boolean {
-	return capturedTools > 0 || content.some((block) => block.type === "text" && block.text.length > 0);
 }
