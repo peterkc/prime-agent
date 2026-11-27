@@ -37,6 +37,7 @@ import {
 	formatStreamFailureMessage,
 	type Model,
 	recordStreamFailure,
+	registerSessionResourceCleanup,
 	type SimpleStreamOptions,
 	StreamFailureError,
 	type ToolCall,
@@ -60,6 +61,17 @@ const defaultQuery: Query = (args) => {
 	return sdk.query(args);
 };
 const sessions = new Map<string, { provider: ClaudeSdkProvider; running: Set<AbortController> }>();
+
+function closeSession(id: string) {
+	const entry = sessions.get(id);
+	if (!entry) return;
+	for (const controller of entry.running) controller.abort();
+	sessions.delete(id);
+}
+registerSessionResourceCleanup((id) => {
+	if (id !== undefined) closeSession(id);
+	else for (const key of sessions.keys()) closeSession(key);
+});
 
 function childEnv() {
 	const env: Record<string, string | undefined> = { DISABLE_AUTO_COMPACT: "1" };
@@ -209,28 +221,36 @@ export class ClaudeSdkProvider {
 			// An empty value clears the previous registration; undefined would preserve it.
 			apiKey: missingAuthMessage ? "" : "local-claude",
 			missingAuthMessage,
-			streamSimple: this.streamSimple,
+			streamSimple: (model, context, options) => {
+				let session = options?.sessionId ? sessions.get(options.sessionId) : undefined;
+				if (!options?.sessionId) {
+					// A late registry refresh can reinstall a handler after its session was disposed.
+					for (const live of sessions.values()) {
+						session = live;
+						if (live.provider === this) break;
+					}
+				}
+				if (!session) throw new StreamFailureError("No live claude-sdk session.", { kind: "invalid_request" });
+				return session.provider.streamSimple(model, context, options, session.running);
+			},
 		});
 		pi.on("session_start", (_event, ctx) => {
 			sessions.set(ctx.sessionManager.getSessionId(), { provider: this, running: new Set() });
 		});
 		pi.on("session_shutdown", (event, ctx) => {
 			if (event.reason === "reload") pi.unregisterProvider("claude-sdk");
-			const id = ctx.sessionManager.getSessionId(),
-				entry = sessions.get(id);
-			if (entry?.provider !== this) return;
-			for (const c of entry.running) c.abort();
-			sessions.delete(id);
+			const id = ctx.sessionManager.getSessionId();
+			if (sessions.get(id)?.provider === this) closeSession(id);
 		});
 	};
 	streamSimple = (
 		model: Model<string>,
 		context: Context,
 		options?: SimpleStreamOptions,
+		running?: Set<AbortController>,
 	): AssistantMessageEventStream => {
-		const stream = createAssistantMessageEventStream(),
-			session = options?.sessionId ? sessions.get(options.sessionId) : undefined;
-		void (session?.provider ?? this).run(stream, model, context, options, session?.running);
+		const stream = createAssistantMessageEventStream();
+		void this.run(stream, model, context, options, running);
 		return stream;
 	};
 	private async run(

@@ -6,6 +6,7 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	calculateCost,
+	getApiProvider,
 	type Model,
 	unregisterApiProviders,
 } from "@earendil-works/pi-ai";
@@ -602,17 +603,22 @@ it.each(["sessions"])("isolates %s under the last handler, including compaction"
 		await ha.session.compact();
 		expect(paths.length).toBeGreaterThan(2);
 		expect(new Set(paths)).toEqual(new Set([a.path]));
-		await b.provider.streamSimple(model, context, { sessionId: hb.session.sessionId }).result();
-		await b.provider.streamSimple(model, context).result();
+		const handler = getApiProvider(model.api)!.streamSimple;
+		await handler(model, context, { sessionId: hb.session.sessionId }).result();
+		await handler(model, context).result();
 		expect(paths.slice(-2)).toEqual([b.path, b.path]);
 		hold = true;
-		const stream = b.provider.streamSimple(model, context, { sessionId: ha.session.sessionId });
-		const closing = b.provider.streamSimple(model, context, { sessionId: hb.session.sessionId });
+		const stream = handler(model, context, { sessionId: ha.session.sessionId });
+		const closing = handler(model, context, { sessionId: hb.session.sessionId });
 		expect(paths.slice(-2)).toEqual([a.path, b.path]);
 		await hb.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		release.resolve();
 		expect((await stream.result()).stopReason).toBe("stop");
 		expect((await closing.result()).stopReason).toBe("aborted");
+		await handler(model, context).result();
+		expect(paths.at(-1)).toBe(a.path);
+		ha.session.dispose();
+		expect(() => handler(model, context)).toThrow(/no live claude-sdk session/i);
 	} finally {
 		release.resolve();
 		ha.cleanup();
