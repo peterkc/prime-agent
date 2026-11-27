@@ -9,7 +9,7 @@ export function readClaudeSettings(agentDir: string): { enabled?: boolean; claud
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("expected an object");
 		const enabled = "enabled" in value ? value.enabled : false;
 		if (typeof enabled !== "boolean") throw Error("expected a boolean enabled");
-		if (!("claudePath" in value)) return { enabled };
+		if (!enabled || !("claudePath" in value)) return { enabled };
 		if (typeof value.claudePath !== "string" || !value.claudePath.trim())
 			throw Error("expected a nonempty claudePath");
 		if (!isAbsolute(value.claudePath)) throw Error("expected an absolute claudePath");

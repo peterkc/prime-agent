@@ -399,13 +399,13 @@ it.each(["availability at registration"])("loads three source models only when b
 		}
 	}
 });
-it.each([undefined, false])(
-	"does not register a provider with enabled=%s even with claude on PATH",
-	async (enabled) => {
+it.each([undefined, { enabled: false }, { enabled: false, claudePath: "bin/claude" }, { claudePath: "~/bin/claude" }])(
+	"does not register a provider with settings %j even with claude on PATH",
+	async (settings) => {
 		const dir = mkdtempSync(join(getAgentDir(), "opt-in-"));
 		vi.stubEnv("PATH", dir);
 		writeFileSync(join(dir, "claude"), "fixture", { mode: 0o700 });
-		if (enabled !== undefined) writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled }));
+		if (settings) writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify(settings));
 		const authStorage = AuthStorage.inMemory(),
 			modelRegistry = ModelRegistry.inMemory(authStorage);
 		const cliModel = modelRegistry.getAll().find((m) => m.provider === "anthropic")!.id;
@@ -418,6 +418,7 @@ it.each([undefined, false])(
 			telemetryDisabled: true,
 		});
 		try {
+			expect(modelRegistry.hasProvider("claude-sdk")).toBe(false);
 			expect(modelRegistry.getAll().some((m) => m.provider === "claude-sdk")).toBe(false);
 			expect(resolveCliModel({ cliModel, modelRegistry })).toEqual(baseline);
 		} finally {

@@ -17,7 +17,9 @@ it.each(["global only", "malformed", "relative", "~/claude"])("reads claudePath:
 		const file = join(agentDir, "claude-sdk.json");
 		writeFileSync(
 			file,
-			mode === "malformed" ? "{bad" : JSON.stringify({ claudePath: mode === "global only" ? "/owned" : mode }),
+			mode === "malformed"
+				? "{bad"
+				: JSON.stringify({ enabled: true, claudePath: mode === "global only" ? "/owned" : mode }),
 		);
 		if (mode === "global only") expect(readClaudeSettings(agentDir).claudePath).toBe("/owned");
 		else expect(() => readClaudeSettings(agentDir)).toThrow(`Cannot read ${file}:`);
