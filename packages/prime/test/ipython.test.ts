@@ -216,7 +216,7 @@ describe("ipython extension boundary", () => {
 		}
 	});
 
-	it("W2: many small stream chunks copy the tail only when an update is emitted", async () => {
+	it("W2: many small stream chunks keep bounded updates with the last 64K shown", async () => {
 		const { runtime, cell } = await host(false);
 		await cell("0");
 		const tool = runtime.session.agent.state.tools.find((tool) => tool.name === "ipython");
@@ -233,27 +233,19 @@ describe("ipython extension boundary", () => {
 		});
 		const options = await entered.promise;
 		vi.useFakeTimers({ now: 1000 });
-		const chunk = "W2:".repeat(100);
-		const expectedTail = chunk.repeat(1000).slice(-DEFAULT_MAX_OUTPUT_CHARS);
-		const joins = vi.spyOn(Array.prototype, "join");
-		const slices = vi.spyOn(String.prototype, "slice");
-		let beforeUpdate: number[] = [];
-		let afterUpdate: number[] = [];
+		const chunks = Array.from({ length: 1000 }, (_, index) => `${index}:`.padEnd(300, "."));
+		const expectedTail = chunks.join("").slice(-DEFAULT_MAX_OUTPUT_CHARS);
 		try {
-			for (let i = 0; i < 1000; i++) options.onStream?.(chunk, "stdout");
-			beforeUpdate = [updates.length, joins.mock.calls.length, slices.mock.calls.length];
+			for (const chunk of chunks) options.onStream?.(chunk, "stdout");
+			expect(updates).toEqual([chunks[0]]);
 			await vi.advanceTimersByTimeAsync(100);
-			afterUpdate = [updates.length, joins.mock.calls.length, slices.mock.calls.length];
 		} finally {
-			joins.mockRestore();
-			slices.mockRestore();
 			release.resolve({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
 			await pending;
 			vi.useRealTimers();
 		}
-		expect(beforeUpdate).toEqual([1, 1, 1]);
-		expect(afterUpdate).toEqual([2, 2, 2]);
-		expect(updates).toEqual([chunk, expectedTail]);
+		expect(updates.every((update) => update.length <= DEFAULT_MAX_OUTPUT_CHARS)).toBe(true);
+		expect(updates).toEqual([chunks[0], expectedTail]);
 	});
 
 	it.each([true, false])("R6-A: persisted=%s journal uses its private agent tree", async (persisted) => {

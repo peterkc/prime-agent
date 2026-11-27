@@ -67,7 +67,7 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 		}));
 }
 
-export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boolean {
+function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boolean {
 	// Pid-only records can never claim identity (undefined === undefined must not match).
 	return orphan.processStartId !== undefined && getProcessStartId(orphan.pid) === orphan.processStartId;
 }
@@ -78,7 +78,7 @@ export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boo
  * so a bare-pid taskkill only risks killing a reused pid. POSIX keeps the
  * best-effort kill (group-scoped; only older runtimes write pid-only actives).
  */
-export function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
+function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
 	if (orphan.processStartId === undefined) {
 		return process.platform !== "win32";
 	}
@@ -110,10 +110,10 @@ export function reapKernelOrphanProcesses(kernelPid: number, path: string): void
 // Hardened cross-platform tree kill for journaled orphans: absolute System32
 // taskkill /T on win32 (a bare name could resolve a planted CWD taskkill.exe),
 // process-group then pid SIGKILL elsewhere.
-export function killOrphanProcess(pid: number): boolean {
+function killOrphanProcess(pid: number): void {
 	if (process.platform === "win32") {
 		// In-kernel bash() kill paths use taskkill /T; the reaper must kill the same tree, not just the shell pid.
-		const result = spawnSyncHidden(
+		spawnSyncHidden(
 			win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
 			["/F", "/T", "/PID", String(pid)],
 			{
@@ -122,20 +122,19 @@ export function killOrphanProcess(pid: number): boolean {
 				env: { ...process.env, NoDefaultCurrentDirectoryInExePath: "1" },
 			},
 		);
-		return result.status === 0;
+		return;
 	}
 	try {
 		process.kill(-pid, "SIGKILL");
-		return true;
+		return;
 	} catch {
 		try {
 			process.kill(pid, "SIGKILL");
-			return true;
+			return;
 		} catch {
 			// The orphan may already have exited.
 		}
 	}
-	return false;
 }
 
 interface ProcessQueryOptions {

@@ -237,8 +237,7 @@ function createIpythonToolDefinition(
 		execute: async (_id, params, signal, onUpdate, ctx) => {
 			const provisioner = getProvisioner(ctx);
 			const manager = await provisioner.ensure(signal);
-			const streamedChunks: string[] = [];
-			let streamedLength = 0;
+			let streamed = "";
 			let updateTimer: ReturnType<typeof setTimeout> | undefined;
 			let updateDirty = false;
 			let lastUpdateAt = 0;
@@ -246,16 +245,13 @@ function createIpythonToolDefinition(
 				if (!onUpdate || !updateDirty) return;
 				updateDirty = false;
 				lastUpdateAt = Date.now();
-				const text = streamedChunks.join("").slice(-DEFAULT_MAX_OUTPUT_CHARS);
+				const text = streamed.slice(-DEFAULT_MAX_OUTPUT_CHARS);
 				onUpdate({ content: [{ type: "text", text }], details: { status: "ok", durationMs: 0 } });
 			}
 			function onStream(chunk: string): void {
 				if (!onUpdate) return;
-				streamedChunks.push(chunk);
-				streamedLength += chunk.length;
-				while (streamedLength - streamedChunks[0].length >= DEFAULT_MAX_OUTPUT_CHARS) {
-					streamedLength -= streamedChunks.shift()!.length;
-				}
+				streamed += chunk;
+				if (streamed.length >= 2 * DEFAULT_MAX_OUTPUT_CHARS) streamed = streamed.slice(-DEFAULT_MAX_OUTPUT_CHARS);
 				updateDirty = true;
 				const delay = OUTPUT_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
 				if (delay <= 0) {
