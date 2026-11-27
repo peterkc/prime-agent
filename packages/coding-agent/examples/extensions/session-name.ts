@@ -16,8 +16,12 @@ export default function (pi: ExtensionAPI) {
 			const name = args.trim();
 
 			if (name) {
-				pi.setSessionName(name);
-				ctx.ui.notify(`Session named: ${name}`, "info");
+				try {
+					await pi.setSessionName(name);
+					ctx.ui.notify(`Session named: ${name}`, "info");
+				} catch {
+					// The refusal is already reported as an extension error.
+				}
 			} else {
 				const current = pi.getSessionName();
 				ctx.ui.notify(current ? `Session: ${current}` : "No session name set", "info");

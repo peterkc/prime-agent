@@ -6792,7 +6792,7 @@ export class AgentDaemon {
 					typeof latestName.name === "string" &&
 					!manager.getEntries().some((entry) => entry.id === latestName.id)
 				)
-					recipientSession.setSessionName(latestName.name);
+					recipientSession.setSessionName(latestName.name, { adopt: true });
 			} catch {
 				this.log(`Mesh name adoption skipped for session ${manager.getSessionId()}`);
 			}

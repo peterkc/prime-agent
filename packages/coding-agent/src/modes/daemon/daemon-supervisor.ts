@@ -71,6 +71,7 @@ import {
 	type SessionMoveReport,
 	sessionMoveChildFiles,
 } from "../../core/session-move.js";
+import { assertSessionNameAvailable } from "../../core/session-name-holder.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { writeFileAtomicSync } from "../../utils/atomic-file.js";
@@ -3775,6 +3776,13 @@ export class DaemonSupervisor {
 				} else {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
+				// Refuse a name held in another daemon before a worker starts; the worker repeats the check.
+				assertSessionNameAvailable(
+					this.defaultSessionConfig.agentDir!,
+					targetSummary.sessionId,
+					createCommand.name!,
+					targetSummary.rlmDepth ?? 0,
+				);
 				return this.launchWorker(createCommand, undefined, ownerClientId);
 			});
 		})();

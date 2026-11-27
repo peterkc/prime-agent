@@ -40,6 +40,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
 } from "./session-lease.js";
+import { assertSessionNameAvailable } from "./session-name-holder.js";
 import {
 	assertSessionHeaderBound,
 	originalParent,
@@ -1154,6 +1155,14 @@ export function appendSessionInfoToExistingFile(
 	name: string,
 	agentDir: string = getDefaultAgentDir(),
 ): string {
+	let header: Partial<SessionHeader> | undefined;
+	try {
+		header = readSessionHeader(sessionFile);
+	} catch {
+		// The append below reports a missing or damaged file.
+	}
+	if (typeof header?.id === "string")
+		assertSessionNameAvailable(agentDir, header.id, name, resolveSessionRlmDepth(header, sessionFile));
 	return appendEntryToExistingFile(
 		sessionFile,
 		(seed) => buildSessionInfoEntry(name, seed),

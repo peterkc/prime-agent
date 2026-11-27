@@ -1,0 +1,1 @@
+- Changed naming or renaming a saved session, and naming a subagent, to refuse a name that another enrolled session in any daemon already uses, ignoring case, so agent messages sent to that name no longer fail as ambiguous. A subagent may share a name with other sessions' subagents, but not with a top-level session.
