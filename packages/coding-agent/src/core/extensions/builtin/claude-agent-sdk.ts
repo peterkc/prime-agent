@@ -81,6 +81,7 @@ registerSessionResourceCleanup((id) => {
 function childEnv(maxTokens: number) {
 	const env: Record<string, string | undefined> = {
 		DISABLE_AUTO_COMPACT: "1",
+		CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING: "1",
 		CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
 		DISABLE_TELEMETRY: "1",
 		DISABLE_ERROR_REPORTING: "1",

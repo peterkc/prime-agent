@@ -360,6 +360,7 @@ it.each([
 	expect(providerStreamFailureDetails(msg)?.kind).toBe("invalid_request");
 });
 const quietEnvironment = {
+	CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING: "1",
 	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
 	DISABLE_TELEMETRY: "1",
 	DISABLE_ERROR_REPORTING: "1",
