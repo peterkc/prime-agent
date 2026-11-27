@@ -753,6 +753,18 @@ export function createDefaultRuntimeFactory(
 		});
 		const { services, sessionOptions, diagnostics } = prepared;
 		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);
+		const carriedModel = runtimeSessionOptions?.model;
+		if (carriedModel && !services.modelRegistry.find(carriedModel.provider, carriedModel.id)) {
+			// Restore from the saved selection instead of treating a stale carry as an explicit SDK model.
+			const saved = sessionManager.buildSessionContext().model;
+			if (
+				hasResolvedModel(carriedModel) &&
+				(saved?.provider !== carriedModel.provider || saved.modelId !== carriedModel.id)
+			) {
+				sessionManager.appendModelChange(carriedModel.provider, carriedModel.id);
+			}
+			resolvedSessionOptions.model = undefined;
+		}
 
 		const created = await createAgentSessionFromServices({
 			services,
