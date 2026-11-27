@@ -445,41 +445,55 @@ function clearProviderEnv() {
 		if (/(?:_API_KEY|_TOKEN)$/.test(key) || /^(?:AWS_|GOOGLE_CLOUD_|GCLOUD_)/.test(key)) vi.stubEnv(key, undefined);
 	}
 }
-it.each(["restored", "default", "none"])("explains why there is no model (saved provider: %s)", async (source) => {
-	clearProviderEnv();
-	const dir = mkdtempSync(join(getAgentDir(), "no-model-"));
-	writeFileSync(join(dir, "claude-sdk.json"), JSON.stringify({ enabled: true, claudePath: join(dir, "missing") }));
-	const services = await createAgentSessionServices({
-		cwd: dir,
-		agentDir: dir,
-		authStorage: AuthStorage.inMemory(),
-		settingsManager: SettingsManager.inMemory(
-			source === "default" ? { defaultModel: "claude", defaultProvider: "claude-sdk" } : {},
-		),
-		telemetryDisabled: true,
-	});
-	const sessionManager = SessionManager.inMemory(dir);
-	if (source === "restored") sessionManager.appendModelChange("claude-sdk", "claude");
-	const { session, modelFallbackMessage } = await createAgentSessionFromServices({
-		services,
-		sessionManager,
-		telemetryDisabled: true,
-	});
-	try {
-		if (source === "none") {
-			await expect(session.prompt("test")).rejects.toThrow(
-				/No API key found for the selected model\.[\s\S]*Use \/login/,
-			);
-			return;
+it.each(["restored", "default", "none", "compact", "restart after opt-out"])(
+	"explains why there is no model (saved provider: %s)",
+	async (source) => {
+		clearProviderEnv();
+		const dir = mkdtempSync(join(getAgentDir(), "no-model-"));
+		writeFileSync(
+			join(dir, "claude-sdk.json"),
+			JSON.stringify({ enabled: source !== "restart after opt-out", claudePath: join(dir, "missing") }),
+		);
+		const services = await createAgentSessionServices({
+			cwd: dir,
+			agentDir: dir,
+			authStorage: AuthStorage.inMemory(),
+			settingsManager: SettingsManager.inMemory(
+				source === "default" ? { defaultModel: "claude", defaultProvider: "claude-sdk" } : {},
+			),
+			telemetryDisabled: true,
+		});
+		const sessionManager = SessionManager.inMemory(dir);
+		if (source !== "default" && source !== "none") sessionManager.appendModelChange("claude-sdk", "claude");
+		const { session, modelFallbackMessage } = await createAgentSessionFromServices({
+			services,
+			sessionManager,
+			telemetryDisabled: true,
+		});
+		try {
+			if (source === "none") {
+				await expect(session.prompt("test")).rejects.toThrow(
+					/No API key found for the selected model\.[\s\S]*Use \/login/,
+				);
+				return;
+			}
+			if (source === "restart after opt-out") {
+				expect(modelFallbackMessage).toBe(
+					"Provider claude-sdk is not registered. Use /model to pick another model.",
+				);
+			} else {
+				expect(modelFallbackMessage).toContain("Cannot find the claude executable");
+			}
+			expect(modelFallbackMessage).not.toMatch(/API key|\/login/i);
+			expect(session.model?.provider).toBe("unknown");
+			const request = source === "compact" ? session.compact() : session.prompt("test");
+			await expect(request).rejects.not.toThrow(/API key|\/login/i);
+			await expect(request).rejects.toEqual(Error(modelFallbackMessage));
+		} finally {
+			session.dispose();
 		}
-		expect(modelFallbackMessage).toContain("Cannot find the claude executable");
-		expect(modelFallbackMessage).not.toMatch(/API key|\/login/i);
-		expect(session.model?.provider).toBe("unknown");
-		await expect(session.prompt("test")).rejects.toEqual(Error(modelFallbackMessage));
-	} finally {
-		session.dispose();
-	}
-});
+	},
+);
 it.each(["absent", "discovery down", "config only"])("reports the saved provider state: %s", async (state) => {
 	clearProviderEnv();
 	const dir = mkdtempSync(join(getAgentDir(), "absent-"));
@@ -520,7 +534,7 @@ it.each(["absent", "discovery down", "config only"])("reports the saved provider
 		session.dispose();
 	}
 });
-it("removes the provider on /reload after opt-out", async () => {
+it.each(["prompt", "compact"])("removes the provider on /reload after opt-out: %s", async (operation) => {
 	clearProviderEnv();
 	const dir = mkdtempSync(join(getAgentDir(), "reload-"));
 	const file = join(dir, "claude-sdk.json");
@@ -545,7 +559,9 @@ it("removes the provider on /reload after opt-out", async () => {
 		writeFileSync(file, JSON.stringify({ enabled: false }));
 		await session.reload();
 		expect(hasRows()).toBe(false);
-		await expect(session.prompt("test")).rejects.toEqual(
+		const request = operation === "compact" ? session.compact() : session.prompt("test");
+		await expect(request).rejects.not.toThrow(/API key|\/login/i);
+		await expect(request).rejects.toEqual(
 			Error("Provider claude-sdk is not registered. Use /model to pick another model."),
 		);
 	} finally {

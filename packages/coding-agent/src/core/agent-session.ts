@@ -2093,12 +2093,23 @@ export class AgentSession {
 		this._subagentRuntimeHost = host;
 	}
 
-	private _missingAuthError(model: Model<Api>, fallback?: string): Error {
-		return new Error(
-			this._modelRegistry.getProviderMissingAuthMessage(model.provider) ??
-				fallback ??
-				formatNoApiKeyFoundMessage(model.provider),
-		);
+	private _missingAuthError(model: Model<Api> | undefined, fallback?: string): Error {
+		const registry = this._modelRegistry;
+		const savedProvider =
+			this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider();
+		const resolved = hasResolvedModel(model);
+		const provider = resolved ? model?.provider : savedProvider;
+		if (provider) {
+			const cause = registry.getProviderMissingAuthMessage(provider);
+			if (cause) return new Error(cause);
+			// A model passed directly by an SDK host need not have a registered provider.
+			if (resolved ? registry.wasProviderRemoved(provider) : !registry.hasProvider(provider))
+				return new Error(formatProviderNotRegisteredMessage(provider));
+		}
+		if (!model) return new Error(formatNoModelSelectedMessage());
+		if (fallback) return new Error(fallback);
+		if (registry.isUsingOAuth(model)) return new Error(formatAuthenticationFailedMessage(model.provider));
+		return new Error(formatNoApiKeyFoundMessage(model.provider));
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -2117,10 +2128,6 @@ export class AgentSession {
 			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
-		const isOAuth = this._modelRegistry.isUsingOAuth(model);
-		if (isOAuth) {
-			throw new Error(formatAuthenticationFailedMessage(model.provider));
-		}
 		throw this._missingAuthError(model);
 	}
 
@@ -2810,25 +2817,7 @@ export class AgentSession {
 	}
 
 	private async _validateCanStartAgentRun(): Promise<void> {
-		const resolved = hasResolvedModel(this.model);
-		if (!resolved) {
-			const provider =
-				this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider();
-			const cause = provider && this._modelRegistry.getProviderMissingAuthMessage(provider);
-			if (cause) throw new Error(cause);
-		}
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-			if (resolved && this._modelRegistry.wasProviderRemoved(this.model.provider))
-				throw new Error(formatProviderNotRegisteredMessage(this.model.provider));
-			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
-			if (isOAuth) {
-				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
-			}
-			throw this._missingAuthError(this.model);
-		}
+		if (!this.model || !this._modelRegistry.hasConfiguredAuth(this.model)) throw this._missingAuthError(this.model);
 	}
 
 	/**
