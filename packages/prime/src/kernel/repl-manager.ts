@@ -16,7 +16,6 @@ import {
 	statSync,
 	writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { ORPHAN_PROCESS_JOURNAL_ENV, reapKernelOrphanProcesses } from "../orphan-process-journal.ts";
@@ -193,6 +192,7 @@ export class ReplKernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
 		| "python"
+		| "orphanJournalParent"
 		| "cwd"
 		| "env"
 		| "sessionId"
@@ -260,6 +260,7 @@ export class ReplKernelManager {
 	constructor(options: KernelManagerOptions) {
 		this.options = {
 			python: options.python,
+			orphanJournalParent: options.orphanJournalParent,
 			cwd: options.cwd,
 			env: options.env,
 			sessionId: options.sessionId,
@@ -346,10 +347,10 @@ export class ReplKernelManager {
 		if (this.state !== "idle") return;
 		const python = this.options.python;
 		if (!python) throw new Error("A checked Python interpreter is required");
-		// Per-kernel journals have no later scavenger: host death without 'exit' leaves this dir.
+		// No later scavenger: host death without 'exit' leaves this dir under the agent tree.
 		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
 		// No pi mode handles SIGINT shutdown, so a delivered SIGINT takes no final snapshot.
-		this.orphanJournalDir = mkdtempSync(join(tmpdir(), "prime-kernel-"));
+		this.orphanJournalDir = mkdtempSync(join(this.options.orphanJournalParent, "prime-kernel-"));
 		const generation = ++this.startGeneration;
 		this.state = "starting";
 		installSignalHandlersOnce();
@@ -1066,10 +1067,6 @@ export class ReplKernelManager {
 		}
 		if (this.activeExecution) {
 			throw new Error("Kernel already has an active execution");
-		}
-		// A temp cleaner can remove the live journal; recreation cannot recover earlier records.
-		if (requestFields.type === "execute" && this.orphanJournalDir) {
-			mkdirSync(this.orphanJournalDir, { recursive: true, mode: 0o700 });
 		}
 
 		const result = createDeferred<InternalExecuteResult>();

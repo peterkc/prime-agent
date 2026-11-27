@@ -35,7 +35,7 @@ const pythonVariable = `${ENV_PREFIX}_KERNEL_PYTHON`;
 const cleanups: Array<() => Promise<void> | void> = [];
 
 if (!existsSync(python))
-	throw new Error("Missing kernel test interpreter. Run uv sync --frozen in packages/prime/runtime.");
+	throw new Error("Missing kernel test interpreter. Run uv sync --locked in packages/prime/runtime.");
 const check = childProcess.spawnSync(python, ["-c", "import rlm.repl, dill"], { encoding: "utf8" });
 if (check.status !== 0) throw new Error(`Kernel test interpreter cannot import rlm.repl and dill: ${check.stderr}`);
 
@@ -178,7 +178,7 @@ describe("ipython extension boundary", () => {
 		["quit", true],
 		["reload", true],
 		["quit", false],
-	] as const)("W1: failed %s flush with UI=%s reports stderr only for interactive quit", async (reason, hasUI) => {
+	] as const)("W1: failed %s flush with UI=%s defers stderr to exit only for quit with UI", async (reason, hasUI) => {
 		const { runtime, cell } = await host();
 		await cell("x = 41");
 		const path = snapshot(runtime);
@@ -186,16 +186,34 @@ describe("ipython extension boundary", () => {
 		mkdirSync(path, { recursive: true });
 		vi.spyOn(runtime.session.extensionRunner, "hasUI").mockReturnValue(hasUI);
 		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		const write = vi.spyOn(fs, "writeSync").mockImplementation(() => {
+			throw new Error("injected EIO");
+		});
+		syncBuiltinESMExports();
+		const previous = new Set(process.rawListeners("exit"));
 		const errors: string[] = [];
 		runtime.session.extensionRunner.onError((error) => errors.push(error.error));
-		await runtime.session.extensionRunner.emit({ type: "session_shutdown", reason });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toMatch(/Final Python snapshot failed:/);
-		if (reason === "quit" && hasUI) {
-			expect(stderr).toHaveBeenCalledExactlyOnceWith(
-				expect.stringMatching(/^Final Python snapshot failed: [^\n]*\n$/),
-			);
-		} else expect(stderr).not.toHaveBeenCalled();
+		try {
+			await runtime.session.extensionRunner.emit({ type: "session_shutdown", reason });
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toMatch(/Final Python snapshot failed:/);
+			expect(stderr).not.toHaveBeenCalled();
+			expect(write).not.toHaveBeenCalled();
+			const listeners = process.rawListeners("exit").filter((listener) => !previous.has(listener));
+			if (reason === "quit" && hasUI) {
+				expect(listeners).toHaveLength(1);
+				expect(() => listeners[0].call(process, 0)).not.toThrow();
+				expect(write).toHaveBeenCalledExactlyOnceWith(
+					2,
+					expect.stringMatching(/^Final Python snapshot failed: [^\n]*\n$/),
+				);
+			} else expect(listeners).toEqual([]);
+		} finally {
+			for (const listener of process.rawListeners("exit")) {
+				// Node's rawListeners type loses the exit callback signature.
+				if (!previous.has(listener)) process.removeListener("exit", listener as (code: number) => void);
+			}
+		}
 	});
 
 	it("W2: many small stream chunks copy the tail only when an update is emitted", async () => {
@@ -238,21 +256,36 @@ describe("ipython extension boundary", () => {
 		expect(updates).toEqual([chunk, expectedTail]);
 	});
 
-	it("W3: a live kernel recreates its removed journal directory before bash enrollment", async () => {
+	it.each([true, false])("R6-A: persisted=%s journal uses its private agent tree", async (persisted) => {
+		const { runtime, cell } = await host(persisted);
+		const path = text(
+			await cell("import os\nprint(os.environ['PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL'])"),
+		).trim();
+		const parent = persisted
+			? join(getAgentDir(), "session-artifacts", runtime.session.sessionId)
+			: join(getAgentDir(), "kernel-journals");
+		expect(join(path, "../..")).toBe(parent);
+		expect(fs.lstatSync(parent).mode & 0o777).toBe(0o700);
+		expect(fs.lstatSync(join(path, "..")).mode & 0o777).toBe(0o700);
+		expect((await cell("completed = await bash('printf private-journal')\ncompleted.output")).isError).toBe(false);
+		expect(existsSync(path)).toBe(true);
+	});
+
+	it("R6-A: a request does not recreate a removed kernel journal directory", async () => {
 		const { cell } = await host(false);
 		const path = text(
 			await cell("import os\nprint(os.environ['PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL'])"),
 		).trim();
 		rmSync(join(path, ".."), { recursive: true });
-		const result = await cell("completed = await bash('printf journal-restored')\ncompleted.output");
-		expect(result.isError).toBe(false);
-		expect(text(result)).toContain("journal-restored");
-		expect(existsSync(path)).toBe(true);
+		expect(text(await cell("21 * 2")).trim()).toBe("42");
+		expect(existsSync(join(path, ".."))).toBe(false);
+		expect((await cell("await bash('printf must-not-run')")).isError).toBe(true);
+		expect(existsSync(join(path, ".."))).toBe(false);
 	});
 
 	it("W4a: journal removal errors do not escape synchronous cleanup", async () => {
 		const { dir } = await host(false);
-		const manager = new ReplKernelManager({ python, cwd: dir });
+		const manager = new ReplKernelManager({ python, cwd: dir, orphanJournalParent: dir });
 		cleanups.push(() => manager.disposeSync());
 		await manager.start();
 		const internal = manager as unknown as { orphanJournalDir: string; kernelStderr: string };
@@ -276,7 +309,7 @@ describe("ipython extension boundary", () => {
 
 	it("W4b: failed journal creation during protocol repair leaves startup idle and usable", async () => {
 		const { dir } = await host(false);
-		const manager = new ReplKernelManager({ python, cwd: dir });
+		const manager = new ReplKernelManager({ python, cwd: dir, orphanJournalParent: dir });
 		cleanups.push(() => manager.disposeSync());
 		await manager.start();
 		const internal = manager as unknown as {
@@ -304,7 +337,13 @@ describe("ipython extension boundary", () => {
 	it.each(["timeout", "shutdown"] as const)("W5: a SIGTERM-ignoring import probe settles on %s", async (mode) => {
 		const { runtime, cell, dir } = await host(false);
 		const server = net.createServer();
-		const accepted = once(server, "connection");
+		const connected = Promise.withResolvers<void>();
+		server.once("connection", (socket) => {
+			cleanups.push(() => {
+				socket.destroy();
+			});
+			connected.resolve();
+		});
 		server.listen(0, "127.0.0.1");
 		await once(server, "listening");
 		cleanups.push(
@@ -319,27 +358,27 @@ describe("ipython extension boundary", () => {
 			{ mode: 0o700 },
 		);
 		vi.stubEnv(pythonVariable, hanging);
-		const spawns = vi.spyOn(childProcess, "spawn");
+		const spawn = childProcess.spawn;
+		const spawns = vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+			expect(options?.timeout).toBe(5000);
+			return spawn(command, args, { ...options, timeout: mode === "timeout" ? 25 : options?.timeout });
+		});
 		syncBuiltinESMExports();
 		const pending = cell("42");
-		const [socket] = await accepted;
-		cleanups.push(() => socket.destroy());
-		const child = spawns.mock.results[0].value as childProcess.ChildProcess;
 		if (mode === "shutdown") {
+			await connected.promise;
+			const child = spawns.mock.results[0].value as childProcess.ChildProcess;
 			const shutdown = runtime.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 			// emit starts handlers synchronously; a later timeout cannot satisfy this assertion.
 			expect(child.killed).toBe(true);
 			await shutdown;
 		}
 		const result = await pending;
+		const child = spawns.mock.results[0].value as childProcess.ChildProcess;
 		expect(result.isError).toBe(true);
 		expect(child.signalCode).toBe("SIGKILL");
 		if (mode === "timeout") expect(text(result)).toMatch(/timed out/i);
 		else expect(text(result)).not.toContain("cannot import");
-	});
-
-	it.each(["0", "NaN", "-1"])("W6: orphan test rejects PID text %s before a signal", (value) => {
-		expect(() => positiveProcessId(value)).toThrow("Invalid process ID");
 	});
 
 	it("L1: a silent nonzero interpreter probe reports its exit code", async () => {
@@ -475,6 +514,7 @@ describe("ipython extension boundary", () => {
 		const manager = new ReplKernelManager({
 			python,
 			cwd: dir,
+			orphanJournalParent: dir,
 			snapshot: { path, manifestPath: join(dir, "kernel-state.json") },
 		});
 		cleanups.push(async () => {
@@ -667,6 +707,10 @@ describe("ipython extension boundary", () => {
 			const restores = vi.spyOn(ReplKernelManager.prototype, "restoreState");
 			const writes = vi.spyOn(ReplKernelManager.prototype as unknown as KernelWire, "writeLine");
 			expect(text(await cell("42")).trim()).toBe("42");
+			const journal = text(
+				await cell("import os\nprint(os.environ['PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL'])"),
+			).trim();
+			expect(join(journal, "../..")).toBe(join(getAgentDir(), "kernel-journals"));
 			await runtime.dispose();
 			expect(restores).not.toHaveBeenCalled();
 			expect(

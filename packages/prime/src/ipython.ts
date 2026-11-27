@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ImageContent, registerSessionResourceCleanup, type TextContent } from "@earendil-works/pi-ai";
@@ -116,7 +116,12 @@ class IpythonKernelProvisioner {
 		}
 		if (signal.aborted) throw new Error("Python kernel is shutting down");
 		const shellPath = resolveKernelBashShell();
+		const orphanJournalParent = this.snapshotDir ?? join(getAgentDir(), "kernel-journals");
+		// Both parents are in the user's agent tree, not shared/aged temp storage.
+		// Keep the parent: persisted sessions also use it for snapshots; in-memory kernels share it.
+		mkdirSync(orphanJournalParent, { recursive: true, mode: 0o700 });
 		const manager = new ReplKernelManager({
+			orphanJournalParent,
 			python,
 			cwd: this.cwd,
 			sessionId: this.sessionId,
@@ -307,7 +312,16 @@ export default function ipython(pi: ExtensionAPI): void {
 			await provisioner?.shutdown();
 		} catch (error) {
 			const message = `Final Python snapshot failed: ${errorMessage(error)}`;
-			if (event.reason === "quit" && ctx.hasUI) process.stderr.write(`${message.replace(/[\r\n]+/g, " ")}\n`);
+			if (event.reason === "quit" && ctx.hasUI) {
+				// Signal shutdown disposes extensions before restoring the terminal. Never write during dispose.
+				process.once("exit", () => {
+					try {
+						writeSync(2, `${message.replace(/[\r\n]+/g, " ")}\n`);
+					} catch {
+						// SIGHUP may have closed stderr; the exit diagnostic must not interrupt cleanup.
+					}
+				});
+			}
 			throw new Error(message, { cause: error });
 		}
 	});

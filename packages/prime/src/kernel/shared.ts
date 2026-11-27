@@ -46,6 +46,8 @@ export interface KernelSnapshotConfig {
 }
 
 export interface KernelManagerOptions {
+	/** Private, non-temporary parent for new per-kernel orphan journal directories. */
+	orphanJournalParent: string;
 	/** Python interpreter with the kernel runtime available. */
 	python?: string;
 	cwd?: string;
