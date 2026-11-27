@@ -104,6 +104,21 @@ describe("ModelRegistry", () => {
 		expect(fetch).not.toHaveBeenCalled();
 	});
 
+	it("preserves the copy's routing when re-registering only modelsFrom", () => {
+		writeModelsJson({
+			source: providerConfig("https://source.invalid", [{ id: "old" }]),
+			replacement: providerConfig("https://replacement.invalid", [{ id: "new" }]),
+		});
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const routing = { api: "copy-api", baseUrl: "https://copy.invalid" };
+		registry.registerProvider("copy", { modelsFrom: "source", ...routing, apiKey: "COPY_TEST_KEY" });
+		registry.registerProvider("copy", { modelsFrom: "replacement" });
+		const rows = getModelsForProvider(registry, "copy");
+		expect(rows).toMatchObject([{ id: "new", ...routing }]);
+		registry.refresh();
+		expect(getModelsForProvider(registry, "copy")).toEqual(rows);
+	});
+
 	it.each(["combined", "successive"])("rejects %s models and modelsFrom without changing the registry", (mode) => {
 		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 		const initial = providerConfig("https://local.invalid", [{ id: "kept" }]);

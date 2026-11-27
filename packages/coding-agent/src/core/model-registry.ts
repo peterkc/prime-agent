@@ -2120,15 +2120,19 @@ export class ModelRegistry {
 
 		this.storeProviderRequestConfig(providerName, config, true);
 
-		if (config.modelsFrom !== undefined) {
-			const rows = this.models.filter((row) => row.provider === config.modelsFrom);
+		const previous = this.registeredProviders.get(providerName);
+		const modelsFrom = config.modelsFrom ?? previous?.modelsFrom;
+		if (modelsFrom !== undefined) {
+			const rows = this.models.filter((row) => row.provider === modelsFrom);
+			const api = config.api ?? previous?.api;
+			const baseUrl = config.baseUrl ?? previous?.baseUrl;
 			this.models = this.models.filter((row) => row.provider !== providerName);
 			for (const row of rows)
 				this.models.push({
 					...row,
 					provider: providerName,
-					api: config.api ?? row.api,
-					baseUrl: config.baseUrl ?? row.baseUrl,
+					api: api ?? row.api,
+					baseUrl: baseUrl ?? row.baseUrl,
 				});
 		} else if (config.models && config.models.length > 0) {
 			this.models = this.models.filter((m) => m.provider !== providerName);
