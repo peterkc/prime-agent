@@ -1,6 +1,6 @@
 import childProcess from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -128,6 +128,12 @@ function text(result: ToolResultMessage): string {
 		.join("\n");
 }
 
+function positiveProcessId(value: string): number {
+	const pid = Number(value);
+	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid process ID: ${value}`);
+	return pid;
+}
+
 function snapshot(runtime: AgentSessionRuntime): string {
 	return join(getAgentDir(), "session-artifacts", runtime.session.sessionId, "kernel-state.dill");
 }
@@ -168,6 +174,200 @@ function holdFinalSnapshot(path: string) {
 }
 
 describe("ipython extension boundary", () => {
+	it.each([
+		["quit", true],
+		["reload", true],
+		["quit", false],
+	] as const)("W1: failed %s flush with UI=%s reports stderr only for interactive quit", async (reason, hasUI) => {
+		const { runtime, cell } = await host();
+		await cell("x = 41");
+		const path = snapshot(runtime);
+		rmSync(path, { force: true });
+		mkdirSync(path, { recursive: true });
+		vi.spyOn(runtime.session.extensionRunner, "hasUI").mockReturnValue(hasUI);
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		const errors: string[] = [];
+		runtime.session.extensionRunner.onError((error) => errors.push(error.error));
+		await runtime.session.extensionRunner.emit({ type: "session_shutdown", reason });
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toMatch(/Final Python snapshot failed:/);
+		if (reason === "quit" && hasUI) {
+			expect(stderr).toHaveBeenCalledExactlyOnceWith(
+				expect.stringMatching(/^Final Python snapshot failed: [^\n]*\n$/),
+			);
+		} else expect(stderr).not.toHaveBeenCalled();
+	});
+
+	it("W2: many small stream chunks copy the tail only when an update is emitted", async () => {
+		const { runtime, cell } = await host(false);
+		await cell("0");
+		const tool = runtime.session.agent.state.tools.find((tool) => tool.name === "ipython");
+		if (!tool) throw new Error("ipython was not registered");
+		const entered = Promise.withResolvers<ExecuteOptions>();
+		const release = Promise.withResolvers<ExecuteResult>();
+		vi.spyOn(ReplKernelManager.prototype, "execute").mockImplementationOnce((_code, options) => {
+			entered.resolve(options ?? {});
+			return release.promise;
+		});
+		const updates: string[] = [];
+		const pending = tool.execute("chunks", { code: "controlled stream" }, undefined, (update) => {
+			for (const block of update.content) if (block.type === "text") updates.push(block.text);
+		});
+		const options = await entered.promise;
+		vi.useFakeTimers({ now: 1000 });
+		const chunk = "W2:".repeat(100);
+		const expectedTail = chunk.repeat(1000).slice(-DEFAULT_MAX_OUTPUT_CHARS);
+		const joins = vi.spyOn(Array.prototype, "join");
+		const slices = vi.spyOn(String.prototype, "slice");
+		let beforeUpdate: number[] = [];
+		let afterUpdate: number[] = [];
+		try {
+			for (let i = 0; i < 1000; i++) options.onStream?.(chunk, "stdout");
+			beforeUpdate = [updates.length, joins.mock.calls.length, slices.mock.calls.length];
+			await vi.advanceTimersByTimeAsync(100);
+			afterUpdate = [updates.length, joins.mock.calls.length, slices.mock.calls.length];
+		} finally {
+			joins.mockRestore();
+			slices.mockRestore();
+			release.resolve({ stdout: "", stderr: "", status: "ok", durationMs: 0 });
+			await pending;
+			vi.useRealTimers();
+		}
+		expect(beforeUpdate).toEqual([1, 1, 1]);
+		expect(afterUpdate).toEqual([2, 2, 2]);
+		expect(updates).toEqual([chunk, expectedTail]);
+	});
+
+	it("W3: a live kernel recreates its removed journal directory before bash enrollment", async () => {
+		const { cell } = await host(false);
+		const path = text(
+			await cell("import os\nprint(os.environ['PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL'])"),
+		).trim();
+		rmSync(join(path, ".."), { recursive: true });
+		const result = await cell("completed = await bash('printf journal-restored')\ncompleted.output");
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain("journal-restored");
+		expect(existsSync(path)).toBe(true);
+	});
+
+	it("W4a: journal removal errors do not escape synchronous cleanup", async () => {
+		const { dir } = await host(false);
+		const manager = new ReplKernelManager({ python, cwd: dir });
+		cleanups.push(() => manager.disposeSync());
+		await manager.start();
+		const internal = manager as unknown as { orphanJournalDir: string; kernelStderr: string };
+		const journalDir = internal.orphanJournalDir;
+		cleanups.push(() => rmSync(journalDir, { recursive: true, force: true }));
+		const remove = fs.rmSync;
+		const stub = vi.spyOn(fs, "rmSync").mockImplementation((path, options) => {
+			if (path === journalDir) throw new Error("injected journal removal failure");
+			return remove(path, options);
+		});
+		syncBuiltinESMExports();
+		try {
+			expect(() => manager.disposeSync()).not.toThrow();
+			expect(internal.kernelStderr).toContain("injected journal removal failure");
+			expect(manager.isDefunct).toBe(true);
+		} finally {
+			stub.mockRestore();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("W4b: failed journal creation during protocol repair leaves startup idle and usable", async () => {
+		const { dir } = await host(false);
+		const manager = new ReplKernelManager({ python, cwd: dir });
+		cleanups.push(() => manager.disposeSync());
+		await manager.start();
+		const internal = manager as unknown as {
+			child: childProcess.ChildProcess;
+			protocolRepairPromise: Promise<void>;
+			state: string;
+		};
+		const stub = vi.spyOn(fs, "mkdtempSync").mockImplementationOnce(() => {
+			throw new Error("injected journal creation failure");
+		});
+		syncBuiltinESMExports();
+		try {
+			internal.child.stdout?.emit("data", Buffer.from("invalid-protocol-frame\n"));
+			await internal.protocolRepairPromise;
+			expect(internal.state).toBe("idle");
+			const result = await manager.execute("21 * 2");
+			expect(result.status).toBe("ok");
+			expect(result.result).toBe("42");
+		} finally {
+			stub.mockRestore();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it.each(["timeout", "shutdown"] as const)("W5: a SIGTERM-ignoring import probe settles on %s", async (mode) => {
+		const { runtime, cell, dir } = await host(false);
+		const server = net.createServer();
+		const accepted = once(server, "connection");
+		server.listen(0, "127.0.0.1");
+		await once(server, "listening");
+		cleanups.push(
+			() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+		);
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Expected a TCP address");
+		const hanging = join(dir, "ignores-sigterm-python");
+		writeFileSync(
+			hanging,
+			`#!${python}\nimport signal, socket\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ns = socket.create_connection(('127.0.0.1', ${address.port}))\ns.recv(1)\n`,
+			{ mode: 0o700 },
+		);
+		vi.stubEnv(pythonVariable, hanging);
+		const spawns = vi.spyOn(childProcess, "spawn");
+		syncBuiltinESMExports();
+		const pending = cell("42");
+		const [socket] = await accepted;
+		cleanups.push(() => socket.destroy());
+		const child = spawns.mock.results[0].value as childProcess.ChildProcess;
+		if (mode === "shutdown") {
+			const shutdown = runtime.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+			// emit starts handlers synchronously; a later timeout cannot satisfy this assertion.
+			expect(child.killed).toBe(true);
+			await shutdown;
+		}
+		const result = await pending;
+		expect(result.isError).toBe(true);
+		expect(child.signalCode).toBe("SIGKILL");
+		if (mode === "timeout") expect(text(result)).toMatch(/timed out/i);
+		else expect(text(result)).not.toContain("cannot import");
+	});
+
+	it.each(["0", "NaN", "-1"])("W6: orphan test rejects PID text %s before a signal", (value) => {
+		expect(() => positiveProcessId(value)).toThrow("Invalid process ID");
+	});
+
+	it("L1: a silent nonzero interpreter probe reports its exit code", async () => {
+		const { cell, dir } = await host(false);
+		const failing = join(dir, "failing-python");
+		writeFileSync(failing, `#!${python}\nraise SystemExit(7)\n`, { mode: 0o700 });
+		vi.stubEnv(pythonVariable, failing);
+		const result = await cell("42");
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain(pythonVariable);
+		expect(text(result)).toContain("exit code 7");
+	});
+
+	it("L6: image-only cells omit empty text while empty cells keep a result block", async () => {
+		const { cell } = await host(false);
+		const image = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
+		const result = await cell(
+			"from rlm.repl import emit\nemit({'application/vnd.prime-agent.attachment+json': {'mime_type': 'image/png', 'data': 'aGVsbG8='}})",
+		);
+		expect(result.isError).toBe(false);
+		expect(result.content).toEqual([image]);
+		expect((await cell("pass")).content).toEqual([{ type: "text", text: "" }]);
+		const mixed = await cell(
+			"print('caption')\nemit({'application/vnd.prime-agent.attachment+json': {'mime_type': 'image/png', 'data': 'aGVsbG8='}})",
+		);
+		expect(mixed.content).toEqual([{ type: "text", text: "caption\n" }, image]);
+	});
+
 	it("R2-1: large streamed output keeps bounded partial-result tails", async () => {
 		const { runtime, cell } = await host(false);
 		const updates: string[] = [];
@@ -399,14 +599,9 @@ describe("ipython extension boundary", () => {
 		const code = `import socket; s=socket.create_connection(('127.0.0.1', ${address.port})); s.recv(1)`;
 		const command = `exec ${JSON.stringify(python)} -c ${JSON.stringify(code)}`;
 		const spawned = await cell(`h = bash(${JSON.stringify(command)})\nh.pid`);
-		const pid = Number(text(spawned).trim());
-		cleanups.push(() => {
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {}
-		});
 		const [socket] = await accepted;
 		cleanups.push(() => socket.destroy());
+		const pid = positiveProcessId(text(spawned).trim());
 		const closed = once(socket, "close");
 		expect((await cell("import os\nos._exit(9)")).isError).toBe(true);
 		await closed;

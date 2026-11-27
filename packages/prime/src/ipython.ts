@@ -83,26 +83,37 @@ class IpythonKernelProvisioner {
 		const python = process.env[variable];
 		const runtimeDir = fileURLToPath(new URL("../runtime/", import.meta.url));
 		if (!python) throw new Error(`Set ${variable} to a Python interpreter with the runtime from ${runtimeDir}.`);
+		const signal = this.startupAbort.signal;
 		const check = spawnHidden(python, ["-c", "import rlm.repl, dill"], {
 			cwd: this.cwd,
 			stdio: ["ignore", "ignore", "pipe"],
 			timeout: 5000,
+			killSignal: "SIGKILL",
 		});
+		const abortCheck = () => check.kill("SIGKILL");
+		signal.addEventListener("abort", abortCheck, { once: true });
+		if (signal.aborted) abortCheck();
 		let stderr = "";
 		check.stderr?.on("data", (chunk: Buffer) => {
 			stderr += chunk.toString();
 		});
 		try {
-			if ((await waitForChildProcess(check)) !== 0)
+			const exitCode = await waitForChildProcess(check);
+			if (exitCode !== 0)
 				throw new Error(
 					check.killed
 						? "Interpreter import check timed out"
-						: stderr.trim() || `Interpreter import check ended by ${check.signalCode}`,
+						: stderr.trim() ||
+								(check.signalCode
+									? `Interpreter import check ended by ${check.signalCode}`
+									: `Interpreter import check exited with exit code ${exitCode}`),
 				);
 		} catch (error) {
+			if (signal.aborted) throw new Error("Python kernel is shutting down", { cause: error });
 			throw new Error(`${variable} cannot import rlm.repl and dill: ${errorMessage(error)}`, { cause: error });
+		} finally {
+			signal.removeEventListener("abort", abortCheck);
 		}
-		const signal = this.startupAbort.signal;
 		if (signal.aborted) throw new Error("Python kernel is shutting down");
 		const shellPath = resolveKernelBashShell();
 		const manager = new ReplKernelManager({
@@ -221,7 +232,8 @@ function createIpythonToolDefinition(
 		execute: async (_id, params, signal, onUpdate, ctx) => {
 			const provisioner = getProvisioner(ctx);
 			const manager = await provisioner.ensure(signal);
-			let streamed = "";
+			const streamedChunks: string[] = [];
+			let streamedLength = 0;
 			let updateTimer: ReturnType<typeof setTimeout> | undefined;
 			let updateDirty = false;
 			let lastUpdateAt = 0;
@@ -229,11 +241,16 @@ function createIpythonToolDefinition(
 				if (!onUpdate || !updateDirty) return;
 				updateDirty = false;
 				lastUpdateAt = Date.now();
-				onUpdate({ content: [{ type: "text", text: streamed }], details: { status: "ok", durationMs: 0 } });
+				const text = streamedChunks.join("").slice(-DEFAULT_MAX_OUTPUT_CHARS);
+				onUpdate({ content: [{ type: "text", text }], details: { status: "ok", durationMs: 0 } });
 			}
 			function onStream(chunk: string): void {
 				if (!onUpdate) return;
-				streamed = (streamed + chunk).slice(-DEFAULT_MAX_OUTPUT_CHARS);
+				streamedChunks.push(chunk);
+				streamedLength += chunk.length;
+				while (streamedLength - streamedChunks[0].length >= DEFAULT_MAX_OUTPUT_CHARS) {
+					streamedLength -= streamedChunks.shift()!.length;
+				}
 				updateDirty = true;
 				const delay = OUTPUT_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
 				if (delay <= 0) {
@@ -264,10 +281,8 @@ function createIpythonToolDefinition(
 			]
 				.filter(Boolean)
 				.join("\n");
-			const content: (TextContent | ImageContent)[] = [
-				{ type: "text", text: output },
-				...imageBlocksFromAttachments(result.attachments),
-			];
+			const content: (TextContent | ImageContent)[] = imageBlocksFromAttachments(result.attachments);
+			if (output || content.length === 0) content.unshift({ type: "text", text: output });
 			return {
 				content,
 				details: { status: result.status, durationMs: result.durationMs },
@@ -286,12 +301,14 @@ export default function ipython(pi: ExtensionAPI): void {
 		return provisioner;
 	}
 	pi.registerTool(createIpythonToolDefinition(getProvisioner));
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event, ctx) => {
 		stopped = true;
 		try {
 			await provisioner?.shutdown();
 		} catch (error) {
-			throw new Error(`Final Python snapshot failed: ${errorMessage(error)}`, { cause: error });
+			const message = `Final Python snapshot failed: ${errorMessage(error)}`;
+			if (event.reason === "quit" && ctx.hasUI) process.stderr.write(`${message.replace(/[\r\n]+/g, " ")}\n`);
+			throw new Error(message, { cause: error });
 		}
 	});
 }

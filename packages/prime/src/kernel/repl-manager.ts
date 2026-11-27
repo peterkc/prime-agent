@@ -1,6 +1,6 @@
 // Kernel client for the REPL runtime: the kernel is a JSON-lines subprocess
 // (`python -m rlm.repl`) — requests on stdin, events on stdout, stderr kept as
-// a diagnostics tail. The protocol is documented in prime-agent-runtime/src/rlm/repl.md.
+// a diagnostics tail. The protocol is documented in packages/prime/runtime/src/rlm/repl.md.
 import type { ChildProcess } from "node:child_process";
 import { randomUUID as uuid } from "node:crypto";
 import {
@@ -143,7 +143,7 @@ interface ActiveExecution {
 	reject: (error: Error) => void;
 }
 
-// Complete event vocabulary of protocol version 2 (see prime-agent-runtime/src/rlm/repl.md).
+// Complete event vocabulary of protocol version 2 (see packages/prime/runtime/src/rlm/repl.md).
 // The version handshake is exact, so an unknown kind is corruption, not a newer runtime.
 const PROTOCOL_EVENT_KINDS = new Set([
 	"ready",
@@ -346,6 +346,10 @@ export class ReplKernelManager {
 		if (this.state !== "idle") return;
 		const python = this.options.python;
 		if (!python) throw new Error("A checked Python interpreter is required");
+		// Per-kernel journals have no later scavenger: host death without 'exit' leaves this dir.
+		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
+		// No pi mode handles SIGINT shutdown, so a delivered SIGINT takes no final snapshot.
+		this.orphanJournalDir = mkdtempSync(join(tmpdir(), "prime-kernel-"));
 		const generation = ++this.startGeneration;
 		this.state = "starting";
 		installSignalHandlersOnce();
@@ -353,10 +357,6 @@ export class ReplKernelManager {
 		// handlers can dispose a kernel that is still booting.
 		liveKernels.add(this);
 
-		// Per-kernel journals have no later scavenger: host death without 'exit' leaves this dir.
-		// If host and kernel die before the owner watchdog runs, bash() groups may survive too.
-		// Print/RPC SIGINT skips awaited shutdown, so Ctrl-C takes no final snapshot.
-		this.orphanJournalDir = mkdtempSync(join(tmpdir(), "prime-kernel-"));
 		const journalPath = join(this.orphanJournalDir, "processes.jsonl");
 		const child = spawnHidden(python, ["-m", "rlm.repl"], {
 			cwd: this.options.cwd,
@@ -1067,6 +1067,10 @@ export class ReplKernelManager {
 		if (this.activeExecution) {
 			throw new Error("Kernel already has an active execution");
 		}
+		// A temp cleaner can remove the live journal; recreation cannot recover earlier records.
+		if (requestFields.type === "execute" && this.orphanJournalDir) {
+			mkdirSync(this.orphanJournalDir, { recursive: true, mode: 0o700 });
+		}
 
 		const result = createDeferred<InternalExecuteResult>();
 		const execution: ActiveExecution = {
@@ -1436,7 +1440,11 @@ export class ReplKernelManager {
 				reapKernelOrphanProcesses(pid, join(this.orphanJournalDir, "processes.jsonl"));
 		}
 		if (this.orphanJournalDir) {
-			rmSync(this.orphanJournalDir, { recursive: true, force: true });
+			try {
+				rmSync(this.orphanJournalDir, { recursive: true, force: true });
+			} catch (error) {
+				this.appendKernelDiagnostic(`cannot remove kernel journal directory: ${errorMessage(error)}`);
+			}
 			this.orphanJournalDir = undefined;
 		}
 		this.startPromise = undefined;

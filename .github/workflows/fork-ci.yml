@@ -128,7 +128,7 @@ jobs:
       - name: Sync the Prime kernel runtime
         if: matrix.name == 'other'
         working-directory: packages/prime/runtime
-        run: uv sync --frozen
+        run: uv sync --locked
 
       - name: Test
         env:
