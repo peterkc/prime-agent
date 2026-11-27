@@ -542,6 +542,7 @@ export class ModelRegistry {
 	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
 	private readonly modelsJsonProviders = new Set<string>();
+	private readonly unregisteredProviders = new Set<string>();
 	private discoveryConfigs = new Map<string, Static<typeof ProviderConfigSchema>>();
 	private discoveryCache = new Map<
 		string,
@@ -1941,6 +1942,11 @@ export class ModelRegistry {
 		);
 	}
 
+	/** Whether an extension unregistered this provider and nothing configures it now. */
+	wasProviderRemoved(provider: string): boolean {
+		return this.unregisteredProviders.has(provider) && !this.hasProvider(provider);
+	}
+
 	getProviderMissingAuthMessage(provider: string): string | undefined {
 		return this.registeredProviders.get(provider)?.missingAuthMessage || undefined;
 	}
@@ -2027,6 +2033,7 @@ export class ModelRegistry {
 	unregisterProvider(providerName: string): void {
 		if (!this.registeredProviders.has(providerName)) return;
 		this.registeredProviders.delete(providerName);
+		this.unregisteredProviders.add(providerName);
 		this.refresh();
 	}
 

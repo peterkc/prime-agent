@@ -2821,7 +2821,7 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-			if (resolved && !this._modelRegistry.hasProvider(this.model.provider))
+			if (resolved && this._modelRegistry.wasProviderRemoved(this.model.provider))
 				throw new Error(formatProviderNotRegisteredMessage(this.model.provider));
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
