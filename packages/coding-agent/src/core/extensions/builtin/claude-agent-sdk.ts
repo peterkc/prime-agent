@@ -1,5 +1,7 @@
-// Adapted from rynfar/meridian src/proxy/server.ts at commit 510da1d9 (MIT, per its README)
-/*
+/*!
+ * Adapted from rynfar/meridian src/proxy/server.ts at commit 510da1d9 (MIT, per its README).
+ * The copyright line is from the upstream LICENSE added after 510da1d9.
+ *
  * MIT License
  *
  * Copyright (c) 2026 Trevor Walker
