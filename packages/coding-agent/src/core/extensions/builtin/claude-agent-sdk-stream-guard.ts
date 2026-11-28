@@ -1,6 +1,5 @@
 /*!
  * Adapted from rynfar/meridian src/proxy/streamIdleGuard.ts at commit 510da1d9 (MIT, per its README)
- * Adapted from rynfar/meridian src/proxy/turnOutcome.ts at commit 510da1d9 (MIT, per its README)
  *
  * MIT License
  *
