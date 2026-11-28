@@ -35,6 +35,10 @@ describe("createAgentSession session manager defaults", () => {
 
 	it("does not report a pending extension provider as unregistered at startup", async () => {
 		vi.stubEnv("PI_OFFLINE", "1");
+		for (const key of Object.keys(process.env)) {
+			if (/(?:_API_KEY|_TOKEN)$/.test(key) || /^(?:AWS_|GOOGLE_CLOUD_|GCLOUD_)/.test(key))
+				vi.stubEnv(key, undefined);
+		}
 		const provider = "pending-provider";
 		const extensionsResult = await createTestExtensionsResult(
 			[
