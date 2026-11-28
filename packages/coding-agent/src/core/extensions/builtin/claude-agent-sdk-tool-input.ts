@@ -1,8 +1,10 @@
-// Adapted from rynfar/meridian src/proxy/passthroughTools.ts at commit 510da1d9 (MIT, per its README)
-/*
+/*!
+ * Adapted from rynfar/meridian src/proxy/passthroughTools.ts at commit 510da1d9 (MIT, per its README)
+ *
  * MIT License
  *
  * Copyright (c) 2026 Trevor Walker
+ * (per the upstream LICENSE added after 510da1d9).
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
