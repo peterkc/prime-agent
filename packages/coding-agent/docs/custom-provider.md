@@ -572,6 +572,11 @@ interface ProviderConfig {
   /** Models to register. If provided, replaces all existing models for this provider. */
   models?: ProviderModelConfig[];
 
+  /** Copy a built-in provider, a models.json provider, or one registered first.
+   * Exclusive with models. A missing source gives zero rows. Chains are not allowed. */
+  modelsFrom?: string;
+  missingAuthMessage?: string; // Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable.
+
   /** OAuth provider for /login support. */
   oauth?: {
     name: string;

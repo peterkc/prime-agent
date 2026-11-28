@@ -541,6 +541,8 @@ function isOfflineModeEnabled(): boolean {
 export class ModelRegistry {
 	private readonly bundledCatalogModels = getBundledModels();
 	private models: Model<Api>[] = [];
+	private readonly modelsJsonProviders = new Set<string>();
+	private readonly unregisteredProviders = new Set<string>();
 	private discoveryConfigs = new Map<string, Static<typeof ProviderConfigSchema>>();
 	private discoveryCache = new Map<
 		string,
@@ -674,6 +676,7 @@ export class ModelRegistry {
 	}
 
 	private loadModels(): void {
+		this.modelsJsonProviders.clear();
 		this.discoveryConfigs.clear();
 		const {
 			models: customModels,
@@ -827,6 +830,7 @@ export class ModelRegistry {
 					});
 				}
 
+				this.modelsJsonProviders.add(providerName);
 				if (providerConfig.discover !== undefined) this.discoveryConfigs.set(providerName, providerConfig);
 				this.storeProviderRequestConfig(providerName, providerConfig);
 
@@ -1775,7 +1779,9 @@ export class ModelRegistry {
 		},
 		fromExtension = false,
 	): void {
-		if (!config.apiKey && !config.headers && !config.authHeader) {
+		const clearsExtensionKey =
+			fromExtension && config.apiKey === "" && this.providerRequestConfigs.get(providerName)?.fromExtension;
+		if (!config.apiKey && !config.headers && !config.authHeader && !clearsExtensionKey) {
 			return;
 		}
 
@@ -1924,6 +1930,27 @@ export class ModelRegistry {
 		};
 	}
 
+	hasExternalAuth(provider: string): boolean {
+		return typeof this.registeredProviders.get(provider)?.missingAuthMessage === "string";
+	}
+
+	hasProvider(provider: string): boolean {
+		return (
+			this.registeredProviders.has(provider) ||
+			this.modelsJsonProviders.has(provider) ||
+			this.models.some((model) => model.provider === provider)
+		);
+	}
+
+	/** Whether an extension unregistered this provider and nothing configures it now. */
+	wasProviderRemoved(provider: string): boolean {
+		return this.unregisteredProviders.has(provider) && !this.hasProvider(provider);
+	}
+
+	getProviderMissingAuthMessage(provider: string): string | undefined {
+		return this.registeredProviders.get(provider)?.missingAuthMessage || undefined;
+	}
+
 	/**
 	 * Get display name for a provider.
 	 */
@@ -2006,6 +2033,7 @@ export class ModelRegistry {
 	unregisterProvider(providerName: string): void {
 		if (!this.registeredProviders.has(providerName)) return;
 		this.registeredProviders.delete(providerName);
+		this.unregisteredProviders.add(providerName);
 		this.refresh();
 	}
 
@@ -2029,6 +2057,23 @@ export class ModelRegistry {
 	}
 
 	private validateProviderConfig(providerName: string, config: ProviderConfigInput): void {
+		const previous = this.registeredProviders.get(providerName);
+		if (
+			(config.models ?? previous?.models) !== undefined &&
+			(config.modelsFrom ?? previous?.modelsFrom) !== undefined
+		) {
+			throw new Error(`Provider ${providerName}: models and modelsFrom cannot be combined.`);
+		}
+		if (config.modelsFrom === providerName) {
+			throw new Error(`Provider ${providerName}: modelsFrom cannot name the provider itself.`);
+		}
+		if (
+			config.modelsFrom !== undefined &&
+			(this.registeredProviders.get(config.modelsFrom)?.modelsFrom !== undefined ||
+				[...this.registeredProviders.values()].some((other) => other.modelsFrom === providerName))
+		) {
+			throw new Error(`Provider ${providerName}: modelsFrom cannot be chained.`);
+		}
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
@@ -2075,7 +2120,21 @@ export class ModelRegistry {
 
 		this.storeProviderRequestConfig(providerName, config, true);
 
-		if (config.models && config.models.length > 0) {
+		const previous = this.registeredProviders.get(providerName);
+		const modelsFrom = config.modelsFrom ?? previous?.modelsFrom;
+		if (modelsFrom !== undefined) {
+			const rows = this.models.filter((row) => row.provider === modelsFrom);
+			const api = config.api ?? previous?.api;
+			const baseUrl = config.baseUrl ?? previous?.baseUrl;
+			this.models = this.models.filter((row) => row.provider !== providerName);
+			for (const row of rows)
+				this.models.push({
+					...row,
+					provider: providerName,
+					api: api ?? row.api,
+					baseUrl: baseUrl ?? row.baseUrl,
+				});
+		} else if (config.models && config.models.length > 0) {
 			this.models = this.models.filter((m) => m.provider !== providerName);
 
 			for (const modelDef of config.models) {
@@ -2120,6 +2179,9 @@ export class ModelRegistry {
  * Input type for registerProvider API.
  */
 export interface ProviderConfigInput {
+	/** Set this field for externally managed auth. Prime never offers login or API-key entry; use an empty string when available, or explain why the provider is unavailable. */
+	missingAuthMessage?: string;
+	modelsFrom?: string;
 	name?: string;
 	baseUrl?: string;
 	apiKey?: string;

@@ -5337,6 +5337,8 @@ export class AgentDaemon {
 						? session.modelRegistry.find(command.provider, command.modelId)
 						: undefined);
 				if (!model) {
+					const cause = session.modelRegistry.getProviderMissingAuthMessage(command.provider);
+					if (cause && session.modelRegistry.find(command.provider, command.modelId)) throw new Error(cause);
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
 				await session.setModel(model, {

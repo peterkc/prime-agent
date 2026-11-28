@@ -52,7 +52,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
-import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
+import { formatNoModelsAvailableMessage, hasResolvedModel } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
@@ -753,6 +753,14 @@ export function createDefaultRuntimeFactory(
 		});
 		const { services, sessionOptions, diagnostics } = prepared;
 		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);
+		const carriedModel = runtimeSessionOptions?.model;
+		if (carriedModel && !services.modelRegistry.hasProvider(carriedModel.provider)) {
+			// Keep the stale provider for missing-model guidance only if there is no saved selection to restore.
+			if (hasResolvedModel(carriedModel) && !sessionManager.buildSessionContext().model) {
+				sessionManager.appendModelChange(carriedModel.provider, carriedModel.id);
+			}
+			resolvedSessionOptions.model = undefined;
+		}
 
 		const created = await createAgentSessionFromServices({
 			services,
@@ -902,7 +910,10 @@ async function resolvePreparedStartupModel(options: {
 		});
 		model = result.model;
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
+			modelFallbackMessage = formatNoModelsAvailableMessage({
+				provider: existingSession.model?.provider ?? settingsManager.getDefaultProvider(),
+				registry: modelRegistry,
+			});
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
@@ -1533,6 +1544,7 @@ export async function main(args: string[], options?: MainOptions) {
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
+			startedWithoutModel: !hasResolvedModel(isFreshDefaultSession ? startupModel.model : summary.model),
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,
@@ -1656,7 +1668,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		throw error;
 	}
-	const { services, session, modelFallbackMessage } = runtime;
+	const { services, session } = runtime;
 	installOwnedSessionRecoveryTracking(runtime);
 	const { settingsManager, modelRegistry } = services;
 
@@ -1696,7 +1708,7 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSession");
 
 	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
+		console.error(chalk.red(runtime.modelFallbackMessage ?? formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
 
@@ -1727,7 +1739,8 @@ export async function main(args: string[], options?: MainOptions) {
 			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
 			migratedProviders,
-			modelFallbackMessage,
+			modelFallbackMessage: runtime.modelFallbackMessage,
+			startedWithoutModel: !hasResolvedModel(session.model),
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,

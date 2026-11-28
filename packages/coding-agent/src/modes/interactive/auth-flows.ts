@@ -316,7 +316,9 @@ export class ProviderAuthFlows {
 
 	getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
 		const authStorage = this.host.modelRegistry.authStorage;
-		const oauthProviders = authStorage.getOAuthProviders();
+		const oauthProviders = authStorage
+			.getOAuthProviders()
+			.filter((provider) => !this.host.modelRegistry.hasExternalAuth(provider.id));
 		const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));
 		const options: AuthSelectorProvider[] = oauthProviders.map((provider) => ({
 			id: provider.id,
@@ -328,7 +330,10 @@ export class ProviderAuthFlows {
 
 		const modelProviders = new Set(this.host.modelRegistry.getAll().map((model) => model.provider));
 		for (const providerId of modelProviders) {
-			if (!isApiKeyLoginProvider(providerId, oauthProviderIds)) {
+			if (
+				this.host.modelRegistry.hasExternalAuth(providerId) ||
+				!isApiKeyLoginProvider(providerId, oauthProviderIds)
+			) {
 				continue;
 			}
 			options.push({

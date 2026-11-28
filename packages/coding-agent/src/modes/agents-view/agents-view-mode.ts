@@ -22,6 +22,7 @@ import {
 	VERSION,
 } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import { hasResolvedModel } from "../../core/auth-guidance.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { appendSessionStateToExistingFile, readSessionInfo } from "../../core/session-manager.js";
 import {
@@ -691,6 +692,7 @@ async function runAgentsViewLoop(
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
+				startedWithoutModel: !hasResolvedModel(opened.summary.model),
 				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,

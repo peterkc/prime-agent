@@ -75,6 +75,82 @@ describe("ModelRegistry", () => {
 		writeFileSync(modelsJsonPath, JSON.stringify({ providers }));
 	}
 
+	it.each([undefined, "https://alias.invalid"])("copies live source rows with base URL %s", (baseUrl) => {
+		const source = (ids: string[]) =>
+			providerConfig(
+				"https://source.invalid",
+				ids.map((id) => ({ id })),
+			);
+		writeModelsJson({ source: source(["one", "two"]) });
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const fetch = vi.fn(() => {
+			throw new Error("unexpected request");
+		});
+		vi.stubGlobal("fetch", fetch);
+		registry.registerProvider("copy", { modelsFrom: "source", api: "copy-api", baseUrl });
+		const check = (ids: string[]) => {
+			const rows = getModelsForProvider(registry, "source");
+			expect(rows.map((row) => row.id)).toEqual(ids);
+			expect(getModelsForProvider(registry, "copy")).toEqual(
+				rows.map((row) => ({ ...row, provider: "copy", api: "copy-api", baseUrl: baseUrl ?? row.baseUrl })),
+			);
+		};
+		check(["one", "two"]);
+		writeModelsJson({ source: source(["two", "custom"]) });
+		registry.refresh();
+		check(["two", "custom"]);
+		registry.registerProvider("copy", { modelsFrom: "missing", api: "copy-api" });
+		expect(getModelsForProvider(registry, "copy")).toEqual([]);
+		expect(fetch).not.toHaveBeenCalled();
+	});
+
+	it("preserves the copy's routing when re-registering only modelsFrom", () => {
+		writeModelsJson({
+			source: providerConfig("https://source.invalid", [{ id: "old" }]),
+			replacement: providerConfig("https://replacement.invalid", [{ id: "new" }]),
+		});
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const routing = { api: "copy-api", baseUrl: "https://copy.invalid" };
+		registry.registerProvider("copy", { modelsFrom: "source", ...routing, apiKey: "COPY_TEST_KEY" });
+		registry.registerProvider("copy", { modelsFrom: "replacement" });
+		const rows = getModelsForProvider(registry, "copy");
+		expect(rows).toMatchObject([{ id: "new", ...routing }]);
+		registry.refresh();
+		expect(getModelsForProvider(registry, "copy")).toEqual(rows);
+	});
+
+	it.each(["combined", "successive"])("rejects %s models and modelsFrom without changing the registry", (mode) => {
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const initial = providerConfig("https://local.invalid", [{ id: "kept" }]);
+		registry.registerProvider("copy", initial);
+		const before = getModelsForProvider(registry, "copy");
+		const conflicting = {
+			modelsFrom: "anthropic",
+			api: "invalid-copy",
+			streamSimple: vi.fn(),
+			...(mode === "combined" ? initial : {}),
+		};
+		expect(() => registry.registerProvider("copy", conflicting)).toThrow(/modelsFrom/);
+		expect(getModelsForProvider(registry, "copy")).toEqual(before);
+		registry.refresh();
+		expect(getModelsForProvider(registry, "copy")).toEqual(before);
+	});
+
+	it.each(["self", "chain", "reverse chain", "cycle"])("rejects modelsFrom %s", (mode) => {
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		if (mode === "chain") registry.registerProvider("source", { modelsFrom: "anthropic" });
+		if (mode === "reverse chain") registry.registerProvider("other", { modelsFrom: "copy" });
+		if (mode === "cycle") registry.registerProvider("source", { modelsFrom: "copy" });
+		expect(() =>
+			registry.registerProvider("copy", {
+				modelsFrom: mode === "self" ? "copy" : "source",
+				api: "copy-api",
+				streamSimple: vi.fn(),
+			}),
+		).toThrow(/modelsFrom/);
+		expect(getModelsForProvider(registry, "copy")).toEqual([]);
+	});
+
 	describe("models.json discovery (pi-3ctln)", () => {
 		let server: Server;
 		let baseUrl: string;
@@ -1006,6 +1082,22 @@ describe("ModelRegistry", () => {
 				expect(models.every((m) => m.baseUrl === expectedBaseUrl)).toBe(true);
 			});
 
+			test("an empty extension key preserves the models.json request key and headers", async () => {
+				writeModelsJson({
+					fixture: {
+						...providerConfig("https://fixture.invalid", [{ id: "test" }]),
+						apiKey: "fixture-key",
+						headers: { "x-source": "file" },
+					},
+				});
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				registry.registerProvider("fixture", { apiKey: "" });
+				expect(await registry.getApiKeyAndHeaders(registry.find("fixture", "test")!)).toMatchObject({
+					ok: true,
+					apiKey: "fixture-key",
+					headers: { "x-source": "file" },
+				});
+			});
 			test("headers-only override keeps custom provider models after refresh", async () => {
 				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 

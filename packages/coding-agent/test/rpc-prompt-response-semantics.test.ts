@@ -225,6 +225,20 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	it("keeps the API-key text for a direct model saved in the session", async () => {
+		const { session, cleanup } = createRuntimeHost({
+			withAuth: false,
+			responseDelayMs: 0,
+			model: { ...getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5")!, provider: "fake-provider" },
+		});
+		try {
+			session.sessionManager.appendModelChange("fake-provider", "fake-model");
+			await expect(session.prompt("Hello")).rejects.toThrow("No API key found for fake-provider.");
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("emits one success response when prompt preflight succeeds", async () => {
 		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 250 });
 

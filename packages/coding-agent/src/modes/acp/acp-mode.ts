@@ -924,7 +924,7 @@ export async function runAcpModeWithConnection(
 				}
 				if (configId === "model" && typeof value === "string") {
 					const current = (await connection.getState()).model;
-					if (current && modelValue(current) === value) {
+					if (current && current.provider !== "claude-sdk" && modelValue(current) === value) {
 						return { configOptions: await refreshConfig(entry) };
 					}
 					let models: AgentConnectionModel[];
@@ -934,8 +934,22 @@ export async function runAcpModeWithConnection(
 						throw acp.RequestError.invalidParams({ reason: "Model discovery is unavailable; try again later" });
 					}
 					const model = models.find((candidate) => modelValue(candidate) === value);
-					if (!model) throw acp.RequestError.invalidParams({ reason: `Unavailable model: ${value}` });
-					await connection.setModel(model.provider, model.id);
+					if (model) {
+						if (!current || modelValue(current) !== value) await connection.setModel(model.provider, model.id);
+					} else {
+						// Ask the session that owns the registration for its refusal reason.
+						const known =
+							value.startsWith('["claude-sdk",') &&
+							(await connection.getModelCatalog()).models.find((candidate) => modelValue(candidate) === value);
+						if (!known) throw acp.RequestError.invalidParams({ reason: `Unavailable model: ${value}` });
+						try {
+							await connection.setModel(known.provider, known.id);
+						} catch (error) {
+							throw acp.RequestError.invalidParams({
+								reason: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
 					entry.models = models;
 				} else if (configId === "thought_level" && typeof value === "string") {
 					const state = await connection.getState();

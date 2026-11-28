@@ -1,8 +1,13 @@
 import { join } from "node:path";
 import { getDocsPath } from "../config.js";
+import type { ModelRegistry } from "./model-registry.js";
 
 const UNKNOWN_PROVIDER = "unknown";
 export const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
+
+export function hasResolvedModel(model: { provider: string } | undefined): boolean {
+	return model !== undefined && model.provider !== UNKNOWN_PROVIDER;
+}
 
 export function getProviderLoginHelp(): string {
 	return [
@@ -12,20 +17,20 @@ export function getProviderLoginHelp(): string {
 	].join("\n");
 }
 
-export function formatNoModelsAvailableMessage(): string {
+export function formatNoModelsAvailableMessage(saved?: {
+	provider: string | undefined;
+	registry: ModelRegistry;
+}): string {
+	if (saved?.provider) {
+		const cause = saved.registry.getProviderMissingAuthMessage(saved.provider);
+		if (cause) return cause;
+		if (!saved.registry.hasProvider(saved.provider)) return formatProviderNotRegisteredMessage(saved.provider);
+	}
 	return `No models available. ${getProviderLoginHelp()}`;
 }
 
-/**
- * Whether a model fallback message is the "no models available" warning.
- *
- * That warning is a claim about current state (no model could be resolved), so
- * consumers must re-check it against the live session before showing it; the
- * other fallback variants ("Could not restore model X. Using Y") are one-time
- * startup notices that stay valid.
- */
-export function isNoModelsAvailableMessage(message: string | undefined): boolean {
-	return message === formatNoModelsAvailableMessage();
+export function formatProviderNotRegisteredMessage(provider: string): string {
+	return `Provider ${provider} is not registered. Use /model to pick another model.`;
 }
 
 export function formatNoModelSelectedMessage(): string {

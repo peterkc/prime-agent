@@ -262,8 +262,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
 		} else {
-			const hintText = "Signed-in providers first. Other models prompt sign-in.";
-			this.warningText = new Text(theme.fg("muted", hintText), 0, 0);
+			this.warningText = new Text("", 0, 0);
 		}
 		this.headerHelpContainer = new Container();
 		this.panel.addChild(this.headerHelpContainer);
@@ -361,6 +360,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 
 		this.allModels = this.sortModels(models);
+		this.warningText?.setText(
+			theme.fg(
+				"muted",
+				models.some((item) => this.hasExternalAuth(item))
+					? "Configured providers first."
+					: "Signed-in providers first. Other models prompt sign-in.",
+			),
+		);
 		const availableModelsById = new Map(availableModels.map((model) => [`${model.provider}/${model.id}`, model]));
 		this.scopedModels = this.scopedModels.map((scoped) => {
 			const scopedModelId = `${scoped.model.provider}/${scoped.model.id}`;
@@ -441,10 +448,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		return true;
 	}
 
+	private hasExternalAuth(item: ModelItem): boolean {
+		return this.modelRegistry.hasExternalAuth(item.provider) || item.model.api === "claude-agent-sdk";
+	}
+
 	private getTrailingSegments(item: ModelItem, isCurrent: boolean, isConfigured: boolean): string[] {
 		const segments: string[] = [];
 		if (isCurrent) segments.push("current");
-		if (!isConfigured) segments.push("require sign in");
+		if (!isConfigured) segments.push(this.hasExternalAuth(item) ? "unavailable" : "require sign in");
 		segments.push(item.provider);
 		return segments;
 	}
@@ -650,7 +661,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				? isCurrent
 					? theme.fg("success", "current")
 					: undefined
-				: theme.fg("warning", isCurrent ? "current · require sign in" : "require sign in");
+				: theme.fg(
+						"warning",
+						`${isCurrent ? "current · " : ""}${this.hasExternalAuth(item) ? "unavailable" : "require sign in"}`,
+					);
 			const inlineSegments = this.getTrailingSegments(item, isCurrent, isConfigured);
 			let primary = this.inline ? item.model.name : item.id;
 			if (this.inline && effortLayout.showCluster) {

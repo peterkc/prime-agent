@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -191,6 +191,25 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = new AgentSessionRuntime(session, services, createRuntime);
 		return { runtime, disposeSession };
 	}
+
+	it("clears the provider cause when the session gains a model", async () => {
+		const cause = "Cannot find the claude executable";
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendModelChange("unavailable", "missing");
+		const availability = vi.spyOn(ModelRegistry.prototype, "refreshAvailableModels").mockResolvedValue([]);
+		try {
+			const { runtime, faux } = await createRuntimeForTest(
+				(pi) => pi.registerProvider("unavailable", { missingAuthMessage: cause }),
+				{ bootstrapModel: false, sessionManager },
+			);
+			expect(runtime.session.model?.provider).toBe("unknown");
+			expect(runtime.modelFallbackMessage).toBe(cause);
+			await runtime.session.setModel(faux.getModel());
+			expect(runtime.modelFallbackMessage).toBeUndefined();
+		} finally {
+			availability.mockRestore();
+		}
+	});
 
 	it("passes session config to replacement runtimes", async () => {
 		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];
@@ -613,6 +632,148 @@ describe("AgentSessionRuntime characterization", () => {
 			expect([created.session.model?.id, created.session.thinkingLevel]).toEqual(
 				explicit ? ["faux-1", "medium"] : ["faux-2", "high"],
 			);
+		},
+	);
+
+	it.each(["empty-branch fork", "runtime-hosted RLM child", "saved selection"])(
+		"keeps the destination model through the production factory: %s",
+		async (operation) => {
+			const h = await createHarness();
+			cleanups.push(h.cleanup);
+			const registered = h.getModel();
+			const custom = { ...registered, id: "custom-model" };
+			const factory = createDefaultRuntimeFactory(
+				{
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					telemetryDisabled: true,
+				},
+				[
+					(pi) =>
+						pi.registerProvider(registered.provider, {
+							baseUrl: registered.baseUrl,
+							apiKey: "faux-key",
+							api: registered.api,
+							models: h.models,
+						}),
+				],
+			);
+			const sessionManager = SessionManager.create(h.tempDir, join(h.tempDir, "sessions"));
+			const saved = operation === "saved selection";
+			if (saved) sessionManager.appendModelChange(registered.provider, registered.id);
+			const runtime = await createAgentSessionRuntime(factory, {
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				sessionManager,
+				sessionOptions: { rlmDepth: 1, model: saved ? { ...custom, provider: "removed-provider" } : registered },
+			});
+			cleanups.push(() => runtime.dispose());
+
+			if (saved) {
+				expect(runtime.session.model?.id).toBe(registered.id);
+				expect(sessionManager.buildSessionContext().model).toEqual({
+					provider: registered.provider,
+					modelId: registered.id,
+				});
+				return;
+			}
+			await runtime.session.setModel(custom, { persist: false });
+			let session: AgentSession;
+			if (operation === "empty-branch fork") {
+				const first = sessionManager.appendMessage(userMsg("first message"));
+				sessionManager.appendMessage(assistantMsg("saved reply"));
+				await runtime.fork(first);
+				session = runtime.session;
+			} else {
+				const child = await runtime.createRlmSubagentRuntime({
+					parentSession: runtime.session,
+					id: "child",
+					prompt: "child prompt",
+					sessionName: "child",
+					sessionDir: join(h.tempDir, "child"),
+					model: custom,
+					thinkingLevel: "off",
+					serviceTier: null,
+					scopedModels: [],
+					activeToolNames: [],
+					customTools: [],
+					includeGoals: false,
+					includeCompactSkill: false,
+					rlmDepth: 2,
+					rlmMaxDepth: 2,
+					rlmParentNodeId: "child",
+				});
+				session = child.session;
+			}
+			expect(session.model?.id).toBe(custom.id);
+		},
+	);
+
+	it.each(["first-message fork", "runtime-hosted RLM child"])(
+		"reports a removed claude-sdk model without login guidance: %s",
+		async (operation) => {
+			for (const key of Object.keys(process.env)) {
+				if (/(?:_API_KEY|_TOKEN)$/.test(key) || /^(?:AWS_|GOOGLE_CLOUD_|GCLOUD_)/.test(key))
+					vi.stubEnv(key, undefined);
+			}
+			const cwd = mkdtempSync(join(tmpdir(), "pi-runtime-claude-sdk-"));
+			cleanups.push(() => rmSync(cwd, { recursive: true, force: true }));
+			const claudePath = join(cwd, "fixture-claude");
+			writeFileSync(claudePath, "fixture", { mode: 0o700 });
+			const config = join(cwd, "claude-sdk.json");
+			writeFileSync(config, JSON.stringify({ enabled: true, claudePath }));
+			const sessionManager = SessionManager.create(cwd, join(cwd, "sessions"));
+			const runtime = await createAgentSessionRuntime(
+				createDefaultRuntimeFactory({
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+					telemetryDisabled: true,
+				}),
+				{ cwd, agentDir: cwd, sessionManager, sessionOptions: { rlmDepth: 1 } },
+			);
+			cleanups.push(() => runtime.dispose());
+			const parentSession = runtime.session;
+			const model = parentSession.modelRegistry
+				.getAvailable()
+				.find((candidate) => candidate.provider === "claude-sdk");
+			if (!model) throw Error("missing claude-sdk model before opt-out");
+			await parentSession.setModel(model);
+			writeFileSync(config, JSON.stringify({ enabled: false }));
+
+			let session: AgentSession;
+			if (operation === "first-message fork") {
+				const first = sessionManager.appendMessage(userMsg("before opt-out"));
+				sessionManager.appendMessage(assistantMsg("saved reply"));
+				await runtime.fork(first);
+				session = runtime.session;
+			} else {
+				const child = await runtime.createRlmSubagentRuntime({
+					parentSession,
+					id: "child",
+					prompt: "after opt-out",
+					sessionName: "child",
+					sessionDir: join(cwd, "child"),
+					model,
+					thinkingLevel: "off",
+					serviceTier: null,
+					scopedModels: [],
+					activeToolNames: [],
+					customTools: [],
+					includeGoals: false,
+					includeCompactSkill: false,
+					rlmDepth: 2,
+					rlmMaxDepth: 2,
+					rlmParentNodeId: "child",
+				});
+				session = child.session;
+			}
+			const prompt = session.prompt("after opt-out");
+			await expect(prompt).rejects.toEqual(
+				Error("Provider claude-sdk is not registered. Use /model to pick another model."),
+			);
+			expect(session.model?.provider).toBe("unknown");
 		},
 	);
 
@@ -1087,6 +1248,7 @@ describe("AgentSessionRuntime characterization", () => {
 					services,
 					sessionManager,
 					sessionStartEvent,
+					model: faux.getModel(),
 				})),
 				services,
 				diagnostics: services.diagnostics,

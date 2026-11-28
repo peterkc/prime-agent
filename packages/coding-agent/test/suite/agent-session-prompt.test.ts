@@ -55,6 +55,20 @@ describe("AgentSession prompt characterization", () => {
 		}
 	});
 
+	it("does not offer Prime login for an externally authenticated Claude SDK turn error", async () => {
+		const harness = await createHarness({ provider: "claude-sdk", settings: { retry: { enabled: false } } });
+		harnesses.push(harness);
+		harness.session.modelRegistry.registerProvider("claude-sdk", { missingAuthMessage: "" });
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized" })]);
+		await harness.session.prompt("test");
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			provider: "claude-sdk",
+			stopReason: "error",
+			errorMessage: "401 Unauthorized",
+		});
+	});
+
 	it("admits concurrent idle prompts in FIFO order with only the waiting action queued", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

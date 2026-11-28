@@ -222,7 +222,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		model = result.model;
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
+			const savedProvider = existingSession.model?.provider ?? settingsManager.getDefaultProvider();
+			const pending =
+				savedProvider &&
+				!modelRegistry.hasProvider(savedProvider) &&
+				resourceLoader
+					.getExtensions()
+					.runtime.pendingProviderRegistrations.some(({ name }) => name === savedProvider);
+			modelFallbackMessage = formatNoModelsAvailableMessage({
+				provider: pending ? undefined : savedProvider,
+				registry: modelRegistry,
+			});
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}

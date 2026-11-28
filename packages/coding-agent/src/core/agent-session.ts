@@ -84,6 +84,8 @@ import {
 	formatAuthenticationFailedMessage,
 	formatNoApiKeyFoundMessage,
 	formatNoModelSelectedMessage,
+	formatProviderNotRegisteredMessage,
+	hasResolvedModel,
 	isLikelyAuthenticationError,
 } from "./auth-guidance.js";
 import type { AuthSourceToken } from "./auth-storage.js";
@@ -2091,6 +2093,25 @@ export class AgentSession {
 		this._subagentRuntimeHost = host;
 	}
 
+	private _missingAuthError(model: Model<Api> | undefined, fallback?: string): Error {
+		const registry = this._modelRegistry;
+		const resolved = hasResolvedModel(model);
+		const provider = resolved
+			? model?.provider
+			: (this.sessionManager.buildSessionContext().model?.provider ?? this.settingsManager.getDefaultProvider());
+		if (provider) {
+			const cause = registry.getProviderMissingAuthMessage(provider);
+			if (cause) return new Error(cause);
+			// A model passed directly by an SDK host need not have a registered provider.
+			if (resolved ? registry.wasProviderRemoved(provider) : !registry.hasProvider(provider))
+				return new Error(formatProviderNotRegisteredMessage(provider));
+		}
+		if (!model) return new Error(formatNoModelSelectedMessage());
+		if (fallback) return new Error(fallback);
+		if (registry.isUsingOAuth(model)) return new Error(formatAuthenticationFailedMessage(model.provider));
+		return new Error(formatNoApiKeyFoundMessage(model.provider));
+	}
+
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
@@ -2099,7 +2120,7 @@ export class AgentSession {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
-				throw new Error(formatNoApiKeyFoundMessage(model.provider));
+				throw this._missingAuthError(model, formatNoApiKeyFoundMessage(model.provider));
 			}
 			throw new Error(result.error);
 		}
@@ -2107,11 +2128,7 @@ export class AgentSession {
 			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
-		const isOAuth = this._modelRegistry.isUsingOAuth(model);
-		if (isOAuth) {
-			throw new Error(formatAuthenticationFailedMessage(model.provider));
-		}
-		throw new Error(formatNoApiKeyFoundMessage(model.provider));
+		throw this._missingAuthError(model);
 	}
 
 	/**
@@ -2800,16 +2817,7 @@ export class AgentSession {
 	}
 
 	private async _validateCanStartAgentRun(): Promise<void> {
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
-			if (isOAuth) {
-				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
-			}
-			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-		}
+		if (!this.model || !this._modelRegistry.hasConfiguredAuth(this.model)) throw this._missingAuthError(this.model);
 	}
 
 	/**
@@ -4728,7 +4736,7 @@ export class AgentSession {
 		if (!message || message.stopReason !== "error" || !message.errorMessage) {
 			return;
 		}
-		if (!isLikelyAuthenticationError(message.errorMessage)) {
+		if (this._modelRegistry.hasExternalAuth(message.provider) || !isLikelyAuthenticationError(message.errorMessage)) {
 			return;
 		}
 		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
@@ -8765,7 +8773,7 @@ export class AgentSession {
 			!this._modelRegistry.hasConfiguredAuth(model) &&
 			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
 		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
+			throw this._missingAuthError(model, `No API key for ${model.provider}/${model.id}`);
 		}
 		if (!(await this._modelRegistry.canUseModel(model, { assumeAuthConfigured: staleOnly }))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
@@ -8773,7 +8781,7 @@ export class AgentSession {
 		if (staleOnly) {
 			this._modelRegistry.clearProviderAuthStale(model.provider);
 			if (!this._modelRegistry.hasConfiguredAuth(model)) {
-				throw new Error(`No API key for ${model.provider}/${model.id}`);
+				throw this._missingAuthError(model, `No API key for ${model.provider}/${model.id}`);
 			}
 		}
 

@@ -764,6 +764,22 @@ describe("AgentSession compaction", () => {
 			options: { withConfiguredAuth: false } as HarnessOptions,
 			prepare: (harness: Harness) => `No API key found for ${harness.getModel().provider}.`,
 		},
+		{
+			name: "OAuth auth is stale and the provider requires an auth header",
+			options: { withConfiguredAuth: false } as HarnessOptions,
+			prepare: (harness: Harness) => {
+				const provider = harness.getModel().provider;
+				harness.authStorage.set(provider, {
+					type: "oauth",
+					access: "fixture",
+					refresh: "fixture",
+					expires: Date.now() + 60_000,
+				});
+				expect(harness.authStorage.markAuthStale(provider)).toBe(true);
+				harness.session.modelRegistry.registerProvider(provider, { authHeader: true });
+				return `No API key found for ${provider}.`;
+			},
+		},
 	])("throws when compacting while $name", async ({ options, prepare }) => {
 		const harness = await createHarness(options);
 		harnesses.push(harness);
