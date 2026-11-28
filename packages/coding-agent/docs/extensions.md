@@ -148,10 +148,13 @@ Prime Agent ships these built-in extensions:
   on `PATH`. To select another executable, set `claudePath` in the global agent
   folder's `claude-sdk.json`, for example `{"enabled":true,"claudePath":"/opt/bin/claude"}`.
   The path must be absolute. Prime lists the models as available only if it finds
-  the executable at registration. Project settings do not override this file.
-  Displayed cost uses catalog rates. Claude Code writes transcripts under
-  `~/.claude/projects`, even if you start Prime with `--no-session`. Each resumed
-  turn forks the Claude session (`forkSession`) and writes a full transcript copy.
+  the executable at registration.
+  Set `idleTimeoutSeconds` in the same file to change how long Prime waits for
+  SDK activity. The default is 300 seconds. Keepalives do not reset the timeout.
+  Project settings do not override this file. Displayed cost uses catalog rates.
+  Claude Code writes transcripts under `~/.claude/projects`, even if you start
+  Prime with `--no-session`. Each resumed turn forks the Claude session
+  (`forkSession`) and writes a full transcript copy.
 - **Observation-pack** archives text-only, successful tool results larger than
   10,240 UTF-8 bytes when compaction keeps them for a new context cycle. With
   `ipython` active, the model sees a stable placeholder with complete-line

@@ -1,5 +1,7 @@
 /*!
  * Adapted from rynfar/meridian src/proxy/server.ts at commit 510da1d9 (MIT, per its README).
+ * Adapted from rynfar/meridian src/proxy/query.ts at commit 510da1d9 (MIT, per its README).
+ * Adapted from rynfar/meridian src/proxy/turnOutcome.ts at commit 510da1d9 (MIT, per its README).
  * The copyright line is from the upstream LICENSE added after 510da1d9.
  *
  * MIT License
@@ -49,6 +51,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { comparePackageVersions } from "../../../utils/version-check.js";
 import type { ExtensionFactory } from "../types.js";
 import { readClaudeSettings } from "./claude-agent-sdk-config.js";
+import { guardClaudeInit, guardClaudeStream } from "./claude-agent-sdk-stream-guard.js";
+import { aliasPrimeTools, primeMcpPrefix, repairToolInput } from "./claude-agent-sdk-tool-input.js";
 
 type Query = (args: {
 	options: Options;
@@ -75,8 +79,22 @@ registerSessionResourceCleanup((id) => {
 	else for (const key of sessions.keys()) closeSession(key);
 });
 
-function childEnv() {
-	const env: Record<string, string | undefined> = { DISABLE_AUTO_COMPACT: "1" };
+function childEnv(maxTokens: number) {
+	const env: Record<string, string | undefined> = {
+		DISABLE_AUTO_COMPACT: "1",
+		CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING: "1",
+		CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+		DISABLE_TELEMETRY: "1",
+		DISABLE_ERROR_REPORTING: "1",
+		DISABLE_FEEDBACK_COMMAND: "1",
+		CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
+		DISABLE_AUTOUPDATER: "1",
+		CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+		CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+		ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+		CLAUDE_CODE_MAX_RETRIES: "0",
+		CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxTokens),
+	};
 	for (const key of Object.keys(process.env))
 		if (
 			/^(?:PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|TERM|LANG|LC_.*|TZ|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|CLAUDE_CONFIG_DIR)$/.test(
@@ -105,11 +123,11 @@ function executable(configured?: string) {
 		kind: "invalid_request",
 	});
 }
-function primeServer(tools: Context["tools"]) {
+function primeServer(tools: ReturnType<typeof aliasPrimeTools>) {
 	const server = new McpServer({ name: "prime", version: "1" }, { capabilities: { tools: {} } });
 	server.server.setRequestHandler(ListToolsRequestSchema, () => ({
-		tools: (tools ?? []).map((t) => ({
-			name: t.name,
+		tools: [...tools].map(([name, t]) => ({
+			name,
 			description: t.description,
 			inputSchema: t.parameters,
 			_meta: { "anthropic/alwaysLoad": true },
@@ -303,20 +321,27 @@ export class ClaudeSdkProvider {
 					},
 				);
 			const path = executable(settings.claudePath);
+			const tools = aliasPrimeTools(context.tools ?? []);
+			const maxTokens = options?.maxTokens ?? model.maxTokens;
+			const capped = (message: string) => /Claude's response exceeded the \d+ output token maximum\./.test(message);
 			let point = resumePoint(model, context);
 			stream.push({ type: "start", partial: msg });
 			for (;;) {
 				ctrl.signal.throwIfAborted();
-				server = primeServer(context.tools);
+				server = primeServer(tools);
 				const level = options?.reasoning;
 				const attempt = new AbortController(),
-					abortAttempt = () => attempt.abort();
+					abortAttempt = () => attempt.abort(),
+					abortIdleAttempt = () => {
+						release();
+						abortAttempt();
+					};
 				const sdkOptions: Options = {
 					...(point ? { resume: point.resume, resumeSessionAt: point.resumeSessionAt, forkSession: true } : {}),
 					pathToClaudeCodeExecutable: path,
 					model: model.id,
 					effort: level === "minimal" ? "low" : level === "off" ? undefined : level,
-					thinking: level === "off" ? { type: "disabled" } : undefined,
+					thinking: !level || level === "off" ? { type: "disabled" } : undefined,
 					systemPrompt: context.systemPrompt ?? "",
 					tools: [],
 					settingSources: [],
@@ -325,7 +350,7 @@ export class ClaudeSdkProvider {
 					verbatimPrompts: true,
 					maxTurns: 1,
 					includePartialMessages: true,
-					env: childEnv(),
+					env: childEnv(maxTokens),
 					abortController: attempt,
 					mcpServers: { prime: { type: "sdk", name: "prime", instance: server } },
 					hooks: {
@@ -335,18 +360,18 @@ export class ClaudeSdkProvider {
 									async (input, id) => {
 										if (
 											input.hook_event_name === "PreToolUse" &&
-											id &&
-											input.tool_name.startsWith("mcp__prime__") &&
-											input.tool_input !== null &&
-											typeof input.tool_input === "object" &&
-											!Array.isArray(input.tool_input)
-										)
-											captured.set(id, {
-												type: "toolCall",
-												id,
-												name: input.tool_name.slice("mcp__prime__".length),
-												arguments: input.tool_input as Record<string, unknown>,
-											});
+											input.tool_name.startsWith(primeMcpPrefix)
+										) {
+											const tool = tools.get(input.tool_name.slice(primeMcpPrefix.length));
+											const args = input.tool_input;
+											if (tool && id && args !== null && typeof args === "object" && !Array.isArray(args))
+												captured.set(id, {
+													type: "toolCall",
+													id,
+													name: tool.name,
+													arguments: repairToolInput(args as Record<string, unknown>, tool.parameters),
+												});
+										}
 										// An early denial cancels generation of later parallel calls. Release at the raw message boundary, not at an assistant block.
 										await hold;
 										return {
@@ -381,10 +406,14 @@ export class ClaudeSdkProvider {
 					});
 					let version: string | undefined;
 					try {
-						version = (await query.initializationResult()).claude_code_version;
+						version = (
+							await guardClaudeInit(query.initializationResult(), settings.idleTimeoutSeconds, abortIdleAttempt)
+						).claude_code_version;
 					} catch (error) {
 						allowPrompt(false);
 						ctrl.signal.throwIfAborted();
+						// An idle timeout aborted the attempt; there is no startup result to read.
+						if (attempt.signal.aborted) throw error;
 						// The CLI can emit a startup failure result before the SDK rejects its control response.
 						for await (const m of query) {
 							if (m.type === "result" && m.subtype !== "success" && m.errors.length)
@@ -399,12 +428,19 @@ export class ClaudeSdkProvider {
 						);
 					ctrl.signal.throwIfAborted();
 					allowPrompt(true);
-					for await (const m of query) {
+					for await (const m of guardClaudeStream(query, settings.idleTimeoutSeconds, abortIdleAttempt)) {
 						ctrl.signal.throwIfAborted();
 						if (m.type === "assistant" && m.supersedes?.length) {
 							// Stream deltas and hooks do not identify their owning assistant UUID.
 							msg.content = [];
 							throw Error("Claude superseded earlier output; discarding this turn");
+						}
+						if (m.type === "assistant" && m.error === "max_output_tokens") {
+							release();
+							assistantUuid = undefined;
+							msg.stopReason = "length";
+							completed = true;
+							break;
 						}
 						if (m.type === "assistant" && m.error) {
 							const error = m.error;
@@ -440,8 +476,9 @@ export class ClaudeSdkProvider {
 								limitAfterTools = true;
 							} else if (m.subtype !== "success" || m.is_error) {
 								throw Error(m.subtype === "success" ? m.result : m.errors.join("; ") || m.subtype);
+							} else if (m.stop_reason === "max_tokens") {
+								msg.stopReason = "length";
 							}
-							if (m.stop_reason === "max_tokens") msg.stopReason = "length";
 							completed = true;
 							continue;
 						}
@@ -519,14 +556,17 @@ export class ClaudeSdkProvider {
 				} catch (error) {
 					allowPrompt(false);
 					query?.close?.();
-					if (
+					const message = error instanceof Error ? error.message : String(error);
+					if (attempt.signal.aborted) throw error;
+					if (capped(message)) {
+						assistantUuid = undefined;
+						msg.stopReason = "length";
+						completed = true;
+					} else if (
 						point &&
-						!ctrl.signal.aborted &&
 						!captured.size &&
 						!msg.content.length &&
-						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(
-							error instanceof Error ? error.message : String(error),
-						)
+						/^(?:No conversation found with session ID|No message found with message\.uuid of)\b/.test(message)
 					) {
 						release();
 						await server.close();
@@ -534,15 +574,19 @@ export class ClaudeSdkProvider {
 						toolOrder.clear();
 						msg.diagnostics = [{ type: "claude_sdk_resume_fallback", timestamp: Date.now() }];
 						continue;
-					}
-					if (!limitAfterTools) throw error;
+					} else if (!limitAfterTools) throw error;
 				} finally {
 					ctrl.signal.removeEventListener("abort", abortAttempt);
 				}
 				ctrl.signal.throwIfAborted();
 				if (!completed) throw Error("Claude query ended without a result");
-				if ([...toolOrder.keys()].some((id) => !captured.has(id)))
-					throw Error("Claude rejected a tool call before Prime could capture it");
+				const allToolsCaptured = [...toolOrder.keys()].every((id) => captured.has(id));
+				if (msg.stopReason !== "length") {
+					if (!allToolsCaptured) throw Error("Claude rejected a tool call before Prime could capture it");
+					if (!captured.size && !msg.content.some((block) => block.type === "text" && block.text.length > 0))
+						throw new StreamFailureError("Claude returned nothing.", { kind: "invalid_request" });
+					msg.stopReason = captured.size ? "toolUse" : "stop";
+				}
 				for (const call of [...captured.values()].sort(
 					(a, b) => (toolOrder.get(a.id) ?? Infinity) - (toolOrder.get(b.id) ?? Infinity),
 				)) {
@@ -550,13 +594,12 @@ export class ClaudeSdkProvider {
 					msg.content.push(call);
 					stream.push({ type: "toolcall_start", contentIndex, partial: msg });
 					stream.push({ type: "toolcall_end", toolCall: call, contentIndex, partial: msg });
-					msg.stopReason = "toolUse";
 				}
-				if (sessionId && assistantUuid && uuid.test(sessionId) && uuid.test(assistantUuid))
+				if (allToolsCaptured && sessionId && assistantUuid && uuid.test(sessionId) && uuid.test(assistantUuid))
 					msg.responseId = `${sessionId}.${assistantUuid}.${historyHash(model, context, [...context.messages, msg])}`;
 				stream.push({
 					type: "done",
-					reason: captured.size ? "toolUse" : msg.stopReason === "length" ? "length" : "stop",
+					reason: msg.stopReason,
 					message: msg,
 				});
 				break;
